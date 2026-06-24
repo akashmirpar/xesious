@@ -20,6 +20,8 @@
 import { Bot, InputFile, type Context } from 'grammy'
 import { run, type RunnerHandle } from '@grammyjs/runner'
 import telegramify from 'telegramify-markdown'
+import { autoRetry } from '@grammyjs/auto-retry'
+import { apiThrottler } from '@grammyjs/transformer-throttler'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync } from 'node:fs'
 import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 'node:path'
@@ -213,12 +215,12 @@ async function runStreaming(ctx: Context, threadId: number | undefined, prompt: 
   const editStatus = async (force = false) => {
     if (!status || (!dirty && !force)) return
     const now = Date.now()
-    if (!force && now - lastEdit < 2500) return
+    if (!force && now - lastEdit < 4000) return
     lastEdit = now; dirty = false
     const body = (steps.length ? steps.slice(-9).join('\n') : '💭 thinking…').slice(0, 3500)
     await ctx.api.editMessageText(ctx.chat!.id, status.message_id, body).catch(() => {})
   }
-  const ticker = setInterval(() => void editStatus(), 2500)
+  const ticker = setInterval(() => void editStatus(), 4000)
 
   return await new Promise<ClaudeResult>(resolve => {
     let buf = '', err = '', finalText = '', sessionId: string | undefined, isError = false, got = false
@@ -513,6 +515,10 @@ function renderTurns(file: string, n: number): string[] {
 
 loadState()
 const bot = new Bot(TOKEN)
+// Stay within Telegram's limits (~20 msgs/min per group): the throttler queues
+// outbound calls, and auto-retry waits out any 429 instead of dropping messages.
+bot.api.config.use(apiThrottler())
+bot.api.config.use(autoRetry({ maxRetryAttempts: 5, maxDelaySeconds: 60 }))
 let botUsername = ''
 
 bot.on('message', async ctx => {
