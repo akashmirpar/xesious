@@ -19,6 +19,7 @@
  */
 import { Bot, InputFile, type Context } from 'grammy'
 import { run, type RunnerHandle } from '@grammyjs/runner'
+import telegramify from 'telegramify-markdown'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync } from 'node:fs'
 import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 'node:path'
@@ -180,30 +181,80 @@ function childEnv(): NodeJS.ProcessEnv {
   return e
 }
 
-function runClaude(prompt: string, cwd: string, resumeId?: string): Promise<ClaudeResult> {
-  const args = ['-p', prompt, '--output-format', 'json', ...permissionArgs()]
+// A short status label for a streamed tool_use event.
+function toolStep(b: any): string {
+  const n = b?.name || 'tool'
+  const i = b?.input || {}
+  const clip = (s: any, m = 72) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, m)
+  switch (n) {
+    case 'Bash': return `⚙️ ${clip(i.command, 84)}`
+    case 'Read': return `📖 ${clip(i.file_path)}`
+    case 'Edit': case 'Write': case 'NotebookEdit': return `✏️ ${clip(i.file_path)}`
+    case 'Glob': case 'Grep': return `🔎 ${n} ${clip(i.pattern)}`
+    case 'WebFetch': return `🌐 ${clip(i.url)}`
+    case 'WebSearch': return `🌐 ${clip(i.query)}`
+    case 'Agent': case 'Task': return `🤖 ${clip(i.description || 'subagent')}`
+    case 'TodoWrite': return '📝 updating todos'
+    default: return `⚙️ ${n}`
+  }
+}
+
+// Run a prompt with streaming output, editing a single "status" message in the
+// topic to show live tool-step progress, then return the final result.
+async function runStreaming(ctx: Context, threadId: number | undefined, prompt: string, cwd: string, resumeId?: string): Promise<ClaudeResult> {
+  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs()]
   if (resumeId) args.push('--resume', resumeId)
   if (MODEL) args.push('--model', MODEL)
-  return new Promise(resolve => {
-    let out = '', err = ''
-    console.log(`[claude] spawn in ${cwd}${resumeId ? ` (resume ${resumeId.slice(0, 8)})` : ' (new)'}`)
+
+  const opts: any = threadId ? { message_thread_id: threadId } : {}
+  const status = await ctx.api.sendMessage(ctx.chat!.id, '💭 thinking…', opts).catch(() => null)
+  const steps: string[] = []
+  let lastEdit = 0, dirty = false
+  const editStatus = async (force = false) => {
+    if (!status || (!dirty && !force)) return
+    const now = Date.now()
+    if (!force && now - lastEdit < 2500) return
+    lastEdit = now; dirty = false
+    const body = (steps.length ? steps.slice(-9).join('\n') : '💭 thinking…').slice(0, 3500)
+    await ctx.api.editMessageText(ctx.chat!.id, status.message_id, body).catch(() => {})
+  }
+  const ticker = setInterval(() => void editStatus(), 2500)
+
+  return await new Promise<ClaudeResult>(resolve => {
+    let buf = '', err = '', finalText = '', sessionId: string | undefined, isError = false, got = false
+    console.log(`[claude] stream in ${cwd}${resumeId ? ` (resume ${resumeId.slice(0, 8)})` : ' (new)'}`)
     const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv() })
     const timer = setTimeout(() => child.kill('SIGKILL'), CLAUDE_TIMEOUT_MS)
-    child.stdout.on('data', d => (out += d))
     child.stderr.on('data', d => (err += d))
-    child.on('error', e => { clearTimeout(timer); resolve({ text: `Failed to launch \`${CLAUDE_BIN}\`: ${e}`, isError: true }) })
-    child.on('close', code => {
-      clearTimeout(timer)
-      console.log(`[claude] done (exit ${code}, ${out.length} bytes)`)
-      const trimmed = out.trim()
-      try {
-        const json = JSON.parse(trimmed)
-        const text = String(json.result ?? '').trim()
-        const isError = Boolean(json.is_error) || json.subtype !== 'success'
-        resolve({ text: text || (isError ? `(claude error: ${json.subtype ?? 'unknown'})` : '(empty response)'), sessionId: json.session_id, isError })
-      } catch {
-        resolve({ text: `Could not parse Claude output.\n\n${(err || trimmed || `exit ${code}`).slice(-1500)}`, isError: true })
+    child.stdout.on('data', d => {
+      buf += d
+      let nl: number
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl); buf = buf.slice(nl + 1)
+        if (!line.trim()) continue
+        let o: any; try { o = JSON.parse(line) } catch { continue }
+        if (o.type === 'assistant' && Array.isArray(o.message?.content)) {
+          for (const b of o.message.content) if (b?.type === 'tool_use') { steps.push(toolStep(b)); dirty = true }
+        } else if (o.type === 'result') {
+          got = true; sessionId = o.session_id
+          isError = Boolean(o.is_error) || o.subtype !== 'success'
+          finalText = String(o.result ?? '').trim()
+        } else if (o.type === 'system' && o.subtype === 'init' && o.session_id) {
+          sessionId ||= o.session_id
+        }
       }
+      void editStatus()
+    })
+    const finish = async (res: ClaudeResult) => {
+      clearTimeout(timer); clearInterval(ticker)
+      if (status) await ctx.api.deleteMessage(ctx.chat!.id, status.message_id).catch(() => {})
+      resolve(res)
+    }
+    child.on('error', e => void finish({ text: `Failed to launch ${CLAUDE_BIN}: ${e}`, isError: true }))
+    child.on('close', code => {
+      console.log(`[claude] done (exit ${code}, ${steps.length} steps)`)
+      if (got) void finish({ text: finalText || (isError ? '(claude error)' : '(empty response)'), sessionId, isError })
+      else void finish({ text: `Could not parse Claude output.\n\n${(err || `exit ${code}`).slice(-1500)}`, isError: true })
     })
   })
 }
@@ -228,6 +279,21 @@ async function send(ctx: Context, threadId: number | undefined, text: string): P
   const opts = threadId ? { message_thread_id: threadId } : {}
   for (const part of chunk(text)) {
     await ctx.api.sendMessage(ctx.chat!.id, part, opts).catch(e => console.error(`[warn] sendMessage: ${e}`))
+  }
+}
+
+// Send Claude's answer with Telegram markdown rendering (code blocks, bold,
+// lists, links). Claude's output can contain anything, so if MarkdownV2 fails
+// to parse we resend that chunk as plain text — formatting is best-effort,
+// delivery is guaranteed.
+async function sendRich(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
+  const opts: any = threadId ? { message_thread_id: threadId } : {}
+  for (const part of chunk(text)) {
+    try {
+      await ctx.api.sendMessage(ctx.chat!.id, telegramify(part, 'escape'), { ...opts, parse_mode: 'MarkdownV2' })
+    } catch {
+      await ctx.api.sendMessage(ctx.chat!.id, part, opts).catch(e => console.error(`[warn] sendMessage: ${e}`))
+    }
   }
 }
 function startTyping(ctx: Context, threadId: number | undefined): () => void {
@@ -339,15 +405,14 @@ function withHint(prompt: string): string {
 async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string): Promise<void> {
   const cwd = resolveCwd(ctx, threadId)
   const resumeId = sessions[key]?.sessionId
-  const stop = startTyping(ctx, threadId)
   try {
-    const res = await runClaude(withHint(prompt), cwd, resumeId)
+    const res = await runStreaming(ctx, threadId, withHint(prompt), cwd, resumeId)
     if (res.sessionId) { sessions[key] = { cwd, sessionId: res.sessionId, updated: new Date().toISOString() }; saveState() }
-    await send(ctx, threadId, res.text)
+    await sendRich(ctx, threadId, res.text)
     await flushOutbox(ctx, threadId, cwd)
   } catch (e) {
     await send(ctx, threadId, `⚠️ ${e}`)
-  } finally { stop() }
+  }
 }
 
 // ---------------------------------------------------------------------------
