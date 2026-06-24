@@ -1,0 +1,14 @@
+{
+  "name": "claude-tg-bridge",
+  "version": "0.1.0",
+  "description": "Drive the Claude Code CLI from Telegram — one resumable session per forum topic. No API key.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run bridge.ts"
+  },
+  "dependencies": {
+    "@grammyjs/runner": "^2.0.3",
+    "grammy": "^1.21.0"
+  }
+}
