@@ -7,7 +7,7 @@
 #   setsid nohup bash restart-notify.sh >/tmp/restart-notify.log 2>&1 </dev/null &
 set -uo pipefail
 
-DIR=/root/sepehr/xesious
+DIR=$(pwd)
 LOG="$DIR/bridge.log"
 CHAT_ID="-1003777585204"
 THREAD_ID="44"
