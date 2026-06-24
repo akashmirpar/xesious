@@ -80,6 +80,13 @@ const BRIDGE_HINT = !/^(0|false|no)$/i.test(process.env.TG_BRIDGE_HINT || '1')
 const TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024 // Bot API getFile cap (download to us)
 const TG_UPLOAD_LIMIT = 50 * 1024 * 1024   // Bot API sendDocument cap (upload to chat)
 
+// Importing existing Claude Code sessions (the ones the IDE/CLI session picker
+// shows) as topics. A directory's sessions live at CLAUDE_PROJECTS/<encoded>/<id>.jsonl.
+const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+const CLAUDE_PROJECTS = join(CLAUDE_DIR, 'projects')
+const IMPORT_BACKFILL = Math.max(0, Number(process.env.TG_IMPORT_BACKFILL || 12))  // turns backfilled per session
+const IMPORT_MAX_SESSIONS = Math.max(1, Number(process.env.TG_IMPORT_MAX || 10))   // cap topics created per /import
+
 // ---------------------------------------------------------------------------
 // Persistent state:  sessions[(chat:topic)] = { sessionId, cwd }
 //                    names[(chat:topic)]    = "human topic name"
@@ -344,6 +351,98 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
 }
 
 // ---------------------------------------------------------------------------
+// Discover & import existing Claude Code sessions (what the IDE/CLI picker shows).
+// A directory's sessions live at CLAUDE_PROJECTS/<encoded-cwd>/<id>.jsonl.
+// ---------------------------------------------------------------------------
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+// Claude encodes a cwd by replacing every non-alphanumeric char with '-'.
+function encodeCwd(dir: string): string { return dir.replace(/[^a-zA-Z0-9]/g, '-') }
+function projectDir(dir: string): string { return join(CLAUDE_PROJECTS, encodeCwd(dir)) }
+
+// Parse the args of /sessions or /import into directories. Space-separated, or
+// comma/newline-separated when a path itself contains spaces.
+function parseDirs(text: string): string[] {
+  const i = text.indexOf(' ')
+  if (i === -1) return []
+  const rest = text.slice(i + 1).trim()
+  if (!rest) return []
+  const parts = (rest.includes('\n') || rest.includes(',')) ? rest.split(/[\n,]+/) : rest.split(/\s+/)
+  return parts.map(p => p.trim()).filter(Boolean)
+}
+
+function ago(ms: number): string {
+  const s = Math.max(0, (Date.now() - ms) / 1000)
+  if (s < 90) return `${Math.round(s)}s ago`
+  if (s < 5400) return `${Math.round(s / 60)}m ago`
+  if (s < 36 * 3600) return `${Math.round(s / 3600)}h ago`
+  return `${Math.round(s / 86400)}d ago`
+}
+
+// Flatten a message's content (string or block array) to plain text. Tool calls
+// are shown compactly; tool results / thinking / images are dropped for readability.
+function blockText(content: any): string {
+  if (typeof content === 'string') return content.trim()
+  if (!Array.isArray(content)) return ''
+  const parts: string[] = []
+  for (const b of content) {
+    if (typeof b === 'string') parts.push(b)
+    else if (b?.type === 'text' && b.text) parts.push(b.text)
+    else if (b?.type === 'tool_use') parts.push(`⚙️ ${b.name}`)
+  }
+  return parts.join('\n').trim()
+}
+
+interface SessionInfo { id: string; file: string; mtimeMs: number; title: string; turns: number }
+
+// List the sessions stored for a directory, newest first.
+function listSessions(dir: string): SessionInfo[] {
+  const pd = projectDir(dir)
+  if (!existsSync(pd)) return []
+  const out: SessionInfo[] = []
+  for (const f of readdirSync(pd)) {
+    if (!f.endsWith('.jsonl')) continue
+    const file = join(pd, f)
+    try {
+      const st = statSync(file); if (!st.isFile()) continue
+      let title = '', firstUser = '', turns = 0
+      for (const line of readFileSync(file, 'utf8').split('\n')) {
+        if (!line.trim()) continue
+        let o: any; try { o = JSON.parse(line) } catch { continue }
+        if (o.type === 'summary' && o.summary && !title) title = String(o.summary)
+        if (o.type === 'user' || o.type === 'assistant') {
+          const t = blockText(o.message?.content)
+          if (!t) continue
+          turns++
+          if (o.type === 'user' && !firstUser && !t.startsWith('⚙️')) firstUser = t
+        }
+      }
+      out.push({
+        id: f.replace(/\.jsonl$/, ''), file, mtimeMs: st.mtimeMs,
+        title: (title || firstUser || '(untitled)').replace(/\s+/g, ' ').slice(0, 80), turns,
+      })
+    } catch {}
+  }
+  return out.sort((a, b) => b.mtimeMs - a.mtimeMs)
+}
+
+// Render the last n user/assistant turns of a session as Telegram-ready lines.
+function renderTurns(file: string, n: number): string[] {
+  const turns: string[] = []
+  try {
+    for (const line of readFileSync(file, 'utf8').split('\n')) {
+      if (!line.trim()) continue
+      let o: any; try { o = JSON.parse(line) } catch { continue }
+      if (o.type !== 'user' && o.type !== 'assistant') continue
+      const t = blockText(o.message?.content)
+      if (t) turns.push(`${o.type === 'user' ? '👤' : '🤖'} ${t}`)
+    }
+  } catch {}
+  return n > 0 ? turns.slice(-n) : turns
+}
+
+// ---------------------------------------------------------------------------
 // Bot
 // ---------------------------------------------------------------------------
 
@@ -405,7 +504,11 @@ bot.on('message', async ctx => {
       `./${OUTBOX_DIR}/ to have it sent back.\n\n` +
       `/whoami — show ids (for the allowlist)\n/new — fresh session here\n` +
       `/get <path> — send a file from this topic's directory back to you\n` +
-      `/cwd <abs-path> — set this topic's working directory\n/status — session id + directory`)
+      `/cwd <abs-path> — set this topic's working directory\n/status — session id + directory\n\n` +
+      `Bring existing Claude sessions in from the IDE/CLI:\n` +
+      `/sessions <dir…> — list the sessions stored for one or more directories\n` +
+      `/import <dir…> — make a topic for each session there (bound + backfilled)\n` +
+      `/history [N] — re-post the last N turns of this topic's session`)
     return
   }
 
@@ -446,6 +549,64 @@ bot.on('message', async ctx => {
     const cwd = resolveCwd(ctx, threadId)
     const target = isAbsolute(arg) ? arg : resolve(cwd, arg)
     await sendFile(ctx, threadId, target)
+    return
+  }
+  if (cmd === '/sessions') {
+    const dirs = parseDirs(text)
+    if (!dirs.length) { await send(ctx, threadId, 'Usage: /sessions <dir> [dir2 …]  (space-, comma- or newline-separated)'); return }
+    for (const dir of dirs) {
+      if (!isAbsolute(dir) || !existsSync(dir)) { await send(ctx, threadId, `skipped (not an absolute existing path): ${dir}`); continue }
+      const list = listSessions(dir)
+      if (!list.length) { await send(ctx, threadId, `${dir}\n  no sessions (looked in ${projectDir(dir)})`); continue }
+      const body = list.slice(0, 30).map((s, i) => `${i + 1}. ${s.id.slice(0, 8)} · ${s.turns} turns · ${ago(s.mtimeMs)}\n   ${s.title}`).join('\n\n')
+      await send(ctx, threadId, `Sessions in ${dir} (${list.length}):\n\n${body}`)
+    }
+    await send(ctx, threadId, `Run /import <dir> [dir2 …] to make a topic per session.`)
+    return
+  }
+  if (cmd === '/import') {
+    const dirs = parseDirs(text)
+    if (!dirs.length) { await send(ctx, threadId, 'Usage: /import <dir> [dir2 …]  (space-, comma- or newline-separated)'); return }
+    if (ctx.chat.type !== 'supergroup') { await send(ctx, threadId, 'Run /import inside the forum group — topics are a supergroup feature.'); return }
+    // Gather (dir, session) candidates across all dirs, skipping already-bound ones.
+    const candidates: { dir: string; s: SessionInfo }[] = []
+    for (const dir of dirs) {
+      if (!isAbsolute(dir) || !existsSync(dir) || !statSync(dir).isDirectory()) { await send(ctx, threadId, `skipped (not a directory): ${dir}`); continue }
+      const bound = new Set(Object.entries(sessions).filter(([k, e]) => k.startsWith(`${chatId}:`) && e.cwd === dir).map(([, e]) => e.sessionId))
+      for (const s of listSessions(dir)) if (!bound.has(s.id)) candidates.push({ dir, s })
+    }
+    if (!candidates.length) { await send(ctx, threadId, 'No new sessions to import (none found, or all already imported).'); return }
+    candidates.sort((a, b) => b.s.mtimeMs - a.s.mtimeMs) // newest first, across all dirs
+    const capped = candidates.slice(0, IMPORT_MAX_SESSIONS)
+    await send(ctx, threadId, `Importing ${capped.length} session(s) from ${dirs.length} dir(s)${candidates.length > capped.length ? ` (newest ${capped.length} of ${candidates.length})` : ''}…`)
+    let ok = 0
+    for (const { dir, s } of capped) {
+      try {
+        const name = `${basename(dir)} · ${s.title}`.slice(0, 120)
+        const topic = await ctx.api.createForumTopic(chatId, name)
+        const tid = topic.message_thread_id
+        const tkey = keyFor(chatId, tid)
+        sessions[tkey] = { cwd: dir, sessionId: s.id, updated: new Date().toISOString() }
+        names[tkey] = name
+        saveState()
+        await send(ctx, tid, `📂 Bound to session ${s.id.slice(0, 8)} · ${dir}\n${s.turns} turns total — last ${Math.min(IMPORT_BACKFILL, s.turns)} below. Message here to continue it.`)
+        for (const t of renderTurns(s.file, IMPORT_BACKFILL)) { await send(ctx, tid, t); await sleep(350) }
+        ok++
+        await sleep(500)
+      } catch (e) { await send(ctx, threadId, `⚠️ couldn't import ${s.id.slice(0, 8)}: ${e}`) }
+    }
+    await send(ctx, threadId, `✅ Imported ${ok}/${capped.length} session(s).`)
+    return
+  }
+  if (cmd === '/history') {
+    const e = sessions[key]
+    if (!e?.sessionId) { await send(ctx, threadId, 'No bound session in this topic yet — message me once, or /import one here.'); return }
+    const n = Math.min(Math.max(parseInt(text.split(/\s+/)[1] || '15', 10) || 15, 1), 60)
+    const file = join(projectDir(e.cwd), `${e.sessionId}.jsonl`)
+    if (!existsSync(file)) { await send(ctx, threadId, `Session transcript not found:\n${file}`); return }
+    const turns = renderTurns(file, n)
+    await send(ctx, threadId, `— last ${turns.length} turns of ${e.sessionId.slice(0, 8)} —`)
+    for (const t of turns) { await send(ctx, threadId, t); await sleep(300) }
     return
   }
   if (cmd) { await send(ctx, threadId, `Unknown command. Try /help`); return }

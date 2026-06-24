@@ -57,7 +57,29 @@ cp .env.example .env          # then edit it
 | `/get <path>` | Send a file from this topic's directory back to you |
 | `/cwd <abs-path>` | Set this topic's working directory (resets its session) |
 | `/status` | Show this topic's session id and cwd |
+| `/sessions <dir…>` | List the Claude sessions stored for one or more directories (what the IDE/CLI picker shows) |
+| `/import <dir…>` | Make a topic for each session in the given directories — bound + recent history backfilled |
+| `/history [N]` | Re-post the last N turns of this topic's bound session |
 | `/help` | Usage |
+
+## Import existing sessions
+
+The sessions the Claude Code IDE/CLI shows are transcripts on disk at
+`~/.claude/projects/<encoded-cwd>/<id>.jsonl`. Because the bridge resumes the
+same files, any topic is the *same* session you'd see in the extension — just
+`cd <dir>` and `claude --continue`, or open `<dir>` in the IDE.
+
+To pull existing sessions into the group: run `/import <dir> [dir2 …]` in the
+forum group (paths are space-, comma-, or newline-separated). Across all the
+directories it takes the newest `TG_IMPORT_MAX` (default 10) sessions, creates a
+topic for each (named after the session), binds it, and backfills the last
+`TG_IMPORT_BACKFILL` (default 12) turns. Message the topic to continue that exact
+session from your phone; `/history [N]` re-posts more past turns. `/sessions
+<dir…>` lists what's there without creating anything.
+
+**One rule:** a session is a single transcript with one writer at a time. Continue
+a session from the IDE/CLI **or** Telegram, not both at the same instant — they
+share history, but simultaneous writes corrupt it.
 
 ## Files
 
