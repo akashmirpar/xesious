@@ -98,6 +98,10 @@ const IMPORT_MAX_SESSIONS = Math.max(1, Number(process.env.TG_IMPORT_MAX || 10))
 type Entry = { sessionId?: string; cwd: string; updated?: string }
 let sessions: Record<string, Entry> = {}
 let names: Record<string, string> = {}
+// "💭 thinking…" status messages for in-flight runs. If the process is killed
+// before a run finishes (e.g. a restart), the next startup deletes these so no
+// orphaned status message is left dangling in a topic.
+let pending: { chat: number; id: number }[] = []
 
 function keyFor(chatId: number | string, threadId: number | undefined): string {
   return `${chatId}:${threadId ?? 'main'}`
@@ -108,13 +112,14 @@ function loadState(): void {
       const o = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
       sessions = o.sessions ?? {}
       names = o.names ?? {}
+      pending = o.pending ?? []
     }
   } catch (e) { console.error(`[warn] could not read state (${e}); starting empty`) }
 }
 function saveState(): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true })
-    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names }, null, 2))
+    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending }, null, 2))
   } catch (e) { console.error(`[warn] could not write state: ${e}`) }
 }
 
@@ -183,20 +188,21 @@ function childEnv(): NodeJS.ProcessEnv {
   return e
 }
 
-// A short status label for a streamed tool_use event.
+// A short, clean status label for a streamed tool_use event. Deliberately does
+// NOT echo raw commands or full paths (that's internal noise to the user) —
+// just the kind of activity, with a file basename where useful.
 function toolStep(b: any): string {
   const n = b?.name || 'tool'
   const i = b?.input || {}
-  const clip = (s: any, m = 72) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, m)
+  const base = (p: any) => (p ? basename(String(p)) : '')
   switch (n) {
-    case 'Bash': return `⚙️ ${clip(i.command, 84)}`
-    case 'Read': return `📖 ${clip(i.file_path)}`
-    case 'Edit': case 'Write': case 'NotebookEdit': return `✏️ ${clip(i.file_path)}`
-    case 'Glob': case 'Grep': return `🔎 ${n} ${clip(i.pattern)}`
-    case 'WebFetch': return `🌐 ${clip(i.url)}`
-    case 'WebSearch': return `🌐 ${clip(i.query)}`
-    case 'Agent': case 'Task': return `🤖 ${clip(i.description || 'subagent')}`
-    case 'TodoWrite': return '📝 updating todos'
+    case 'Bash': return '⚙️ Running a command'
+    case 'Read': return `📖 Reading ${base(i.file_path)}`.trimEnd()
+    case 'Edit': case 'Write': case 'NotebookEdit': return `✏️ Editing ${base(i.file_path)}`.trimEnd()
+    case 'Glob': case 'Grep': return '🔎 Searching the code'
+    case 'WebFetch': case 'WebSearch': return '🌐 Looking something up'
+    case 'Agent': case 'Task': return '🤖 Running a subagent'
+    case 'TodoWrite': return '📝 Planning'
     default: return `⚙️ ${n}`
   }
 }
@@ -210,6 +216,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, prompt: 
 
   const opts: any = threadId ? { message_thread_id: threadId } : {}
   const status = await ctx.api.sendMessage(ctx.chat!.id, '💭 thinking…', opts).catch(() => null)
+  if (status) { pending.push({ chat: ctx.chat!.id, id: status.message_id }); saveState() }
   const steps: string[] = []
   let lastEdit = 0, dirty = false
   const editStatus = async (force = false) => {
@@ -249,7 +256,10 @@ async function runStreaming(ctx: Context, threadId: number | undefined, prompt: 
     })
     const finish = async (res: ClaudeResult) => {
       clearTimeout(timer); clearInterval(ticker)
-      if (status) await ctx.api.deleteMessage(ctx.chat!.id, status.message_id).catch(() => {})
+      if (status) {
+        pending = pending.filter(p => !(p.chat === ctx.chat!.id && p.id === status.message_id)); saveState()
+        await ctx.api.deleteMessage(ctx.chat!.id, status.message_id).catch(() => {})
+      }
       resolve(res)
     }
     child.on('error', e => void finish({ text: `Failed to launch ${CLAUDE_BIN}: ${e}`, isError: true }))
@@ -706,6 +716,14 @@ async function main() {
   // Clear stale pending updates (e.g. a message buffered before a restart) so
   // we don't reprocess old messages on startup.
   await bot.api.deleteWebhook({ drop_pending_updates: true }).catch(() => {})
+
+  // Delete any "💭 thinking…" status messages orphaned by a restart that killed
+  // a run mid-flight, so no dangling status is left in a topic.
+  if (pending.length) {
+    for (const p of pending) await bot.api.deleteMessage(p.chat, p.id).catch(() => {})
+    console.log(`[ok] cleaned ${pending.length} orphaned status message(s)`)
+    pending = []; saveState()
+  }
 
   // Resilient polling via @grammyjs/runner. The runner treats a 409 as fatal
   // (normally it means a real second instance). In our case a 409 right after a
