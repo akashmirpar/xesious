@@ -22,10 +22,10 @@ import { run, type RunnerHandle } from '@grammyjs/runner'
 import telegramify from 'telegramify-markdown'
 import { autoRetry } from '@grammyjs/auto-retry'
 import { apiThrottler } from '@grammyjs/transformer-throttler'
-import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync } from 'node:fs'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync } from 'node:fs'
 import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 'node:path'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -89,6 +89,7 @@ const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
 const CLAUDE_PROJECTS = join(CLAUDE_DIR, 'projects')
 const IMPORT_BACKFILL = Math.max(0, Number(process.env.TG_IMPORT_BACKFILL || 12))  // turns backfilled per session
 const IMPORT_MAX_SESSIONS = Math.max(1, Number(process.env.TG_IMPORT_MAX || 10))   // cap topics created per /import
+const REPLY_FILE_CHARS = Math.max(0, Number(process.env.TG_REPLY_FILE_CHARS || 6000)) // replies longer than this go as a .md file
 
 // ---------------------------------------------------------------------------
 // Persistent state:  sessions[(chat:topic)] = { sessionId, cwd }
@@ -160,6 +161,10 @@ function ensureDir(dir: string): string {
 // ---------------------------------------------------------------------------
 
 const queues = new Map<string, Promise<unknown>>()
+// The claude child currently running for a topic (for /stop), and topics whose
+// run was deliberately killed via /stop (so we suppress the error reply).
+const activeRuns = new Map<string, ChildProcess>()
+const stopped = new Set<string>()
 function enqueue<T>(key: string, task: () => Promise<T>): Promise<T> {
   const prev = queues.get(key) ?? Promise.resolve()
   const next = prev.catch(() => {}).then(task)
@@ -209,7 +214,7 @@ function toolStep(b: any): string {
 
 // Run a prompt with streaming output, editing a single "status" message in the
 // topic to show live tool-step progress, then return the final result.
-async function runStreaming(ctx: Context, threadId: number | undefined, prompt: string, cwd: string, resumeId?: string): Promise<ClaudeResult> {
+async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string): Promise<ClaudeResult> {
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs()]
   if (resumeId) args.push('--resume', resumeId)
   if (MODEL) args.push('--model', MODEL)
@@ -233,6 +238,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, prompt: 
     let buf = '', err = '', finalText = '', sessionId: string | undefined, isError = false, got = false
     console.log(`[claude] stream in ${cwd}${resumeId ? ` (resume ${resumeId.slice(0, 8)})` : ' (new)'}`)
     const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv() })
+    activeRuns.set(key, child)
     const timer = setTimeout(() => child.kill('SIGKILL'), CLAUDE_TIMEOUT_MS)
     child.stderr.on('data', d => (err += d))
     child.stdout.on('data', d => {
@@ -256,6 +262,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, prompt: 
     })
     const finish = async (res: ClaudeResult) => {
       clearTimeout(timer); clearInterval(ticker)
+      activeRuns.delete(key)
       if (status) {
         pending = pending.filter(p => !(p.chat === ctx.chat!.id && p.id === status.message_id)); saveState()
         await ctx.api.deleteMessage(ctx.chat!.id, status.message_id).catch(() => {})
@@ -414,13 +421,29 @@ function withHint(prompt: string): string {
 }
 
 // Run one prompt against a topic's session, post the reply, deliver the outbox.
+// Deliver a Claude answer: inline (markdown) if short, else as an answer.md file
+// with a preview caption — so a huge reply isn't a dozen chunked messages.
+async function deliver(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
+  if (REPLY_FILE_CHARS && text.length > REPLY_FILE_CHARS) {
+    const dir = mkdtempSync(join(tmpdir(), 'tg-'))
+    const p = join(dir, 'answer.md')
+    try {
+      writeFileSync(p, text)
+      await sendFile(ctx, threadId, p, `${text.slice(0, 900).trimEnd()} …\n\n📄 Full answer (${text.length} chars) attached.`)
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  } else {
+    await sendRich(ctx, threadId, text)
+  }
+}
+
 async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string): Promise<void> {
   const cwd = resolveCwd(ctx, threadId)
   const resumeId = sessions[key]?.sessionId
   try {
-    const res = await runStreaming(ctx, threadId, withHint(prompt), cwd, resumeId)
+    const res = await runStreaming(ctx, threadId, key, withHint(prompt), cwd, resumeId)
+    if (stopped.has(key)) { stopped.delete(key); return } // killed via /stop — status already cleared, no reply
     if (res.sessionId) { sessions[key] = { cwd, sessionId: res.sessionId, updated: new Date().toISOString() }; saveState() }
-    await sendRich(ctx, threadId, res.text)
+    await deliver(ctx, threadId, res.text)
     await flushOutbox(ctx, threadId, cwd)
   } catch (e) {
     await send(ctx, threadId, `⚠️ ${e}`)
@@ -584,6 +607,7 @@ bot.on('message', async ctx => {
       `Send a file to drop it in this topic's ./${INBOX_DIR}/; ask Claude to put a file in ` +
       `./${OUTBOX_DIR}/ to have it sent back.\n\n` +
       `/whoami — show ids (for the allowlist)\n/new — fresh session here\n` +
+      `/stop — cancel the task currently running in this topic\n` +
       `/get <path> — send a file from this topic's directory back to you\n` +
       `/cwd <abs-path> — set this topic's working directory\n/status — session id + directory\n\n` +
       `Bring existing Claude sessions in from the IDE/CLI:\n` +
@@ -601,6 +625,12 @@ bot.on('message', async ctx => {
     if (!mentioned) return
   }
 
+  if (cmd === '/stop' || cmd === '/cancel') {
+    const child = activeRuns.get(key)
+    if (child) { stopped.add(key); child.kill('SIGKILL'); await send(ctx, threadId, '🛑 Stopped the running task.') }
+    else await send(ctx, threadId, 'Nothing is running in this topic right now.')
+    return
+  }
   if (cmd === '/new' || cmd === '/reset') {
     if (sessions[key]) { delete sessions[key].sessionId; saveState() }
     await send(ctx, threadId, '🧹 Fresh session for this topic. History cleared (same directory).')
