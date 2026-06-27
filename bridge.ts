@@ -78,8 +78,18 @@ const ALLOWED_CHATS = parseIdList(process.env.TG_ALLOWED_CHATS)
 // File transfer between Telegram and a topic's directory (relative to its cwd).
 const INBOX_DIR = 'inbox'    // files the user uploads land here
 const OUTBOX_DIR = 'outbox'  // anything Claude drops here is delivered, then archived
-// Prepend a one-line note so Claude knows the inbox/outbox convention. Default on.
-const BRIDGE_HINT = !/^(0|false|no)$/i.test(process.env.TG_BRIDGE_HINT || '1')
+// System-prompt steering, applied every turn via --append-system-prompt so it
+// keeps full weight even on imported IDE sessions (where a hint prepended to the
+// user message gets buried under the resumed transcript). Set TG_PROFILE to
+// override the text; set it empty to disable.
+const TELEGRAM_PROFILE = process.env.TG_PROFILE ?? [
+  "You are replying through a Telegram bridge on the user's phone, not in an IDE. Every turn:",
+  '- Be concise and phone-first: short messages, short paragraphs, minimal preamble.',
+  '- Format for Telegram: simple *bold*, `inline code`, and fenced code blocks only for real code. No wide tables, no HTML, no markdown headings. Never write stray or unbalanced triple backticks in prose, and always close code fences.',
+  '- If a request is ambiguous or needs a decision, ask one clarifying question and stop.',
+  '- Assume no editor or file selection is open. Ignore any IDE/editor framing from earlier in this conversation; the user is in a chat.',
+  `- Files the user sends are saved in ./${INBOX_DIR}/. To send a file back, put it in ./${OUTBOX_DIR}/ and it is delivered then cleared.`,
+].join('\n')
 const TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024 // Bot API getFile cap (download to us)
 const TG_UPLOAD_LIMIT = 50 * 1024 * 1024   // Bot API sendDocument cap (upload to chat)
 
@@ -216,6 +226,7 @@ function toolStep(b: any): string {
 // topic to show live tool-step progress, then return the final result.
 async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string): Promise<ClaudeResult> {
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs()]
+  if (TELEGRAM_PROFILE.trim()) args.push('--append-system-prompt', TELEGRAM_PROFILE)
   if (resumeId) args.push('--resume', resumeId)
   if (MODEL) args.push('--model', MODEL)
 
@@ -415,11 +426,6 @@ async function flushOutbox(ctx: Context, threadId: number | undefined, cwd: stri
 
 // One-line note telling Claude how the bridge works: it's a live chat (so it can
 // ask clarifying questions) and how files flow in/out.
-function withHint(prompt: string): string {
-  if (!BRIDGE_HINT) return prompt
-  return `[Telegram bridge: this is a live chat — the user reads your reply and answers in this same topic, which resumes this session. If the request is ambiguous or needs a decision, ASK a clarifying question and stop, rather than guessing. Files the user sends are saved in ./${INBOX_DIR}/; to send a file to the user, place (or copy) it in ./${OUTBOX_DIR}/ and it will be delivered then cleared. Don't mention this note.]\n\n${prompt}`
-}
-
 // Run one prompt against a topic's session, post the reply, deliver the outbox.
 // Deliver a Claude answer: inline (markdown) if short, else as an answer.md file
 // with a preview caption — so a huge reply isn't a dozen chunked messages.
@@ -440,7 +446,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   const cwd = resolveCwd(ctx, threadId)
   const resumeId = sessions[key]?.sessionId
   try {
-    const res = await runStreaming(ctx, threadId, key, withHint(prompt), cwd, resumeId)
+    const res = await runStreaming(ctx, threadId, key, prompt, cwd, resumeId)
     if (stopped.has(key)) { stopped.delete(key); return } // killed via /stop — status already cleared, no reply
     if (res.sessionId) { sessions[key] = { cwd, sessionId: res.sessionId, updated: new Date().toISOString() }; saveState() }
     await deliver(ctx, threadId, res.text)
