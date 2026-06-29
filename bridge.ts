@@ -613,6 +613,7 @@ bot.on('message', async ctx => {
       `Send a file to drop it in this topic's ./${INBOX_DIR}/; ask Claude to put a file in ` +
       `./${OUTBOX_DIR}/ to have it sent back.\n\n` +
       `/whoami — show ids (for the allowlist)\n/new — fresh session here\n` +
+      `/compact [focus] — summarize this topic's history to free up context\n` +
       `/stop — cancel the task currently running in this topic\n` +
       `/get <path> — send a file from this topic's directory back to you\n` +
       `/cwd <abs-path> — set this topic's working directory\n/status — session id + directory\n\n` +
@@ -640,6 +641,20 @@ bot.on('message', async ctx => {
   if (cmd === '/new' || cmd === '/reset') {
     if (sessions[key]) { delete sessions[key].sessionId; saveState() }
     await send(ctx, threadId, '🧹 Fresh session for this topic. History cleared (same directory).')
+    return
+  }
+  if (cmd === '/compact') {
+    const e = sessions[key]
+    if (!e?.sessionId) { await send(ctx, threadId, 'No session in this topic yet — nothing to compact.'); return }
+    const instr = text.replace(/^\/compact(@\S+)?\s*/i, '').trim()  // optional focus instructions
+    enqueue(key, async () => {
+      const res = await runStreaming(ctx, threadId, key, `/compact${instr ? ' ' + instr : ''}`, e.cwd, e.sessionId)
+      if (stopped.has(key)) { stopped.delete(key); return }
+      if (res.sessionId) { sessions[key] = { cwd: e.cwd, sessionId: res.sessionId, updated: new Date().toISOString() }; saveState() }
+      await send(ctx, threadId, res.isError
+        ? `⚠️ Compact failed: ${res.text.slice(0, 300)}`
+        : '🗜️ Compacted — this topic’s history is summarized (memory kept). Carry on.')
+    }).catch(err => console.error(`[error] compact ${key}: ${err}`))
     return
   }
   if (cmd === '/status') {
