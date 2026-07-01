@@ -85,7 +85,7 @@ const OUTBOX_DIR = 'outbox'  // anything Claude drops here is delivered, then ar
 const TELEGRAM_PROFILE = process.env.TG_PROFILE ?? [
   "You are replying through a Telegram bridge on the user's phone, not in an IDE. Every turn:",
   '- Be concise and phone-first: short messages, short paragraphs, minimal preamble.',
-  '- Format for Telegram: simple *bold*, `inline code`, and fenced code blocks only for real code. No wide tables, no HTML, no markdown headings. Never write stray or unbalanced triple backticks in prose, and always close code fences.',
+  '- Write in your normal markdown; the bridge encodes it for Telegram (tables become aligned code blocks, headings become bold). Just keep code fences balanced.',
   '- If a request is ambiguous or needs a decision, ask one clarifying question and stop.',
   '- Assume no editor or file selection is open. Ignore any IDE/editor framing from earlier in this conversation; the user is in a chat.',
   `- Files the user sends are saved in ./${INBOX_DIR}/. To send a file back, put it in ./${OUTBOX_DIR}/ and it is delivered then cleared.`,
@@ -312,13 +312,38 @@ async function send(ctx: Context, threadId: number | undefined, text: string): P
   }
 }
 
+// Telegram has no tables — convert each markdown table into an aligned monospace
+// code block so columns line up. The agent writes normal markdown; the bridge
+// encodes it for Telegram.
+function mdTablesToCode(text: string): string {
+  const lines = text.split('\n')
+  const isSep = (l: string) => l.includes('|') && /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(l)
+  const cells = (l: string) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim())
+  const out: string[] = []
+  let i = 0
+  while (i < lines.length) {
+    if (lines[i].includes('|') && i + 1 < lines.length && isSep(lines[i + 1])) {
+      const rows: string[][] = [cells(lines[i])]
+      let j = i + 2
+      while (j < lines.length && lines[j].includes('|') && lines[j].trim()) { rows.push(cells(lines[j])); j++ }
+      const ncol = Math.max(...rows.map(r => r.length))
+      const w = new Array(ncol).fill(0)
+      for (const r of rows) for (let c = 0; c < ncol; c++) w[c] = Math.max(w[c], (r[c] || '').length)
+      const body = rows.map(r => Array.from({ length: ncol }, (_, c) => (r[c] || '').padEnd(w[c])).join('  ').trimEnd()).join('\n')
+      out.push('```\n' + body + '\n```')
+      i = j
+    } else { out.push(lines[i]); i++ }
+  }
+  return out.join('\n')
+}
+
 // Send Claude's answer with Telegram markdown rendering (code blocks, bold,
-// lists, links). Claude's output can contain anything, so if MarkdownV2 fails
-// to parse we resend that chunk as plain text — formatting is best-effort,
-// delivery is guaranteed.
+// lists, links). Tables are converted to aligned code blocks first; if MarkdownV2
+// still fails to parse we resend that chunk as plain text — formatting is
+// best-effort, delivery is guaranteed.
 async function sendRich(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
   const opts: any = threadId ? { message_thread_id: threadId } : {}
-  for (const part of chunk(text)) {
+  for (const part of chunk(mdTablesToCode(text))) {
     try {
       await ctx.api.sendMessage(ctx.chat!.id, telegramify(part, 'escape'), { ...opts, parse_mode: 'MarkdownV2' })
     } catch {
