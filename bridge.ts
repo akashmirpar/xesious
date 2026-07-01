@@ -294,16 +294,39 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
 // ---------------------------------------------------------------------------
 
 const MAX = 4000
+// Split into <=MAX-char messages WITHOUT breaking a code block: if a ``` fence is
+// still open at a chunk boundary, close it here and reopen it in the next chunk,
+// so telegramify never sees an unbalanced fence (the main cause of broken renders).
 function chunk(text: string): string[] {
-  const parts: string[] = []
-  let rest = text
-  while (rest.length > MAX) {
-    let cut = rest.lastIndexOf('\n', MAX)
-    if (cut < MAX * 0.5) cut = MAX
-    parts.push(rest.slice(0, cut)); rest = rest.slice(cut).replace(/^\n/, '')
+  const chunks: string[] = []
+  let cur: string[] = []
+  let len = 0
+  let inFence = false
+  const push = () => { chunks.push(cur.join('\n') + (inFence ? '\n```' : '')); cur = inFence ? ['```'] : []; len = inFence ? 4 : 0 }
+  for (const raw of text.split('\n')) {
+    const pieces = raw.length > MAX ? (raw.match(new RegExp(`.{1,${MAX}}`, 'g')) || [raw]) : [raw]
+    for (const line of pieces) {
+      if (len + line.length + 1 > MAX && cur.length) push()
+      if (/^\s*```/.test(line)) inFence = !inFence
+      cur.push(line); len += line.length + 1
+    }
   }
-  if (rest.length) parts.push(rest)
-  return parts
+  if (cur.length) chunks.push(cur.join('\n') + (inFence ? '\n```' : ''))
+  return chunks
+}
+
+// Strip markdown markers to clean readable text — the fallback when Telegram
+// rejects the MarkdownV2, so a failed parse never shows raw ** or backticks.
+function stripMd(s: string): string {
+  return s
+    .replace(/```[^\n]*\n?/g, '')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*\n]+)\*/g, '$1')
+    .replace(/(^|[\s(])_([^_\n]+)_/g, '$1$2')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/^\s*>\s?/gm, '')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)')
 }
 async function send(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
   const opts = threadId ? { message_thread_id: threadId } : {}
@@ -347,7 +370,7 @@ async function sendRich(ctx: Context, threadId: number | undefined, text: string
     try {
       await ctx.api.sendMessage(ctx.chat!.id, telegramify(part, 'escape'), { ...opts, parse_mode: 'MarkdownV2' })
     } catch {
-      await ctx.api.sendMessage(ctx.chat!.id, part, opts).catch(e => console.error(`[warn] sendMessage: ${e}`))
+      await ctx.api.sendMessage(ctx.chat!.id, stripMd(part), opts).catch(e => console.error(`[warn] sendMessage: ${e}`))
     }
   }
 }
