@@ -254,7 +254,10 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   return await new Promise<ClaudeResult>(resolve => {
     let buf = '', err = '', finalText = '', sessionId: string | undefined, isError = false, got = false
     console.log(`[claude] stream in ${cwd}${resumeId ? ` (resume ${resumeId.slice(0, 8)})` : ' (new)'}`)
-    const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv() })
+    // stdin = 'ignore' (/dev/null) so claude gets immediate EOF instead of waiting
+    // for piped input (it otherwise warns "no stdin data received in 3s" and can
+    // return without a parseable result).
+    const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
     activeRuns.set(key, child)
     const timer = setTimeout(() => child.kill('SIGKILL'), CLAUDE_TIMEOUT_MS)
     child.stderr.on('data', d => (err += d))
