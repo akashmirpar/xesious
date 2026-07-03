@@ -107,7 +107,7 @@ const INTERRUPT_DEFAULT = /^(1|true|yes)$/i.test(process.env.TG_INTERRUPT || '')
 //                    names[(chat:topic)]    = "human topic name"
 // ---------------------------------------------------------------------------
 
-type Entry = { sessionId?: string; cwd: string; updated?: string }
+type Entry = { sessionId?: string; prevSessionId?: string; cwd: string; updated?: string }
 let sessions: Record<string, Entry> = {}
 let names: Record<string, string> = {}
 // "💭 thinking…" status messages for in-flight runs. If the process is killed
@@ -669,7 +669,8 @@ bot.on('message', async ctx => {
       `Send any text to talk to Claude in this topic.\n\n` +
       `Send a file to drop it in this topic's ./${INBOX_DIR}/; ask Claude to put a file in ` +
       `./${OUTBOX_DIR}/ to have it sent back.\n\n` +
-      `/whoami — show ids (for the allowlist)\n/new — fresh session here\n` +
+      `/whoami — show ids (for the allowlist)\n/new — fresh session here (old one kept; /resume to undo)\n` +
+      `/resume [id] — restore the previous session, or bind a past session id\n` +
       `/compact [focus] — summarize this topic's history to free up context\n` +
       `/stop — cancel the task currently running in this topic\n` +
       `/interrupt [on|off] — new messages cancel the running task instead of queueing\n` +
@@ -707,8 +708,29 @@ bot.on('message', async ctx => {
     return
   }
   if (cmd === '/new' || cmd === '/reset') {
-    if (sessions[key]) { delete sessions[key].sessionId; saveState() }
-    await send(ctx, threadId, '🧹 Fresh session for this topic. History cleared (same directory).')
+    const e = sessions[key]
+    if (e?.sessionId) { e.prevSessionId = e.sessionId; delete e.sessionId; saveState() }
+    await send(ctx, threadId, e?.prevSessionId
+      ? `🧹 Fresh session started. The old one is kept (${e.prevSessionId.slice(0, 8)}) — send /resume to restore it. Nothing was deleted.`
+      : '🧹 Fresh session for this topic.')
+    return
+  }
+  if (cmd === '/resume') {
+    const arg = text.split(/\s+/)[1]?.trim()
+    const e = sessions[key] ?? (sessions[key] = { cwd: resolveCwd(ctx, threadId) })
+    if (arg) {
+      if (!existsSync(join(projectDir(e.cwd), `${arg}.jsonl`))) {
+        await send(ctx, threadId, `No session ${arg} found for this topic's directory:\n${e.cwd}`); return
+      }
+      e.prevSessionId = e.sessionId; e.sessionId = arg; saveState()
+      await send(ctx, threadId, `↩️ Bound this topic to session ${arg.slice(0, 8)} — message to continue it.`)
+    } else if (e.prevSessionId) {
+      const restore = e.prevSessionId
+      e.prevSessionId = e.sessionId; e.sessionId = restore; saveState()
+      await send(ctx, threadId, `↩️ Restored session ${restore.slice(0, 8)} — message to continue it.`)
+    } else {
+      await send(ctx, threadId, 'Usage: /resume <session-id> — bind this topic to a past session. (No id = undo the last /new.)')
+    }
     return
   }
   if (cmd === '/compact') {

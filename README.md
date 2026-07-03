@@ -53,7 +53,8 @@ cp .env.example .env          # then edit it
 | *(any text)* | Send a prompt to this topic's Claude session |
 | *(any file)* | Upload it into this topic's `inbox/` (a caption runs as a prompt) |
 | `/whoami` | Show your user/chat/topic ids (for the allowlist) — works for anyone |
-| `/new` | Start a fresh session in this topic (forget history) |
+| `/new` | Start a fresh session in this topic. The old session id is **kept** (nothing deleted) — `/resume` to undo |
+| `/resume [id]` | Restore the previous session (undo `/new`), or bind this topic to a specific past session id |
 | `/compact [focus]` | Summarize this topic's session history to free up context (memory kept) |
 | `/stop` | Cancel the task currently running in this topic |
 | `/interrupt [on\|off]` | Toggle interrupt mode: a new message cancels the running task and starts immediately (its reply comes as a new message) instead of queueing. Default from `TG_INTERRUPT`. |
