@@ -56,6 +56,7 @@ cp .env.example .env          # then edit it
 | `/new` | Start a fresh session in this topic (forget history) |
 | `/compact [focus]` | Summarize this topic's session history to free up context (memory kept) |
 | `/stop` | Cancel the task currently running in this topic |
+| `/interrupt [on\|off]` | Toggle interrupt mode: a new message cancels the running task and starts immediately (its reply comes as a new message) instead of queueing. Default from `TG_INTERRUPT`. |
 | `/get <path>` | Send a file from this topic's directory back to you |
 | `/cwd <abs-path>` | Set this topic's working directory (resets its session) |
 | `/status` | Show this topic's session id and cwd |

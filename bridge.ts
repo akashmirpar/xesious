@@ -100,6 +100,7 @@ const CLAUDE_PROJECTS = join(CLAUDE_DIR, 'projects')
 const IMPORT_BACKFILL = Math.max(0, Number(process.env.TG_IMPORT_BACKFILL || 12))  // turns backfilled per session
 const IMPORT_MAX_SESSIONS = Math.max(1, Number(process.env.TG_IMPORT_MAX || 10))   // cap topics created per /import
 const REPLY_FILE_CHARS = Math.max(0, Number(process.env.TG_REPLY_FILE_CHARS || 6000)) // replies longer than this go as a .md file
+const INTERRUPT_DEFAULT = /^(1|true|yes)$/i.test(process.env.TG_INTERRUPT || '')       // a new message interrupts the running one instead of queueing
 
 // ---------------------------------------------------------------------------
 // Persistent state:  sessions[(chat:topic)] = { sessionId, cwd }
@@ -113,6 +114,10 @@ let names: Record<string, string> = {}
 // before a run finishes (e.g. a restart), the next startup deletes these so no
 // orphaned status message is left dangling in a topic.
 let pending: { chat: number; id: number }[] = []
+// Per-topic "interrupt mode": a new message cancels the running run and starts
+// the new one immediately, instead of queueing behind it. Defaults to TG_INTERRUPT.
+let interruptMode: Record<string, boolean> = {}
+const isInterrupt = (key: string) => interruptMode[key] ?? INTERRUPT_DEFAULT
 
 function keyFor(chatId: number | string, threadId: number | undefined): string {
   return `${chatId}:${threadId ?? 'main'}`
@@ -124,13 +129,14 @@ function loadState(): void {
       sessions = o.sessions ?? {}
       names = o.names ?? {}
       pending = o.pending ?? []
+      interruptMode = o.interruptMode ?? {}
     }
   } catch (e) { console.error(`[warn] could not read state (${e}); starting empty`) }
 }
 function saveState(): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true })
-    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending }, null, 2))
+    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode }, null, 2))
   } catch (e) { console.error(`[warn] could not write state: ${e}`) }
 }
 
@@ -663,6 +669,7 @@ bot.on('message', async ctx => {
       `/whoami — show ids (for the allowlist)\n/new — fresh session here\n` +
       `/compact [focus] — summarize this topic's history to free up context\n` +
       `/stop — cancel the task currently running in this topic\n` +
+      `/interrupt [on|off] — new messages cancel the running task instead of queueing\n` +
       `/get <path> — send a file from this topic's directory back to you\n` +
       `/cwd <abs-path> — set this topic's working directory\n/status — session id + directory\n\n` +
       `Bring existing Claude sessions in from the IDE/CLI:\n` +
@@ -684,6 +691,16 @@ bot.on('message', async ctx => {
     const child = activeRuns.get(key)
     if (child) { stopped.add(key); child.kill('SIGKILL'); await send(ctx, threadId, '🛑 Stopped the running task.') }
     else await send(ctx, threadId, 'Nothing is running in this topic right now.')
+    return
+  }
+  if (cmd === '/interrupt') {
+    const arg = text.split(/\s+/)[1]?.toLowerCase()
+    const next = arg === 'on' ? true : arg === 'off' ? false : !isInterrupt(key)
+    interruptMode[key] = next
+    saveState()
+    await send(ctx, threadId, next
+      ? '⚡ Interrupt mode ON — a new message cancels the running task and starts immediately; its reply arrives as a new message.'
+      : '⏸ Interrupt mode OFF — messages queue and run one at a time.')
     return
   }
   if (cmd === '/new' || cmd === '/reset') {
@@ -791,6 +808,12 @@ bot.on('message', async ctx => {
   }
   if (cmd) { await send(ctx, threadId, `Unknown command. Try /help`); return }
 
+  // Interrupt mode: cancel the run in progress so this message starts immediately
+  // (its reply arrives as a new message, after the interrupted one stops).
+  if (isInterrupt(key) && activeRuns.has(key)) {
+    stopped.add(key)
+    activeRuns.get(key)!.kill('SIGKILL')
+  }
   enqueue(key, () => handlePrompt(ctx, threadId, key, text))
     .catch(e => console.error(`[error] task ${key}: ${e}`))
 })
