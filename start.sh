@@ -22,10 +22,12 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
   exit 0
 fi
 
-# Kill any orphaned poller from a previous run so we never overlap (Telegram
-# allows only one getUpdates per token; two => 409 Conflict and a crash).
-pkill -9 -f "$DIR/bridge.ts" 2>/dev/null || true
-pkill -9 -f "bun run bridge.ts" 2>/dev/null || true
+# Kill only THIS instance's orphaned poller (matched by working directory), so a
+# second instance in another directory is never affected. Telegram allows one
+# getUpdates per token; two => 409.
+for p in $(pgrep -x bun 2>/dev/null); do
+  [ "$(readlink /proc/$p/cwd 2>/dev/null)" = "$DIR" ] && kill -9 "$p" 2>/dev/null || true
+done
 sleep 3  # let Telegram release the previous long-poll lock
 
 # Respawn wrapper with a long restart delay. grammY can't catch a polling 409
