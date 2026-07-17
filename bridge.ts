@@ -105,6 +105,11 @@ const TG_UPLOAD_LIMIT = (LOCAL_API ? 2000 : 50) * 1024 * 1024          // sendDo
 // (setMyProfilePhoto is a real Bot API method — BotFather is not required.)
 const BOT_LOGO = process.env.TG_BOT_LOGO || join(HERE, 'assets', 'bot-logo.jpg')
 const SET_LOGO = !/^(0|false|no)$/i.test(process.env.TG_SET_LOGO || '')
+// The forum group's photo. Same posture as the avatar: startup only fills it in
+// when the group has none, so an existing photo is never taken over. /logo group
+// sets it deliberately. Needs the bot to be an admin with can_change_info.
+const GROUP_LOGO = process.env.TG_GROUP_LOGO || join(HERE, 'assets', 'group-logo.jpg')
+const SET_GROUP_LOGO = !/^(0|false|no)$/i.test(process.env.TG_SET_GROUP_LOGO || '')
 // Show the actual tool input (command, path, url) in the live status message,
 // inside a collapsed <blockquote expandable>. Set 0 for the older terse labels.
 const PROGRESS_DETAIL = !/^(0|false|no)$/i.test(process.env.TG_PROGRESS_DETAIL || '')
@@ -836,6 +841,7 @@ bot.on('message', async ctx => {
       `/interrupt [on|off] — new messages cancel the running task instead of queueing\n` +
       `/mode [${MODES.join('|')}] — permission mode for this topic (tap to switch)\n` +
       `/plan <task> — one read-only turn: propose without editing\n` +
+      `/logo bot|group — set the bot's avatar / this group's photo\n` +
       `/get <path> — send a file from this topic's directory back to you\n` +
       `/cwd <abs-path> — set this topic's working directory\n/status — session id + directory + mode\n\n` +
       `Claude's own commands, forwarded as-is:\n${[...PASSTHROUGH].join(' · ')}\n\n` +
@@ -868,6 +874,26 @@ bot.on('message', async ctx => {
     await send(ctx, threadId, next
       ? '⚡ Interrupt mode ON — a new message cancels the running task and starts immediately; its reply arrives as a new message.'
       : '⏸ Interrupt mode OFF — messages queue and run one at a time.')
+    return
+  }
+  // Startup only fills in a MISSING photo; this is how you replace one on purpose.
+  if (cmd === '/logo') {
+    const what = (text.split(/\s+/)[1] || '').toLowerCase()
+    if (what !== 'bot' && what !== 'group') {
+      await send(ctx, threadId, `Usage: /logo bot | /logo group\n\nSets the avatar from ${BOT_LOGO} (bot) or ${GROUP_LOGO} (group).\nOn startup these are only applied when the bot/group has no photo at all; this command replaces an existing one.`)
+      return
+    }
+    const path = what === 'bot' ? BOT_LOGO : GROUP_LOGO
+    if (!existsSync(path)) { await send(ctx, threadId, `⚠️ no image at ${path} — set ${what === 'bot' ? 'TG_BOT_LOGO' : 'TG_GROUP_LOGO'}.`); return }
+    if (what === 'group' && ctx.chat.type === 'private') { await send(ctx, threadId, 'Run /logo group inside the group whose photo you want to set.'); return }
+    try {
+      if (what === 'bot') await setBotLogo()
+      else await setGroupLogo(chatId)
+      await send(ctx, threadId, `✅ ${what} photo set from ${path}`)
+    } catch (e) {
+      await send(ctx, threadId, `⚠️ could not set the ${what} photo: ${e}` +
+        (what === 'group' ? '\n(the bot needs to be an admin with "change group info")' : ''))
+    }
     return
   }
   if (cmd === '/mode') {
@@ -1070,15 +1096,35 @@ async function ensureBotLogo(botId: number): Promise<void> {
     const photos = await bot.api.getUserProfilePhotos(botId, { limit: 1 })
     if (photos.total_count > 0) return
     if (!existsSync(BOT_LOGO)) { console.log(`[warn] no bot logo at ${BOT_LOGO} (set TG_BOT_LOGO, or TG_SET_LOGO=0)`); return }
-    await bot.api.setMyProfilePhoto({ type: 'static', photo: new InputFile(BOT_LOGO) })
+    await setBotLogo()
     console.log(`[ok] set bot profile photo from ${BOT_LOGO}`)
   } catch (e) { console.error(`[warn] could not set bot logo: ${e}`) }
+}
+const setBotLogo = () => bot.api.setMyProfilePhoto({ type: 'static', photo: new InputFile(BOT_LOGO) })
+const setGroupLogo = (chatId: number | string) => bot.api.setChatPhoto(chatId, new InputFile(GROUP_LOGO))
+
+// Give each allowed group a photo if it has none. Deliberately never replaces an
+// existing one — a group's photo belongs to the people in it, and a bot restart
+// is not consent to change it. /logo group is the way to say so explicitly.
+// Needs the bot to be an admin with can_change_info; a failure is only logged.
+async function ensureGroupLogos(): Promise<void> {
+  if (!SET_GROUP_LOGO || !ALLOWED_CHATS.size) return
+  if (!existsSync(GROUP_LOGO)) return
+  for (const id of ALLOWED_CHATS) {
+    try {
+      const chat = await bot.api.getChat(id)
+      if (chat.type === 'private' || (chat as any).photo) continue
+      await setGroupLogo(id)
+      console.log(`[ok] set group photo for ${id} from ${GROUP_LOGO}`)
+    } catch (e) { console.error(`[warn] could not set group photo for ${id}: ${e}`) }
+  }
 }
 
 async function main() {
   const me = await bot.api.getMe()
   botUsername = me.username
   await ensureBotLogo(me.id)
+  await ensureGroupLogos()
   console.log(`[ok] @${me.username} up`)
   console.log(`     claude bin     : ${CLAUDE_BIN}`)
   console.log(`     sessions base  : ${SESSIONS_BASE}`)

@@ -61,6 +61,7 @@ cp .env.example .env          # then edit it
 | `/mode [plan\|acceptEdits\|auto\|bypass]` | Show or set this topic's permission mode. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_PERMISSION_MODE`. |
 | `/plan <task>` | One read-only turn: Claude researches and proposes without editing. Doesn't change the topic's mode, so "go ahead" carries the plan out. |
 | `/usage` `/cost` `/context` | Claude's own commands, forwarded to the CLI as-is. They report rather than prompt the model, so they're free and take no turn. |
+| `/logo bot\|group` | Set the bot's avatar (`setMyProfilePhoto`) or this group's photo (`setChatPhoto`) from `assets/`. Startup only fills these in when they're missing; this replaces an existing one. |
 | `/get <path>` | Send a file from this topic's directory back to you |
 | `/cwd <abs-path>` | Set this topic's working directory (resets its session) |
 | `/status` | Show this topic's session id, cwd and permission mode |
@@ -115,6 +116,9 @@ All keys live in `.env` (see [.env.example](.env.example)). Highlights:
 - `TG_REQUIRE_MENTION` — in groups, only answer when @mentioned.
 - `TG_PROGRESS_DETAIL` — show the real command/path/query in the status message (default on).
 - `TG_BOT_LOGO` / `TG_SET_LOGO` — avatar to set on startup **if the bot has none**.
+- `TG_GROUP_LOGO` / `TG_SET_GROUP_LOGO` — group photo to set **if the group has none**
+  (needs the bot to be an admin with *change group info*). Neither is ever replaced
+  automatically — `/logo bot|group` does that on purpose.
 - `TG_API_ROOT` — a local Bot API server, for files over 20 MB (see below).
 
 ## Permission modes
