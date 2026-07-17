@@ -11,7 +11,7 @@ SESSION="${CLAUDE_TG_SESSION:-claude-tg}"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # bun lives in the node bin dir (installed via npm); make sure it's on PATH.
-export PATH="/root/.nvm/versions/node/v24.2.0/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 
 command -v bun >/dev/null 2>&1 || { echo "ERROR: bun not on PATH" >&2; exit 1; }
 [ -f "$DIR/.env" ] || { echo "ERROR: $DIR/.env missing (cp .env.example .env)" >&2; exit 1; }
