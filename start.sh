@@ -16,6 +16,13 @@ export PATH="$HOME/.local/bin:$PATH"
 command -v bun >/dev/null 2>&1 || { echo "ERROR: bun not on PATH" >&2; exit 1; }
 [ -f "$DIR/.env" ] || { echo "ERROR: $DIR/.env missing (cp .env.example .env)" >&2; exit 1; }
 
+# Optional: bring up the local Bot API server alongside the bridge (big files).
+# Only starts the container — it never migrates the bot off the cloud API, since
+# that's irreversible for 10 minutes. See ./local-api.sh migrate.
+if grep -qE '^TG_LOCAL_API=(1|true|yes)' "$DIR/.env" 2>/dev/null; then
+  "$DIR/local-api.sh" up || { echo "ERROR: local Bot API server failed to start" >&2; exit 1; }
+fi
+
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "Already running in tmux session '$SESSION'.  Attach: tmux attach -t $SESSION"
   echo "(to restart: tmux kill-session -t $SESSION && ./start.sh)"

@@ -53,14 +53,17 @@ cp .env.example .env          # then edit it
 | *(any text)* | Send a prompt to this topic's Claude session |
 | *(any file)* | Upload it into this topic's `inbox/` (a caption runs as a prompt) |
 | `/whoami` | Show your user/chat/topic ids (for the allowlist) — works for anyone |
-| `/new` | Start a fresh session in this topic. The old session id is **kept** (nothing deleted) — `/resume` to undo |
+| `/new` (or `/clear`) | Start a fresh session in this topic. The old session id is **kept** (nothing deleted) — `/resume` to undo. Like Claude's own `/clear`, this resets context without deleting the session. |
 | `/resume [id]` | Restore the previous session (undo `/new`), or bind this topic to a specific past session id |
 | `/compact [focus]` | Summarize this topic's session history to free up context (memory kept) |
 | `/stop` | Cancel the task currently running in this topic |
 | `/interrupt [on\|off]` | Toggle interrupt mode: a new message cancels the running task and starts immediately (its reply comes as a new message) instead of queueing. Default from `TG_INTERRUPT`. |
+| `/mode [plan\|acceptEdits\|auto\|bypass]` | Show or set this topic's permission mode. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_PERMISSION_MODE`. |
+| `/plan <task>` | One read-only turn: Claude researches and proposes without editing. Doesn't change the topic's mode, so "go ahead" carries the plan out. |
+| `/usage` `/cost` `/context` | Claude's own commands, forwarded to the CLI as-is. They report rather than prompt the model, so they're free and take no turn. |
 | `/get <path>` | Send a file from this topic's directory back to you |
 | `/cwd <abs-path>` | Set this topic's working directory (resets its session) |
-| `/status` | Show this topic's session id and cwd |
+| `/status` | Show this topic's session id, cwd and permission mode |
 | `/sessions <dir…>` | List the Claude sessions stored for one or more directories (what the IDE/CLI picker shows) |
 | `/import <dir…>` | Make a topic for each session in the given directories — bound + recent history backfilled |
 | `/history [N]` | Re-post the last N turns of this topic's bound session |
@@ -93,24 +96,71 @@ Send and receive files through the same topic.
   and it's saved into `<topic-dir>/inbox/`. If the message has a **caption**, the
   caption runs as a prompt with the saved path noted, so Claude can act on it
   immediately ("summarise this"). With no caption it's just saved and acknowledged
-  — reference it in your next message. (Telegram caps bot downloads at 20 MB.)
+  — reference it in your next message. (Telegram caps bot downloads at 20 MB; see
+  [Big files](#big-files-local-bot-api-server) to lift it.)
 - **Claude → you.** Anything Claude places in `<topic-dir>/outbox/` is delivered to
   the topic after the run, then moved to `outbox/.sent/` so it isn't sent twice.
   A one-line hint (`TG_BRIDGE_HINT`, on by default) tells Claude this convention,
   so "send me the report" just works. You can also pull a file yourself with
   `/get <path>` (relative to the topic's directory, or absolute). Bot uploads are
-  capped at 50 MB.
+  capped at 50 MB (2000 MB with a local server).
 
 ## Config
 
 All keys live in `.env` (see [.env.example](.env.example)). Highlights:
 
 - `TG_WORKDIR` — default directory Claude runs in (override per topic with `/cwd`).
-- `TG_PERMISSION_MODE` — `acceptEdits` (default) or `bypass` for full autonomy
-  (`--dangerously-skip-permissions`). The CLI can't prompt you over Telegram, so
-  it must be pre-authorized. Only loosen this on a server you trust.
+- `TG_PERMISSION_MODE` — the **default** permission mode (see below); `/mode` overrides it per topic.
 - `TG_ALLOWED_TOOLS` — tools auto-approved in `acceptEdits` mode.
 - `TG_REQUIRE_MENTION` — in groups, only answer when @mentioned.
+- `TG_PROGRESS_DETAIL` — show the real command/path/query in the status message (default on).
+- `TG_BOT_LOGO` / `TG_SET_LOGO` — avatar to set on startup **if the bot has none**.
+- `TG_API_ROOT` — a local Bot API server, for files over 20 MB (see below).
+
+## Permission modes
+
+The CLI can't pop a permission prompt at you over Telegram, so every run has to be
+pre-authorized. Pick the posture per topic with `/mode` (or set the default with
+`TG_PERMISSION_MODE`):
+
+| Mode | What it does |
+| --- | --- |
+| `plan` | Read-only. Researches and proposes; never edits. Also available as a one-shot: `/plan <task>`. |
+| `acceptEdits` | *(default)* Auto-approves edits and the tools in `TG_ALLOWED_TOOLS`. |
+| `auto` | Runs unattended, but routes each tool call through Claude's classifier, which blocks destructive/irreversible ones. The middle ground between `acceptEdits` and `bypass`. |
+| `bypass` | No checks at all (`--dangerously-skip-permissions`). Only on a server you're willing to lose. |
+
+`auto` trusts only your working directory and the current repo's remotes by
+default, so pushing to your org or writing to a team bucket is blocked until you
+describe your infrastructure in the `autoMode` block of `~/.claude/settings.json`
+— note it deliberately ignores a repo's own `.claude/settings.json`, so a cloned
+repo can't grant itself permissions. See
+[auto mode config](https://code.claude.com/docs/en/auto-mode-config).
+
+A typical loop from the phone: `/plan refactor the parser` → read it → "go ahead"
+(runs in the topic's normal mode).
+
+## Big files (local Bot API server)
+
+The cloud Bot API caps bot **downloads at 20 MB** and **uploads at 50 MB** — a
+hard limit of Telegram's, not this bridge's. Running a
+[local Bot API server](https://github.com/tdlib/telegram-bot-api) removes the
+download cap and raises uploads to 2000 MB. `./local-api.sh up` starts one in
+Docker (needs `TG_API_ID`/`TG_API_HASH` from [my.telegram.org](https://my.telegram.org/apps)),
+then set `TG_API_ROOT=http://localhost:8081` and restart. With `TG_LOCAL_API=1` in
+`.env`, `./start.sh` brings it up for you.
+
+**Understand the trade before you migrate.** A bot talks to exactly one API
+server. Binding it to a local one means calling `logOut` on the cloud API, and
+Telegram then refuses to let it back for **10 minutes**; `file_id`s minted before
+the move stop resolving. So this is a standing posture for the deployment — it
+cannot be switched on just for one big file. `./local-api.sh migrate` performs the
+logOut, and asks you to type the bot's username first. Nothing else ever calls it.
+
+The server we run is the [tdlight](https://hub.docker.com/r/tdlight/tdlightbotapi)
+fork rather than upstream, because upstream
+[keeps every downloaded file in RAM forever](https://github.com/tdlib/telegram-bot-api/issues/514)
+— enough to OOM a small VPS after a couple of large transfers.
 
 ## Security
 
