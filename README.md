@@ -117,8 +117,10 @@ All keys live in `.env` (see [.env.example](.env.example)). Highlights:
 - `TG_PROGRESS_DETAIL` — show the real command/path/query in the status message (default on).
 - `TG_BOT_LOGO` / `TG_SET_LOGO` — avatar to set on startup **if the bot has none**.
 - `TG_GROUP_LOGO` / `TG_SET_GROUP_LOGO` — group photo to set **if the group has none**
-  (needs the bot to be an admin with *change group info*). Neither is ever replaced
-  automatically — `/logo bot|group` does that on purpose.
+  (needs the bot to be an admin with *change group info*). Applied at startup and
+  whenever the bot is promoted to admin — not when it's added, since it has no rights
+  at that point. Neither photo is ever replaced automatically; `/logo bot|group` does
+  that on purpose.
 - `TG_API_ROOT` — a local Bot API server, for files over 20 MB (see below).
 
 ## Permission modes
