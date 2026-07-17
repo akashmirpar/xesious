@@ -65,7 +65,10 @@ const DEFAULT_WORKDIR = process.env.TG_WORKDIR || process.cwd()
 // Root under which each topic gets its own directory (named after the topic).
 const SESSIONS_BASE = process.env.TG_SESSIONS_BASE || join(homedir(), 'tg-topics')
 const STATE_FILE = process.env.TG_STATE_FILE || join(HERE, 'state', 'sessions.json')
-const PERMISSION_MODE = (process.env.TG_PERMISSION_MODE || 'acceptEdits').trim()
+// Default posture per topic (override with /mode). `auto` over `acceptEdits`: the
+// classifier still blocks destructive and irreversible calls, where acceptEdits
+// waves through everything in TG_ALLOWED_TOOLS — Bash included — unexamined.
+const PERMISSION_MODE = (process.env.TG_PERMISSION_MODE || 'auto').trim()
 const ALLOWED_TOOLS =
   process.env.TG_ALLOWED_TOOLS ||
   'Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch,Agent,TodoWrite,NotebookEdit'
@@ -512,13 +515,15 @@ function modeText(key: string): string {
     MODES.map(m => `${MODE_EMOJI[m]} ${m} — ${MODE_HELP[m]}`).join('\n') +
     `\n\nTap to switch, or /mode <name>.`
 }
+// One button per row: four side by side get squeezed to unreadable stubs on a
+// phone, which is the only screen this bot is used from.
 function modeKeyboard(key: string) {
   const cur = modeFor(key)
   return {
-    inline_keyboard: [MODES.map(m => ({
+    inline_keyboard: MODES.map(m => [{
       text: `${m === cur ? '● ' : ''}${MODE_EMOJI[m]} ${m}`,
       callback_data: `mode:${m}`,
-    }))],
+    }]),
   }
 }
 
