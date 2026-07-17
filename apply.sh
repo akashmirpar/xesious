@@ -9,7 +9,7 @@
 # bot a moment to deliver the finished reply, then gracefully restart.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
-export PATH="/root/.nvm/versions/node/v24.2.0/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 SESSION="${CLAUDE_TG_SESSION:-claude-tg}"
 BUSY='claude.*--output-format stream-json'
 
