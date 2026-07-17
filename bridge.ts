@@ -1068,6 +1068,16 @@ bot.on('message', async ctx => {
     .catch(e => console.error(`[error] task ${key}: ${e}`))
 })
 
+// The bot cannot set a group photo the moment it's added — it isn't an admin yet,
+// and the chat usually isn't allowlisted yet either. The promotion is the first
+// point where it's actually possible, so retry there rather than making the user
+// restart the bridge to pick it up.
+bot.on('my_chat_member', async ctx => {
+  const status = ctx.myChatMember.new_chat_member.status
+  if (status !== 'administrator') return
+  await ensureGroupLogo(ctx.chat.id)
+})
+
 // The /mode keyboard. The topic is taken from the message the button lives on,
 // so callback_data only has to carry the mode (it's capped at 64 bytes).
 bot.on('callback_query:data', async ctx => {
@@ -1107,17 +1117,18 @@ const setGroupLogo = (chatId: number | string) => bot.api.setChatPhoto(chatId, n
 // existing one — a group's photo belongs to the people in it, and a bot restart
 // is not consent to change it. /logo group is the way to say so explicitly.
 // Needs the bot to be an admin with can_change_info; a failure is only logged.
+async function ensureGroupLogo(id: number | string): Promise<void> {
+  if (!SET_GROUP_LOGO || !existsSync(GROUP_LOGO)) return
+  if (!ALLOWED_CHATS.has(String(id))) return // never redecorate a group we don't serve
+  try {
+    const chat = await bot.api.getChat(id)
+    if (chat.type === 'private' || (chat as any).photo) return
+    await setGroupLogo(id)
+    console.log(`[ok] set group photo for ${id} from ${GROUP_LOGO}`)
+  } catch (e) { console.error(`[warn] could not set group photo for ${id}: ${e}`) }
+}
 async function ensureGroupLogos(): Promise<void> {
-  if (!SET_GROUP_LOGO || !ALLOWED_CHATS.size) return
-  if (!existsSync(GROUP_LOGO)) return
-  for (const id of ALLOWED_CHATS) {
-    try {
-      const chat = await bot.api.getChat(id)
-      if (chat.type === 'private' || (chat as any).photo) continue
-      await setGroupLogo(id)
-      console.log(`[ok] set group photo for ${id} from ${GROUP_LOGO}`)
-    } catch (e) { console.error(`[warn] could not set group photo for ${id}: ${e}`) }
-  }
+  for (const id of ALLOWED_CHATS) await ensureGroupLogo(id)
 }
 
 async function main() {
