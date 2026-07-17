@@ -544,11 +544,21 @@ function modeKeyboard(key: string) {
 // Human label for the model currently in effect for a topic.
 function modelLabel(key: string): string {
   const m = modelFor(key)
-  return m ? m : `${MODEL_DEFAULT} (account default${MODEL ? `: ${MODEL}` : ''})`
+  if (m) return m
+  return MODEL ? `${MODEL_DEFAULT} → TG_MODEL (${MODEL})` : `${MODEL_DEFAULT} → system default`
+}
+// What "default" resolves to. When TG_MODEL is set it's that; otherwise the bridge
+// passes no --model flag and the CLI uses whatever Claude itself defaults to — the
+// model in ~/.claude/settings.json, or the account/plan default.
+function defaultExplainer(): string {
+  return MODEL
+    ? `"${MODEL_DEFAULT}" uses TG_MODEL (${MODEL}).`
+    : `"${MODEL_DEFAULT}" runs no --model flag, so Claude uses your system default: the model set in ~/.claude/settings.json, or your account default.`
 }
 function modelText(key: string): string {
   return `Model for this topic: ${modelLabel(key)}\n\n` +
-    `Tap to switch, or /model <alias|full-id>. "${MODEL_DEFAULT}" clears the override.`
+    `${defaultExplainer()}\n\n` +
+    `Every model works in any /mode (plan, auto, …). Tap to switch, or /model <alias|full-id>.`
 }
 function modelKeyboard(key: string) {
   const cur = modelFor(key)
@@ -954,7 +964,7 @@ bot.on('message', async ctx => {
       if (m === undefined) { await send(ctx, threadId, `Unknown model "${arg}". Try: ${MODEL_ALIASES.join(', ')}, a full id (claude-…), or "${MODEL_DEFAULT}".`); return }
       if (m) models[key] = m; else delete models[key]
       saveState()
-      await send(ctx, threadId, `🧠 Model for this topic: ${modelLabel(key)}`)
+      await send(ctx, threadId, `🧠 Model for this topic: ${modelLabel(key)}` + (m ? '' : `\n${defaultExplainer()}`))
       return
     }
     await ctx.api.sendMessage(ctx.chat.id, modelText(key), {
