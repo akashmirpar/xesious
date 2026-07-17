@@ -146,6 +146,10 @@ const isInterrupt = (key: string) => interruptMode[key] ?? INTERRUPT_DEFAULT
 // TG_PERMISSION_MODE.
 let modes: Record<string, string> = {}
 const modeFor = (key: string) => modes[key] ?? PERMISSION_MODE
+// Per-topic model override, switchable with /model. Empty string ⇒ fall back to
+// TG_MODEL, and empty TG_MODEL ⇒ the account default (no --model flag at all).
+let models: Record<string, string> = {}
+const modelFor = (key: string) => models[key] ?? MODEL
 
 function keyFor(chatId: number | string, threadId: number | undefined): string {
   return `${chatId}:${threadId ?? 'main'}`
@@ -159,28 +163,23 @@ function loadState(): void {
       pending = o.pending ?? []
       interruptMode = o.interruptMode ?? {}
       modes = o.modes ?? {}
+      models = o.models ?? {}
     }
   } catch (e) { console.error(`[warn] could not read state (${e}); starting empty`) }
 }
 function saveState(): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true })
-    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes }, null, 2))
+    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models }, null, 2))
   } catch (e) { console.error(`[warn] could not write state: ${e}`) }
 }
 
-// The six icon colors Telegram accepts for a forum topic. Passing icon_color
-// WITHOUT icon_custom_emoji_id is what gets the flat folder icon; naming a custom
-// emoji (even the 📁 in the Topics set) swaps in a 3D sticker instead.
-const TOPIC_COLORS = [0x6fb9f0, 0xffd67e, 0xcb86db, 0x8eee98, 0xff93b2, 0xfb6f5f] as const
-type TopicColor = (typeof TOPIC_COLORS)[number]
-// Pick by a stable hash of the name so a given project keeps its color across
-// re-imports, and sibling topics still come out visually distinct.
-function topicColor(name: string): TopicColor {
-  let h = 0
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0
-  return TOPIC_COLORS[h % TOPIC_COLORS.length]
-}
+// The icon for topics the bridge creates. Telegram only accepts custom-emoji ids
+// from its built-in "Topics" set (getForumTopicIconStickers), and 📁 is the only
+// folder in it — so a topic reads as a folder. Overriding needs an id from that
+// set, not an arbitrary emoji. (An icon_color alone just tints a letter bubble,
+// which is why an earlier attempt at a "flat folder" never produced one.)
+const TOPIC_ICON = process.env.TG_TOPIC_ICON || '5357315181649076022' // 📁
 
 function sanitize(name: string): string {
   return name.normalize('NFKD').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'topic'
@@ -258,6 +257,21 @@ function permissionArgs(mode: string): string[] {
   return ['--permission-mode', mode, '--allowedTools', ALLOWED_TOOLS]
 }
 
+// Model choices offered by /model. The CLI takes a bare alias or a full id; these
+// are the aliases, plus 'default' meaning "no --model flag, use the account
+// default". A full id typed as an argument is passed through untouched.
+const MODEL_ALIASES = ['opus', 'sonnet', 'haiku', 'fable'] as const
+const MODEL_DEFAULT = 'default' // the label for "clear the override"
+// Returns '' for the default (clears the override), the alias/id otherwise.
+function normalizeModel(m: string): string | undefined {
+  const s = m.trim().toLowerCase()
+  if (s === MODEL_DEFAULT || s === 'reset' || s === 'clear' || s === '') return ''
+  if ((MODEL_ALIASES as readonly string[]).includes(s)) return s
+  // A full model id (e.g. claude-opus-4-8) — accept it as given.
+  if (/^claude[\w.-]*$/i.test(m.trim())) return m.trim()
+  return undefined
+}
+
 // Env for the claude subprocess: strip TELEGRAM_*/TG_* so the Claude Code
 // process (and any installed telegram channel plugin) can't grab our bot token
 // and start a competing getUpdates poll on it (causes 409 and kills the bridge).
@@ -317,11 +331,11 @@ function renderSteps(steps: Step[]): string {
 
 // Run a prompt with streaming output, editing a single "status" message in the
 // topic to show live tool-step progress, then return the final result.
-async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE): Promise<ClaudeResult> {
+async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL): Promise<ClaudeResult> {
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs(mode)]
   if (TELEGRAM_PROFILE.trim()) args.push('--append-system-prompt', TELEGRAM_PROFILE)
   if (resumeId) args.push('--resume', resumeId)
-  if (MODEL) args.push('--model', MODEL)
+  if (model) args.push('--model', model)
 
   const opts: any = threadId ? { message_thread_id: threadId } : {}
   // Status is machine chatter, not an answer — post and edit it silently so only
@@ -527,6 +541,22 @@ function modeKeyboard(key: string) {
   }
 }
 
+// Human label for the model currently in effect for a topic.
+function modelLabel(key: string): string {
+  const m = modelFor(key)
+  return m ? m : `${MODEL_DEFAULT} (account default${MODEL ? `: ${MODEL}` : ''})`
+}
+function modelText(key: string): string {
+  return `Model for this topic: ${modelLabel(key)}\n\n` +
+    `Tap to switch, or /model <alias|full-id>. "${MODEL_DEFAULT}" clears the override.`
+}
+function modelKeyboard(key: string) {
+  const cur = modelFor(key)
+  const rows = MODEL_ALIASES.map(m => [{ text: `${m === cur ? '● ' : ''}${m}`, callback_data: `model:${m}` }])
+  rows.push([{ text: `${cur === '' ? '● ' : ''}${MODEL_DEFAULT}`, callback_data: `model:${MODEL_DEFAULT}` }])
+  return { inline_keyboard: rows }
+}
+
 // Gate on the SENDER's id, never the room.
 function isAllowed(ctx: Context): boolean {
   const userId = String(ctx.from?.id ?? '')
@@ -653,7 +683,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   const cwd = resolveCwd(ctx, threadId)
   const resumeId = sessions[key]?.sessionId
   try {
-    const res = await runStreaming(ctx, threadId, key, prompt, cwd, resumeId, mode ?? modeFor(key))
+    const res = await runStreaming(ctx, threadId, key, prompt, cwd, resumeId, mode ?? modeFor(key), modelFor(key))
     if (stopped.has(key)) { stopped.delete(key); return } // killed via /stop — status already cleared, no reply
     if (res.sessionId) { sessions[key] = { ...sessions[key], cwd, sessionId: res.sessionId, updated: new Date().toISOString() }; saveState() }
     await deliver(ctx, threadId, res.text)
@@ -675,7 +705,7 @@ const PASSTHROUGH = new Set(['/usage', '/cost', '/context'])
 async function handlePassthrough(ctx: Context, threadId: number | undefined, key: string, text: string): Promise<void> {
   const cwd = resolveCwd(ctx, threadId)
   try {
-    const res = await runStreaming(ctx, threadId, key, text, cwd, sessions[key]?.sessionId, modeFor(key))
+    const res = await runStreaming(ctx, threadId, key, text, cwd, sessions[key]?.sessionId, modeFor(key), modelFor(key))
     if (stopped.has(key)) { stopped.delete(key); return }
     await deliver(ctx, threadId, res.text)
   } catch (e) {
@@ -845,6 +875,7 @@ bot.on('message', async ctx => {
       `/stop — cancel the task currently running in this topic\n` +
       `/interrupt [on|off] — new messages cancel the running task instead of queueing\n` +
       `/mode [${MODES.join('|')}] — permission mode for this topic (tap to switch)\n` +
+      `/model [${MODEL_ALIASES.join('|')}] — model for this topic (tap to switch)\n` +
       `/plan <task> — one read-only turn: propose without editing\n` +
       `/logo bot|group — set the bot's avatar / this group's photo\n` +
       `/get <path> — send a file from this topic's directory back to you\n` +
@@ -916,6 +947,22 @@ bot.on('message', async ctx => {
     }).catch(e => console.error(`[warn] /mode: ${e}`))
     return
   }
+  if (cmd === '/model') {
+    const arg = text.split(/\s+/)[1]
+    if (arg) {
+      const m = normalizeModel(arg)
+      if (m === undefined) { await send(ctx, threadId, `Unknown model "${arg}". Try: ${MODEL_ALIASES.join(', ')}, a full id (claude-…), or "${MODEL_DEFAULT}".`); return }
+      if (m) models[key] = m; else delete models[key]
+      saveState()
+      await send(ctx, threadId, `🧠 Model for this topic: ${modelLabel(key)}`)
+      return
+    }
+    await ctx.api.sendMessage(ctx.chat.id, modelText(key), {
+      ...(threadId ? { message_thread_id: threadId } : {}),
+      reply_markup: modelKeyboard(key),
+    }).catch(e => console.error(`[warn] /model: ${e}`))
+    return
+  }
   if (cmd === '/plan') {
     const arg = text.slice(text.indexOf(' ') + 1).trim()
     if (!arg || !text.includes(' ')) { await send(ctx, threadId, `Usage: /plan <what you want>\n\nRuns one read-only turn: Claude researches and proposes, without editing. Reply "go ahead" to carry it out in this topic's usual mode (${modeFor(key)}).`); return }
@@ -970,7 +1017,8 @@ bot.on('message', async ctx => {
     await send(ctx, threadId,
       `directory: ${e?.cwd ?? resolveCwd(ctx, threadId)}\n` +
       `session: ${e?.sessionId ?? '(none yet)'}\n` +
-      `mode: ${modeFor(key)}\n\n` +
+      `mode: ${modeFor(key)}\n` +
+      `model: ${modelLabel(key)}\n\n` +
       `resume on the server:\n  cd "${e?.cwd ?? resolveCwd(ctx, threadId)}" && claude --continue`)
     return
   }
@@ -1027,7 +1075,7 @@ bot.on('message', async ctx => {
     for (const { dir, s } of capped) {
       try {
         const name = `${basename(dir)} · ${s.title}`.slice(0, 120)
-        const topic = await ctx.api.createForumTopic(chatId, name, { icon_color: topicColor(name) })
+        const topic = await ctx.api.createForumTopic(chatId, name, TOPIC_ICON ? { icon_custom_emoji_id: TOPIC_ICON } : {})
         const tid = topic.message_thread_id
         const tkey = keyFor(chatId, tid)
         sessions[tkey] = { cwd: dir, sessionId: s.id, updated: new Date().toISOString() }
@@ -1087,14 +1135,22 @@ bot.on('my_chat_member', async ctx => {
 // so callback_data only has to carry the mode (it's capped at 64 bytes).
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
-  if (!data.startsWith('mode:')) return
   if (!isAllowed(ctx)) { await ctx.answerCallbackQuery({ text: 'Not authorized.', show_alert: true }).catch(() => {}); return }
-  const m = normalizeMode(data.slice(5))
-  if (!m) { await ctx.answerCallbackQuery({ text: 'Unknown mode.' }).catch(() => {}); return }
   const key = keyFor(ctx.chat!.id, ctx.callbackQuery.message?.message_thread_id)
-  modes[key] = m; saveState()
-  await ctx.answerCallbackQuery({ text: `Mode: ${m}` }).catch(() => {})
-  await ctx.editMessageText(modeText(key), { reply_markup: modeKeyboard(key) }).catch(() => {})
+  if (data.startsWith('mode:')) {
+    const m = normalizeMode(data.slice(5))
+    if (!m) { await ctx.answerCallbackQuery({ text: 'Unknown mode.' }).catch(() => {}); return }
+    modes[key] = m; saveState()
+    await ctx.answerCallbackQuery({ text: `Mode: ${m}` }).catch(() => {})
+    await ctx.editMessageText(modeText(key), { reply_markup: modeKeyboard(key) }).catch(() => {})
+  } else if (data.startsWith('model:')) {
+    const m = normalizeModel(data.slice(6))
+    if (m === undefined) { await ctx.answerCallbackQuery({ text: 'Unknown model.' }).catch(() => {}); return }
+    if (m) models[key] = m; else delete models[key]
+    saveState()
+    await ctx.answerCallbackQuery({ text: `Model: ${m || MODEL_DEFAULT}` }).catch(() => {})
+    await ctx.editMessageText(modelText(key), { reply_markup: modelKeyboard(key) }).catch(() => {})
+  }
 })
 
 // ---------------------------------------------------------------------------
