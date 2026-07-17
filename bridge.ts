@@ -23,7 +23,7 @@ import telegramify from 'telegramify-markdown'
 import { autoRetry } from '@grammyjs/auto-retry'
 import { apiThrottler } from '@grammyjs/transformer-throttler'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync, copyFileSync } from 'node:fs'
 import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 
@@ -90,8 +90,24 @@ const TELEGRAM_PROFILE = process.env.TG_PROFILE ?? [
   '- Assume no editor or file selection is open. Ignore any IDE/editor framing from earlier in this conversation; the user is in a chat.',
   `- Files the user sends are saved in ./${INBOX_DIR}/. To send a file back, put it in ./${OUTBOX_DIR}/ and it is delivered then cleared.`,
 ].join('\n')
-const TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024 // Bot API getFile cap (download to us)
-const TG_UPLOAD_LIMIT = 50 * 1024 * 1024   // Bot API sendDocument cap (upload to chat)
+// A local Bot API server (tdlib/telegram-bot-api or the tdlight fork) lifts the
+// cloud's file caps: 2000 MB up, no download cap, and getFile returns an absolute
+// path on disk instead of a URL to fetch. Point TG_API_ROOT at it to switch.
+// NOTE: a bot must be logOut()'d from the cloud API before it can bind to a local
+// server, and cannot return to the cloud for 10 minutes — so this is a standing
+// posture for the deployment, not something to toggle per file. See README.
+const API_ROOT = (process.env.TG_API_ROOT || '').trim().replace(/\/+$/, '')
+const LOCAL_API = Boolean(API_ROOT)
+const TG_DOWNLOAD_LIMIT = LOCAL_API ? Infinity : 20 * 1024 * 1024      // cloud getFile cap
+const TG_UPLOAD_LIMIT = (LOCAL_API ? 2000 : 50) * 1024 * 1024          // sendDocument cap
+
+// The bot's own avatar. On startup, if the bot has no profile photo, set this one.
+// (setMyProfilePhoto is a real Bot API method — BotFather is not required.)
+const BOT_LOGO = process.env.TG_BOT_LOGO || join(HERE, 'assets', 'bot-logo.jpg')
+const SET_LOGO = !/^(0|false|no)$/i.test(process.env.TG_SET_LOGO || '')
+// Show the actual tool input (command, path, url) in the live status message,
+// inside a collapsed <blockquote expandable>. Set 0 for the older terse labels.
+const PROGRESS_DETAIL = !/^(0|false|no)$/i.test(process.env.TG_PROGRESS_DETAIL || '')
 
 // Importing existing Claude Code sessions (the ones the IDE/CLI session picker
 // shows) as topics. A directory's sessions live at CLAUDE_PROJECTS/<encoded>/<id>.jsonl.
@@ -118,6 +134,10 @@ let pending: { chat: number; id: number }[] = []
 // the new one immediately, instead of queueing behind it. Defaults to TG_INTERRUPT.
 let interruptMode: Record<string, boolean> = {}
 const isInterrupt = (key: string) => interruptMode[key] ?? INTERRUPT_DEFAULT
+// Per-topic permission mode, switchable from Telegram with /mode. Defaults to
+// TG_PERMISSION_MODE.
+let modes: Record<string, string> = {}
+const modeFor = (key: string) => modes[key] ?? PERMISSION_MODE
 
 function keyFor(chatId: number | string, threadId: number | undefined): string {
   return `${chatId}:${threadId ?? 'main'}`
@@ -130,14 +150,28 @@ function loadState(): void {
       names = o.names ?? {}
       pending = o.pending ?? []
       interruptMode = o.interruptMode ?? {}
+      modes = o.modes ?? {}
     }
   } catch (e) { console.error(`[warn] could not read state (${e}); starting empty`) }
 }
 function saveState(): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true })
-    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode }, null, 2))
+    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes }, null, 2))
   } catch (e) { console.error(`[warn] could not write state: ${e}`) }
+}
+
+// The six icon colors Telegram accepts for a forum topic. Passing icon_color
+// WITHOUT icon_custom_emoji_id is what gets the flat folder icon; naming a custom
+// emoji (even the 📁 in the Topics set) swaps in a 3D sticker instead.
+const TOPIC_COLORS = [0x6fb9f0, 0xffd67e, 0xcb86db, 0x8eee98, 0xff93b2, 0xfb6f5f] as const
+type TopicColor = (typeof TOPIC_COLORS)[number]
+// Pick by a stable hash of the name so a given project keeps its color across
+// re-imports, and sibling topics still come out visually distinct.
+function topicColor(name: string): TopicColor {
+  let h = 0
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0
+  return TOPIC_COLORS[h % TOPIC_COLORS.length]
 }
 
 function sanitize(name: string): string {
@@ -194,10 +228,26 @@ function enqueue<T>(key: string, task: () => Promise<T>): Promise<T> {
 
 interface ClaudeResult { text: string; sessionId?: string; isError: boolean }
 
-function permissionArgs(): string[] {
-  const m = PERMISSION_MODE.toLowerCase()
-  if (m === 'bypass' || m === 'bypasspermissions') return ['--dangerously-skip-permissions']
-  return ['--permission-mode', PERMISSION_MODE, '--allowedTools', ALLOWED_TOOLS]
+// The permission postures the bridge offers, in ascending autonomy. `auto` routes
+// each tool call through Claude's classifier (blocks the irreversible/destructive
+// ones, no prompting) — configure what it trusts via `autoMode` in
+// ~/.claude/settings.json. `plan` researches and proposes without touching files.
+const MODES = ['plan', 'acceptEdits', 'auto', 'bypass'] as const
+const MODE_HELP: Record<string, string> = {
+  plan: 'read-only — researches and proposes, never edits',
+  acceptEdits: 'auto-approves edits + the TG_ALLOWED_TOOLS list',
+  auto: 'classifier-gated autonomy — blocks destructive/irreversible calls',
+  bypass: 'no permission checks at all (--dangerously-skip-permissions)',
+}
+function normalizeMode(m: string): string | undefined {
+  const s = m.trim().toLowerCase()
+  if (s === 'bypass' || s === 'bypasspermissions') return 'bypass'
+  return MODES.find(x => x.toLowerCase() === s)
+}
+function permissionArgs(mode: string): string[] {
+  // bypassPermissions is only honoured via its dedicated flag in -p runs.
+  if (normalizeMode(mode) === 'bypass') return ['--dangerously-skip-permissions']
+  return ['--permission-mode', mode, '--allowedTools', ALLOWED_TOOLS]
 }
 
 // Env for the claude subprocess: strip TELEGRAM_*/TG_* so the Claude Code
@@ -209,45 +259,90 @@ function childEnv(): NodeJS.ProcessEnv {
   return e
 }
 
-// A short, clean status label for a streamed tool_use event. Deliberately does
-// NOT echo raw commands or full paths (that's internal noise to the user) —
-// just the kind of activity, with a file basename where useful.
-function toolStep(b: any): string {
+// A status line for one streamed event: a short label, plus the detail of what
+// was actually tried (the command, the path, the query). The label alone reads as
+// generic — "running a command" doesn't say which — so the detail carries the
+// substance and the renderer collapses it behind an expandable quote.
+// Set TG_PROGRESS_DETAIL=0 to drop the detail and keep the terse labels only.
+type Step = { label: string; detail?: string }
+
+function toolStep(b: any): Step {
   const n = b?.name || 'tool'
   const i = b?.input || {}
   const base = (p: any) => (p ? basename(String(p)) : '')
+  const str = (v: any) => (v == null ? undefined : String(v))
   switch (n) {
-    case 'Bash': return '⚙️ Running a command'
-    case 'Read': return `📖 Reading ${base(i.file_path)}`.trimEnd()
-    case 'Edit': case 'Write': case 'NotebookEdit': return `✏️ Editing ${base(i.file_path)}`.trimEnd()
-    case 'Glob': case 'Grep': return '🔎 Searching the code'
-    case 'WebFetch': case 'WebSearch': return '🌐 Looking something up'
-    case 'Agent': case 'Task': return '🤖 Running a subagent'
-    case 'TodoWrite': return '📝 Planning'
-    default: return `⚙️ ${n}`
+    case 'Bash': return { label: '⚙️ Running a command', detail: str(i.command) }
+    case 'Read': return { label: `📖 Reading ${base(i.file_path)}`.trimEnd(), detail: str(i.file_path) }
+    case 'Edit': case 'Write': case 'NotebookEdit':
+      return { label: `✏️ Editing ${base(i.file_path)}`.trimEnd(), detail: str(i.file_path) }
+    case 'Glob': case 'Grep':
+      return { label: '🔎 Searching the code', detail: [i.pattern, i.path].filter(Boolean).join('  in  ') || undefined }
+    case 'WebFetch': case 'WebSearch':
+      return { label: '🌐 Looking something up', detail: str(i.url ?? i.query ?? i.prompt) }
+    case 'Agent': case 'Task':
+      return { label: '🤖 Running a subagent', detail: str(i.description ?? i.prompt) }
+    case 'TodoWrite': {
+      const todos = Array.isArray(i.todos) ? i.todos.map((t: any) => `• ${t?.content ?? t}`).join('\n') : undefined
+      return { label: '📝 Planning', detail: todos }
+    }
+    default: return { label: `⚙️ ${n}`, detail: str(i.command ?? i.file_path ?? i.pattern) }
   }
+}
+
+const escapeHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+
+// Render the step list for the live status message as HTML: bold label, and the
+// detail tucked into a collapsed expandable quote so the topic stays scannable
+// but the actual attempt is one tap away.
+const DETAIL_MAX = 250
+function renderSteps(steps: Step[]): string {
+  return steps.map(s => {
+    const label = `<b>${escapeHtml(s.label)}</b>`
+    if (!PROGRESS_DETAIL || !s.detail) return label
+    const d = s.detail.trim()
+    if (!d) return label
+    const clipped = d.length > DETAIL_MAX ? `${d.slice(0, DETAIL_MAX)}…` : d
+    return `${label}\n<blockquote expandable>${escapeHtml(clipped)}</blockquote>`
+  }).join('\n')
 }
 
 // Run a prompt with streaming output, editing a single "status" message in the
 // topic to show live tool-step progress, then return the final result.
-async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string): Promise<ClaudeResult> {
-  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs()]
+async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE): Promise<ClaudeResult> {
+  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs(mode)]
   if (TELEGRAM_PROFILE.trim()) args.push('--append-system-prompt', TELEGRAM_PROFILE)
   if (resumeId) args.push('--resume', resumeId)
   if (MODEL) args.push('--model', MODEL)
 
   const opts: any = threadId ? { message_thread_id: threadId } : {}
-  const status = await ctx.api.sendMessage(ctx.chat!.id, '💭 thinking…', opts).catch(() => null)
+  // Status is machine chatter, not an answer — post and edit it silently so only
+  // the real reply buzzes the user's phone.
+  const status = await ctx.api.sendMessage(ctx.chat!.id, '💭 thinking…', { ...opts, disable_notification: true }).catch(() => null)
   if (status) { pending.push({ chat: ctx.chat!.id, id: status.message_id }); saveState() }
-  const steps: string[] = []
+  const steps: Step[] = []
   let lastEdit = 0, dirty = false
   const editStatus = async (force = false) => {
     if (!status || (!dirty && !force)) return
     const now = Date.now()
     if (!force && now - lastEdit < 4000) return
     lastEdit = now; dirty = false
-    const body = (steps.length ? steps.slice(-9).join('\n') : '💭 thinking…').slice(0, 3500)
-    await ctx.api.editMessageText(ctx.chat!.id, status.message_id, body).catch(() => {})
+    if (!steps.length) {
+      await ctx.api.editMessageText(ctx.chat!.id, status.message_id, '💭 thinking…').catch(() => {})
+      return
+    }
+    // Trim from the oldest until the HTML body fits: slicing a rendered string
+    // mid-tag would break the parse and lose the whole update.
+    let shown = steps.slice(-9)
+    let body = renderSteps(shown)
+    while (body.length > 3500 && shown.length > 1) { shown = shown.slice(1); body = renderSteps(shown) }
+    try {
+      await ctx.api.editMessageText(ctx.chat!.id, status.message_id, body, { parse_mode: 'HTML' })
+    } catch {
+      // Same posture as sendRich: formatting is best-effort, the update is not.
+      const plain = shown.map(s => s.label).join('\n').slice(0, 3500)
+      await ctx.api.editMessageText(ctx.chat!.id, status.message_id, plain).catch(() => {})
+    }
   }
   const ticker = setInterval(() => void editStatus(), 4000)
 
@@ -269,7 +364,15 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
         if (!line.trim()) continue
         let o: any; try { o = JSON.parse(line) } catch { continue }
         if (o.type === 'assistant' && Array.isArray(o.message?.content)) {
-          for (const b of o.message.content) if (b?.type === 'tool_use') { steps.push(toolStep(b)); dirty = true }
+          for (const b of o.message.content) {
+            if (b?.type === 'tool_use') { steps.push(toolStep(b)); dirty = true }
+            // The reasoning behind the next step — what the model is trying, not
+            // just what it ran. Collapsed like any other detail.
+            else if (b?.type === 'thinking' && PROGRESS_DETAIL) {
+              const t = String(b.thinking ?? '').trim()
+              if (t) { steps.push({ label: '💭 Thinking', detail: t }); dirty = true }
+            }
+          }
         } else if (o.type === 'result') {
           got = true; sessionId = o.session_id
           isError = Boolean(o.is_error) || o.subtype !== 'success'
@@ -337,8 +440,11 @@ function stripMd(s: string): string {
     .replace(/^\s*>\s?/gm, '')
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)')
 }
-async function send(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
-  const opts = threadId ? { message_thread_id: threadId } : {}
+// quiet=true sends without a notification — for status, acks and other bookkeeping
+// the user doesn't need buzzed about. Answers and warnings stay loud.
+async function send(ctx: Context, threadId: number | undefined, text: string, quiet = false): Promise<void> {
+  const opts: any = threadId ? { message_thread_id: threadId } : {}
+  if (quiet) opts.disable_notification = true
   for (const part of chunk(text)) {
     await ctx.api.sendMessage(ctx.chat!.id, part, opts).catch(e => console.error(`[warn] sendMessage: ${e}`))
   }
@@ -389,6 +495,28 @@ function startTyping(ctx: Context, threadId: number | undefined): () => void {
   ping(); const id = setInterval(ping, 4500); return () => clearInterval(id)
 }
 
+// ---------------------------------------------------------------------------
+// Permission-mode UI (/mode + its inline keyboard)
+// ---------------------------------------------------------------------------
+
+const MODE_EMOJI: Record<string, string> = { plan: '📋', acceptEdits: '✏️', auto: '🤖', bypass: '⚠️' }
+
+function modeText(key: string): string {
+  const cur = modeFor(key)
+  return `Permission mode for this topic: ${MODE_EMOJI[cur] ?? ''} ${cur}\n${MODE_HELP[cur] ?? ''}\n\n` +
+    MODES.map(m => `${MODE_EMOJI[m]} ${m} — ${MODE_HELP[m]}`).join('\n') +
+    `\n\nTap to switch, or /mode <name>.`
+}
+function modeKeyboard(key: string) {
+  const cur = modeFor(key)
+  return {
+    inline_keyboard: [MODES.map(m => ({
+      text: `${m === cur ? '● ' : ''}${MODE_EMOJI[m]} ${m}`,
+      callback_data: `mode:${m}`,
+    }))],
+  }
+}
+
 // Gate on the SENDER's id, never the room.
 function isAllowed(ctx: Context): boolean {
   const userId = String(ctx.from?.id ?? '')
@@ -437,15 +565,23 @@ function pickAttachment(msg: any): { fileId: string; name: string; size: number 
 // Download a Telegram file into a topic's inbox. Returns the saved absolute path.
 async function receiveFile(ctx: Context, att: { fileId: string; name: string; size: number }, cwd: string): Promise<string> {
   if (att.size && att.size > TG_DOWNLOAD_LIMIT)
-    throw new Error(`file is ${fmtBytes(att.size)}; Telegram lets bots fetch at most ${fmtBytes(TG_DOWNLOAD_LIMIT)}`)
+    throw new Error(
+      `file is ${fmtBytes(att.size)}, over the ${fmtBytes(TG_DOWNLOAD_LIMIT)} the cloud Bot API lets bots fetch.\n` +
+      `To lift this, run a local Bot API server and set TG_API_ROOT (see README) — or copy the file to ${cwd}/${INBOX_DIR}/ directly.`)
   const file = await ctx.api.getFile(att.fileId)
   if (!file.file_path) throw new Error('Telegram returned no file_path')
-  const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`)
-  if (!res.ok) throw new Error(`download failed (HTTP ${res.status})`)
-  const buf = Buffer.from(await res.arrayBuffer())
   const dest = uniquePath(ensureDir(join(cwd, INBOX_DIR)), safeName(att.name, extname(file.file_path)))
-  writeFileSync(dest, buf)
-  console.log(`[file<-] ${dest} (${fmtBytes(buf.length)})`)
+  // A local server in --local mode has already written the file to its own disk
+  // and hands back an absolute path; there is nothing to download.
+  if (LOCAL_API && isAbsolute(file.file_path) && existsSync(file.file_path)) {
+    copyFileSync(file.file_path, dest)
+  } else {
+    const base = LOCAL_API ? API_ROOT : 'https://api.telegram.org'
+    const res = await fetch(`${base}/file/bot${TOKEN}/${file.file_path}`)
+    if (!res.ok) throw new Error(`download failed (HTTP ${res.status})`)
+    writeFileSync(dest, Buffer.from(await res.arrayBuffer()))
+  }
+  console.log(`[file<-] ${dest} (${fmtBytes(statSync(dest).size)})`)
   return dest
 }
 
@@ -453,7 +589,11 @@ async function receiveFile(ctx: Context, att: { fileId: string; name: string; si
 async function sendFile(ctx: Context, threadId: number | undefined, path: string, caption?: string): Promise<boolean> {
   if (!existsSync(path) || !statSync(path).isFile()) { await send(ctx, threadId, `Not a file: ${path}`); return false }
   const size = statSync(path).size
-  if (size > TG_UPLOAD_LIMIT) { await send(ctx, threadId, `${basename(path)} is ${fmtBytes(size)} — over Telegram's ${fmtBytes(TG_UPLOAD_LIMIT)} bot upload limit.`); return false }
+  if (size > TG_UPLOAD_LIMIT) {
+    await send(ctx, threadId, `${basename(path)} is ${fmtBytes(size)} — over the ${fmtBytes(TG_UPLOAD_LIMIT)} bot upload limit.` +
+      (LOCAL_API ? '' : `\nA local Bot API server raises this to 2000 MB (set TG_API_ROOT — see README).`))
+    return false
+  }
   const opts: any = threadId ? { message_thread_id: threadId } : {}
   if (caption) opts.caption = caption.slice(0, 1024)
   try {
@@ -499,15 +639,35 @@ async function deliver(ctx: Context, threadId: number | undefined, text: string)
   }
 }
 
-async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string): Promise<void> {
+async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string): Promise<void> {
   const cwd = resolveCwd(ctx, threadId)
   const resumeId = sessions[key]?.sessionId
   try {
-    const res = await runStreaming(ctx, threadId, key, prompt, cwd, resumeId)
+    const res = await runStreaming(ctx, threadId, key, prompt, cwd, resumeId, mode ?? modeFor(key))
     if (stopped.has(key)) { stopped.delete(key); return } // killed via /stop — status already cleared, no reply
-    if (res.sessionId) { sessions[key] = { cwd, sessionId: res.sessionId, updated: new Date().toISOString() }; saveState() }
+    if (res.sessionId) { sessions[key] = { ...sessions[key], cwd, sessionId: res.sessionId, updated: new Date().toISOString() }; saveState() }
     await deliver(ctx, threadId, res.text)
     await flushOutbox(ctx, threadId, cwd)
+  } catch (e) {
+    await send(ctx, threadId, `⚠️ ${e}`)
+  }
+}
+
+// Built-in CLI slash commands that the client answers by itself: they report
+// (usage, cost, context) rather than prompt the model, so they cost nothing and
+// take no turn. Anything that actually drives the model (/doctor) or that the
+// bridge already owns (/status, /new, …) is deliberately not here.
+const PASSTHROUGH = new Set(['/usage', '/cost', '/context'])
+
+// Forward one such command to the CLI and post what it printed. The session id it
+// returns is NEVER stored: with --resume it's the same id anyway, and without one
+// the CLI mints a throwaway that would otherwise bind this topic to an empty session.
+async function handlePassthrough(ctx: Context, threadId: number | undefined, key: string, text: string): Promise<void> {
+  const cwd = resolveCwd(ctx, threadId)
+  try {
+    const res = await runStreaming(ctx, threadId, key, text, cwd, sessions[key]?.sessionId, modeFor(key))
+    if (stopped.has(key)) { stopped.delete(key); return }
+    await deliver(ctx, threadId, res.text)
   } catch (e) {
     await send(ctx, threadId, `⚠️ ${e}`)
   }
@@ -610,7 +770,7 @@ function renderTurns(file: string, n: number): string[] {
 // ---------------------------------------------------------------------------
 
 loadState()
-const bot = new Bot(TOKEN)
+const bot = new Bot(TOKEN, API_ROOT ? { client: { apiRoot: API_ROOT } } : undefined)
 // Stay within Telegram's limits (~20 msgs/min per group): the throttler queues
 // outbound calls, and auto-retry waits out any 429 instead of dropping messages.
 bot.api.config.use(apiThrottler())
@@ -644,7 +804,7 @@ bot.on('message', async ctx => {
       if (caption) {
         await handlePrompt(ctx, threadId, aKey, `[The user attached a file, saved at ${saved} (./${relative(cwd, saved)}).]\n\n${caption}`)
       } else {
-        await send(ctx, threadId, `📎 Saved → ${saved}\n(in ./${relative(cwd, saved)} — reference it in your next message)`)
+        await send(ctx, threadId, `📎 Saved → ${saved}\n(in ./${relative(cwd, saved)} — reference it in your next message)`, true)
       }
     }).catch(e => console.error(`[error] file task ${aKey}: ${e}`))
     return
@@ -669,13 +829,16 @@ bot.on('message', async ctx => {
       `Send any text to talk to Claude in this topic.\n\n` +
       `Send a file to drop it in this topic's ./${INBOX_DIR}/; ask Claude to put a file in ` +
       `./${OUTBOX_DIR}/ to have it sent back.\n\n` +
-      `/whoami — show ids (for the allowlist)\n/new — fresh session here (old one kept; /resume to undo)\n` +
+      `/whoami — show ids (for the allowlist)\n/new (or /clear) — fresh session here (old one kept; /resume to undo)\n` +
       `/resume [id] — restore the previous session, or bind a past session id\n` +
       `/compact [focus] — summarize this topic's history to free up context\n` +
       `/stop — cancel the task currently running in this topic\n` +
       `/interrupt [on|off] — new messages cancel the running task instead of queueing\n` +
+      `/mode [${MODES.join('|')}] — permission mode for this topic (tap to switch)\n` +
+      `/plan <task> — one read-only turn: propose without editing\n` +
       `/get <path> — send a file from this topic's directory back to you\n` +
-      `/cwd <abs-path> — set this topic's working directory\n/status — session id + directory\n\n` +
+      `/cwd <abs-path> — set this topic's working directory\n/status — session id + directory + mode\n\n` +
+      `Claude's own commands, forwarded as-is:\n${[...PASSTHROUGH].join(' · ')}\n\n` +
       `Bring existing Claude sessions in from the IDE/CLI:\n` +
       `/sessions <dir…> — list the sessions stored for one or more directories\n` +
       `/import <dir…> — make a topic for each session there (bound + backfilled)\n` +
@@ -694,7 +857,7 @@ bot.on('message', async ctx => {
   if (cmd === '/stop' || cmd === '/cancel') {
     const child = activeRuns.get(key)
     if (child) { stopped.add(key); child.kill('SIGKILL'); await send(ctx, threadId, '🛑 Stopped the running task.') }
-    else await send(ctx, threadId, 'Nothing is running in this topic right now.')
+    else await send(ctx, threadId, 'Nothing is running in this topic right now.', true)
     return
   }
   if (cmd === '/interrupt') {
@@ -707,7 +870,31 @@ bot.on('message', async ctx => {
       : '⏸ Interrupt mode OFF — messages queue and run one at a time.')
     return
   }
-  if (cmd === '/new' || cmd === '/reset') {
+  if (cmd === '/mode') {
+    const arg = text.split(/\s+/)[1]
+    if (arg) {
+      const m = normalizeMode(arg)
+      if (!m) { await send(ctx, threadId, `Unknown mode "${arg}". One of: ${MODES.join(', ')}`); return }
+      modes[key] = m; saveState()
+      await send(ctx, threadId, `${MODE_EMOJI[m]} Mode for this topic: ${m} — ${MODE_HELP[m]}`)
+      return
+    }
+    await ctx.api.sendMessage(ctx.chat.id, modeText(key), {
+      ...(threadId ? { message_thread_id: threadId } : {}),
+      reply_markup: modeKeyboard(key),
+    }).catch(e => console.error(`[warn] /mode: ${e}`))
+    return
+  }
+  if (cmd === '/plan') {
+    const arg = text.slice(text.indexOf(' ') + 1).trim()
+    if (!arg || !text.includes(' ')) { await send(ctx, threadId, `Usage: /plan <what you want>\n\nRuns one read-only turn: Claude researches and proposes, without editing. Reply "go ahead" to carry it out in this topic's usual mode (${modeFor(key)}).`); return }
+    if (isInterrupt(key) && activeRuns.has(key)) { stopped.add(key); activeRuns.get(key)!.kill('SIGKILL') }
+    // One-shot: the topic's sticky mode is untouched, so the follow-up executes.
+    enqueue(key, () => handlePrompt(ctx, threadId, key, arg, 'plan'))
+      .catch(e => console.error(`[error] plan task ${key}: ${e}`))
+    return
+  }
+  if (cmd === '/new' || cmd === '/reset' || cmd === '/clear') {
     const e = sessions[key]
     if (e?.sessionId) { e.prevSessionId = e.sessionId; delete e.sessionId; saveState() }
     await send(ctx, threadId, e?.prevSessionId
@@ -751,7 +938,8 @@ bot.on('message', async ctx => {
     const e = sessions[key]
     await send(ctx, threadId,
       `directory: ${e?.cwd ?? resolveCwd(ctx, threadId)}\n` +
-      `session: ${e?.sessionId ?? '(none yet)'}\n\n` +
+      `session: ${e?.sessionId ?? '(none yet)'}\n` +
+      `mode: ${modeFor(key)}\n\n` +
       `resume on the server:\n  cd "${e?.cwd ?? resolveCwd(ctx, threadId)}" && claude --continue`)
     return
   }
@@ -783,7 +971,7 @@ bot.on('message', async ctx => {
       const body = list.slice(0, 30).map((s, i) => `${i + 1}. ${s.id.slice(0, 8)} · ${s.turns} turns · ${ago(s.mtimeMs)}\n   ${s.title}`).join('\n\n')
       await send(ctx, threadId, `Sessions in ${dir} (${list.length}):\n\n${body}`)
     }
-    await send(ctx, threadId, `Run /import <dir> [dir2 …] to make a topic per session.`)
+    await send(ctx, threadId, `Run /import <dir> [dir2 …] to make a topic per session.`, true)
     return
   }
   if (cmd === '/import') {
@@ -800,19 +988,22 @@ bot.on('message', async ctx => {
     if (!candidates.length) { await send(ctx, threadId, 'No new sessions to import (none found, or all already imported).'); return }
     candidates.sort((a, b) => b.s.mtimeMs - a.s.mtimeMs) // newest first, across all dirs
     const capped = candidates.slice(0, IMPORT_MAX_SESSIONS)
-    await send(ctx, threadId, `Importing ${capped.length} session(s) from ${dirs.length} dir(s)${candidates.length > capped.length ? ` (newest ${capped.length} of ${candidates.length})` : ''}…`)
+    // An import is a bulk operation: a topic, a bind note and a dozen backfilled
+    // turns each. Notifying on every one of those buzzes the phone ~100 times, so
+    // the whole run is silent except the final tally.
+    await send(ctx, threadId, `Importing ${capped.length} session(s) from ${dirs.length} dir(s)${candidates.length > capped.length ? ` (newest ${capped.length} of ${candidates.length})` : ''}…`, true)
     let ok = 0
     for (const { dir, s } of capped) {
       try {
         const name = `${basename(dir)} · ${s.title}`.slice(0, 120)
-        const topic = await ctx.api.createForumTopic(chatId, name)
+        const topic = await ctx.api.createForumTopic(chatId, name, { icon_color: topicColor(name) })
         const tid = topic.message_thread_id
         const tkey = keyFor(chatId, tid)
         sessions[tkey] = { cwd: dir, sessionId: s.id, updated: new Date().toISOString() }
         names[tkey] = name
         saveState()
-        await send(ctx, tid, `📂 Bound to session ${s.id.slice(0, 8)} · ${dir}\n${s.turns} turns total — last ${Math.min(IMPORT_BACKFILL, s.turns)} below. Message here to continue it.`)
-        for (const t of renderTurns(s.file, IMPORT_BACKFILL)) { await send(ctx, tid, t); await sleep(350) }
+        await send(ctx, tid, `📂 Bound to session ${s.id.slice(0, 8)} · ${dir}\n${s.turns} turns total — last ${Math.min(IMPORT_BACKFILL, s.turns)} below. Message here to continue it.`, true)
+        for (const t of renderTurns(s.file, IMPORT_BACKFILL)) { await send(ctx, tid, t, true); await sleep(350) }
         ok++
         await sleep(500)
       } catch (e) { await send(ctx, threadId, `⚠️ couldn't import ${s.id.slice(0, 8)}: ${e}`) }
@@ -827,11 +1018,19 @@ bot.on('message', async ctx => {
     const file = join(projectDir(e.cwd), `${e.sessionId}.jsonl`)
     if (!existsSync(file)) { await send(ctx, threadId, `Session transcript not found:\n${file}`); return }
     const turns = renderTurns(file, n)
-    await send(ctx, threadId, `— last ${turns.length} turns of ${e.sessionId.slice(0, 8)} —`)
-    for (const t of turns) { await send(ctx, threadId, t); await sleep(300) }
+    // Re-posted history is a wall of old messages — never worth a notification each.
+    await send(ctx, threadId, `— last ${turns.length} turns of ${e.sessionId.slice(0, 8)} —`, true)
+    for (const t of turns) { await send(ctx, threadId, t, true); await sleep(300) }
     return
   }
-  if (cmd) { await send(ctx, threadId, `Unknown command. Try /help`); return }
+  // Client-side CLI commands (/usage, /cost, …) — forward them rather than
+  // rejecting: `claude -p "/usage"` answers them for free, without a turn.
+  if (PASSTHROUGH.has(cmd)) {
+    enqueue(key, () => handlePassthrough(ctx, threadId, key, text))
+      .catch(e => console.error(`[error] passthrough ${key}: ${e}`))
+    return
+  }
+  if (cmd) { await send(ctx, threadId, `Unknown command. Try /help`, true); return }
 
   // Interrupt mode: cancel the run in progress so this message starts immediately
   // (its reply arrives as a new message, after the interrupted one stops).
@@ -843,19 +1042,49 @@ bot.on('message', async ctx => {
     .catch(e => console.error(`[error] task ${key}: ${e}`))
 })
 
+// The /mode keyboard. The topic is taken from the message the button lives on,
+// so callback_data only has to carry the mode (it's capped at 64 bytes).
+bot.on('callback_query:data', async ctx => {
+  const data = ctx.callbackQuery.data
+  if (!data.startsWith('mode:')) return
+  if (!isAllowed(ctx)) { await ctx.answerCallbackQuery({ text: 'Not authorized.', show_alert: true }).catch(() => {}); return }
+  const m = normalizeMode(data.slice(5))
+  if (!m) { await ctx.answerCallbackQuery({ text: 'Unknown mode.' }).catch(() => {}); return }
+  const key = keyFor(ctx.chat!.id, ctx.callbackQuery.message?.message_thread_id)
+  modes[key] = m; saveState()
+  await ctx.answerCallbackQuery({ text: `Mode: ${m}` }).catch(() => {})
+  await ctx.editMessageText(modeText(key), { reply_markup: modeKeyboard(key) }).catch(() => {})
+})
+
 // ---------------------------------------------------------------------------
 // Startup — single clean start. A 409 means another instance owns the token;
 // we exit with a clear message rather than fight it (only one poller per token).
 // ---------------------------------------------------------------------------
 
+// Give the bot its default avatar if it has none. Telegram exposes the bot's own
+// photos through getUserProfilePhotos on its own id, and setMyProfilePhoto sets
+// them — no BotFather round-trip. Never fatal: a bot with no picture still works.
+async function ensureBotLogo(botId: number): Promise<void> {
+  if (!SET_LOGO) return
+  try {
+    const photos = await bot.api.getUserProfilePhotos(botId, { limit: 1 })
+    if (photos.total_count > 0) return
+    if (!existsSync(BOT_LOGO)) { console.log(`[warn] no bot logo at ${BOT_LOGO} (set TG_BOT_LOGO, or TG_SET_LOGO=0)`); return }
+    await bot.api.setMyProfilePhoto({ type: 'static', photo: new InputFile(BOT_LOGO) })
+    console.log(`[ok] set bot profile photo from ${BOT_LOGO}`)
+  } catch (e) { console.error(`[warn] could not set bot logo: ${e}`) }
+}
+
 async function main() {
   const me = await bot.api.getMe()
   botUsername = me.username
+  await ensureBotLogo(me.id)
   console.log(`[ok] @${me.username} up`)
   console.log(`     claude bin     : ${CLAUDE_BIN}`)
   console.log(`     sessions base  : ${SESSIONS_BASE}`)
   console.log(`     default cwd    : ${DEFAULT_WORKDIR}`)
   console.log(`     permission     : ${PERMISSION_MODE}`)
+  console.log(`     api            : ${API_ROOT || 'https://api.telegram.org (cloud)'}`)
   console.log(`     allowed users  : ${[...ALLOWED_USERS].join(', ') || '(none — set TG_ALLOWED_USERS!)'}`)
   console.log(`     allowed chats  : ${[...ALLOWED_CHATS].join(', ') || '(none)'}`)
   if (ALLOWED_USERS.size === 0) console.log(`[warn] allowlist empty: DM the bot /whoami, add your id, restart.`)
