@@ -132,8 +132,8 @@ pre-authorized. Pick the posture per topic with `/mode` (or set the default with
 | Mode | What it does |
 | --- | --- |
 | `plan` | Read-only. Researches and proposes; never edits. Also available as a one-shot: `/plan <task>`. |
-| `acceptEdits` | *(default)* Auto-approves edits and the tools in `TG_ALLOWED_TOOLS`. |
-| `auto` | Runs unattended, but routes each tool call through Claude's classifier, which blocks destructive/irreversible ones. The middle ground between `acceptEdits` and `bypass`. |
+| `acceptEdits` | Auto-approves edits and the tools in `TG_ALLOWED_TOOLS`. |
+| `auto` | *(default)* Runs unattended, but routes each tool call through Claude's classifier, which blocks destructive/irreversible ones. Preferred over `acceptEdits`, which waves through everything in `TG_ALLOWED_TOOLS` — `Bash` included — without looking at it. |
 | `bypass` | No checks at all (`--dangerously-skip-permissions`). Only on a server you're willing to lose. |
 
 `auto` trusts only your working directory and the current repo's remotes by
