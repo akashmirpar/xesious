@@ -9,7 +9,11 @@
 # bot a moment to deliver the finished reply, then gracefully restart.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
-export PATH="$HOME/.local/bin:$PATH"
+if ! command -v bun >/dev/null 2>&1; then
+  for d in "$HOME/.bun/bin" "$HOME/.local/bin" "$HOME"/.nvm/versions/node/*/bin; do
+    [ -x "$d/bun" ] && { export PATH="$d:$PATH"; break; }
+  done
+fi
 SESSION="${CLAUDE_TG_SESSION:-claude-tg}"
 BUSY='claude.*--output-format stream-json'
 

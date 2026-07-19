@@ -101,6 +101,10 @@ const TELEGRAM_PROFILE = process.env.TG_PROFILE ?? [
 // posture for the deployment, not something to toggle per file. See README.
 const API_ROOT = (process.env.TG_API_ROOT || '').trim().replace(/\/+$/, '')
 const LOCAL_API = Boolean(API_ROOT)
+// A local server hands back absolute paths that we copy from. Confine those to its
+// own data dir: any path outside it means a misconfigured or compromised server,
+// and copying it would pull an arbitrary host file into a chat-readable inbox.
+const LOCAL_API_DATA = resolve(process.env.TG_LOCAL_API_DATA || join(HERE, 'state', 'bot-api'))
 const TG_DOWNLOAD_LIMIT = LOCAL_API ? Infinity : 20 * 1024 * 1024      // cloud getFile cap
 const TG_UPLOAD_LIMIT = (LOCAL_API ? 2000 : 50) * 1024 * 1024          // sendDocument cap
 
@@ -115,7 +119,10 @@ const GROUP_LOGO = process.env.TG_GROUP_LOGO || join(HERE, 'assets', 'group-logo
 const SET_GROUP_LOGO = !/^(0|false|no)$/i.test(process.env.TG_SET_GROUP_LOGO || '')
 // Show the actual tool input (command, path, url) in the live status message,
 // inside a collapsed <blockquote expandable>. Set 0 for the older terse labels.
-const PROGRESS_DETAIL = !/^(0|false|no)$/i.test(process.env.TG_PROGRESS_DETAIL || '')
+// OPT-IN (TG_PROGRESS_DETAIL=1). The detail is the raw tool input — commands
+// routinely carry secrets (tokens in curl URLs, DB passwords), and anything shown
+// here is posted into the chat and kept in Telegram's history. Off by default.
+const PROGRESS_DETAIL = /^(1|true|yes)$/i.test(process.env.TG_PROGRESS_DETAIL || '')
 
 // Importing existing Claude Code sessions (the ones the IDE/CLI session picker
 // shows) as topics. A directory's sessions live at CLAUDE_PROJECTS/<encoded>/<id>.jsonl.
@@ -145,7 +152,12 @@ const isInterrupt = (key: string) => interruptMode[key] ?? INTERRUPT_DEFAULT
 // Per-topic permission mode, switchable from Telegram with /mode. Defaults to
 // TG_PERMISSION_MODE.
 let modes: Record<string, string> = {}
-const modeFor = (key: string) => modes[key] ?? PERMISSION_MODE
+const modeFor = (key: string) => {
+  const m = modes[key] ?? PERMISSION_MODE
+  // A bypass persisted before the opt-in existed (or set via TG_PERMISSION_MODE)
+  // must not silently keep taking effect once TG_ALLOW_BYPASS is off.
+  return m === 'bypass' && !ALLOW_BYPASS ? 'auto' : m
+}
 // Per-topic model override, switchable with /model. Empty string ⇒ fall back to
 // TG_MODEL, and empty TG_MODEL ⇒ the account default (no --model flag at all).
 let models: Record<string, string> = {}
@@ -239,7 +251,12 @@ interface ClaudeResult { text: string; sessionId?: string; isError: boolean }
 // each tool call through Claude's classifier (blocks the irreversible/destructive
 // ones, no prompting) — configure what it trusts via `autoMode` in
 // ~/.claude/settings.json. `plan` researches and proposes without touching files.
-const MODES = ['plan', 'acceptEdits', 'auto', 'bypass'] as const
+const ALL_MODES = ['plan', 'acceptEdits', 'auto', 'bypass'] as const
+// `bypass` (= --dangerously-skip-permissions) removes the last guardrail on a bot
+// that runs as root, so it is opt-in: without TG_ALLOW_BYPASS=1 it is neither
+// offered as a button nor accepted as an argument.
+const ALLOW_BYPASS = /^(1|true|yes)$/i.test(process.env.TG_ALLOW_BYPASS || '')
+const MODES: readonly string[] = ALL_MODES.filter(m => m !== 'bypass' || ALLOW_BYPASS)
 const MODE_HELP: Record<string, string> = {
   plan: 'read-only — researches and proposes, never edits',
   acceptEdits: 'auto-approves edits + the TG_ALLOWED_TOOLS list',
@@ -248,7 +265,7 @@ const MODE_HELP: Record<string, string> = {
 }
 function normalizeMode(m: string): string | undefined {
   const s = m.trim().toLowerCase()
-  if (s === 'bypass' || s === 'bypasspermissions') return 'bypass'
+  if (s === 'bypass' || s === 'bypasspermissions') return ALLOW_BYPASS ? 'bypass' : undefined
   return MODES.find(x => x.toLowerCase() === s)
 }
 function permissionArgs(mode: string): string[] {
@@ -624,7 +641,10 @@ async function receiveFile(ctx: Context, att: { fileId: string; name: string; si
   // A local server in --local mode has already written the file to its own disk
   // and hands back an absolute path; there is nothing to download.
   if (LOCAL_API && isAbsolute(file.file_path) && existsSync(file.file_path)) {
-    copyFileSync(file.file_path, dest)
+    const src = resolve(file.file_path)
+    if (src !== LOCAL_API_DATA && !src.startsWith(LOCAL_API_DATA + '/'))
+      throw new Error(`refusing to copy ${src}: outside the local Bot API data dir (${LOCAL_API_DATA})`)
+    copyFileSync(src, dest)
   } else {
     const base = LOCAL_API ? API_ROOT : 'https://api.telegram.org'
     const res = await fetch(`${base}/file/bot${TOKEN}/${file.file_path}`)
