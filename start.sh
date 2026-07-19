@@ -10,8 +10,14 @@ set -euo pipefail
 SESSION="${CLAUDE_TG_SESSION:-claude-tg}"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# bun lives in the node bin dir (installed via npm); make sure it's on PATH.
-export PATH="$HOME/.local/bin:$PATH"
+# Put bun on PATH portably. Hardcoding one install dir breaks on any host that
+# put it elsewhere, so prefer a bun that already resolves, else search the usual
+# locations (bun's own dir, ~/.local/bin, any nvm node bin).
+if ! command -v bun >/dev/null 2>&1; then
+  for d in "$HOME/.bun/bin" "$HOME/.local/bin" "$HOME"/.nvm/versions/node/*/bin; do
+    [ -x "$d/bun" ] && { export PATH="$d:$PATH"; break; }
+  done
+fi
 
 command -v bun >/dev/null 2>&1 || { echo "ERROR: bun not on PATH" >&2; exit 1; }
 [ -f "$DIR/.env" ] || { echo "ERROR: $DIR/.env missing (cp .env.example .env)" >&2; exit 1; }

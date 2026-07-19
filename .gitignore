@@ -2,3 +2,7 @@ node_modules/
 .env
 state/
 *.log
+# Per-topic file transfer dirs — these hold files the USER uploaded and files
+# staged to send back. They must never land in the repo (this one is public).
+inbox/
+outbox/
