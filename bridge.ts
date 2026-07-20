@@ -76,6 +76,9 @@ const MODEL = process.env.TG_MODEL?.trim() || ''
 const REQUIRE_MENTION = /^(1|true|yes)$/i.test(process.env.TG_REQUIRE_MENTION || '')
 const CLAUDE_TIMEOUT_MS = Number(process.env.TG_CLAUDE_TIMEOUT_MS || 30 * 60 * 1000)
 const ALLOWED_USERS = parseIdList(process.env.TG_ALLOWED_USERS)
+// See isAllowed(): trust every member of an allowlisted group instead of listing
+// users. Off by default — it widens authorization to whoever is in that group.
+const TRUST_CHAT_MEMBERS = /^(1|true|yes)$/i.test(process.env.TG_TRUST_CHAT_MEMBERS || '')
 const ALLOWED_CHATS = parseIdList(process.env.TG_ALLOWED_CHATS)
 
 // File transfer between Telegram and a topic's directory (relative to its cwd).
@@ -586,10 +589,16 @@ function modelKeyboard(key: string) {
 
 // Gate on the SENDER's id, never the room.
 function isAllowed(ctx: Context): boolean {
-  const userId = String(ctx.from?.id ?? '')
-  if (!ALLOWED_USERS.has(userId)) return false
   const chat = ctx.chat
   if (!chat) return false
+  const userId = String(ctx.from?.id ?? '')
+  // Opt-in (TG_TRUST_CHAT_MEMBERS=1): treat membership of an allowlisted GROUP as
+  // authorization, so you don't have to enumerate every member. Everyone who can
+  // be added to that group can then drive Claude as this bot's user — which is why
+  // it is off by default. DMs are never covered: a private chat id is the sender's,
+  // so it could only match by being listed in TG_ALLOWED_CHATS explicitly.
+  if (TRUST_CHAT_MEMBERS && chat.type !== 'private') return ALLOWED_CHATS.has(String(chat.id))
+  if (!ALLOWED_USERS.has(userId)) return false
   if (chat.type === 'private') return true
   return ALLOWED_CHATS.has(String(chat.id))
 }
@@ -1235,7 +1244,16 @@ async function main() {
   console.log(`     api            : ${API_ROOT || 'https://api.telegram.org (cloud)'}`)
   console.log(`     allowed users  : ${[...ALLOWED_USERS].join(', ') || '(none — set TG_ALLOWED_USERS!)'}`)
   console.log(`     allowed chats  : ${[...ALLOWED_CHATS].join(', ') || '(none)'}`)
-  if (ALLOWED_USERS.size === 0) console.log(`[warn] allowlist empty: DM the bot /whoami, add your id, restart.`)
+  console.log(`     trust chat mem : ${TRUST_CHAT_MEMBERS ? 'yes (any member of an allowed chat)' : 'no'}`)
+  // With no users AND no chat-member trust, isAllowed() rejects everyone: the bot
+  // polls happily while silently dropping every message. That looked like "the bot
+  // died" once already, so make it unmistakable rather than a passing warning.
+  if (ALLOWED_USERS.size === 0 && !TRUST_CHAT_MEMBERS) {
+    console.error('[FATAL] TG_ALLOWED_USERS is empty and TG_TRUST_CHAT_MEMBERS is off —')
+    console.error('        nothing can authorize, so every message would be dropped silently.')
+    console.error('        Set TG_ALLOWED_USERS=<your id> (DM the bot /whoami), or TG_TRUST_CHAT_MEMBERS=1.')
+    process.exit(2)
+  }
 
   // Clear stale pending updates (e.g. a message buffered before a restart) so
   // we don't reprocess old messages on startup.
