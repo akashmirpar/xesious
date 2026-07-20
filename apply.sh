@@ -15,14 +15,23 @@ if ! command -v bun >/dev/null 2>&1; then
   done
 fi
 SESSION="${CLAUDE_TG_SESSION:-claude-tg}"
-BUSY='claude.*--output-format stream-json'
+# Bridge-is-busy = this instance's bun has a claude child. A command-line match
+# would also catch the IDE's own claude and deadlock against it.
+busy() {
+  local b
+  for b in $(pgrep -x bun 2>/dev/null); do
+    [ "$(readlink /proc/$b/cwd 2>/dev/null)" = "$PWD" ] || continue
+    pgrep -x -P "$b" claude >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
 
 # Wait for idle: loop until no run is active through a short grace window (so a
 # message that arrives mid-wait doesn't get its reply cut off either).
 while true; do
-  for _ in $(seq 1 240); do pgrep -f "$BUSY" >/dev/null || break; sleep 3; done
+  for _ in $(seq 1 240); do busy || break; sleep 3; done
   sleep 8                                  # let the bot deliver the just-finished reply
-  pgrep -f "$BUSY" >/dev/null || break     # still idle after grace -> safe to restart
+  busy || break                            # still idle after grace -> safe to restart
 done
 
 # Graceful stop (clean long-poll close -> no ghost), then fresh start.

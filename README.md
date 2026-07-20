@@ -46,6 +46,28 @@ cp .env.example .env          # then edit it
    - Add the bot, send `/whoami` in the group, put the chat id into `TG_ALLOWED_CHATS`, restart.
    - Now each topic is its own session.
 
+## Updating
+
+**Always update with `./update.sh`** — don't edit and hand-restart:
+
+```bash
+./update.sh          # apply the working tree, verify, roll back if it breaks
+./update.sh --pull   # git pull first, then the same
+```
+
+It does, in order: `bun install` → **typecheck** (a bad edit is caught before the
+bot is touched) → back up `bridge.ts` → **wait for the bridge to go idle** (never
+cuts off a reply mid-flight) → restart → **health-check** → **roll back** to the
+exact previous bytes if the check fails.
+
+The health check asks whether it can actually *serve*, not just whether the
+process is alive — each condition is a real outage this repo has had: no
+`polling Telegram`, a `[fatal]`, a `409` (another instance holding the token), or
+an auth config where nothing can authorize. That last one matters: the bridge once
+logged `polling Telegram` for hours while silently dropping every message because
+`TG_ALLOWED_USERS` was empty — so an empty allowlist with `TG_TRUST_CHAT_MEMBERS`
+off is now a **hard startup error**, not a warning.
+
 ## Commands
 
 | Command | Effect |
