@@ -239,9 +239,11 @@ holding a conversation.
   push-to-talk, sentence-by-sentence playback, barge-in.
 - **Behind nginx** on its own subdomain (see `live/nginx-app.besporesh.ir.conf`):
   proxy `/` to `127.0.0.1:3060` with WebSocket upgrade + a long read timeout.
-- **Gate it.** The URL drives Claude on your server, so `LIVE_PASSCODE` is required
-  and the server refuses to start without one. Default permission mode is `plan`
-  (read-only) — the web mouth shouldn't edit unasked.
+- **Per session, no password.** In a Telegram topic, `/live` mints a `LIVE_URL/<uuid>`
+  link bound to *that* topic's Claude session (shared via `state/live-links.json`).
+  The uuid is the only secret. Speech-to-text happens in the browser (Web Speech
+  API) — only text is sent, so it's fast; the page shows your words live plus
+  Claude's thinking, tool use, and answer. Default permission mode `plan` (read-only).
 
 Setup: `voice/setup.sh --kokoro`, set `LIVE_PASSCODE` in `.env`, `live/start-live.sh`,
 point the subdomain at `:3060`. Latency floor is Kokoro (~1x realtime on CPU); a GPU

@@ -7,131 +7,114 @@
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { margin:0; height:100dvh; display:flex; flex-direction:column; font:16px/1.5 system-ui,sans-serif;
-         background:#0b0f1a; color:#e7ecf5; }
-  header { padding:14px 16px; font-weight:600; border-bottom:1px solid #1d2740; display:flex; gap:10px; align-items:center; }
-  #dot { width:10px; height:10px; border-radius:50%; background:#556; }
-  #dot.on { background:#3ad07a; } #dot.busy { background:#f5b544; } #dot.err { background:#ef5b5b; }
-  #log { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:10px; }
-  .msg { max-width:80%; padding:9px 13px; border-radius:14px; white-space:pre-wrap; }
+  body { margin:0; height:100dvh; display:flex; flex-direction:column; font:16px/1.5 system-ui,sans-serif; background:#0b0f1a; color:#e7ecf5; }
+  header { padding:12px 16px; font-weight:600; border-bottom:1px solid #1d2740; display:flex; gap:10px; align-items:center; }
+  #dot { width:10px; height:10px; border-radius:50%; background:#556; flex:none; }
+  #dot.on{background:#3ad07a} #dot.busy{background:#f5b544} #dot.err{background:#ef5b5b}
+  #where { margin-left:auto; color:#8b97b3; font-size:12px; max-width:55%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #log { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:8px; }
+  .msg { max-width:82%; padding:8px 12px; border-radius:14px; white-space:pre-wrap; word-wrap:break-word; }
   .you { align-self:flex-end; background:#243a67; border-bottom-right-radius:4px; }
   .bot { align-self:flex-start; background:#182238; border-bottom-left-radius:4px; }
+  .think { align-self:flex-start; background:#12172a; color:#8fa0c4; font-style:italic; font-size:14px; border-left:3px solid #3a4670; }
+  .tool { align-self:flex-start; background:#1a2b1f; color:#8fd0a0; font-size:13px; }
   .sys { align-self:center; color:#8b97b3; font-size:13px; }
+  #interim { align-self:flex-end; background:#1c2c50; color:#9fb4e0; border-radius:14px; padding:8px 12px; max-width:82%; font-style:italic; display:none; }
   footer { padding:16px; border-top:1px solid #1d2740; display:flex; flex-direction:column; gap:12px; align-items:center; }
-  #talk { width:120px; height:120px; border-radius:50%; border:none; font-size:15px; font-weight:600; color:#fff;
-          background:#2b57c4; transition:transform .08s, background .2s; touch-action:none; user-select:none; }
-  #talk:active { transform:scale(.95); }
-  #talk.rec { background:#e0483f; box-shadow:0 0 0 8px rgba(224,72,63,.18); }
-  #talk.speaking { background:#7a52d8; }
-  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:center; }
-  input, select, button.mini { background:#141c30; color:#e7ecf5; border:1px solid #2a3350; border-radius:9px; padding:9px 11px; font-size:15px; }
-  button.mini { cursor:pointer; }
+  #talk { width:116px; height:116px; border-radius:50%; border:none; font-size:15px; font-weight:600; color:#fff; background:#2b57c4; transition:transform .08s, background .2s; touch-action:none; user-select:none; }
+  #talk:active { transform:scale(.95); } #talk.rec{background:#e0483f; box-shadow:0 0 0 8px rgba(224,72,63,.18)} #talk.speaking{background:#7a52d8}
+  .row { display:flex; gap:14px; align-items:center; justify-content:center; }
   label { color:#9fb0d0; font-size:14px; }
-  #setup { text-align:center; }
 </style>
 </head>
 <body>
-<header><span id="dot"></span><span>Live voice · Claude</span><span id="mode" style="margin-left:auto;color:#8b97b3;font-size:13px"></span></header>
+<header><span id="dot"></span><span>Live · Claude</span><span id="where"></span></header>
 <div id="log"></div>
+<div id="interim"></div>
 <footer>
-  <div id="setup" class="row">
-    <input id="pass" type="password" placeholder="passcode" autocomplete="off">
-    <button id="connect" class="mini">Connect</button>
-  </div>
-  <div id="live" class="row" style="display:none; flex-direction:column;">
-    <button id="talk">Hold&nbsp;to&nbsp;talk</button>
-    <div class="row">
-      <label><input type="checkbox" id="auto"> hands-free (auto)</label>
-      <button id="hangup" class="mini">Hang up</button>
-    </div>
+  <button id="talk">Hold to talk</button>
+  <div class="row">
+    <label><input type="checkbox" id="auto"> hands-free</label>
+    <span style="color:#6b7a99;font-size:12px">headphones recommended</span>
   </div>
 </footer>
 <script>
-const $ = s => document.querySelector(s)
-const log = $('#log'), dot = $('#dot')
-let ws, actx, micStream, analyser, mediaRec, chunks = [], recording = false
-let playQueue = [], curSource = null, botSpeaking = false
-let autoMode = false, vadRAF = 0, speechFrames = 0, silenceFrames = 0
+const $=s=>document.querySelector(s), log=$('#log'), dot=$('#dot'), interim=$('#interim')
+let ws, actx, rec, recActive=false, autoMode=false, holding=false
+let playQueue=[], curSource=null, botSpeaking=false
+const uuid = location.pathname.replace(/^\/+/,'').split('/')[0]
 
-function line(cls, text){ const d=document.createElement('div'); d.className='msg '+cls; d.textContent=text; log.appendChild(d); log.scrollTop=log.scrollHeight; return d }
-function sys(t){ line('sys', t) }
-function setDot(c){ dot.className = c||'' }
-function setMode(){ $('#mode').textContent = autoMode ? 'hands-free' : 'push-to-talk' }
+function line(cls,text){ const d=document.createElement('div'); d.className='msg '+cls; d.textContent=text; log.appendChild(d); log.scrollTop=log.scrollHeight; return d }
+function sys(t){ line('sys',t) }
+function setDot(c){ dot.className=c||'' }
+function showInterim(t){ interim.textContent=t; interim.style.display=t?'block':'none'; log.scrollTop=log.scrollHeight }
 
-$('#connect').onclick = connect
-$('#hangup').onclick = () => { try{ws.close()}catch{}; location.reload() }
-$('#auto').onchange = e => { autoMode = e.target.checked; setMode(); $('#talk').textContent = autoMode ? 'Listening…' : 'Hold to talk'; if(autoMode) startVad(); else stopVad() }
-
-async function connect(){
-  const pass = $('#pass').value.trim(); if(!pass){ return }
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-  ws = new WebSocket(`${proto}://${location.host}/ws`)
-  ws.binaryType = 'arraybuffer'
+// ---- connect (uuid from URL is the key; no password) ----
+function connect(){
+  if(!uuid){ sys('No session link. Get one with /live in your Telegram topic.'); setDot('err'); return }
+  const proto = location.protocol==='https:'?'wss':'ws'
+  ws = new WebSocket(`${proto}://${location.host}/ws`); ws.binaryType='arraybuffer'
   setDot('busy'); sys('connecting…')
-  ws.onopen = () => ws.send(JSON.stringify({type:'auth', pass}))
-  ws.onclose = () => { setDot('err'); sys('disconnected') }
-  ws.onerror = () => { setDot('err') }
-  ws.onmessage = async ev => {
-    if (typeof ev.data !== 'string'){ return playChunk(ev.data) }   // binary = TTS audio
-    const m = JSON.parse(ev.data)
-    if (m.type === 'ready'){ await onReady() }
-    else if (m.type === 'denied'){ setDot('err'); sys('wrong passcode') }
-    else if (m.type === 'you'){ line('you', m.text) }
-    else if (m.type === 'bot'){ line('bot', m.text) }
-    else if (m.type === 'nospeech'){ sys("(didn't catch that)") }
-    else if (m.type === 'turn_end'){ botTurnEnd() }
+  ws.onopen = ()=> ws.send(JSON.stringify({type:'auth', uuid}))
+  ws.onclose= ()=>{ setDot('err'); sys('disconnected') }
+  ws.onerror= ()=> setDot('err')
+  ws.onmessage = async ev=>{
+    if(typeof ev.data!=='string') return playChunk(ev.data)
+    const m=JSON.parse(ev.data)
+    if(m.type==='ready'){ setDot('on'); $('#where').textContent=(m.model||'')+'  ·  '+(m.where||''); sys('connected — talk to Claude'); ensureMic() }
+    else if(m.type==='denied'){ setDot('err'); sys('link not recognized — get a fresh one with /live') }
+    else if(m.type==='you'){ line('you', m.text) }
+    else if(m.type==='thinking'){ line('think', m.text) }
+    else if(m.type==='tool'){ line('tool', '🔧 '+m.name) }
+    else if(m.type==='bot'){ line('bot', m.text) }
+    else if(m.type==='turn_end'){ /* answer complete */ }
   }
 }
 
-async function onReady(){
-  setDot('on'); sys('connected — talk to Claude'); $('#setup').style.display='none'; $('#live').style.display='flex'
-  micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true } })
-  actx = new (window.AudioContext||window.webkitAudioContext)()
-  const src = actx.createMediaStreamSource(micStream)
-  analyser = actx.createAnalyser(); analyser.fftSize = 1024; src.connect(analyser)
-  setMode()
+// ---- speech-to-text in the browser (Web Speech API) ----
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition
+function ensureMic(){
+  if(!SR){ sys('This browser has no speech recognition — use Chrome (Android/desktop).'); return }
+  rec = new SR(); rec.lang='en-US'; rec.continuous=true; rec.interimResults=true
+  rec.onresult = e=>{
+    let itxt=''
+    for(let i=e.resultIndex;i<e.results.length;i++){
+      const r=e.results[i]
+      if(r.isFinal){ const t=r[0].transcript.trim(); if(t) sendText(t) }
+      else itxt+=r[0].transcript
+    }
+    showInterim(itxt)
+    if(itxt && botSpeaking) bargeIn()   // talking over the bot = interrupt
+  }
+  rec.onerror = ev=>{ if(ev.error==='not-allowed') sys('microphone blocked — allow it and reload') }
+  rec.onend = ()=>{ recActive=false; if(autoMode || holding){ try{rec.start(); recActive=true}catch{} } }
+  if(autoMode) startRec()
 }
+function startRec(){ if(!rec||recActive) return; try{ rec.start(); recActive=true; $('#talk').classList.add('rec') }catch{} }
+function stopRec(){ if(!rec) return; holding=false; try{ rec.stop() }catch{}; $('#talk').classList.remove('rec') }
+function sendText(t){ showInterim(''); line('you', t); if(ws?.readyState===1){ ws.send(JSON.stringify({type:'text', text:t})); setDot('busy') } }
 
-// ---- recording an utterance ----
-function startRec(){
-  if (recording) return
-  if (botSpeaking){ bargeIn() }            // talking over the bot = interrupt
-  chunks = []; mediaRec = new MediaRecorder(micStream, { mimeType: pickMime() })
-  mediaRec.ondataavailable = e => { if (e.data.size) chunks.push(e.data) }
-  mediaRec.onstop = () => { const b = new Blob(chunks, {type: chunks[0]?.type||'audio/webm'}); if (b.size>1200 && ws.readyState===1){ ws.send(b); setDot('busy') } }
-  mediaRec.start(); recording = true; $('#talk').classList.add('rec'); if(!autoMode) $('#talk').textContent='Release to send'
-}
-function stopRec(){ if (!recording) return; recording=false; try{mediaRec.stop()}catch{}; $('#talk').classList.remove('rec'); if(!autoMode) $('#talk').textContent='Hold to talk' }
-function pickMime(){ for (const m of ['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg']) if (MediaRecorder.isTypeSupported(m)) return m; return '' }
+$('#auto').onchange = e=>{ autoMode=e.target.checked; $('#talk').textContent=autoMode?'Listening…':'Hold to talk'; if(autoMode) startRec(); else stopRec() }
+const talk=$('#talk')
+talk.addEventListener('pointerdown', e=>{ e.preventDefault(); if(autoMode) return; if(actx?.state==='suspended') actx.resume(); holding=true; startRec() })
+const release=e=>{ e.preventDefault(); if(autoMode) return; stopRec() }
+talk.addEventListener('pointerup', release); talk.addEventListener('pointercancel', release); talk.addEventListener('pointerleave', release)
 
-// ---- push-to-talk ----
-const talk = $('#talk')
-const down = e => { e.preventDefault(); if(autoMode) return; if(actx?.state==='suspended') actx.resume(); startRec() }
-const up   = e => { e.preventDefault(); if(autoMode) return; stopRec() }
-talk.addEventListener('pointerdown', down); talk.addEventListener('pointerup', up); talk.addEventListener('pointercancel', up); talk.addEventListener('pointerleave', up)
-
-// ---- VAD (hands-free) ----
-const START_RMS=0.020, STOP_RMS=0.012, START_FR=3, SILENCE_FR=28   // ~28*16ms ≈ 0.45s tuning target
-function rms(){ const buf=new Uint8Array(analyser.fftSize); analyser.getByteTimeDomainData(buf); let s=0; for(const v of buf){ const x=(v-128)/128; s+=x*x } return Math.sqrt(s/buf.length) }
-function startVad(){ if(vadRAF) return; const loop=()=>{ vadRAF=requestAnimationFrame(loop); if(!analyser) return; const e=rms()
-    if (!recording){ if (e>START_RMS){ if(++speechFrames>=START_FR){ speechFrames=0; startRec() } } else speechFrames=0 }
-    else { if (e<STOP_RMS){ if(++silenceFrames>=SILENCE_FR){ silenceFrames=0; stopRec() } } else silenceFrames=0 }
-    if (botSpeaking && e>START_RMS && !recording){ if(++speechFrames>=START_FR){ speechFrames=0; startRec() } }
-  }; loop() }
-function stopVad(){ cancelAnimationFrame(vadRAF); vadRAF=0; speechFrames=silenceFrames=0 }
-
-// ---- playback of the bot's voice (sentence chunks) ----
+// ---- playback of the bot's voice, with barge-in ----
 async function playChunk(arrayBuffer){
-  try { const audioBuf = await actx.decodeAudioData(arrayBuffer.slice(0)); playQueue.push(audioBuf); if(!botSpeaking) playNext() } catch(e){}
+  if(!actx) actx=new (window.AudioContext||window.webkitAudioContext)()
+  try{ const b=await actx.decodeAudioData(arrayBuffer.slice(0)); playQueue.push(b); if(!botSpeaking) playNext() }catch(e){}
 }
 function playNext(){
-  const b = playQueue.shift(); if(!b){ botSpeaking=false; setDot('on'); $('#talk').classList.remove('speaking'); return }
+  const b=playQueue.shift()
+  if(!b){ botSpeaking=false; setDot('on'); $('#talk').classList.remove('speaking'); return }
   botSpeaking=true; setDot('busy'); $('#talk').classList.add('speaking')
-  const s = actx.createBufferSource(); s.buffer=b; s.connect(actx.destination); curSource=s
-  s.onended = () => { curSource=null; playNext() }; s.start()
+  const s=actx.createBufferSource(); s.buffer=b; s.connect(actx.destination); curSource=s
+  s.onended=()=>{ curSource=null; playNext() }; s.start()
 }
 function bargeIn(){ playQueue=[]; try{curSource?.stop()}catch{}; curSource=null; botSpeaking=false; if(ws?.readyState===1) ws.send(JSON.stringify({type:'interrupt'})) }
-function botTurnEnd(){ if(!botSpeaking && !playQueue.length){ setDot('on'); $('#talk').classList.remove('speaking') } }
+
+connect()
 </script>
 </body>
 </html>

@@ -26,6 +26,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync, copyFileSync } from 'node:fs'
 import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
+import { randomUUID } from 'node:crypto'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -131,6 +132,25 @@ const PROGRESS_DETAIL = /^(1|true|yes)$/i.test(process.env.TG_PROGRESS_DETAIL ||
 // and run as a prompt, and each answer is also spoken back as a voice message —
 // so the whole loop is eyes-free. STT (faster-whisper) and TTS (piper/espeak-ng)
 // run locally, no API key. All three commands are overridable.
+// Live voice web client: /live mints a per-topic link at LIVE_URL/<uuid>, bound to
+// this topic's Claude session. The uuid is the only secret — no password. The link
+// map is shared on disk with the live server (live/server.ts).
+const LIVE_URL = (process.env.LIVE_URL || 'https://app.besporesh.ir').replace(/\/+$/, '')
+const LINKS_FILE = process.env.LIVE_LINKS_FILE || join(HERE, 'state', 'live-links.json')
+type LiveLink = { key: string; cwd: string; model?: string; sessionId?: string; created: string }
+function loadLinks(): Record<string, LiveLink> {
+  try { return JSON.parse(readFileSync(LINKS_FILE, 'utf8')) } catch { return {} }
+}
+function saveLinks(l: Record<string, LiveLink>): void {
+  try { mkdirSync(dirname(LINKS_FILE), { recursive: true }); writeFileSync(LINKS_FILE, JSON.stringify(l, null, 2)) } catch (e) { console.error(`[live-links] ${e}`) }
+}
+// The (single) live link bound to a topic, if any.
+function linkForKey(key: string): { uuid: string; link: LiveLink } | null {
+  const l = loadLinks()
+  for (const [uuid, link] of Object.entries(l)) if (link.key === key) return { uuid, link }
+  return null
+}
+
 const VOICE_DEFAULT = /^(1|true|yes)$/i.test(process.env.TG_VOICE || '')
 const STT_CMD = process.env.TG_STT_CMD || `python3 ${join(HERE, 'voice', 'stt.py')}`
 const TTS_CMD = process.env.TG_TTS_CMD || join(HERE, 'voice', 'tts.sh')
@@ -832,11 +852,18 @@ async function speakAnswer(ctx: Context, threadId: number | undefined, text: str
 
 async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string): Promise<void> {
   const cwd = resolveCwd(ctx, threadId)
-  const resumeId = sessions[key]?.sessionId
+  // If this topic has a live link, the shared link is the source of truth for the
+  // session id, so a conversation held over the live web call continues here (and
+  // vice-versa). Otherwise use the topic's own stored id.
+  const linked = linkForKey(key)
+  const resumeId = linked?.link.sessionId ?? sessions[key]?.sessionId
   try {
     const res = await runStreaming(ctx, threadId, key, prompt, cwd, resumeId, mode ?? modeFor(key), modelFor(key))
     if (stopped.has(key)) { stopped.delete(key); return } // killed via /stop — status already cleared, no reply
-    if (res.sessionId) { sessions[key] = { ...sessions[key], cwd, sessionId: res.sessionId, updated: new Date().toISOString() }; saveState() }
+    if (res.sessionId) {
+      sessions[key] = { ...sessions[key], cwd, sessionId: res.sessionId, updated: new Date().toISOString() }; saveState()
+      if (linked) { const l = loadLinks(); if (l[linked.uuid]) { l[linked.uuid].sessionId = res.sessionId; saveLinks(l) } }
+    }
     await deliver(ctx, threadId, res.text)
     await flushOutbox(ctx, threadId, cwd)
     // Speak the answer too when this topic is in voice mode.
@@ -1050,6 +1077,7 @@ bot.on('message', async ctx => {
       `/stop — cancel the task currently running in this topic\n` +
       `/interrupt [on|off] — new messages cancel the running task instead of queueing\n` +
       `/voice [on|summary|off] — speak answers back; full or summarized (text is always complete)\n` +
+      `/live — get a private link to a real-time voice call bound to this session\n` +
       `/mode [${MODES.join('|')}] — permission mode for this topic (tap to switch)\n` +
       `/model [${MODEL_ALIASES.join('|')}] — model for this topic (tap to switch)\n` +
       `/plan <task> — one read-only turn: propose without editing\n` +
@@ -1109,6 +1137,19 @@ bot.on('message', async ctx => {
       next === 'full' ? '🎙 Voice ON (full) — I speak the whole answer, and the complete answer also comes as text.'
       : next === 'summary' ? '🎙 Voice ON (summary) — I speak a short summary; the complete answer still comes as text.'
       : '🔇 Voice OFF — replies are text only.')
+    return
+  }
+  if (cmd === '/live') {
+    const cwd = resolveCwd(ctx, threadId)
+    const links = loadLinks()
+    for (const [u, l] of Object.entries(links)) if (l.key === key) delete links[u] // one link per topic
+    const uuid = randomUUID()
+    links[uuid] = { key, cwd, model: models[key], sessionId: sessions[key]?.sessionId, created: new Date().toISOString() }
+    saveLinks(links)
+    await send(ctx, threadId,
+      `🎙 Live voice call for *this* session:\n${LIVE_URL}/${uuid}\n\n` +
+      `Open it on your phone — no password, the link itself is the key, so keep it private (anyone with it talks as you). ` +
+      `It continues this exact conversation, in ${cwd}. Send /live again for a fresh link (revokes this one).`)
     return
   }
   // Startup only fills in a MISSING photo; this is how you replace one on purpose.
