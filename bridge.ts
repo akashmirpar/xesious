@@ -331,7 +331,8 @@ function childEnv(): NodeJS.ProcessEnv {
 // the whisper model/lang. Re-add just those for stt.py / tts.sh.
 function voiceEnv(): NodeJS.ProcessEnv {
   const e = childEnv()
-  for (const k of ['TG_PIPER_VOICE', 'TG_PIPER_BIN', 'TG_ESPEAK_VOICE', 'TG_ESPEAK_WPM', 'TG_STT_MODEL', 'TG_STT_LANG']) {
+  for (const k of ['TG_TTS_ENGINE', 'TG_KOKORO_VOICE', 'TG_KOKORO_MODEL', 'TG_KOKORO_VOICES', 'TG_KOKORO_SPEED', 'TG_KOKORO_LANG',
+                   'TG_PIPER_VOICE', 'TG_PIPER_BIN', 'TG_ESPEAK_VOICE', 'TG_ESPEAK_WPM', 'TG_STT_MODEL', 'TG_STT_LANG']) {
     if (process.env[k]) e[k] = process.env[k]
   }
   return e
