@@ -178,8 +178,15 @@ const modeFor = (key: string) => {
 let models: Record<string, string> = {}
 const modelFor = (key: string) => models[key] ?? MODEL
 // Per-topic voice mode (transcribe voice notes, speak answers). Toggle with /voice.
-let voice: Record<string, boolean> = {}
-const voiceMode = (key: string) => voice[key] ?? VOICE_DEFAULT
+// Per-topic voice: 'full' (speak the whole answer) or 'summary' (speak a short
+// summary). Absent falls back to TG_VOICE. Text is always the complete answer.
+let voice: Record<string, string> = {}
+function voiceMode(key: string): 'off' | 'full' | 'summary' {
+  const v = voice[key]
+  if (v === 'full' || v === 'summary') return v
+  if (v === undefined) return VOICE_DEFAULT ? 'full' : 'off'
+  return 'off'
+}
 
 function keyFor(chatId: number | string, threadId: number | undefined): string {
   return `${chatId}:${threadId ?? 'main'}`
@@ -195,6 +202,8 @@ function loadState(): void {
       modes = o.modes ?? {}
       models = o.models ?? {}
       voice = o.voice ?? {}
+      // migrate old boolean state: true → 'full', false/other → off
+      for (const k of Object.keys(voice)) { const v: any = voice[k]; if (v === true) voice[k] = 'full'; else if (v !== 'full' && v !== 'summary') delete voice[k] }
     }
   } catch (e) { console.error(`[warn] could not read state (${e}); starting empty`) }
 }
@@ -801,10 +810,13 @@ function summarizeForSpeech(answer: string): Promise<string> {
 
 // Speak an answer back as a Telegram voice message. Short answers verbatim; long
 // ones summarized first so the note stays a few seconds.
-async function speakAnswer(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
+async function speakAnswer(ctx: Context, threadId: number | undefined, text: string, mode: 'full' | 'summary'): Promise<void> {
   const clean = stripMd(text).trim()
   if (!clean) return
-  let speak = clean.length <= 350 ? clean : (await summarizeForSpeech(text)) || clean
+  // 'summary' → a short spoken summary; 'full' → the whole answer read out (capped
+  // by VOICE_SPEAK_MAX so a very long answer doesn't become a multi-minute note —
+  // the complete answer is always available as text regardless).
+  let speak = mode === 'summary' ? ((await summarizeForSpeech(text)) || clean) : clean
   speak = stripMd(speak).trim().slice(0, VOICE_SPEAK_MAX)
   if (!speak) return
   const dir = mkdtempSync(join(tmpdir(), 'tg-tts-'))
@@ -827,7 +839,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     await deliver(ctx, threadId, res.text)
     await flushOutbox(ctx, threadId, cwd)
     // Speak the answer too when this topic is in voice mode.
-    if (voiceMode(key) && !res.isError) await speakAnswer(ctx, threadId, res.text)
+    const vm = voiceMode(key); if (vm !== 'off' && !res.isError) await speakAnswer(ctx, threadId, res.text, vm)
   } catch (e) {
     await send(ctx, threadId, `⚠️ ${e}`)
   }
@@ -973,7 +985,7 @@ bot.on('message', async ctx => {
   // Voice note (or round video) → transcribe → run as a prompt, when the topic is
   // in voice mode. handlePrompt then speaks the answer back. Otherwise it falls
   // through to the generic attachment path (saved to inbox).
-  if ((msg.voice || msg.video_note) && voiceMode(keyFor(chatId, threadId))) {
+  if ((msg.voice || msg.video_note) && voiceMode(keyFor(chatId, threadId)) !== 'off') {
     if (!isAllowed(ctx)) return
     const vKey = keyFor(chatId, threadId)
     const att = pickAttachment(msg)!
@@ -1036,7 +1048,7 @@ bot.on('message', async ctx => {
       `/compact [focus] — summarize this topic's history to free up context\n` +
       `/stop — cancel the task currently running in this topic\n` +
       `/interrupt [on|off] — new messages cancel the running task instead of queueing\n` +
-      `/voice [on|off] — voice notes transcribed + answers spoken back (eyes-free)\n` +
+      `/voice [on|summary|off] — speak answers back; full or summarized (text is always complete)\n` +
       `/mode [${MODES.join('|')}] — permission mode for this topic (tap to switch)\n` +
       `/model [${MODEL_ALIASES.join('|')}] — model for this topic (tap to switch)\n` +
       `/plan <task> — one read-only turn: propose without editing\n` +
@@ -1077,12 +1089,25 @@ bot.on('message', async ctx => {
   }
   if (cmd === '/voice') {
     const arg = text.split(/\s+/)[1]?.toLowerCase()
-    const next = arg === 'on' ? true : arg === 'off' ? false : !voiceMode(key)
-    voice[key] = next // store the explicit choice so it overrides TG_VOICE either way
+    let next: 'off' | 'full' | 'summary' | undefined
+    if (arg === 'off') next = 'off'
+    else if (arg === 'on' || arg === 'full') next = 'full'
+    else if (arg === 'summary' || arg === 'short' || arg === 'summarized') next = 'summary'
+    else if (!arg) {
+      await send(ctx, threadId,
+        `🎙 Voice here: ${voiceMode(key)}\n\n` +
+        `/voice on — speak the full answer\n` +
+        `/voice summary — speak a short summary\n` +
+        `/voice off — text only\n\n` +
+        `Either way, the complete answer always comes as text.`)
+      return
+    } else { await send(ctx, threadId, 'Usage: /voice on | summary | off'); return }
+    if (next === 'off') delete voice[key]; else voice[key] = next
     saveState()
-    await send(ctx, threadId, next
-      ? '🎙 Voice mode ON — send a voice note and I run it; I also speak each answer back (a short summary for long ones).'
-      : '🔇 Voice mode OFF — replies are text only.')
+    await send(ctx, threadId,
+      next === 'full' ? '🎙 Voice ON (full) — I speak the whole answer, and the complete answer also comes as text.'
+      : next === 'summary' ? '🎙 Voice ON (summary) — I speak a short summary; the complete answer still comes as text.'
+      : '🔇 Voice OFF — replies are text only.')
     return
   }
   // Startup only fills in a MISSING photo; this is how you replace one on purpose.
@@ -1192,7 +1217,7 @@ bot.on('message', async ctx => {
       `session: ${e?.sessionId ?? '(none yet)'}\n` +
       `mode: ${modeFor(key)}\n` +
       `model: ${modelLabel(key)}\n` +
-      `voice: ${voiceMode(key) ? 'on' : 'off'}\n\n` +
+      `voice: ${voiceMode(key)}\n\n` +
       `resume on the server:\n  cd "${e?.cwd ?? resolveCwd(ctx, threadId)}" && claude --continue`)
     return
   }
