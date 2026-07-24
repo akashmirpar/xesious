@@ -83,7 +83,8 @@ type Conn = { authed: boolean; uuid?: string; cwd: string; model?: string; sessi
 async function runTurn(ws: any, text: string) {
   const gen = ++ws.data.gen
   const alive = () => ws.data.gen === gen && ws.readyState === 1
-  ws.send(JSON.stringify({ type: 'you', text }))
+  // note: the browser already rendered the user's text locally (client-side STT),
+  // so we do NOT echo a {type:'you'} back — that was the double.
   const model = ws.data.model || DEFAULT_MODEL
   const args = ['-p', text, '--output-format', 'stream-json', '--verbose', '--model', model, '--permission-mode', PERM, '--append-system-prompt', PROFILE]
   if (ws.data.sessionId) args.push('--resume', ws.data.sessionId)
