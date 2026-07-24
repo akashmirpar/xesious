@@ -13,3 +13,6 @@ voice/piper/
 # Kokoro model files (voice/setup.sh --kokoro)
 voice/kokoro/*.onnx
 voice/kokoro/*.bin
+
+# live voice server log
+live/live.log
