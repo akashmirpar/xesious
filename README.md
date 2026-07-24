@@ -79,6 +79,7 @@ off is now a **hard startup error**, not a warning.
 | `/resume [id]` | Restore the previous session (undo `/new`), or bind this topic to a specific past session id |
 | `/compact [focus]` | Summarize this topic's session history to free up context (memory kept) |
 | `/stop` | Cancel the task currently running in this topic |
+| `/voice [on\|off]` | Voice mode: transcribe voice notes and speak answers back (eyes-free). Default from `TG_VOICE`. |
 | `/interrupt [on\|off]` | Toggle interrupt mode: a new message cancels the running task and starts immediately (its reply comes as a new message) instead of queueing. Default from `TG_INTERRUPT`. |
 | `/mode [plan\|acceptEdits\|auto\|bypass]` | Show or set this topic's permission mode. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_PERMISSION_MODE`. |
 | `/plan <task>` | One read-only turn: Claude researches and proposes without editing. Doesn't change the topic's mode, so "go ahead" carries the plan out. |
@@ -128,6 +129,31 @@ Send and receive files through the same topic.
   so "send me the report" just works. You can also pull a file yourself with
   `/get <path>` (relative to the topic's directory, or absolute). Bot uploads are
   capped at 50 MB (2000 MB with a local server).
+
+## Voice (eyes-free, turn-based)
+
+Talk to a topic and hear the answer — no reading or typing. It runs **locally, no
+API key**: `faster-whisper` for speech→text, `piper`/`espeak-ng` for text→speech,
+and a fast model (Haiku) to summarize long answers into a few spoken sentences.
+
+Setup once:
+
+```bash
+voice/setup.sh            # ffmpeg + faster-whisper + espeak-ng (robotic voice)
+voice/setup.sh --piper    # also a natural neural voice (recommended)
+```
+
+Then per topic send `/voice on` (or set `TG_VOICE=1` for all topics). With voice on:
+
+- **Send a voice note** → it's transcribed and run as your message. The bridge first
+  echoes `🎙 "<what it heard>"` so a mis-hear is visible, then answers.
+- **Every answer is also spoken back** as a voice message — short answers verbatim,
+  long ones summarized to a couple of sentences so the note stays seconds, not minutes.
+- Works with everything else: `/stop`, `/interrupt`, `/mode`, `/model` still apply.
+
+`/voice off` returns a topic to text-only. Knobs: `TG_STT_MODEL` (whisper size),
+`TG_STT_LANG` (force a language), `TG_PIPER_VOICE`, `TG_VOICE_SUMMARY_MODEL`,
+`TG_VOICE_MAX_CHARS`, `TG_STT_CMD`/`TG_TTS_CMD` (swap in any engine).
 
 ## Config
 

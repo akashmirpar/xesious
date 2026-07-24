@@ -127,6 +127,18 @@ const SET_GROUP_LOGO = !/^(0|false|no)$/i.test(process.env.TG_SET_GROUP_LOGO || 
 // here is posted into the chat and kept in Telegram's history. Off by default.
 const PROGRESS_DETAIL = /^(1|true|yes)$/i.test(process.env.TG_PROGRESS_DETAIL || '')
 
+// Turn-based voice. When a topic is in voice mode: a voice note is transcribed
+// and run as a prompt, and each answer is also spoken back as a voice message —
+// so the whole loop is eyes-free. STT (faster-whisper) and TTS (piper/espeak-ng)
+// run locally, no API key. All three commands are overridable.
+const VOICE_DEFAULT = /^(1|true|yes)$/i.test(process.env.TG_VOICE || '')
+const STT_CMD = process.env.TG_STT_CMD || `python3 ${join(HERE, 'voice', 'stt.py')}`
+const TTS_CMD = process.env.TG_TTS_CMD || join(HERE, 'voice', 'tts.sh')
+// A short answer is spoken verbatim; a long one is first summarized to a couple
+// of sentences by a fast model so the voice note stays seconds, not minutes.
+const VOICE_SUMMARY_MODEL = process.env.TG_VOICE_SUMMARY_MODEL || 'haiku'
+const VOICE_SPEAK_MAX = Math.max(200, Number(process.env.TG_VOICE_MAX_CHARS || 1400))
+
 // Importing existing Claude Code sessions (the ones the IDE/CLI session picker
 // shows) as topics. A directory's sessions live at CLAUDE_PROJECTS/<encoded>/<id>.jsonl.
 const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
@@ -165,6 +177,9 @@ const modeFor = (key: string) => {
 // TG_MODEL, and empty TG_MODEL ⇒ the account default (no --model flag at all).
 let models: Record<string, string> = {}
 const modelFor = (key: string) => models[key] ?? MODEL
+// Per-topic voice mode (transcribe voice notes, speak answers). Toggle with /voice.
+let voice: Record<string, boolean> = {}
+const voiceMode = (key: string) => voice[key] ?? VOICE_DEFAULT
 
 function keyFor(chatId: number | string, threadId: number | undefined): string {
   return `${chatId}:${threadId ?? 'main'}`
@@ -179,13 +194,14 @@ function loadState(): void {
       interruptMode = o.interruptMode ?? {}
       modes = o.modes ?? {}
       models = o.models ?? {}
+      voice = o.voice ?? {}
     }
   } catch (e) { console.error(`[warn] could not read state (${e}); starting empty`) }
 }
 function saveState(): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true })
-    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models }, null, 2))
+    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models, voice }, null, 2))
   } catch (e) { console.error(`[warn] could not write state: ${e}`) }
 }
 
@@ -718,6 +734,78 @@ async function deliver(ctx: Context, threadId: number | undefined, text: string)
   }
 }
 
+// ---------------------------------------------------------------------------
+// Voice (turn-based): transcribe inbound audio, speak outbound answers.
+// ---------------------------------------------------------------------------
+
+// STT_CMD <audio-file> -> transcript on stdout. '' on any failure (logged).
+function transcribe(path: string): Promise<string> {
+  return new Promise(resolve => {
+    const parts = STT_CMD.split(/\s+/)
+    const child = spawn(parts[0], [...parts.slice(1), path], { env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = '', err = ''
+    child.stdout.on('data', d => (out += d))
+    child.stderr.on('data', d => (err += d))
+    child.on('error', e => { console.error(`[voice] stt spawn: ${e}`); resolve('') })
+    child.on('close', code => {
+      if (!out.trim() && code !== 0) console.error(`[voice] stt exit ${code}: ${err.slice(-300)}`)
+      resolve(out.trim())
+    })
+  })
+}
+
+// TTS_CMD <out.ogg>, text on stdin -> the ogg path, or null on failure.
+function synthesize(text: string, ogg: string): Promise<string | null> {
+  return new Promise(resolve => {
+    const child = spawn(TTS_CMD, [ogg], { env: childEnv(), stdio: ['pipe', 'ignore', 'pipe'] })
+    let err = ''
+    child.stderr.on('data', d => (err += d))
+    child.on('error', e => { console.error(`[voice] tts spawn: ${e}`); resolve(null) })
+    child.on('close', code => {
+      if (code === 0 && existsSync(ogg)) resolve(ogg)
+      else { console.error(`[voice] tts exit ${code}: ${err.slice(-300)}`); resolve(null) }
+    })
+    child.stdin.write(text); child.stdin.end()
+  })
+}
+
+// A stateless fast-model pass that turns a full answer into a couple of spoken
+// sentences. It never --resumes the topic session, so it can't pollute or rebind
+// it, and runs read-only (plan) so it can't touch anything.
+function summarizeForSpeech(answer: string): Promise<string> {
+  const prompt =
+    'Rewrite the following assistant reply as a SHORT spoken summary for text-to-speech: ' +
+    '1-3 plain sentences, no markdown, no code, no lists, no URLs or ids read out. Convey the ' +
+    'outcome and any decision the user must make. If it is already short, lightly rephrase for the ear.\n\n---\n' +
+    answer.slice(0, 6000)
+  return new Promise(resolve => {
+    const args = ['-p', prompt, '--output-format', 'json', '--model', VOICE_SUMMARY_MODEL, '--permission-mode', 'plan']
+    const child = spawn(CLAUDE_BIN, args, { cwd: HERE, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    child.stdout.on('data', d => (out += d))
+    child.on('error', () => resolve(''))
+    child.on('close', () => { try { resolve(String(JSON.parse(out).result ?? '').trim()) } catch { resolve('') } })
+  })
+}
+
+// Speak an answer back as a Telegram voice message. Short answers verbatim; long
+// ones summarized first so the note stays a few seconds.
+async function speakAnswer(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
+  const clean = stripMd(text).trim()
+  if (!clean) return
+  let speak = clean.length <= 350 ? clean : (await summarizeForSpeech(text)) || clean
+  speak = stripMd(speak).trim().slice(0, VOICE_SPEAK_MAX)
+  if (!speak) return
+  const dir = mkdtempSync(join(tmpdir(), 'tg-tts-'))
+  try {
+    const ogg = await synthesize(speak, join(dir, 'reply.ogg'))
+    if (ogg) {
+      const opts: any = threadId ? { message_thread_id: threadId } : {}
+      await ctx.api.sendVoice(ctx.chat!.id, new InputFile(ogg), opts).catch(e => console.error(`[voice] sendVoice: ${e}`))
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+}
+
 async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string): Promise<void> {
   const cwd = resolveCwd(ctx, threadId)
   const resumeId = sessions[key]?.sessionId
@@ -727,6 +815,8 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     if (res.sessionId) { sessions[key] = { ...sessions[key], cwd, sessionId: res.sessionId, updated: new Date().toISOString() }; saveState() }
     await deliver(ctx, threadId, res.text)
     await flushOutbox(ctx, threadId, cwd)
+    // Speak the answer too when this topic is in voice mode.
+    if (voiceMode(key) && !res.isError) await speakAnswer(ctx, threadId, res.text)
   } catch (e) {
     await send(ctx, threadId, `⚠️ ${e}`)
   }
@@ -869,6 +959,28 @@ bot.on('message', async ctx => {
   if (edited?.name && threadId !== undefined) { names[keyFor(chatId, threadId)] = edited.name; saveState(); return }
 
   // File uploads: save into this topic's inbox. A caption (if any) runs as a prompt.
+  // Voice note (or round video) → transcribe → run as a prompt, when the topic is
+  // in voice mode. handlePrompt then speaks the answer back. Otherwise it falls
+  // through to the generic attachment path (saved to inbox).
+  if ((msg.voice || msg.video_note) && voiceMode(keyFor(chatId, threadId))) {
+    if (!isAllowed(ctx)) return
+    const vKey = keyFor(chatId, threadId)
+    const att = pickAttachment(msg)!
+    console.log(`[in] chat=${chatId} topic=${threadId ?? '-'} from=${ctx.from.id} 🎙 voice (${fmtBytes(att.size)})`)
+    if (isInterrupt(vKey) && activeRuns.has(vKey)) { stopped.add(vKey); activeRuns.get(vKey)!.kill('SIGKILL') }
+    enqueue(vKey, async () => {
+      const cwd = resolveCwd(ctx, threadId)
+      let saved: string
+      try { saved = await receiveFile(ctx, att, cwd) }
+      catch (e) { await send(ctx, threadId, `⚠️ couldn't save the voice note: ${e}`); return }
+      const heard = await transcribe(saved)
+      if (!heard) { await send(ctx, threadId, '🎙 Sorry — I couldn’t make out that voice note. Try again, a bit closer to the mic.'); return }
+      await send(ctx, threadId, `🎙 “${heard}”`, true) // show what was heard, so a mis-hear is visible
+      await handlePrompt(ctx, threadId, vKey, heard)
+    }).catch(e => console.error(`[error] voice task ${keyFor(chatId, threadId)}: ${e}`))
+    return
+  }
+
   const attachment = pickAttachment(msg)
   if (attachment) {
     if (!isAllowed(ctx)) return
@@ -913,6 +1025,7 @@ bot.on('message', async ctx => {
       `/compact [focus] — summarize this topic's history to free up context\n` +
       `/stop — cancel the task currently running in this topic\n` +
       `/interrupt [on|off] — new messages cancel the running task instead of queueing\n` +
+      `/voice [on|off] — voice notes transcribed + answers spoken back (eyes-free)\n` +
       `/mode [${MODES.join('|')}] — permission mode for this topic (tap to switch)\n` +
       `/model [${MODEL_ALIASES.join('|')}] — model for this topic (tap to switch)\n` +
       `/plan <task> — one read-only turn: propose without editing\n` +
@@ -949,6 +1062,16 @@ bot.on('message', async ctx => {
     await send(ctx, threadId, next
       ? '⚡ Interrupt mode ON — a new message cancels the running task and starts immediately; its reply arrives as a new message.'
       : '⏸ Interrupt mode OFF — messages queue and run one at a time.')
+    return
+  }
+  if (cmd === '/voice') {
+    const arg = text.split(/\s+/)[1]?.toLowerCase()
+    const next = arg === 'on' ? true : arg === 'off' ? false : !voiceMode(key)
+    voice[key] = next // store the explicit choice so it overrides TG_VOICE either way
+    saveState()
+    await send(ctx, threadId, next
+      ? '🎙 Voice mode ON — send a voice note and I run it; I also speak each answer back (a short summary for long ones).'
+      : '🔇 Voice mode OFF — replies are text only.')
     return
   }
   // Startup only fills in a MISSING photo; this is how you replace one on purpose.
@@ -1057,7 +1180,8 @@ bot.on('message', async ctx => {
       `directory: ${e?.cwd ?? resolveCwd(ctx, threadId)}\n` +
       `session: ${e?.sessionId ?? '(none yet)'}\n` +
       `mode: ${modeFor(key)}\n` +
-      `model: ${modelLabel(key)}\n\n` +
+      `model: ${modelLabel(key)}\n` +
+      `voice: ${voiceMode(key) ? 'on' : 'off'}\n\n` +
       `resume on the server:\n  cd "${e?.cwd ?? resolveCwd(ctx, threadId)}" && claude --continue`)
     return
   }
