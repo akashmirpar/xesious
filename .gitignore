@@ -6,3 +6,6 @@ state/
 # staged to send back. They must never land in the repo (this one is public).
 inbox/
 outbox/
+
+# downloaded neural voice model (voice/setup.sh --piper)
+voice/piper/
