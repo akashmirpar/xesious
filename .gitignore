@@ -9,3 +9,7 @@ outbox/
 
 # downloaded neural voice model (voice/setup.sh --piper)
 voice/piper/
+
+# Kokoro model files (voice/setup.sh --kokoro)
+voice/kokoro/*.onnx
+voice/kokoro/*.bin

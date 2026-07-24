@@ -27,6 +27,15 @@ PY
 # 3. TTS — espeak-ng always (robotic but reliable); Piper optional (natural).
 command -v espeak-ng >/dev/null 2>&1 || { say "installing espeak-ng (fallback voice)…"; APT install -y espeak-ng; }
 
+if [ "${1:-}" = "--kokoro" ]; then
+  say "installing Kokoro (kokoro-onnx, CPU)…"; PIP kokoro-onnx soundfile || say "(kokoro-onnx pip install failed)"
+  mkdir -p voice/kokoro
+  KBASE="${TG_KOKORO_URL:-https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0}"
+  [ -f voice/kokoro/kokoro-v1.0.onnx ] || { say "downloading Kokoro model (~311MB)…"; curl -fL "$KBASE/kokoro-v1.0.onnx" -o voice/kokoro/kokoro-v1.0.onnx; }
+  [ -f voice/kokoro/voices-v1.0.bin ]  || { say "downloading Kokoro voices…"; curl -fL "$KBASE/voices-v1.0.bin" -o voice/kokoro/voices-v1.0.bin; }
+  say "Kokoro ready. In .env set:  TG_TTS_ENGINE=kokoro  and  TG_KOKORO_VOICE=af_heart"
+fi
+
 if [ "${1:-}" = "--piper" ]; then
   say "installing Piper…"; PIP piper-tts || say "(piper-tts pip install failed; espeak-ng still works)"
   mkdir -p voice/piper
