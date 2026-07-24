@@ -224,3 +224,27 @@ The bot is publicly addressable. Access is gated on the **sender's** user id
 dropped. `/whoami` is the only ungated command and reveals only the caller's own
 ids. Anyone you allowlist can run tools on your server — allowlist only yourself
 and people you fully trust.
+
+## Live voice call (web, real-time)
+
+`live/` is a real-time voice page — open it on your phone, talk, and Claude talks
+back, with barge-in (talk over it to interrupt). It reuses whisper + Kokoro + the
+`claude` CLI (no API key). Turn-based Telegram voice is for messaging; this is for
+holding a conversation.
+
+- **Server:** `live/server.ts` (Bun) serves the page and a WebSocket. A persistent
+  `live/worker.py` keeps whisper + Kokoro loaded so each turn is ~a few seconds,
+  not ~15s. `live/start-live.sh` runs it in tmux.
+- **Page:** `live/index.html` — mic capture, client-side VAD (hands-free) or
+  push-to-talk, sentence-by-sentence playback, barge-in.
+- **Behind nginx** on its own subdomain (see `live/nginx-app.besporesh.ir.conf`):
+  proxy `/` to `127.0.0.1:3060` with WebSocket upgrade + a long read timeout.
+- **Per session, no password.** In a Telegram topic, `/live` mints a `LIVE_URL/<uuid>`
+  link bound to *that* topic's Claude session (shared via `state/live-links.json`).
+  The uuid is the only secret. Speech-to-text happens in the browser (Web Speech
+  API) — only text is sent, so it's fast; the page shows your words live plus
+  Claude's thinking, tool use, and answer. Default permission mode `plan` (read-only).
+
+Setup: `voice/setup.sh --kokoro`, set `LIVE_PASSCODE` in `.env`, `live/start-live.sh`,
+point the subdomain at `:3060`. Latency floor is Kokoro (~1x realtime on CPU); a GPU
+or a lighter voice makes it snappier.
