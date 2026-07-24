@@ -317,6 +317,17 @@ function childEnv(): NodeJS.ProcessEnv {
   return e
 }
 
+// childEnv() scrubs every TG_ var (so the bot token never reaches a subprocess),
+// but the voice helpers legitimately need a few of them — the Piper voice path,
+// the whisper model/lang. Re-add just those for stt.py / tts.sh.
+function voiceEnv(): NodeJS.ProcessEnv {
+  const e = childEnv()
+  for (const k of ['TG_PIPER_VOICE', 'TG_PIPER_BIN', 'TG_ESPEAK_VOICE', 'TG_ESPEAK_WPM', 'TG_STT_MODEL', 'TG_STT_LANG']) {
+    if (process.env[k]) e[k] = process.env[k]
+  }
+  return e
+}
+
 // A status line for one streamed event: a short label, plus the detail of what
 // was actually tried (the command, the path, the query). The label alone reads as
 // generic — "running a command" doesn't say which — so the detail carries the
@@ -742,7 +753,7 @@ async function deliver(ctx: Context, threadId: number | undefined, text: string)
 function transcribe(path: string): Promise<string> {
   return new Promise(resolve => {
     const parts = STT_CMD.split(/\s+/)
-    const child = spawn(parts[0], [...parts.slice(1), path], { env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(parts[0], [...parts.slice(1), path], { env: voiceEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
     let out = '', err = ''
     child.stdout.on('data', d => (out += d))
     child.stderr.on('data', d => (err += d))
@@ -757,7 +768,7 @@ function transcribe(path: string): Promise<string> {
 // TTS_CMD <out.ogg>, text on stdin -> the ogg path, or null on failure.
 function synthesize(text: string, ogg: string): Promise<string | null> {
   return new Promise(resolve => {
-    const child = spawn(TTS_CMD, [ogg], { env: childEnv(), stdio: ['pipe', 'ignore', 'pipe'] })
+    const child = spawn(TTS_CMD, [ogg], { env: voiceEnv(), stdio: ['pipe', 'ignore', 'pipe'] })
     let err = ''
     child.stderr.on('data', d => (err += d))
     child.on('error', e => { console.error(`[voice] tts spawn: ${e}`); resolve(null) })
