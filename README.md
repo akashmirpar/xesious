@@ -227,6 +227,9 @@ and people you fully trust.
 
 ## Live voice call (web, real-time)
 
+The live call is **two-tier**: a fast model (Haiku) answers chat and follow-ups instantly from the running conversation; anything that needs real work (commands, file edits, search, deep reasoning) is **dispatched** to the heavy model (Opus), which runs in the bridge, posts the full answer into the Telegram topic, and the live front speaks a short summary. So the call is a fast surface; the real work lands in Telegram.
+
+
 `live/` is a real-time voice page — open it on your phone, talk, and Claude talks
 back, with barge-in (talk over it to interrupt). It reuses whisper + Kokoro + the
 `claude` CLI (no API key). Turn-based Telegram voice is for messaging; this is for
