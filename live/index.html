@@ -73,7 +73,7 @@ if(tg){
 }
 function haptic(t){ try{ tg && tg.HapticFeedback && tg.HapticFeedback.impactOccurred(t) }catch{} }
 
-let awaitingReply=false, turnEnded=false
+let awaitingReply=false, turnEnded=false, dispatching=false
 const typingEl=document.createElement('div'); typingEl.className='msg typing'; typingEl.innerHTML='<i></i><i></i><i></i>'
 function line(cls,text){ const d=document.createElement('div'); d.className='msg '+cls; d.textContent=text; log.appendChild(d); if(typingEl.parentNode) log.appendChild(typingEl); log.scrollTop=log.scrollHeight; return d }
 function sys(t){ line('sys',t) }
@@ -99,10 +99,11 @@ function connect(){
     const m=JSON.parse(ev.data)
     if(m.type==='ready'){ setDot('on'); $('#sub').textContent=(m.model||'')+(m.where?'  ·  '+m.where:''); sys('connected — talk to Claude'); ensureMic() }
     else if(m.type==='denied'){ setDot('err'); sys('link not recognized — get a fresh one with /live') }
-    else if(m.type==='thinking'){ showTyping(false); line('think', m.text) }
-    else if(m.type==='tool'){ showTyping(false); line('tool', '🔧 '+m.name) }
-    else if(m.type==='bot'){ showTyping(false); line('bot', m.text); haptic('soft') }
-    else if(m.type==='turn_end'){ turnEnded=true; if(!botSpeaking) replyDone() }
+    else if(m.type==='thinking'){ line('think', m.text) }
+    else if(m.type==='tool'){ line('tool', '🔧 '+m.name) }
+    else if(m.type==='dispatch'){ dispatching=true; line('tool', '🧠 running on the full model — full answer in your Telegram chat'); showTyping(true) }
+    else if(m.type==='bot'){ line('bot', m.text); haptic('soft'); showTyping(dispatching) }
+    else if(m.type==='turn_end'){ dispatching=false; showTyping(false); turnEnded=true; if(!botSpeaking) replyDone() }
   }
 }
 

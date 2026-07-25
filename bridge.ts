@@ -1479,6 +1479,9 @@ async function main() {
   process.once('SIGINT', stop)
   process.once('SIGTERM', stop)
 
+  // Poll for heavy jobs dispatched by the live voice server.
+  setInterval(() => { processLiveJobs().catch(e => console.error(`[live-job] ${e}`)) }, Number(process.env.LIVE_JOB_POLL_MS || 1200))
+
   for (let attempt = 1; ; attempt++) {
     handle = run(bot)
     console.log(`[ok] polling Telegram${attempt > 1 ? ` (resumed #${attempt})` : ''}`)
@@ -1493,4 +1496,69 @@ async function main() {
     }
   }
 }
+// ---------------------------------------------------------------------------
+// Live-voice heavy jobs: the live server (live/server.ts) enqueues real work in
+// state/live-jobs.json; here we run it on the heavy model in that topic's
+// session, post the answer to the Telegram topic, and write the result back for
+// the live front to summarize aloud. This is the "heavy back" of the live call.
+// ---------------------------------------------------------------------------
+const JOBS_FILE = process.env.LIVE_JOBS_FILE || join(HERE, 'state', 'live-jobs.json')
+type LiveJob = { key: string; prompt: string; model?: string; cwd: string; sessionId?: string; status: string; result?: string; error?: string; created: string }
+function loadJobs(): Record<string, LiveJob> { try { return JSON.parse(readFileSync(JOBS_FILE, 'utf8')) } catch { return {} } }
+function saveJobs(j: Record<string, LiveJob>) { try { mkdirSync(dirname(JOBS_FILE), { recursive: true }); writeFileSync(JOBS_FILE, JSON.stringify(j, null, 2)) } catch (e) { console.error(`[live-job] ${e}`) } }
+
+// One non-streaming claude run → { text, sessionId }.
+function runClaudeJson(prompt: string, cwd: string, resumeId: string | undefined, mode: string, model: string): Promise<{ text: string; sessionId?: string }> {
+  return new Promise(resolve => {
+    const args = ['-p', prompt, '--output-format', 'json', '--model', model, '--permission-mode', mode]
+    if (resumeId) args.push('--resume', resumeId)
+    const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    child.stdout.on('data', d => (out += d))
+    child.on('error', () => resolve({ text: '' }))
+    child.on('close', () => { try { const o = JSON.parse(out); resolve({ text: String(o.result ?? '').trim(), sessionId: o.session_id }) } catch { resolve({ text: '' }) } })
+  })
+}
+
+let liveJobsBusy = false
+async function processLiveJobs(): Promise<void> {
+  if (liveJobsBusy) return
+  const jobs = loadJobs()
+  // prune old finished jobs so the file doesn't grow unbounded
+  const now = Date.now(); let pruned = false
+  for (const [id, j] of Object.entries(jobs)) if (j.status === 'done' && now - Date.parse(j.created) > 600000) { delete jobs[id]; pruned = true }
+  if (pruned) saveJobs(jobs)
+  const pending = Object.entries(jobs).filter(([, j]) => j.status === 'pending')
+  if (!pending.length) return
+  liveJobsBusy = true
+  try {
+    for (const [id, job] of pending) {
+      const cur = loadJobs(); if (!cur[id] || cur[id].status !== 'pending') continue
+      cur[id].status = 'running'; saveJobs(cur)
+      const [chatIdStr, threadStr] = job.key.split(':')
+      const chatId = Number(chatIdStr); const threadId = threadStr ? Number(threadStr) : undefined
+      const fakeCtx: any = { chat: { id: chatId }, api: bot.api }
+      console.log(`[live-job] ${id} → ${job.key}: ${JSON.stringify(job.prompt).slice(0, 90)}`)
+      const stopTyping = startTyping(fakeCtx, threadId)
+      let text = '', sid: string | undefined, err: string | undefined
+      try {
+        const link = linkForKey(job.key)
+        const resumeId = link?.link.sessionId ?? sessions[job.key]?.sessionId ?? job.sessionId
+        const model = job.model || modelFor(job.key) || 'opus'
+        const res = await runClaudeJson(`[Relayed from a live voice call] ${job.prompt}`, job.cwd, resumeId, modeFor(job.key), model)
+        text = res.text; sid = res.sessionId
+        stopTyping()
+        if (sid) {
+          sessions[job.key] = { ...sessions[job.key], cwd: job.cwd, sessionId: sid, updated: new Date().toISOString() }; saveState()
+          if (link) { const l = loadLinks(); if (l[link.uuid]) { l[link.uuid].sessionId = sid; saveLinks(l) } }
+        }
+        if (text) await deliver(fakeCtx, threadId, text)
+        else err = 'empty result'
+      } catch (e) { stopTyping(); err = String(e); console.error(`[live-job] ${id}: ${e}`) }
+      const fin = loadJobs()
+      if (fin[id]) { fin[id].status = 'done'; fin[id].result = text; fin[id].sessionId = sid; if (err) fin[id].error = err; saveJobs(fin) }
+    }
+  } finally { liveJobsBusy = false }
+}
+
 main().catch(e => { console.error(`[fatal] ${e}`); process.exit(1) })
