@@ -1087,7 +1087,8 @@ bot.on('message', async ctx => {
       `Claude's own commands, forwarded as-is:\n${[...PASSTHROUGH].join(' · ')}\n\n` +
       `Bring existing Claude sessions in from the IDE/CLI:\n` +
       `/sessions <dir…> — list the sessions stored for one or more directories\n` +
-      `/import <dir…> — make a topic for each session there (bound + backfilled)\n` +
+      `/import <dir…> — a topic per newest session there (bound + backfilled)\n` +
+      `/import <dir> <id-or-title> — one specific session into its own topic\n` +
       `/history [N] — re-post the last N turns of this topic's session`)
     return
   }
@@ -1291,14 +1292,57 @@ bot.on('message', async ctx => {
       const body = list.slice(0, 30).map((s, i) => `${i + 1}. ${s.id.slice(0, 8)} · ${s.turns} turns · ${ago(s.mtimeMs)}\n   ${s.title}`).join('\n\n')
       await send(ctx, threadId, `Sessions in ${dir} (${list.length}):\n\n${body}`)
     }
-    await send(ctx, threadId, `Run /import <dir> [dir2 …] to make a topic per session.`, true)
+    await send(ctx, threadId, `/import <dir> [dir2 …] — a topic per newest session.\n/import <dir> <id-or-title> — just that one session.`, true)
     return
   }
   if (cmd === '/import') {
-    const dirs = parseDirs(text)
-    if (!dirs.length) { await send(ctx, threadId, 'Usage: /import <dir> [dir2 …]  (space-, comma- or newline-separated)'); return }
     if (ctx.chat.type !== 'supergroup') { await send(ctx, threadId, 'Run /import inside the forum group — topics are a supergroup feature.'); return }
-    // Gather (dir, session) candidates across all dirs, skipping already-bound ones.
+    // Create a topic for one session, bind it, backfill its last turns. Shared by
+    // the newest-N sweep and the single-session selector below. Silent throughout
+    // (an import buzzes the phone once per backfilled turn otherwise).
+    const importOne = async (dir: string, s: SessionInfo) => {
+      const name = `${basename(dir)} · ${s.title}`.slice(0, 120)
+      const topic = await ctx.api.createForumTopic(chatId, name, TOPIC_ICON ? { icon_custom_emoji_id: TOPIC_ICON } : {})
+      const tid = topic.message_thread_id
+      const tkey = keyFor(chatId, tid)
+      sessions[tkey] = { cwd: dir, sessionId: s.id, updated: new Date().toISOString() }
+      names[tkey] = name
+      saveState()
+      await send(ctx, tid, `📂 Bound to session ${s.id.slice(0, 8)} · ${dir}\n${s.turns} turns total — last ${Math.min(IMPORT_BACKFILL, s.turns)} below. Message here to continue it.`, true)
+      for (const t of renderTurns(s.file, IMPORT_BACKFILL)) { await send(ctx, tid, t, true); await sleep(350) }
+      return tid
+    }
+
+    // Single-session mode: "/import <dir> <id-or-title>". Triggered when the first
+    // token is a directory and the remainder is not itself a path — so multi-dir
+    // "/import <a> <b>" still sweeps newest-N. The selector matches a session id
+    // (exact or ≥6-char prefix) first, else a case-insensitive title substring.
+    const raw = text.slice(text.indexOf(' ') + 1).trim()
+    const sel = raw.match(/^(\S+)\s+(.+)$/s)
+    if (sel && isAbsolute(sel[1]) && existsSync(sel[1]) && statSync(sel[1]).isDirectory() && !sel[2].trim().startsWith('/')) {
+      const dir = sel[1], q = sel[2].trim(), ql = q.toLowerCase()
+      const all = listSessions(dir)
+      let hits = all.filter(s => s.id === q || (q.length >= 6 && s.id.startsWith(q)))
+      if (!hits.length) hits = all.filter(s => s.title.toLowerCase().includes(ql))
+      if (!hits.length) { await send(ctx, threadId, `No session in ${dir} matches “${q}”. Try /sessions ${dir} to see what's there.`); return }
+      if (hits.length > 1) {
+        const body = hits.slice(0, 10).map((s, i) => `${i + 1}. ${s.id.slice(0, 8)} · ${s.turns} turns · ${ago(s.mtimeMs)}\n   ${s.title}`).join('\n\n')
+        await send(ctx, threadId, `“${q}” matches ${hits.length} sessions — narrow it (an id prefix is unambiguous):\n\n${body}`)
+        return
+      }
+      const s = hits[0]
+      const dup = Object.entries(sessions).find(([k, e]) => k.startsWith(`${chatId}:`) && e.cwd === dir && e.sessionId === s.id)
+      if (dup) { await send(ctx, threadId, `Already imported — session ${s.id.slice(0, 8)} is bound to topic ${dup[0].split(':')[1]}.`); return }
+      try {
+        await importOne(dir, s)
+        await send(ctx, threadId, `✅ Imported session ${s.id.slice(0, 8)} — “${s.title}” — into a new topic.`)
+      } catch (e) { await send(ctx, threadId, `⚠️ couldn't import ${s.id.slice(0, 8)}: ${e}`) }
+      return
+    }
+
+    // Newest-N sweep across one or more directories, skipping already-bound ones.
+    const dirs = parseDirs(text)
+    if (!dirs.length) { await send(ctx, threadId, 'Usage:\n/import <dir> [dir2 …]  — the newest sessions there\n/import <dir> <id-or-title>  — one specific session'); return }
     const candidates: { dir: string; s: SessionInfo }[] = []
     for (const dir of dirs) {
       if (!isAbsolute(dir) || !existsSync(dir) || !statSync(dir).isDirectory()) { await send(ctx, threadId, `skipped (not a directory): ${dir}`); continue }
@@ -1308,25 +1352,11 @@ bot.on('message', async ctx => {
     if (!candidates.length) { await send(ctx, threadId, 'No new sessions to import (none found, or all already imported).'); return }
     candidates.sort((a, b) => b.s.mtimeMs - a.s.mtimeMs) // newest first, across all dirs
     const capped = candidates.slice(0, IMPORT_MAX_SESSIONS)
-    // An import is a bulk operation: a topic, a bind note and a dozen backfilled
-    // turns each. Notifying on every one of those buzzes the phone ~100 times, so
-    // the whole run is silent except the final tally.
     await send(ctx, threadId, `Importing ${capped.length} session(s) from ${dirs.length} dir(s)${candidates.length > capped.length ? ` (newest ${capped.length} of ${candidates.length})` : ''}…`, true)
     let ok = 0
     for (const { dir, s } of capped) {
-      try {
-        const name = `${basename(dir)} · ${s.title}`.slice(0, 120)
-        const topic = await ctx.api.createForumTopic(chatId, name, TOPIC_ICON ? { icon_custom_emoji_id: TOPIC_ICON } : {})
-        const tid = topic.message_thread_id
-        const tkey = keyFor(chatId, tid)
-        sessions[tkey] = { cwd: dir, sessionId: s.id, updated: new Date().toISOString() }
-        names[tkey] = name
-        saveState()
-        await send(ctx, tid, `📂 Bound to session ${s.id.slice(0, 8)} · ${dir}\n${s.turns} turns total — last ${Math.min(IMPORT_BACKFILL, s.turns)} below. Message here to continue it.`, true)
-        for (const t of renderTurns(s.file, IMPORT_BACKFILL)) { await send(ctx, tid, t, true); await sleep(350) }
-        ok++
-        await sleep(500)
-      } catch (e) { await send(ctx, threadId, `⚠️ couldn't import ${s.id.slice(0, 8)}: ${e}`) }
+      try { await importOne(dir, s); ok++; await sleep(500) }
+      catch (e) { await send(ctx, threadId, `⚠️ couldn't import ${s.id.slice(0, 8)}: ${e}`) }
     }
     await send(ctx, threadId, `✅ Imported ${ok}/${capped.length} session(s).`)
     return
