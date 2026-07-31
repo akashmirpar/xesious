@@ -27,6 +27,14 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSy
 import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
+import {
+  parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
+  MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
+  parseStreamLine, type Step,
+  normalizeMode as libNormalizeMode,
+  permissionArgs as libPermissionArgs,
+  renderSteps as libRenderSteps,
+} from './lib'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -55,9 +63,6 @@ function requireEnv(name: string): string {
   const v = process.env[name]
   if (!v) { console.error(`[fatal] ${name} is required (set it in the environment or .env)`); process.exit(1) }
   return v
-}
-function parseIdList(s: string | undefined): Set<string> {
-  return new Set((s || '').split(',').map(x => x.trim()).filter(Boolean))
 }
 
 const TOKEN = requireEnv('TELEGRAM_BOT_TOKEN')
@@ -208,9 +213,6 @@ function voiceMode(key: string): 'off' | 'full' | 'summary' {
   return 'off'
 }
 
-function keyFor(chatId: number | string, threadId: number | undefined): string {
-  return `${chatId}:${threadId ?? 'main'}`
-}
 function loadState(): void {
   try {
     if (existsSync(STATE_FILE)) {
@@ -241,9 +243,6 @@ function saveState(): void {
 // which is why an earlier attempt at a "flat folder" never produced one.)
 const TOPIC_ICON = process.env.TG_TOPIC_ICON || '5357315181649076022' // 📁
 
-function sanitize(name: string): string {
-  return name.normalize('NFKD').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'topic'
-}
 
 // Resolve (and create) the working directory for a chat/topic. Once chosen for a
 // key it is stored and stays stable, so its session always resumes correctly.
@@ -299,43 +298,15 @@ interface ClaudeResult { text: string; sessionId?: string; isError: boolean }
 // each tool call through Claude's classifier (blocks the irreversible/destructive
 // ones, no prompting) — configure what it trusts via `autoMode` in
 // ~/.claude/settings.json. `plan` researches and proposes without touching files.
-const ALL_MODES = ['plan', 'acceptEdits', 'auto', 'bypass'] as const
 // `bypass` (= --dangerously-skip-permissions) removes the last guardrail on a bot
 // that runs as root, so it is opt-in: without TG_ALLOW_BYPASS=1 it is neither
 // offered as a button nor accepted as an argument.
 const ALLOW_BYPASS = /^(1|true|yes)$/i.test(process.env.TG_ALLOW_BYPASS || '')
-const MODES: readonly string[] = ALL_MODES.filter(m => m !== 'bypass' || ALLOW_BYPASS)
-const MODE_HELP: Record<string, string> = {
-  plan: 'read-only — researches and proposes, never edits',
-  acceptEdits: 'auto-approves edits + the TG_ALLOWED_TOOLS list',
-  auto: 'classifier-gated autonomy — blocks destructive/irreversible calls',
-  bypass: 'no permission checks at all (--dangerously-skip-permissions)',
-}
-function normalizeMode(m: string): string | undefined {
-  const s = m.trim().toLowerCase()
-  if (s === 'bypass' || s === 'bypasspermissions') return ALLOW_BYPASS ? 'bypass' : undefined
-  return MODES.find(x => x.toLowerCase() === s)
-}
-function permissionArgs(mode: string): string[] {
-  // bypassPermissions is only honoured via its dedicated flag in -p runs.
-  if (normalizeMode(mode) === 'bypass') return ['--dangerously-skip-permissions']
-  return ['--permission-mode', mode, '--allowedTools', ALLOWED_TOOLS]
-}
-
-// Model choices offered by /model. The CLI takes a bare alias or a full id; these
-// are the aliases, plus 'default' meaning "no --model flag, use the account
-// default". A full id typed as an argument is passed through untouched.
-const MODEL_ALIASES = ['opus', 'sonnet', 'haiku', 'fable'] as const
-const MODEL_DEFAULT = 'default' // the label for "clear the override"
-// Returns '' for the default (clears the override), the alias/id otherwise.
-function normalizeModel(m: string): string | undefined {
-  const s = m.trim().toLowerCase()
-  if (s === MODEL_DEFAULT || s === 'reset' || s === 'clear' || s === '') return ''
-  if ((MODEL_ALIASES as readonly string[]).includes(s)) return s
-  // A full model id (e.g. claude-opus-4-8) — accept it as given.
-  if (/^claude[\w.-]*$/i.test(m.trim())) return m.trim()
-  return undefined
-}
+const MODES: readonly string[] = allowedModes(ALLOW_BYPASS)
+// Thin wrappers over ./lib that bind this process's config. MODE_HELP, MODEL_ALIASES,
+// MODEL_DEFAULT and normalizeModel are imported directly (no config dependency).
+const normalizeMode = (m: string) => libNormalizeMode(m, { allowBypass: ALLOW_BYPASS })
+const permissionArgs = (mode: string) => libPermissionArgs(mode, { allowBypass: ALLOW_BYPASS, allowedTools: ALLOWED_TOOLS })
 
 // Env for the claude subprocess: strip TELEGRAM_*/TG_* so the Claude Code
 // process (and any installed telegram channel plugin) can't grab our bot token
@@ -358,53 +329,9 @@ function voiceEnv(): NodeJS.ProcessEnv {
   return e
 }
 
-// A status line for one streamed event: a short label, plus the detail of what
-// was actually tried (the command, the path, the query). The label alone reads as
-// generic — "running a command" doesn't say which — so the detail carries the
-// substance and the renderer collapses it behind an expandable quote.
-// Set TG_PROGRESS_DETAIL=0 to drop the detail and keep the terse labels only.
-type Step = { label: string; detail?: string }
-
-function toolStep(b: any): Step {
-  const n = b?.name || 'tool'
-  const i = b?.input || {}
-  const base = (p: any) => (p ? basename(String(p)) : '')
-  const str = (v: any) => (v == null ? undefined : String(v))
-  switch (n) {
-    case 'Bash': return { label: '⚙️ Running a command', detail: str(i.command) }
-    case 'Read': return { label: `📖 Reading ${base(i.file_path)}`.trimEnd(), detail: str(i.file_path) }
-    case 'Edit': case 'Write': case 'NotebookEdit':
-      return { label: `✏️ Editing ${base(i.file_path)}`.trimEnd(), detail: str(i.file_path) }
-    case 'Glob': case 'Grep':
-      return { label: '🔎 Searching the code', detail: [i.pattern, i.path].filter(Boolean).join('  in  ') || undefined }
-    case 'WebFetch': case 'WebSearch':
-      return { label: '🌐 Looking something up', detail: str(i.url ?? i.query ?? i.prompt) }
-    case 'Agent': case 'Task':
-      return { label: '🤖 Running a subagent', detail: str(i.description ?? i.prompt) }
-    case 'TodoWrite': {
-      const todos = Array.isArray(i.todos) ? i.todos.map((t: any) => `• ${t?.content ?? t}`).join('\n') : undefined
-      return { label: '📝 Planning', detail: todos }
-    }
-    default: return { label: `⚙️ ${n}`, detail: str(i.command ?? i.file_path ?? i.pattern) }
-  }
-}
-
-const escapeHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-
-// Render the step list for the live status message as HTML: bold label, and the
-// detail tucked into a collapsed expandable quote so the topic stays scannable
-// but the actual attempt is one tap away.
-const DETAIL_MAX = 250
-function renderSteps(steps: Step[]): string {
-  return steps.map(s => {
-    const label = `<b>${escapeHtml(s.label)}</b>`
-    if (!PROGRESS_DETAIL || !s.detail) return label
-    const d = s.detail.trim()
-    if (!d) return label
-    const clipped = d.length > DETAIL_MAX ? `${d.slice(0, DETAIL_MAX)}…` : d
-    return `${label}\n<blockquote expandable>${escapeHtml(clipped)}</blockquote>`
-  }).join('\n')
-}
+// toolStep, the Step type and the status renderer live in ./lib. renderSteps there
+// takes progressDetail as a parameter; bind this process's PROGRESS_DETAIL here.
+const renderSteps = (steps: Step[]) => libRenderSteps(steps, { progressDetail: PROGRESS_DETAIL })
 
 // Run a prompt with streaming output, editing a single "status" message in the
 // topic to show live tool-step progress, then return the final result.
@@ -460,24 +387,11 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
       let nl: number
       while ((nl = buf.indexOf('\n')) !== -1) {
         const line = buf.slice(0, nl); buf = buf.slice(nl + 1)
-        if (!line.trim()) continue
-        let o: any; try { o = JSON.parse(line) } catch { continue }
-        if (o.type === 'assistant' && Array.isArray(o.message?.content)) {
-          for (const b of o.message.content) {
-            if (b?.type === 'tool_use') { steps.push(toolStep(b)); dirty = true }
-            // The reasoning behind the next step — what the model is trying, not
-            // just what it ran. Collapsed like any other detail.
-            else if (b?.type === 'thinking' && PROGRESS_DETAIL) {
-              const t = String(b.thinking ?? '').trim()
-              if (t) { steps.push({ label: '💭 Thinking', detail: t }); dirty = true }
-            }
-          }
-        } else if (o.type === 'result') {
-          got = true; sessionId = o.session_id
-          isError = Boolean(o.is_error) || o.subtype !== 'success'
-          finalText = String(o.result ?? '').trim()
-        } else if (o.type === 'system' && o.subtype === 'init' && o.session_id) {
-          sessionId ||= o.session_id
+        // Classification lives in ./lib (parseStreamLine); the side effects stay here.
+        for (const ev of parseStreamLine(line, { progressDetail: PROGRESS_DETAIL })) {
+          if (ev.kind === 'step') { steps.push(ev.step); dirty = true }
+          else if (ev.kind === 'result') { got = true; sessionId = ev.sessionId; isError = ev.isError; finalText = ev.text }
+          else if (ev.kind === 'init') { sessionId ||= ev.sessionId }
         }
       }
       void editStatus()
@@ -901,19 +815,8 @@ async function handlePassthrough(ctx: Context, threadId: number | undefined, key
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 // Claude encodes a cwd by replacing every non-alphanumeric char with '-'.
-function encodeCwd(dir: string): string { return dir.replace(/[^a-zA-Z0-9]/g, '-') }
+// encodeCwd and parseDirs live in ./lib.
 function projectDir(dir: string): string { return join(CLAUDE_PROJECTS, encodeCwd(dir)) }
-
-// Parse the args of /sessions or /import into directories. Space-separated, or
-// comma/newline-separated when a path itself contains spaces.
-function parseDirs(text: string): string[] {
-  const i = text.indexOf(' ')
-  if (i === -1) return []
-  const rest = text.slice(i + 1).trim()
-  if (!rest) return []
-  const parts = (rest.includes('\n') || rest.includes(',')) ? rest.split(/[\n,]+/) : rest.split(/\s+/)
-  return parts.map(p => p.trim()).filter(Boolean)
-}
 
 function ago(ms: number): string {
   const s = Math.max(0, (Date.now() - ms) / 1000)
@@ -990,7 +893,7 @@ function renderTurns(file: string, n: number): string[] {
 // ---------------------------------------------------------------------------
 
 loadState()
-const bot = new Bot(TOKEN, API_ROOT ? { client: { apiRoot: API_ROOT } } : undefined)
+export const bot = new Bot(TOKEN, API_ROOT ? { client: { apiRoot: API_ROOT } } : undefined)
 // Stay within Telegram's limits (~20 msgs/min per group): the throttler queues
 // outbound calls, and auto-retry waits out any 429 instead of dropping messages.
 bot.api.config.use(apiThrottler())
@@ -1493,4 +1396,9 @@ async function main() {
     }
   }
 }
-main().catch(e => { console.error(`[fatal] ${e}`); process.exit(1) })
+// Test seam (bridge.e2e.test.ts): await a topic's queue so a test can wait out the
+// fire-and-forget handlePrompt chain kicked off by an incoming message. The bot only
+// starts polling when this file is run directly, never when it is imported.
+export function _drainQueue(key: string): Promise<unknown> { return queues.get(key) ?? Promise.resolve() }
+
+if (import.meta.main) main().catch(e => { console.error(`[fatal] ${e}`); process.exit(1) })

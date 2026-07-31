@@ -1,0 +1,68 @@
+#!/usr/bin/env bun
+/**
+ * Tier 2 test double for the `claude` CLI. bridge.ts spawns $CLAUDE_BIN with
+ *   -p <prompt> --output-format stream-json --verbose [--resume <id>] [--model <m>] …
+ * and reads NDJSON `stream-json` events off stdout. This stub emits canned events
+ * chosen by the prompt text, so the whole model layer disappears: no API, no token,
+ * deterministic output.
+ *
+ * Scenarios (the first whitespace-delimited word of the prompt):
+ *   EMPTY  → init + a successful result with empty text  → bridge shows "(empty response)"
+ *   ERROR  → init + result with is_error:true            → bridge marks the turn failed
+ *   HANG   → init, then sleep past the test's timeout     → exercises the SIGKILL path
+ *   TOOLS  → init + two tool_use steps + success
+ *   (else) → init + one Bash tool_use + success
+ *
+ * Every successful result echoes what the stub was invoked with, in letters-only
+ * tokens that survive MarkdownV2 escaping, so tests can assert on the reply:
+ *   hadResume / noResume   — was --resume passed (session persistence round-trip)
+ *   modelSet / modelDefault — was --model passed
+ */
+const argv = process.argv.slice(2)
+const val = (flag: string): string | undefined => {
+  const i = argv.indexOf(flag)
+  return i >= 0 ? argv[i + 1] : undefined
+}
+
+const prompt = val('-p') ?? ''
+const scenario = prompt.trim().split(/\s+/)[0] ?? ''
+const resumeId = val('--resume')
+const model = val('--model')
+// A stable-ish session id derived from the resume arg: a new turn mints one, a
+// resumed turn keeps reporting a session so bridge re-persists it.
+const sessionId = resumeId ?? 'sessTESTAAA'
+
+const emit = (o: unknown) => process.stdout.write(JSON.stringify(o) + '\n')
+const initLine = () => emit({ type: 'system', subtype: 'init', session_id: sessionId, model: model ?? 'claude-test-default' })
+const result = (extra: Record<string, unknown>) =>
+  emit({ type: 'result', subtype: 'success', is_error: false, session_id: sessionId, ...extra })
+
+const tag = `${resumeId ? 'hadResume' : 'noResume'} ${model ? 'modelSet' : 'modelDefault'}`
+
+async function main() {
+  initLine()
+
+  if (scenario === 'HANG') {
+    // Stay genuinely alive (a real timer — a bare pending promise wouldn't keep the
+    // event loop up, and Bun would exit immediately) so the bridge's
+    // CLAUDE_TIMEOUT_MS is what SIGKILLs us. That is the path under test.
+    setTimeout(() => process.exit(0), 60_000)
+    return
+  }
+  if (scenario === 'EMPTY') { result({ result: '' }); return }
+  if (scenario === 'ERROR') {
+    emit({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: sessionId, result: 'boom' })
+    return
+  }
+  if (scenario === 'TOOLS') {
+    emit({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/etc/hosts' } }] } })
+    emit({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'echo hi' } }] } })
+    result({ result: `ranTools ${tag}` })
+    return
+  }
+  // default: one tool step, then a success that echoes the invocation facts.
+  emit({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'true' } }] } })
+  result({ result: `okReply ${tag}` })
+}
+
+main()

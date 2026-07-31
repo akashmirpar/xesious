@@ -5,7 +5,8 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "bun run bridge.ts"
+    "start": "bun run bridge.ts",
+    "test": "bun test"
   },
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",
