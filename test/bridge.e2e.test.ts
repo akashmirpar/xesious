@@ -165,3 +165,74 @@ describe('authorization gate', () => {
     expect(cs.some(c => c.method === 'editMessageText')).toBe(false)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Feature / regression coverage. Each block pins a user-facing feature's real
+// behaviour, so a future change that breaks it fails here instead of in prod.
+// Add a block whenever a feature ships. Chat ids 1020+ keep topics isolated.
+// ---------------------------------------------------------------------------
+
+const stateNow = () => JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+
+describe('session lifecycle: /new and /resume', () => {
+  test('/new starts a fresh session so the next turn does NOT --resume', async () => {
+    const bind = await incoming(1020, 'bind a session')
+    expect(finalReply(bind)).toContain('noResume')            // first turn is new
+    expect(stateNow().sessions['1020:main'].sessionId).toBe('sessTESTAAA')
+
+    const nw = await incoming(1020, '/new')
+    expect(finalReply(nw)).toMatch(/Fresh session/i)
+    expect(stateNow().sessions['1020:main'].sessionId).toBeUndefined()  // cleared
+
+    const after = await incoming(1020, 'after new')
+    expect(finalReply(after)).toContain('noResume')           // proves it reset
+  })
+
+  test('/resume restores the session /new set aside (next turn --resumes)', async () => {
+    await incoming(1021, 'bind')
+    await incoming(1021, '/new')
+    const r = await incoming(1021, '/resume')
+    expect(finalReply(r)).toMatch(/Restored session/i)
+    const cont = await incoming(1021, 'continue')
+    expect(finalReply(cont)).toContain('hadResume')           // resuming again
+  })
+})
+
+describe('/status reports the topic state', () => {
+  test('shows directory, mode, and model', async () => {
+    const r = finalReply(await incoming(1022, '/status')) || ''
+    expect(r).toContain('directory:')
+    expect(r).toContain('dm-1')          // the private-chat cwd (dm-<userId>)
+    expect(r).toContain('mode: auto')    // default permission mode
+  })
+})
+
+describe('/mode: switch permission posture + bypass safety gate', () => {
+  test('/mode plan switches and persists, and /status reflects it', async () => {
+    expect(finalReply(await incoming(1023, '/mode plan'))).toMatch(/plan/i)
+    expect(stateNow().modes['1023:main']).toBe('plan')
+    expect(finalReply(await incoming(1023, '/status'))).toContain('mode: plan')
+  })
+
+  test('bypass is REFUSED when TG_ALLOW_BYPASS is off (root-safety guard)', async () => {
+    const cs = await incoming(1024, '/mode bypass')
+    expect(finalReply(cs)).toMatch(/Unknown mode/i)           // not accepted
+    expect(stateNow().modes?.['1024:main']).toBeUndefined()   // and not persisted
+  })
+})
+
+describe('unknown command', () => {
+  test('is rejected with a hint, not run as a prompt', async () => {
+    const cs = await incoming(1025, '/frobnicate')
+    expect(finalReply(cs)).toContain('Unknown command')
+    expect(cs.some(c => c.method === 'deleteMessage')).toBe(false)  // no run happened
+  })
+})
+
+describe('file delivery: a file staged in ./outbox/ is sent back', () => {
+  test('the staged file goes out as a document, plus the text reply', async () => {
+    const cs = await incoming(1030, 'OUTBOX')
+    expect(finalReply(cs)).toContain('wroteOutbox')                 // the answer text
+    expect(cs.some(c => c.method === 'sendDocument')).toBe(true)    // the file itself
+  })
+})

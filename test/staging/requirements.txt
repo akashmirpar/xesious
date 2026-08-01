@@ -1,0 +1,5 @@
+# Tier 3 staging driver — a Telegram USER client (not a bot) that drives the
+# staging bridge over real Telegram. Install into a venv:
+#   python3 -m venv test/staging/.venv && . test/staging/.venv/bin/activate
+#   pip install -r test/staging/requirements.txt
+telethon>=1.36,<2

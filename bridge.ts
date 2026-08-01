@@ -57,7 +57,10 @@ function loadDotenv(path: string): void {
     if (process.env[key] === undefined) process.env[key] = val
   }
 }
-loadDotenv(join(HERE, '.env'))
+// Defaults to the sibling .env. An isolated instance (e.g. the Tier 3 staging
+// harness) can point this elsewhere — or at /dev/null — so it never inherits the
+// production .env. Bun's own auto-load is disabled separately via --env-file.
+loadDotenv(process.env.TG_ENV_FILE || join(HERE, '.env'))
 
 function requireEnv(name: string): string {
   const v = process.env[name]

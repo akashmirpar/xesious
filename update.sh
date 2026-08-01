@@ -51,6 +51,18 @@ say "typechecking…"
 bun build bridge.ts --target=node >/dev/null 2>/tmp/update-build.err || {
   fail "bridge.ts does not compile — NOT restarting. Nothing changed."; cat /tmp/update-build.err >&2; exit 1; }
 
+# 2b. Run the test suite BEFORE touching the running bot. This is the regression
+#     gate: a change that breaks any tested feature stops the deploy here, with the
+#     bot still happily running the old code. --env-file=/dev/null keeps it hermetic
+#     (never loads the production .env). Set UPDATE_SKIP_TESTS=1 to bypass in a pinch.
+if [ "${UPDATE_SKIP_TESTS:-0}" = 1 ]; then
+  say "SKIPPING tests (UPDATE_SKIP_TESTS=1)"
+else
+  say "running tests…"
+  bun --env-file=/dev/null test >/tmp/update-test.err 2>&1 || {
+    fail "tests failed — NOT restarting. Nothing changed. See below:"; tail -40 /tmp/update-test.err >&2; exit 1; }
+fi
+
 # 3. Snapshot the exact file we're replacing, so rollback is a copy, not a git guess
 #    (the working tree may hold edits that were never committed).
 BAK="$(mktemp -d /tmp/bridge-bak-XXXX)"; cp bridge.ts "$BAK/bridge.ts"
