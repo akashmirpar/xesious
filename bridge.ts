@@ -92,7 +92,9 @@ const OUTBOX_DIR = 'outbox'  // anything Claude drops here is delivered, then ar
 const TELEGRAM_PROFILE = process.env.TG_PROFILE ?? [
   "You are replying through a Telegram bridge on the user's phone, not in an IDE. Every turn:",
   '- Be concise and phone-first: short messages, short paragraphs, minimal preamble.',
-  '- Write in your normal markdown; the bridge encodes it for Telegram (tables become aligned code blocks, headings become bold). Just keep code fences balanced.',
+  '- Write in your normal markdown; Telegram renders it natively: real headings, lists, tables, code blocks.',
+  '- LaTeX renders too: $x^2$ inline and $$...$$ on its own line. Also available: ==marked==, ||spoiler||, - [ ] task lists, footnotes[^1].',
+  '- Tables render as real tables, so use one whenever data has columns. Cap it at 20 columns; keep cells short so they fit a phone screen.',
   '- If a request is ambiguous or needs a decision, ask one clarifying question and stop.',
   '- Assume no editor or file selection is open. Ignore any IDE/editor framing from earlier in this conversation; the user is in a chat.',
   `- Files the user sends are saved in ./${INBOX_DIR}/. To send a file back, put it in ./${OUTBOX_DIR}/ and it is delivered then cleared.`,
@@ -176,7 +178,7 @@ const INTERRUPT_DEFAULT = /^(1|true|yes)$/i.test(process.env.TG_INTERRUPT || '')
 type Entry = { sessionId?: string; prevSessionId?: string; cwd: string; updated?: string }
 let sessions: Record<string, Entry> = {}
 let names: Record<string, string> = {}
-// "💭 thinking…" status messages for in-flight runs. If the process is killed
+// "💭 Thinking…" status messages for in-flight runs. If the process is killed
 // before a run finishes (e.g. a restart), the next startup deletes these so no
 // orphaned status message is left dangling in a topic.
 let pending: { chat: number; id: number }[] = []
@@ -363,7 +365,9 @@ function voiceEnv(): NodeJS.ProcessEnv {
 // generic — "running a command" doesn't say which — so the detail carries the
 // substance and the renderer collapses it behind an expandable quote.
 // Set TG_PROGRESS_DETAIL=0 to drop the detail and keep the terse labels only.
-type Step = { label: string; detail?: string }
+// kind steers how the detail is rendered: a URL becomes a tappable link and a todo
+// list becomes real checkboxes, while everything else is quoted verbatim.
+type Step = { label: string; detail?: string; kind?: 'link' | 'todo' }
 
 function toolStep(b: any): Step {
   const n = b?.name || 'tool'
@@ -378,12 +382,16 @@ function toolStep(b: any): Step {
     case 'Glob': case 'Grep':
       return { label: '🔎 Searching the code', detail: [i.pattern, i.path].filter(Boolean).join('  in  ') || undefined }
     case 'WebFetch': case 'WebSearch':
-      return { label: '🌐 Looking something up', detail: str(i.url ?? i.query ?? i.prompt) }
+      return { label: '🌐 Looking something up', detail: str(i.url ?? i.query ?? i.prompt), kind: i.url ? 'link' : undefined }
     case 'Agent': case 'Task':
       return { label: '🤖 Running a subagent', detail: str(i.description ?? i.prompt) }
     case 'TodoWrite': {
-      const todos = Array.isArray(i.todos) ? i.todos.map((t: any) => `• ${t?.content ?? t}`).join('\n') : undefined
-      return { label: '📝 Planning', detail: todos }
+      // Carry each item's status through as a checkbox marker — the renderer turns
+      // it into a real task list, so the step shows progress and not just a list.
+      const todos = Array.isArray(i.todos)
+        ? i.todos.map((t: any) => `[${t?.status === 'completed' ? 'x' : ' '}] ${t?.content ?? t}`).join('\n')
+        : undefined
+      return { label: '📝 Planning', detail: todos, kind: todos ? 'todo' : undefined }
     }
     default: return { label: `⚙️ ${n}`, detail: str(i.command ?? i.file_path ?? i.pattern) }
   }
@@ -391,19 +399,70 @@ function toolStep(b: any): Step {
 
 const escapeHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
-// Render the step list for the live status message as HTML: bold label, and the
-// detail tucked into a collapsed expandable quote so the topic stays scannable
-// but the actual attempt is one tap away.
-const DETAIL_MAX = 250
-function renderSteps(steps: Step[]): string {
-  return steps.map(s => {
+// Rich markdown parses both markdown and arbitrary inline HTML, so raw tool output
+// has to be neutralised on both fronts before it can be quoted back: HTML entities
+// for the tag characters, backslashes for the markdown punctuation.
+const escapeRich = (s: string) => s
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/([\\`*_~=|#\[\]()!$^+-])/g, '\\$1')
+
+// A rich message holds 32768 characters, so a detail no longer has to be cut to a
+// single line the way it did when every step shared one HTML message.
+const DETAIL_MAX = 1200
+const clip = (d: string) => (d.length > DETAIL_MAX ? `${d.slice(0, DETAIL_MAX)}…` : d)
+
+// Each step gets its own collapsed <details>: the summary is the step label, so the
+// topic still reads as a plain list of what ran, and the arguments or the reasoning
+// behind any one of them are a single tap away without expanding the rest.
+// Markdown folds consecutive lines into one paragraph, which would run a todo list
+// or a wrapped thought together; ending each line with two spaces is the GFM hard
+// break, keeping the original lines without opening a paragraph gap between them.
+// Commands, paths and patterns are quoted rather than set in monospace: the quote
+// already marks them as machine text, and mixing fonts inside a paragraph is what
+// makes Telegram's line spacing ripple (see the note on needsRich).
+// Takes the detail UNCLIPPED: a link's target has to stay whole, because clipping a
+// URL yields one that still looks like a URL and silently goes to the wrong place.
+// Only the visible text is shortened; every other kind is clipped as usual.
+function renderDetail(s: Step, raw: string): string {
+  if (s.kind === 'todo') {
+    return clip(raw).split('\n').map(l => {
+      const m = l.match(/^\[([ xX])\]\s*(.*)$/)
+      return m ? `- [${m[1].trim() ? 'x' : ' '}] ${escapeRich(m[2])}` : `- [ ] ${escapeRich(l)}`
+    }).join('\n')
+  }
+  // A ')' would close the markdown link early, so anything odd stays a plain quote.
+  if (s.kind === 'link' && /^https?:\/\/\S+$/.test(raw) && !raw.includes(')')) {
+    return `[${escapeRich(raw.length > 60 ? `${raw.slice(0, 57)}…` : raw)}](${raw})`
+  }
+  return '> ' + escapeRich(clip(raw)).split('\n').map(l => l.trim()).filter(Boolean).join('  \n> ')
+}
+
+// The run's headline. It stays at the top for the whole run and the steps append
+// under it, so an update adds to the status instead of replacing what was there.
+const THINKING = '💭 Thinking…'
+
+function renderSteps(steps: Step[], total: number): string {
+  const parts = steps.map(s => {
+    const label = escapeRich(s.label)
+    const d = PROGRESS_DETAIL ? (s.detail ?? '').trim() : ''
+    if (!d) return `**${label}**`
+    return `<details><summary>${label}</summary>\n\n${renderDetail(s, d)}\n\n</details>`
+  })
+  // Trimming the oldest steps must not silently shrink the run's history.
+  const hidden = total - steps.length
+  if (hidden > 0) parts.unshift(`_+${hidden} earlier step${hidden === 1 ? '' : 's'}_`)
+  return [escapeRich(THINKING), ...parts].join('\n\n')
+}
+
+// The pre-10.1 rendering, kept as the fallback: one expandable quote per step.
+function renderStepsHtml(steps: Step[]): string {
+  return [escapeHtml(THINKING), ...steps.map(s => {
     const label = `<b>${escapeHtml(s.label)}</b>`
     if (!PROGRESS_DETAIL || !s.detail) return label
     const d = s.detail.trim()
     if (!d) return label
-    const clipped = d.length > DETAIL_MAX ? `${d.slice(0, DETAIL_MAX)}…` : d
-    return `${label}\n<blockquote expandable>${escapeHtml(clipped)}</blockquote>`
-  }).join('\n')
+    return `${label}\n<blockquote expandable>${escapeHtml(clip(d))}</blockquote>`
+  })].join('\n')
 }
 
 // Run a prompt with streaming output, editing a single "status" message in the
@@ -417,7 +476,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   const opts: any = threadId ? { message_thread_id: threadId } : {}
   // Status is machine chatter, not an answer — post and edit it silently so only
   // the real reply buzzes the user's phone.
-  const status = await ctx.api.sendMessage(ctx.chat!.id, '💭 thinking…', { ...opts, disable_notification: true }).catch(() => null)
+  const status = await ctx.api.sendMessage(ctx.chat!.id, THINKING, { ...opts, disable_notification: true }).catch(() => null)
   if (status) { pending.push({ chat: ctx.chat!.id, id: status.message_id }); saveState() }
   const steps: Step[] = []
   let lastEdit = 0, dirty = false
@@ -427,20 +486,25 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     if (!force && now - lastEdit < 4000) return
     lastEdit = now; dirty = false
     if (!steps.length) {
-      await ctx.api.editMessageText(ctx.chat!.id, status.message_id, '💭 thinking…').catch(() => {})
+      await ctx.api.editMessageText(ctx.chat!.id, status.message_id, THINKING).catch(() => {})
       return
     }
-    // Trim from the oldest until the HTML body fits: slicing a rendered string
-    // mid-tag would break the parse and lose the whole update.
-    let shown = steps.slice(-9)
-    let body = renderSteps(shown)
-    while (body.length > 3500 && shown.length > 1) { shown = shown.slice(1); body = renderSteps(shown) }
+    // Trim from the oldest until the body fits: slicing a rendered string mid-tag
+    // would break the parse and lose the whole update. The summary still counts
+    // every step, so trimming never misreports how much work was done.
+    let shown = steps.slice(-12)
+    let body = renderSteps(shown, steps.length)
+    while (body.length > 15000 && shown.length > 1) { shown = shown.slice(1); body = renderSteps(shown, steps.length) }
     try {
-      await ctx.api.editMessageText(ctx.chat!.id, status.message_id, body, { parse_mode: 'HTML' })
+      await ctx.api.raw.editMessageText({ chat_id: ctx.chat!.id, message_id: status.message_id, rich_message: { markdown: body } })
     } catch {
       // Same posture as sendRich: formatting is best-effort, the update is not.
-      const plain = shown.map(s => s.label).join('\n').slice(0, 3500)
-      await ctx.api.editMessageText(ctx.chat!.id, status.message_id, plain).catch(() => {})
+      try {
+        await ctx.api.editMessageText(ctx.chat!.id, status.message_id, renderStepsHtml(shown), { parse_mode: 'HTML' })
+      } catch {
+        const plain = [THINKING, ...shown.map(s => s.label)].join('\n').slice(0, 3500)
+        await ctx.api.editMessageText(ctx.chat!.id, status.message_id, plain).catch(() => {})
+      }
     }
   }
   const ticker = setInterval(() => void editStatus(), 4000)
@@ -505,19 +569,23 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
 // ---------------------------------------------------------------------------
 
 const MAX = 4000
-// Split into <=MAX-char messages WITHOUT breaking a code block: if a ``` fence is
+// A rich message holds far more than a plain one (32768 chars, 500 blocks), so it
+// is chunked much less often — which matters because a split mid-table would cut
+// the table in half.
+const RICH_MAX = 30000
+// Split into <=max-char messages WITHOUT breaking a code block: if a ``` fence is
 // still open at a chunk boundary, close it here and reopen it in the next chunk,
 // so telegramify never sees an unbalanced fence (the main cause of broken renders).
-function chunk(text: string): string[] {
+function chunk(text: string, max = MAX): string[] {
   const chunks: string[] = []
   let cur: string[] = []
   let len = 0
   let inFence = false
   const push = () => { chunks.push(cur.join('\n') + (inFence ? '\n```' : '')); cur = inFence ? ['```'] : []; len = inFence ? 4 : 0 }
   for (const raw of text.split('\n')) {
-    const pieces = raw.length > MAX ? (raw.match(new RegExp(`.{1,${MAX}}`, 'g')) || [raw]) : [raw]
+    const pieces = raw.length > max ? (raw.match(new RegExp(`.{1,${max}}`, 'g')) || [raw]) : [raw]
     for (const line of pieces) {
-      if (len + line.length + 1 > MAX && cur.length) push()
+      if (len + line.length + 1 > max && cur.length) push()
       if (/^\s*```/.test(line)) inFence = !inFence
       cur.push(line); len += line.length + 1
     }
@@ -554,7 +622,9 @@ async function send(ctx: Context, threadId: number | undefined, text: string, qu
 // encodes it for Telegram.
 function mdTablesToCode(text: string): string {
   const lines = text.split('\n')
-  const isSep = (l: string) => l.includes('|') && /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(l)
+  // Same rule as the table detector above: the delimiter row must carry a pipe, or
+  // a "---" setext underline turns the prose above it into a code block.
+  const isSep = (l: string) => l.includes('|') && /^[ \t:|-]*-[ \t:|-]*$/.test(l)
   const cells = (l: string) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim())
   const out: string[] = []
   let i = 0
@@ -574,17 +644,115 @@ function mdTablesToCode(text: string): string {
   return out.join('\n')
 }
 
-// Send Claude's answer with Telegram markdown rendering (code blocks, bold,
-// lists, links). Tables are converted to aligned code blocks first; if MarkdownV2
-// still fails to parse we resend that chunk as plain text — formatting is
-// best-effort, delivery is guaranteed.
-async function sendRich(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
-  const opts: any = threadId ? { message_thread_id: threadId } : {}
+// The MarkdownV2 path. This is the DEFAULT for ordinary prose, not a fallback —
+// see the note on needsRich. Tables have no MarkdownV2 equivalent, so they are
+// flattened to aligned code blocks first, and a chunk Telegram still refuses to
+// parse is resent as plain text.
+async function sendLegacyMd(ctx: Context, opts: any, text: string): Promise<void> {
   for (const part of chunk(mdTablesToCode(text))) {
     try {
       await ctx.api.sendMessage(ctx.chat!.id, telegramify(part, 'escape'), { ...opts, parse_mode: 'MarkdownV2' })
     } catch {
       await ctx.api.sendMessage(ctx.chat!.id, stripMd(part), opts).catch(e => console.error(`[warn] sendMessage: ${e}`))
+    }
+  }
+}
+
+// TEMPORARY — REMOVE WHEN TELEGRAM FIXES THE BUGS BELOW.
+//
+// A rich message renders its plain paragraphs in a different font and line height
+// from every other message in the chat, so a thread that mixes the two looks
+// inconsistent, and rich text is broken outright for right-to-left scripts:
+//   https://bugs.telegram.org/c/63677  taller bubbles / extra line spacing than the
+//     same text sent normally (Desktop + iOS). CLOSED 2026-07-16 with no explanation
+//     and no fix — so do NOT read "closed" here as "safe to remove this workaround".
+//   https://bugs.telegram.org/c/62776  iOS ignores the user's Settings > Appearance
+//     text size for rich text, plus odd padding and line spacing. Open.
+//   https://bugs.telegram.org/c/62877  RTL (Persian/Arabic): table alignment breaks
+//     and list bullets sit on the wrong side, on Android but not Desktop. Open.
+// Verified here 2026-08-01: the SAME unformatted sentence sent through
+// sendRichMessage and through sendMessage came back visibly different.
+//
+// So rich is spent only where it buys something MarkdownV2 genuinely cannot
+// express — a table, a collapsible, a formula, a task list, a footnote, a spoiler.
+// Ordinary prose, bold, italic, links, quotes, bullet lists and code blocks all
+// render fine the old way and now stay there; so do headings, which MarkdownV2
+// turns into bold. Once the rendering is consistent, delete needsRich/hasRtl and
+// send everything as rich again.
+//
+// Detectors run on the text with code stripped out: a shell snippet is full of
+// pipes and dollar signs, and matching those would send every command to the rich
+// path for a table and a formula that aren't there.
+const stripCode = (s: string) => s.replace(/```[\s\S]*?```/g, '').replace(/`[^`\n]+`/g, '')
+const RICH_ONLY = [
+  // Table: a header line, then a delimiter row on the VERY next line that itself
+  // contains a pipe. Both conditions matter — GFM breaks a table at a blank line,
+  // and a bare "---" under a line that merely happens to contain a pipe is a setext
+  // heading, not a table. Telegram agrees: it parses that as a heading.
+  /^[^\n]*\|[^\n]*\n(?=[^\n]*\|)[ \t:|-]*-[ \t:|-]*$/m,
+  /<details|<summary|<tg-/i,                            // collapsible and custom blocks
+  /\$\$[\s\S]+?\$\$|```math/,                           // display formula
+  /\$[^$\n]*[\\^_{}][^$\n]*\$/,                         // inline formula (LaTeX-ish, not "$5")
+  /^\s*[-*+]\s+\[[ xX]\]\s/m,                           // task list (MarkdownV2 drops the checkbox)
+  /^\s*\[\^[^\]]+\]:/m,                                 // footnote definition
+  /==[^=\n]+==|\|\|[^|\n]+\|\||<sub>|<sup>/i,           // marked, spoiler, sub/sup
+]
+const needsRich = (s: string) => { const t = stripCode(s); return RICH_ONLY.some(re => re.test(t)) }
+// Rich text mis-orders right-to-left scripts, so never use it for them. The last
+// range stops at FEFC, the final Arabic presentation form: FEFF is the byte order
+// mark, and a stray BOM in quoted text is not a reason to reformat the message.
+const hasRtl = (s: string) => /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFC]/.test(s)
+
+// A rich message reads $...$ as inline LaTeX, and it pairs the dollars line by
+// line — so a sentence carrying two prices ("the $390B figure … a ~$5B/year
+// business") renders everything between them as an unreadable formula, and eats
+// the markdown in there with it. The money isn't what sent the message down this
+// path: one table or task list anywhere in the answer drags every dollar sign in
+// it along, so the escaping has to happen here and not in needsRich.
+//
+// Same test as the inline-formula detector: a span holding LaTeX punctuation is a
+// formula and is left alone, anything else is money and gets its opening dollar
+// escaped. Escaping only the opener matters — it leaves that dollar's partner free
+// to open a real formula later on the line, so "costs $5 and $x^2$" keeps both.
+const LATEXISH = /[\\^_{}]/
+function escapeMoneyLine(line: string): string {
+  let out = '', i = 0
+  while (i < line.length) {
+    const open = line.indexOf('$', i)
+    if (open < 0) { out += line.slice(i); break }
+    if (line[open - 1] === '\\') { out += line.slice(i, open + 1); i = open + 1; continue }
+    const close = line.indexOf('$', open + 1)
+    if (close > 0 && LATEXISH.test(line.slice(open + 1, close))) {
+      out += line.slice(i, close + 1); i = close + 1        // a formula — leave it whole
+    } else {
+      out += line.slice(i, open) + '\\$'; i = open + 1      // money
+    }
+  }
+  return out
+}
+// Code keeps its dollars: Telegram doesn't parse math inside a fence or a code
+// span, and "\$HOME" in a shell snippet would be wrong to copy out. $$…$$ display
+// math is passed through for the same reason the inline formulas are.
+export function escapeMoneyDollars(text: string): string {
+  return text
+    .split(/(```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$)/)
+    .map((seg, i) => (i % 2 ? seg : seg.split('\n').map(escapeMoneyLine).join('\n')))
+    .join('')
+}
+
+// Send Claude's answer, as a Bot API 10.1 rich message when the content actually
+// needs one. Rich markdown is the dialect the agent already writes, so apart from
+// the dollars above no escaping pass is needed. If the call fails we drop to the
+// MarkdownV2 path — formatting is best-effort, delivery is guaranteed.
+async function sendRich(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
+  const opts: any = threadId ? { message_thread_id: threadId } : {}
+  for (const part of chunk(text, RICH_MAX)) {
+    if (!needsRich(part) || hasRtl(part)) { await sendLegacyMd(ctx, opts, part); continue }
+    try {
+      await ctx.api.sendRichMessage(ctx.chat!.id, { markdown: escapeMoneyDollars(part) }, opts)
+    } catch (e) {
+      console.error(`[warn] sendRichMessage, falling back to MarkdownV2: ${e}`)
+      await sendLegacyMd(ctx, opts, part)
     }
   }
 }
@@ -1461,7 +1629,7 @@ async function main() {
   // we don't reprocess old messages on startup.
   await bot.api.deleteWebhook({ drop_pending_updates: true }).catch(() => {})
 
-  // Delete any "💭 thinking…" status messages orphaned by a restart that killed
+  // Delete any "💭 Thinking…" status messages orphaned by a restart that killed
   // a run mid-flight, so no dangling status is left in a topic.
   if (pending.length) {
     for (const p of pending) await bot.api.deleteMessage(p.chat, p.id).catch(() => {})
@@ -1493,4 +1661,5 @@ async function main() {
     }
   }
 }
-main().catch(e => { console.error(`[fatal] ${e}`); process.exit(1) })
+// Guarded so the module can be imported by a test without starting a poller.
+if (import.meta.main) main().catch(e => { console.error(`[fatal] ${e}`); process.exit(1) })
