@@ -703,16 +703,53 @@ const needsRich = (s: string) => { const t = stripCode(s); return RICH_ONLY.some
 // mark, and a stray BOM in quoted text is not a reason to reformat the message.
 const hasRtl = (s: string) => /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFC]/.test(s)
 
+// A rich message reads $...$ as inline LaTeX, and it pairs the dollars line by
+// line — so a sentence carrying two prices ("the $390B figure … a ~$5B/year
+// business") renders everything between them as an unreadable formula, and eats
+// the markdown in there with it. The money isn't what sent the message down this
+// path: one table or task list anywhere in the answer drags every dollar sign in
+// it along, so the escaping has to happen here and not in needsRich.
+//
+// Same test as the inline-formula detector: a span holding LaTeX punctuation is a
+// formula and is left alone, anything else is money and gets its opening dollar
+// escaped. Escaping only the opener matters — it leaves that dollar's partner free
+// to open a real formula later on the line, so "costs $5 and $x^2$" keeps both.
+const LATEXISH = /[\\^_{}]/
+function escapeMoneyLine(line: string): string {
+  let out = '', i = 0
+  while (i < line.length) {
+    const open = line.indexOf('$', i)
+    if (open < 0) { out += line.slice(i); break }
+    if (line[open - 1] === '\\') { out += line.slice(i, open + 1); i = open + 1; continue }
+    const close = line.indexOf('$', open + 1)
+    if (close > 0 && LATEXISH.test(line.slice(open + 1, close))) {
+      out += line.slice(i, close + 1); i = close + 1        // a formula — leave it whole
+    } else {
+      out += line.slice(i, open) + '\\$'; i = open + 1      // money
+    }
+  }
+  return out
+}
+// Code keeps its dollars: Telegram doesn't parse math inside a fence or a code
+// span, and "\$HOME" in a shell snippet would be wrong to copy out. $$…$$ display
+// math is passed through for the same reason the inline formulas are.
+export function escapeMoneyDollars(text: string): string {
+  return text
+    .split(/(```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$)/)
+    .map((seg, i) => (i % 2 ? seg : seg.split('\n').map(escapeMoneyLine).join('\n')))
+    .join('')
+}
+
 // Send Claude's answer, as a Bot API 10.1 rich message when the content actually
-// needs one. Rich markdown is the dialect the agent already writes, so no escaping
-// pass is needed. If the call fails we drop to the MarkdownV2 path — formatting is
-// best-effort, delivery is guaranteed.
+// needs one. Rich markdown is the dialect the agent already writes, so apart from
+// the dollars above no escaping pass is needed. If the call fails we drop to the
+// MarkdownV2 path — formatting is best-effort, delivery is guaranteed.
 async function sendRich(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
   const opts: any = threadId ? { message_thread_id: threadId } : {}
   for (const part of chunk(text, RICH_MAX)) {
     if (!needsRich(part) || hasRtl(part)) { await sendLegacyMd(ctx, opts, part); continue }
     try {
-      await ctx.api.sendRichMessage(ctx.chat!.id, { markdown: part }, opts)
+      await ctx.api.sendRichMessage(ctx.chat!.id, { markdown: escapeMoneyDollars(part) }, opts)
     } catch (e) {
       console.error(`[warn] sendRichMessage, falling back to MarkdownV2: ${e}`)
       await sendLegacyMd(ctx, opts, part)
@@ -1624,4 +1661,5 @@ async function main() {
     }
   }
 }
-main().catch(e => { console.error(`[fatal] ${e}`); process.exit(1) })
+// Guarded so the module can be imported by a test without starting a poller.
+if (import.meta.main) main().catch(e => { console.error(`[fatal] ${e}`); process.exit(1) })
