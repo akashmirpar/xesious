@@ -288,6 +288,46 @@ export function escapeMoneyDollars(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// polling conflicts (409)
+// ---------------------------------------------------------------------------
+
+// What to say when Telegram answers getUpdates with 409 — it has another open
+// getUpdates for this token. Pure, so the wording is testable rather than being
+// strings only a human can audit.
+//
+// The distinction this exists to draw only became available once the bridge takes
+// a token lock at startup. Before that, every 409 got one generic guess. Now:
+//
+//   * Early conflicts are almost certainly THIS deployment's own previous poll. A
+//     bridge that exits leaves its long-poll reserved server-side for ~30s, so a
+//     restart routinely meets its own ghost. Waiting past the reservation clears
+//     it, which is why this path self-heals instead of crash-looping.
+//   * Once we have waited well past that window and are still being terminated, a
+//     ghost no longer explains it. We hold the token lock, and the lock is scoped
+//     per user and per token — so no bridge of THIS user on THIS machine can be
+//     polling. That leaves exactly what the lock cannot see: the same token running
+//     as another user on this box, or on another machine entirely.
+//
+// Both cases keep retrying, because either clears the moment the other side stops.
+// Only the diagnosis changes, and it changes what a human should do about it.
+export function conflictAdvice(n: number, opts: { ghostLimit: number; waitMs: number }): string[] {
+  const secs = Math.round(opts.waitMs / 1000)
+  if (n <= opts.ghostLimit) {
+    return [`409 conflict (#${n}) — most likely this deployment's own previous poll, ` +
+            `still reserved server-side for ~30s after a restart. Waiting ${secs}s for it to expire…`]
+  }
+  const waited = Math.round((n * opts.waitMs) / 1000)
+  return [
+    `409 conflict (#${n}) — a lingering poll of our own no longer explains this: ` +
+      `we have waited about ${waited}s, well past the ~30s reservation.`,
+    `we hold this token's lock, so no bridge of this user on this machine is polling it. ` +
+      `That leaves the same TELEGRAM_BOT_TOKEN running as ANOTHER USER on this box, or on another machine.`,
+    `still retrying every ${secs}s — this clears by itself once that instance stops. ` +
+      `To fix it: stop that instance, or give this deployment its own token.`,
+  ]
+}
+
+// ---------------------------------------------------------------------------
 // stream-json parsing
 // ---------------------------------------------------------------------------
 

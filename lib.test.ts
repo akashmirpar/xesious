@@ -12,7 +12,7 @@ import {
   allowedModes, normalizeMode, permissionArgs,
   normalizeModel, MODEL_DEFAULT,
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
-  needsRich, hasRtl, escapeMoneyDollars,
+  needsRich, hasRtl, escapeMoneyDollars, conflictAdvice,
 } from './lib'
 
 describe('parseIdList', () => {
@@ -390,5 +390,48 @@ describe('escapeMoneyDollars', () => {
   test('text with no dollars is returned untouched', () => {
     const src = '# Heading\n\n- [x] done\n\n> quote\n'
     expect(escapeMoneyDollars(src)).toBe(src)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// polling conflicts
+// ---------------------------------------------------------------------------
+
+describe('conflictAdvice', () => {
+  const opts = { ghostLimit: 2, waitMs: 40_000 }
+  const joined = (n: number) => conflictAdvice(n, opts).join(' ')
+
+  test('an early conflict is blamed on our own expiring poll', () => {
+    for (const n of [1, 2]) {
+      expect(joined(n)).toMatch(/own previous poll/i)
+      expect(joined(n)).toContain('~30s')
+      expect(conflictAdvice(n, opts)).toHaveLength(1)   // one line; this is routine
+    }
+  })
+  test('past the reservation window it stops blaming a ghost', () => {
+    const t = joined(3)
+    expect(t).not.toMatch(/own previous poll/i)
+    expect(t).toMatch(/no longer explains/i)
+  })
+  test('and it names what the token lock cannot see', () => {
+    const t = joined(3)
+    // The lock is per user and per machine, so these are the only cases left —
+    // saying so is the whole point of distinguishing the two.
+    expect(t).toMatch(/another user/i)
+    expect(t).toMatch(/another machine/i)
+    expect(t).toMatch(/we hold this token's lock/i)
+  })
+  test('it always says it keeps retrying, and how to actually fix it', () => {
+    expect(joined(5)).toMatch(/still retrying/i)
+    expect(joined(5)).toMatch(/its own token/i)
+  })
+  test('the wait and the elapsed total are reported in seconds, not milliseconds', () => {
+    expect(joined(1)).toContain('40s')
+    expect(joined(3)).toContain('120s')          // 3 rounds x 40s
+    expect(joined(3)).not.toContain('40000')
+  })
+  test('ghostLimit is honoured as given', () => {
+    expect(conflictAdvice(1, { ghostLimit: 0, waitMs: 40_000 }).join(' ')).toMatch(/no longer explains/i)
+    expect(conflictAdvice(9, { ghostLimit: 99, waitMs: 40_000 }).join(' ')).toMatch(/own previous poll/i)
   })
 })

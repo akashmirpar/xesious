@@ -30,7 +30,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import {
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
-  parseStreamLine, type Step, THINKING,
+  parseStreamLine, type Step, THINKING, conflictAdvice,
   needsRich, hasRtl, escapeMoneyDollars,
   normalizeMode as libNormalizeMode,
   permissionArgs as libPermissionArgs,
@@ -91,6 +91,12 @@ const CLAUDE_TIMEOUT_MS = Number(process.env.TG_CLAUDE_TIMEOUT_MS || 30 * 60 * 1
 // backstop for a SIGTERM that lands mid-run — and for the hung-child case, where
 // the child never exits at all.
 const DRAIN_MAX_MS = Number(process.env.TG_DRAIN_MAX_MS || 5 * 60 * 1000)
+
+// How long to wait out a polling 409, and how many rounds may still be blamed on
+// our own expiring long-poll. 40s clears the ~30s server-side reservation; two
+// rounds is 80s, comfortably past it, so anything beyond that is a real rival.
+const CONFLICT_WAIT_MS = 40_000
+const GHOST_CONFLICTS = 2
 const ALLOWED_USERS = parseIdList(process.env.TG_ALLOWED_USERS)
 // See isAllowed(): trust every member of an allowlisted group instead of listing
 // users. Off by default — it widens authorization to whoever is in that group.
@@ -1603,7 +1609,12 @@ async function main() {
   // restart is the PREVIOUS process's long-poll still reserved server-side
   // (~30s). So on 409 we wait it out and resume — this self-heals the cycle
   // instead of crash-looping. A genuine second poller just keeps it waiting.
+  //
+  // Since we now hold a token lock, the two causes can be told apart after a few
+  // rounds: see conflictAdvice() in ./lib for which is which and why the advice
+  // differs. Retrying is correct either way, so only the diagnosis changes.
   let handle: RunnerHandle | undefined
+  let conflicts = 0
 
   // Graceful drain. The previous handler stopped polling and then exited at once,
   // which abandoned every in-flight `claude` child and threw away replies that had
@@ -1653,8 +1664,17 @@ async function main() {
     } catch (e: any) {
       if (!(e?.error_code === 409 || String(e).includes('409'))) throw e
       try { await handle.stop() } catch {}
-      console.error('[warn] 409 conflict — likely a prior instance’s lingering poll. Waiting 40s to clear, then resuming…')
-      await new Promise(r => setTimeout(r, 40000))
+      conflicts++
+      // Print the full explanation once, when the diagnosis actually changes, then
+      // stay terse — this loop can run for hours and the log has other readers.
+      if (conflicts <= GHOST_CONFLICTS || conflicts === GHOST_CONFLICTS + 1) {
+        for (const line of conflictAdvice(conflicts, { ghostLimit: GHOST_CONFLICTS, waitMs: CONFLICT_WAIT_MS })) {
+          console.error(`[warn] ${line}`)
+        }
+      } else {
+        console.error(`[warn] 409 conflict (#${conflicts}) — still held by an instance outside this user/machine; retrying`)
+      }
+      await new Promise(r => setTimeout(r, CONFLICT_WAIT_MS))
     }
   }
 }
