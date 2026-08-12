@@ -287,3 +287,72 @@ describe('startup mutex (otherLiveBridge)', () => {
     clear()
   })
 })
+
+describe('token lock (one poller per bot token)', () => {
+  // The per-deployment pidfile cannot see a second checkout sharing a token —
+  // verified by running two, where one sat in the 409 retry loop while the other
+  // polled. These pin the rules that decide whether a bridge may start, and the
+  // bias is deliberate: anything unprovable must read as "no holder", because a
+  // lock we wrongly think is held keeps the bot DOWN, which is worse than a 409.
+  const tmpLock = join(TMP, 'lock')
+  const write = (rec: any) => writeFileSync(tmpLock, typeof rec === 'string' ? rec : JSON.stringify(rec))
+
+  test('keyed by the full sha256 of the token, never the token itself', () => {
+    const a = bridge._tokenLockPath('111:aaa')
+    const b = bridge._tokenLockPath('222:bbb')
+    expect(a).not.toBe(b)
+    expect(bridge._tokenLockPath('111:aaa')).toBe(a)           // deterministic
+    expect(a.split('/').pop()).toMatch(/^[0-9a-f]{64}$/)       // full digest, not a prefix
+    expect(a).not.toContain('111:aaa')                         // the secret never lands on disk
+  })
+
+  test('missing, malformed, dead and foreign records all read as no holder', () => {
+    expect(bridge._lockHolder(join(TMP, 'does-not-exist'))).toBeUndefined()
+    for (const junk of ['', 'not json', '{}', '{"pid":0,"cwd":"/"}', '{"pid":-1,"cwd":"/"}', '{"pid":7}']) {
+      write(junk)
+      expect(bridge._lockHolder(tmpLock)).toBeUndefined()
+    }
+    write({ pid: 999999, cwd: process.cwd(), started: '1' })    // dead pid
+    expect(bridge._lockHolder(tmpLock)).toBeUndefined()
+    write({ pid: 1, cwd: '/', started: '1' })                   // root's init
+    expect(bridge._lockHolder(tmpLock)).toBeUndefined()
+    write({ pid: process.pid, cwd: process.cwd(), started: bridge._procStartTime(process.pid) })
+    expect(bridge._lockHolder(tmpLock)).toBeUndefined()         // never our own rival
+  })
+
+  test('a real live bun IS a holder, but only when cwd and start-time both match', async () => {
+    // A genuine second bun of ours, so the positive path is exercised against a
+    // real process rather than a fixture.
+    const child = Bun.spawn(['bun', '-e', 'setTimeout(() => {}, 60000)'], { cwd: process.cwd(), stdout: 'ignore', stderr: 'ignore' })
+    try {
+      await new Promise(r => setTimeout(r, 400))
+      const started = bridge._procStartTime(child.pid)
+      expect(started).toBeTruthy()
+
+      write({ pid: child.pid, cwd: process.cwd(), started })
+      expect(bridge._lockHolder(tmpLock)?.pid).toBe(child.pid)  // held
+
+      // A recycled pid would present as a live bun of ours with a DIFFERENT cwd or
+      // start time. Either mismatch must release the lock rather than keep the bot
+      // down waiting on a process that is not the one that took it.
+      write({ pid: child.pid, cwd: '/nowhere', started })
+      expect(bridge._lockHolder(tmpLock)).toBeUndefined()
+      write({ pid: child.pid, cwd: process.cwd(), started: '999999999' })
+      expect(bridge._lockHolder(tmpLock)).toBeUndefined()
+    } finally {
+      child.kill()
+      await child.exited
+    }
+  }, 10000)
+
+  test('a dead holder releases the lock (SIGKILL leaves a stale record)', async () => {
+    const child = Bun.spawn(['bun', '-e', 'setTimeout(() => {}, 60000)'], { cwd: process.cwd(), stdout: 'ignore', stderr: 'ignore' })
+    await new Promise(r => setTimeout(r, 400))
+    write({ pid: child.pid, cwd: process.cwd(), started: bridge._procStartTime(child.pid) })
+    expect(bridge._lockHolder(tmpLock)?.pid).toBe(child.pid)
+    child.kill('SIGKILL')
+    await child.exited
+    await new Promise(r => setTimeout(r, 200))
+    expect(bridge._lockHolder(tmpLock)).toBeUndefined()
+  }, 10000)
+})

@@ -23,6 +23,12 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 BACKOFF="${TG_RESPAWN_BACKOFF:-50}"
+# Exit 3 means another instance holds this bot token. Retrying is still right —
+# it self-heals the moment that instance stops — but at the crash cadence it would
+# reprint the same three fatal lines every 50s forever, which buries anything else
+# in the log. Back off much further for a condition a human has to resolve.
+HELD_BACKOFF="${TG_RESPAWN_HELD_BACKOFF:-300}"
+EXIT_TOKEN_HELD=3
 LOG="bridge.log"
 
 while true; do
@@ -30,6 +36,9 @@ while true; do
   rc=${PIPESTATUS[0]}
   if [ "$rc" = 0 ]; then
     echo "[respawn] clean exit at $(date +%H:%M:%S) — restarting now" | tee -a "$LOG"
+  elif [ "$rc" = "$EXIT_TOKEN_HELD" ]; then
+    echo "[respawn] another instance holds this bot token — retrying in ${HELD_BACKOFF}s" | tee -a "$LOG"
+    sleep "$HELD_BACKOFF"
   else
     echo "[respawn] exited rc=$rc at $(date +%H:%M:%S) — restarting in ${BACKOFF}s" | tee -a "$LOG"
     sleep "$BACKOFF"

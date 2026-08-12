@@ -26,7 +26,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync, copyFileSync, readlinkSync } from 'node:fs'
 import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import {
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
@@ -310,6 +310,99 @@ const PID_FILE = join(dirname(STATE_FILE), 'bridge.pid')
 // proofs lib.sh uses — alive, ours, and in this directory — because a pidfile is
 // only a claim: a SIGKILLed or OOM-killed bridge leaves one behind, and pids get
 // reused. A file that fails any proof is stale and gets overwritten.
+// ---------------------------------------------------------------------------
+// token lock — one poller per bot token
+// ---------------------------------------------------------------------------
+//
+// Telegram permits exactly one open getUpdates per TOKEN, and the 409 it returns
+// is the mild half of the problem. The update queue is server-side and shared per
+// token, and each getUpdates confirms an offset for everything before it, so two
+// pollers consume from the same queue: every message goes to whichever instance
+// happens to be polling at that moment. A conversation silently splits across two
+// processes with different session bindings, working directories and state files.
+//
+// PID_FILE above cannot see that. It is scoped to the state directory, so two
+// checkouts of the same deployment each believe they are alone — verified by
+// running two of them: both started, then one sat in the 40s 409 retry loop while
+// the other polled. The lock therefore has to be keyed on what Telegram actually
+// serialises on: the token.
+//
+// Keyed by the FULL sha256 digest, never the token itself (it is a secret, and it
+// would otherwise appear in a filename). Full digest rather than a short prefix
+// because a collision here would refuse to start an unrelated bot — the opposite
+// trade-off from session names, where a short digest is merely cosmetic.
+//
+// Per-user by construction: the lock lives in $HOME, so it cannot detect the same
+// token being duplicated by a DIFFERENT user. That limit is deliberate — a shared
+// location such as /tmp would let any local user plant a lock and hold this bot
+// down. Nor can it see a bridge on another machine; nothing local could.
+const LOCK_DIR = join(homedir(), '.xesious', 'locks')
+const EXIT_TOKEN_HELD = 3
+const tokenLockPath = (token: string) => join(LOCK_DIR, createHash('sha256').update(token).digest('hex'))
+
+type LockHolder = { pid: number; cwd: string; started: string }
+
+// Field 22 of /proc/<pid>/stat is the process start time. comm (field 2) is
+// parenthesised and may itself contain spaces and parens, so parse from the LAST
+// ')' rather than splitting the whole line.
+function procStartTime(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]
+  } catch { return undefined }
+}
+
+// Who holds this lock — or nobody. Every proof must land, and anything unprovable
+// counts as STALE so we take the lock and accept a possible 409.
+//
+// That direction is deliberate. A 409 is disruptive but partially self-healing; a
+// lock we wrongly believe is held keeps the bot down until a human deletes a file,
+// which is the worse failure. So: a SIGKILLed or OOM-killed holder leaves a record
+// whose pid is gone (stale), and a container where /proc hides the other process
+// reads as stale too — falling back to the old behaviour rather than an outage.
+function lockHolder(path: string): LockHolder | undefined {
+  let rec: LockHolder
+  try {
+    rec = JSON.parse(readFileSync(path, 'utf8'))
+    if (!Number.isInteger(rec?.pid) || rec.pid <= 0 || !rec.cwd) return undefined
+  } catch { return undefined }
+  if (rec.pid === process.pid) return undefined
+  try {
+    if (statSync(`/proc/${rec.pid}`).uid !== process.getuid?.()) return undefined
+    if (readFileSync(`/proc/${rec.pid}/comm`, 'utf8').trim() !== 'bun') return undefined
+    if (readlinkSync(`/proc/${rec.pid}/cwd`) !== rec.cwd) return undefined
+    // Start time is what makes pid reuse unmistakable. Without it, a recycled pid
+    // that happened to be another bun of ours in the same directory would read as
+    // a live holder and keep this bridge down for no reason.
+    if (procStartTime(rec.pid) !== rec.started) return undefined
+    return rec
+  } catch { return undefined }
+}
+
+function takeLock(path: string): void {
+  try {
+    mkdirSync(LOCK_DIR, { recursive: true, mode: 0o700 })
+    const rec: LockHolder = { pid: process.pid, cwd: process.cwd(), started: procStartTime(process.pid) ?? '' }
+    // Write-then-rename so a reader never sees a half-written record.
+    const tmp = `${path}.${process.pid}.tmp`
+    writeFileSync(tmp, JSON.stringify(rec), { mode: 0o600 })
+    renameSync(tmp, path)
+  } catch {}
+}
+
+// Rotating the token changes the key, orphaning the old file. Sweep records whose
+// holder is gone so the directory does not accumulate one per rotation. A live
+// lock for any other token verifies and is left alone.
+function pruneStaleLocks(keep: string): void {
+  try {
+    for (const name of readdirSync(LOCK_DIR)) {
+      const p = join(LOCK_DIR, name)
+      if (p === keep || name.endsWith('.tmp')) continue
+      if (!lockHolder(p)) rmSync(p, { force: true })
+    }
+  } catch {}
+}
+
 function otherLiveBridge(): number | undefined {
   try {
     if (!existsSync(PID_FILE)) return undefined
@@ -1469,6 +1562,22 @@ async function main() {
   }
   try { mkdirSync(dirname(PID_FILE), { recursive: true }); writeFileSync(PID_FILE, String(process.pid)) } catch {}
 
+  // And refuse to be a second poller for this TOKEN, wherever it runs from. The
+  // check above only covers this deployment; two checkouts sharing a token each
+  // pass it and then fight over the same update queue.
+  const lockPath = tokenLockPath(TOKEN)
+  const holder = lockHolder(lockPath)
+  if (holder) {
+    console.error(`[fatal] another bridge (pid ${holder.pid}) in ${holder.cwd} is already polling this bot token`)
+    console.error(`[fatal] two pollers share one update queue, so messages would be split between them — refusing to start`)
+    console.error(`[fatal] stop that instance, or give this deployment its own TELEGRAM_BOT_TOKEN`)
+    try { rmSync(PID_FILE, { force: true }) } catch {}
+    try { rmSync(tokenLockPath(TOKEN), { force: true }) } catch {}
+    process.exit(EXIT_TOKEN_HELD)
+  }
+  takeLock(lockPath)
+  pruneStaleLocks(lockPath)
+
   // Drop the backlog only when we did NOT shut down cleanly. A deliberate restart
   // is a window in which a user's message would otherwise vanish silently — and
   // /restart makes that window a routine event rather than a rare one. After a
@@ -1555,6 +1664,9 @@ async function main() {
 // Test seam (bridge.e2e.test.ts): the startup mutex's staleness rules decide
 // whether a redeploy is allowed to proceed, so they are worth pinning directly.
 export function _otherLiveBridge(): number | undefined { return otherLiveBridge() }
+export const _tokenLockPath = tokenLockPath
+export const _lockHolder = lockHolder
+export const _procStartTime = procStartTime
 export const _PID_FILE = PID_FILE
 
 export function _drainQueue(key: string): Promise<unknown> { return queues.get(key) ?? Promise.resolve() }
