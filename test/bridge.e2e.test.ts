@@ -23,7 +23,11 @@ process.env.CLAUDE_BIN = join(import.meta.dir, 'claude-stub.ts')
 process.env.TG_SESSIONS_BASE = join(TMP, 'sessions')
 process.env.TG_STATE_FILE = STATE_FILE
 process.env.TG_CLAUDE_TIMEOUT_MS = '1500' // keep the HANG scenario fast
-// leave TG_PROGRESS_DETAIL unset → off by default (labels only in status edits)
+// These two must be pinned, not merely left unset: bun auto-loads the repo's .env,
+// so a developer machine with TG_ALLOW_BYPASS=1 in it would otherwise silently turn
+// the bypass safety-gate test green for the wrong reason.
+process.env.TG_PROGRESS_DETAIL = '0'      // labels only in status edits
+process.env.TG_ALLOW_BYPASS = '0'         // bypass must be refused
 
 // Dynamic import so the assignments above land first.
 const bridge: any = await import('../bridge')
@@ -79,6 +83,11 @@ async function incoming(chatId: number, text: string, fromId = 1): Promise<Call[
 }
 
 const sends = (cs: Call[]) => cs.filter(c => c.method === 'sendMessage')
+// The status message is edited as a Bot API 10.1 rich message, whose body travels in
+// rich_message.markdown rather than text; plain edits (and the fallbacks) still use
+// text. Read either, so an assertion about what the user saw doesn't depend on which
+// path the bridge took.
+const textOf = (c: Call): string => String(c.payload?.rich_message?.markdown ?? c.payload?.text ?? '')
 const finalReply = (cs: Call[]): string | undefined => {
   const s = sends(cs)
   return s.length ? s[s.length - 1].payload.text : undefined
@@ -87,10 +96,10 @@ const finalReply = (cs: Call[]): string | undefined => {
 describe('a normal turn', () => {
   test('posts a status message, edits in tool steps, deletes it, and delivers the reply', async () => {
     const cs = await incoming(1001, 'hello there')
-    // status "💭 thinking…" sent…
-    expect(sends(cs).some(c => String(c.payload.text).includes('thinking'))).toBe(true)
+    // status "💭 Thinking…" sent…
+    expect(sends(cs).some(c => textOf(c).includes('Thinking'))).toBe(true)
     // …edited to show the tool step ("⚙️ Running a command" from the stub's Bash use)…
-    expect(cs.some(c => c.method === 'editMessageText' && String(c.payload.text).includes('Running a command'))).toBe(true)
+    expect(cs.some(c => c.method === 'editMessageText' && textOf(c).includes('Running a command'))).toBe(true)
     // …deleted when the run finished…
     expect(cs.some(c => c.method === 'deleteMessage')).toBe(true)
     // …and the final answer delivered.
@@ -101,7 +110,7 @@ describe('a normal turn', () => {
 describe('tool steps render into the status message', () => {
   test('a tool step renders into the status message', async () => {
     const cs = await incoming(1002, 'TOOLS please')
-    const edits = cs.filter(c => c.method === 'editMessageText').map(c => String(c.payload.text)).join('\n')
+    const edits = cs.filter(c => c.method === 'editMessageText').map(textOf).join('\n')
     // The status is edited at most once per 4s (editStatus throttle), so within one
     // fast turn we're only guaranteed the first step renders — not every one. Whether
     // Read or Bash lands first depends on stdout chunking; either proves the

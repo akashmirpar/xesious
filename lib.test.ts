@@ -11,7 +11,8 @@ import {
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
   allowedModes, normalizeMode, permissionArgs,
   normalizeModel, MODEL_DEFAULT,
-  toolStep, renderSteps, parseStreamLine,
+  toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
+  needsRich, hasRtl, escapeMoneyDollars,
 } from './lib'
 
 describe('parseIdList', () => {
@@ -156,25 +157,73 @@ describe('toolStep', () => {
   })
 })
 
-describe('renderSteps', () => {
-  const steps = [{ label: 'A & B', detail: 'echo <hi>' }]
-  test('progressDetail off → bold label only, HTML-escaped, no blockquote', () => {
-    const out = renderSteps(steps, { progressDetail: false })
-    expect(out).toBe('<b>A &amp; B</b>')
-    expect(out).not.toContain('blockquote')
+describe('renderSteps (rich markdown)', () => {
+  const steps: Step[] = [{ label: 'A & B', detail: 'echo <hi>' }]
+  test('the headline leads the body', () => {
+    expect(renderSteps(steps, 1, { progressDetail: false }).startsWith(THINKING)).toBe(true)
   })
-  test('progressDetail on → detail in an expandable blockquote, escaped', () => {
-    const out = renderSteps(steps, { progressDetail: true })
-    expect(out).toContain('<b>A &amp; B</b>')
-    expect(out).toContain('<blockquote expandable>echo &lt;hi&gt;</blockquote>')
+  test('progressDetail off → bold label only, no collapsible', () => {
+    const out = renderSteps(steps, 1, { progressDetail: false })
+    expect(out).toContain('**A &amp; B**')
+    expect(out).not.toContain('<details>')
+  })
+  test('progressDetail on → detail in a collapsible, escaped on both fronts', () => {
+    const out = renderSteps(steps, 1, { progressDetail: true })
+    expect(out).toContain('<details><summary>A &amp; B</summary>')
+    expect(out).toContain('> echo &lt;hi&gt;')
   })
   test('detail longer than detailMax is clipped with an ellipsis', () => {
-    const out = renderSteps([{ label: 'x', detail: 'y'.repeat(50) }], { progressDetail: true, detailMax: 10 })
+    const out = renderSteps([{ label: 'x', detail: 'y'.repeat(50) }], 1, { progressDetail: true, detailMax: 10 })
     expect(out).toContain('yyyyyyyyyy…')
     expect(out).not.toContain('y'.repeat(11))
   })
   test('step with no detail renders just the label even when detail is on', () => {
-    expect(renderSteps([{ label: 'solo' }], { progressDetail: true })).toBe('<b>solo</b>')
+    const out = renderSteps([{ label: 'solo' }], 1, { progressDetail: true })
+    expect(out).toBe(`${THINKING}\n\n**solo**`)
+  })
+  test('trimmed steps are still counted, not silently dropped', () => {
+    const out = renderSteps([{ label: 'last' }], 5, { progressDetail: true })
+    expect(out).toContain('_+4 earlier steps_')
+    expect(renderSteps([{ label: 'last' }], 2, { progressDetail: true })).toContain('_+1 earlier step_')
+  })
+  test('a todo detail becomes a real task list, ticked where completed', () => {
+    const step = toolStep({ name: 'TodoWrite', input: { todos: [
+      { content: 'done thing', status: 'completed' },
+      { content: 'next thing', status: 'pending' },
+    ] } })
+    const out = renderSteps([step], 1, { progressDetail: true })
+    expect(out).toContain('- [x] done thing')
+    expect(out).toContain('- [ ] next thing')
+  })
+  test('a link detail becomes a markdown link whose target stays whole', () => {
+    const url = `https://example.com/${'a'.repeat(80)}`
+    const out = renderSteps([toolStep({ name: 'WebFetch', input: { url } })], 1, { progressDetail: true })
+    expect(out).toContain(`](${url})`)   // target unclipped — a clipped URL still looks like one
+    expect(out).toContain('…]')          // only the visible text is shortened
+  })
+  test('a link detail that could break the markdown falls back to a quote', () => {
+    const out = renderSteps([{ label: 'l', detail: 'https://x.test/a(b)c', kind: 'link' }], 1, { progressDetail: true })
+    expect(out).not.toContain('](')
+    expect(out).toContain('>')
+  })
+})
+
+describe('renderStepsHtml (pre-10.1 fallback)', () => {
+  const steps: Step[] = [{ label: 'A & B', detail: 'echo <hi>' }]
+  test('progressDetail off → bold label only, HTML-escaped, no blockquote', () => {
+    const out = renderStepsHtml(steps, { progressDetail: false })
+    expect(out).toBe(`${THINKING}\n<b>A &amp; B</b>`)
+    expect(out).not.toContain('blockquote')
+  })
+  test('progressDetail on → detail in an expandable blockquote, escaped', () => {
+    const out = renderStepsHtml(steps, { progressDetail: true })
+    expect(out).toContain('<b>A &amp; B</b>')
+    expect(out).toContain('<blockquote expandable>echo &lt;hi&gt;</blockquote>')
+  })
+  test('detail longer than detailMax is clipped with an ellipsis', () => {
+    const out = renderStepsHtml([{ label: 'x', detail: 'y'.repeat(50) }], { progressDetail: true, detailMax: 10 })
+    expect(out).toContain('yyyyyyyyyy…')
+    expect(out).not.toContain('y'.repeat(11))
   })
 })
 
@@ -254,5 +303,92 @@ describe('parseStreamLine', () => {
   test('result with no text → empty string (bridge maps this to "(empty response)")', () => {
     const line = JSON.stringify({ type: 'result', subtype: 'success', session_id: 's' })
     expect(parseStreamLine(line, on)[0]).toMatchObject({ text: '', isError: false })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// rich-message routing
+// ---------------------------------------------------------------------------
+
+describe('needsRich', () => {
+  test('ordinary prose stays on the MarkdownV2 path', () => {
+    expect(needsRich('Just a sentence with **bold**, a [link](https://x.test) and a list:\n- one\n- two')).toBe(false)
+    expect(needsRich('# Heading\n\n> a quote\n\n`inline code`')).toBe(false)
+  })
+  test('a real table goes rich', () => {
+    expect(needsRich('| a | b |\n|---|---|\n| 1 | 2 |')).toBe(true)
+  })
+  test('a setext heading under a line containing a pipe is NOT a table', () => {
+    // Telegram parses this as a heading, not a table — so must not trigger rich.
+    expect(needsRich('costs a | b dollars\n---\nnext paragraph')).toBe(false)
+  })
+  test('a blank line between header and delimiter breaks the table', () => {
+    expect(needsRich('| a | b |\n\n|---|---|')).toBe(false)
+  })
+  test('collapsibles, formulas, task lists, footnotes and spoilers go rich', () => {
+    expect(needsRich('<details><summary>x</summary>y</details>')).toBe(true)
+    expect(needsRich('$$a^2 + b^2$$')).toBe(true)
+    expect(needsRich('the area $x^2$ is')).toBe(true)
+    expect(needsRich('- [ ] todo')).toBe(true)
+    expect(needsRich('[^1]: a footnote')).toBe(true)
+    expect(needsRich('==marked== text')).toBe(true)
+    expect(needsRich('||spoiler||')).toBe(true)
+  })
+  test('a price is not a formula', () => {
+    expect(needsRich('it cost $5 and then $6')).toBe(false)
+  })
+  test('code is stripped before detecting: a shell snippet is not a table or a formula', () => {
+    expect(needsRich('```sh\ncat a | b\n---\necho $HOME | wc -l\n```')).toBe(false)
+    expect(needsRich('run `echo $x | tee f` first')).toBe(false)
+  })
+})
+
+describe('hasRtl', () => {
+  test('RTL text is kept off the rich path (Telegram mis-orders it)', () => {
+    expect(hasRtl('سلام دنیا')).toBe(true)
+    expect(hasRtl('שלום')).toBe(true)
+  })
+  test('latin text and a stray BOM are not RTL', () => {
+    expect(hasRtl('plain ascii')).toBe(false)
+    expect(hasRtl('quoted\uFEFFtext')).toBe(false)
+  })
+})
+
+describe('escapeMoneyDollars', () => {
+  test('a price is escaped so it cannot open a formula', () => {
+    expect(escapeMoneyDollars('it cost $5')).toBe('it cost \\$5')
+  })
+  test('the regression: two prices in one sentence stay prices', () => {
+    const src = 'The $390B/2025 figure from [McKinsey](https://x.com) is B2B. Actual is a **~$5B/year** business.'
+    expect(escapeMoneyDollars(src)).toBe('The \\$390B/2025 figure from [McKinsey](https://x.com) is B2B. Actual is a **~\\$5B/year** business.')
+  })
+  test('a real inline formula is left alone', () => {
+    expect(escapeMoneyDollars('the area is $x^2$ here')).toBe('the area is $x^2$ here')
+    expect(escapeMoneyDollars('$\\frac{a}{b}$')).toBe('$\\frac{a}{b}$')
+  })
+  test('money and a formula on the same line both survive', () => {
+    expect(escapeMoneyDollars('costs $5 and $x^2$')).toBe('costs \\$5 and $x^2$')
+  })
+  test('display math is passed through, prices around it are not', () => {
+    expect(escapeMoneyDollars('cost $9:\n$$a_1 + b^2$$\nand $9 again')).toBe('cost \\$9:\n$$a_1 + b^2$$\nand \\$9 again')
+  })
+  test('code keeps its dollars', () => {
+    expect(escapeMoneyDollars('run `echo $HOME` now')).toBe('run `echo $HOME` now')
+    expect(escapeMoneyDollars('```sh\ncd $HOME && x=$1\n```')).toBe('```sh\ncd $HOME && x=$1\n```')
+    expect(escapeMoneyDollars('```sh\necho $PATH\n```\nit cost $5')).toBe('```sh\necho $PATH\n```\nit cost \\$5')
+  })
+  test('dollars pair per line, matching Telegram', () => {
+    expect(escapeMoneyDollars('a $5 here\nand $6 there')).toBe('a \\$5 here\nand \\$6 there')
+  })
+  test('an already-escaped dollar is not double-escaped', () => {
+    expect(escapeMoneyDollars('a \\$5 and $6')).toBe('a \\$5 and \\$6')
+  })
+  test('table cells full of money survive', () => {
+    expect(escapeMoneyDollars('| b402 | $467,095 | **$517,460** |'))
+      .toBe('| b402 | \\$467,095 | **\\$517,460** |')
+  })
+  test('text with no dollars is returned untouched', () => {
+    const src = '# Heading\n\n- [x] done\n\n> quote\n'
+    expect(escapeMoneyDollars(src)).toBe(src)
   })
 })

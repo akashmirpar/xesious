@@ -30,10 +30,12 @@ import { randomUUID } from 'node:crypto'
 import {
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
-  parseStreamLine, type Step,
+  parseStreamLine, type Step, THINKING,
+  needsRich, hasRtl, escapeMoneyDollars,
   normalizeMode as libNormalizeMode,
   permissionArgs as libPermissionArgs,
   renderSteps as libRenderSteps,
+  renderStepsHtml as libRenderStepsHtml,
 } from './lib'
 
 // ---------------------------------------------------------------------------
@@ -100,7 +102,9 @@ const OUTBOX_DIR = 'outbox'  // anything Claude drops here is delivered, then ar
 const TELEGRAM_PROFILE = process.env.TG_PROFILE ?? [
   "You are replying through a Telegram bridge on the user's phone, not in an IDE. Every turn:",
   '- Be concise and phone-first: short messages, short paragraphs, minimal preamble.',
-  '- Write in your normal markdown; the bridge encodes it for Telegram (tables become aligned code blocks, headings become bold). Just keep code fences balanced.',
+  '- Write in your normal markdown; Telegram renders it natively: real headings, lists, tables, code blocks.',
+  '- LaTeX renders too: $x^2$ inline and $$...$$ on its own line. Also available: ==marked==, ||spoiler||, - [ ] task lists, footnotes[^1].',
+  '- Tables render as real tables, so use one whenever data has columns. Cap it at 20 columns; keep cells short so they fit a phone screen.',
   '- If a request is ambiguous or needs a decision, ask one clarifying question and stop.',
   '- Assume no editor or file selection is open. Ignore any IDE/editor framing from earlier in this conversation; the user is in a chat.',
   `- Files the user sends are saved in ./${INBOX_DIR}/. To send a file back, put it in ./${OUTBOX_DIR}/ and it is delivered then cleared.`,
@@ -184,7 +188,7 @@ const INTERRUPT_DEFAULT = /^(1|true|yes)$/i.test(process.env.TG_INTERRUPT || '')
 type Entry = { sessionId?: string; prevSessionId?: string; cwd: string; updated?: string }
 let sessions: Record<string, Entry> = {}
 let names: Record<string, string> = {}
-// "💭 thinking…" status messages for in-flight runs. If the process is killed
+// "💭 Thinking…" status messages for in-flight runs. If the process is killed
 // before a run finishes (e.g. a restart), the next startup deletes these so no
 // orphaned status message is left dangling in a topic.
 let pending: { chat: number; id: number }[] = []
@@ -332,9 +336,11 @@ function voiceEnv(): NodeJS.ProcessEnv {
   return e
 }
 
-// toolStep, the Step type and the status renderer live in ./lib. renderSteps there
-// takes progressDetail as a parameter; bind this process's PROGRESS_DETAIL here.
-const renderSteps = (steps: Step[]) => libRenderSteps(steps, { progressDetail: PROGRESS_DETAIL })
+// toolStep, the Step type and both status renderers live in ./lib. renderSteps and
+// renderStepsHtml there take progressDetail as a parameter; bind this process's
+// PROGRESS_DETAIL here.
+const renderSteps = (steps: Step[], total: number) => libRenderSteps(steps, total, { progressDetail: PROGRESS_DETAIL })
+const renderStepsHtml = (steps: Step[]) => libRenderStepsHtml(steps, { progressDetail: PROGRESS_DETAIL })
 
 // Run a prompt with streaming output, editing a single "status" message in the
 // topic to show live tool-step progress, then return the final result.
@@ -347,7 +353,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   const opts: any = threadId ? { message_thread_id: threadId } : {}
   // Status is machine chatter, not an answer — post and edit it silently so only
   // the real reply buzzes the user's phone.
-  const status = await ctx.api.sendMessage(ctx.chat!.id, '💭 thinking…', { ...opts, disable_notification: true }).catch(() => null)
+  const status = await ctx.api.sendMessage(ctx.chat!.id, THINKING, { ...opts, disable_notification: true }).catch(() => null)
   if (status) { pending.push({ chat: ctx.chat!.id, id: status.message_id }); saveState() }
   const steps: Step[] = []
   let lastEdit = 0, dirty = false
@@ -357,20 +363,25 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     if (!force && now - lastEdit < 4000) return
     lastEdit = now; dirty = false
     if (!steps.length) {
-      await ctx.api.editMessageText(ctx.chat!.id, status.message_id, '💭 thinking…').catch(() => {})
+      await ctx.api.editMessageText(ctx.chat!.id, status.message_id, THINKING).catch(() => {})
       return
     }
-    // Trim from the oldest until the HTML body fits: slicing a rendered string
-    // mid-tag would break the parse and lose the whole update.
-    let shown = steps.slice(-9)
-    let body = renderSteps(shown)
-    while (body.length > 3500 && shown.length > 1) { shown = shown.slice(1); body = renderSteps(shown) }
+    // Trim from the oldest until the body fits: slicing a rendered string mid-tag
+    // would break the parse and lose the whole update. The summary still counts
+    // every step, so trimming never misreports how much work was done.
+    let shown = steps.slice(-12)
+    let body = renderSteps(shown, steps.length)
+    while (body.length > 15000 && shown.length > 1) { shown = shown.slice(1); body = renderSteps(shown, steps.length) }
     try {
-      await ctx.api.editMessageText(ctx.chat!.id, status.message_id, body, { parse_mode: 'HTML' })
+      await ctx.api.raw.editMessageText({ chat_id: ctx.chat!.id, message_id: status.message_id, rich_message: { markdown: body } })
     } catch {
       // Same posture as sendRich: formatting is best-effort, the update is not.
-      const plain = shown.map(s => s.label).join('\n').slice(0, 3500)
-      await ctx.api.editMessageText(ctx.chat!.id, status.message_id, plain).catch(() => {})
+      try {
+        await ctx.api.editMessageText(ctx.chat!.id, status.message_id, renderStepsHtml(shown), { parse_mode: 'HTML' })
+      } catch {
+        const plain = [THINKING, ...shown.map(s => s.label)].join('\n').slice(0, 3500)
+        await ctx.api.editMessageText(ctx.chat!.id, status.message_id, plain).catch(() => {})
+      }
     }
   }
   const ticker = setInterval(() => void editStatus(), 4000)
@@ -422,19 +433,23 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
 // ---------------------------------------------------------------------------
 
 const MAX = 4000
-// Split into <=MAX-char messages WITHOUT breaking a code block: if a ``` fence is
+// A rich message holds far more than a plain one (32768 chars, 500 blocks), so it
+// is chunked much less often — which matters because a split mid-table would cut
+// the table in half.
+const RICH_MAX = 30000
+// Split into <=max-char messages WITHOUT breaking a code block: if a ``` fence is
 // still open at a chunk boundary, close it here and reopen it in the next chunk,
 // so telegramify never sees an unbalanced fence (the main cause of broken renders).
-function chunk(text: string): string[] {
+function chunk(text: string, max = MAX): string[] {
   const chunks: string[] = []
   let cur: string[] = []
   let len = 0
   let inFence = false
   const push = () => { chunks.push(cur.join('\n') + (inFence ? '\n```' : '')); cur = inFence ? ['```'] : []; len = inFence ? 4 : 0 }
   for (const raw of text.split('\n')) {
-    const pieces = raw.length > MAX ? (raw.match(new RegExp(`.{1,${MAX}}`, 'g')) || [raw]) : [raw]
+    const pieces = raw.length > max ? (raw.match(new RegExp(`.{1,${max}}`, 'g')) || [raw]) : [raw]
     for (const line of pieces) {
-      if (len + line.length + 1 > MAX && cur.length) push()
+      if (len + line.length + 1 > max && cur.length) push()
       if (/^\s*```/.test(line)) inFence = !inFence
       cur.push(line); len += line.length + 1
     }
@@ -471,7 +486,9 @@ async function send(ctx: Context, threadId: number | undefined, text: string, qu
 // encodes it for Telegram.
 function mdTablesToCode(text: string): string {
   const lines = text.split('\n')
-  const isSep = (l: string) => l.includes('|') && /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(l)
+  // Same rule as the table detector above: the delimiter row must carry a pipe, or
+  // a "---" setext underline turns the prose above it into a code block.
+  const isSep = (l: string) => l.includes('|') && /^[ \t:|-]*-[ \t:|-]*$/.test(l)
   const cells = (l: string) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim())
   const out: string[] = []
   let i = 0
@@ -491,17 +508,37 @@ function mdTablesToCode(text: string): string {
   return out.join('\n')
 }
 
-// Send Claude's answer with Telegram markdown rendering (code blocks, bold,
-// lists, links). Tables are converted to aligned code blocks first; if MarkdownV2
-// still fails to parse we resend that chunk as plain text — formatting is
-// best-effort, delivery is guaranteed.
-async function sendRich(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
-  const opts: any = threadId ? { message_thread_id: threadId } : {}
+// The MarkdownV2 path. This is the DEFAULT for ordinary prose, not a fallback —
+// see the note on needsRich. Tables have no MarkdownV2 equivalent, so they are
+// flattened to aligned code blocks first, and a chunk Telegram still refuses to
+// parse is resent as plain text.
+async function sendLegacyMd(ctx: Context, opts: any, text: string): Promise<void> {
   for (const part of chunk(mdTablesToCode(text))) {
     try {
       await ctx.api.sendMessage(ctx.chat!.id, telegramify(part, 'escape'), { ...opts, parse_mode: 'MarkdownV2' })
     } catch {
       await ctx.api.sendMessage(ctx.chat!.id, stripMd(part), opts).catch(e => console.error(`[warn] sendMessage: ${e}`))
+    }
+  }
+}
+
+// needsRich, hasRtl and escapeMoneyDollars — the rich-vs-MarkdownV2 routing rules
+// and the money-escaping pass — are pure, so they live in ./lib and are unit-tested
+// there. The long note on WHY rich is rationed is on needsRich in that file.
+
+// Send Claude's answer, as a Bot API 10.1 rich message when the content actually
+// needs one. Rich markdown is the dialect the agent already writes, so apart from
+// the dollars above no escaping pass is needed. If the call fails we drop to the
+// MarkdownV2 path — formatting is best-effort, delivery is guaranteed.
+async function sendRich(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
+  const opts: any = threadId ? { message_thread_id: threadId } : {}
+  for (const part of chunk(text, RICH_MAX)) {
+    if (!needsRich(part) || hasRtl(part)) { await sendLegacyMd(ctx, opts, part); continue }
+    try {
+      await ctx.api.sendRichMessage(ctx.chat!.id, { markdown: escapeMoneyDollars(part) }, opts)
+    } catch (e) {
+      console.error(`[warn] sendRichMessage, falling back to MarkdownV2: ${e}`)
+      await sendLegacyMd(ctx, opts, part)
     }
   }
 }
@@ -1367,7 +1404,7 @@ async function main() {
   // we don't reprocess old messages on startup.
   await bot.api.deleteWebhook({ drop_pending_updates: true }).catch(() => {})
 
-  // Delete any "💭 thinking…" status messages orphaned by a restart that killed
+  // Delete any "💭 Thinking…" status messages orphaned by a restart that killed
   // a run mid-flight, so no dangling status is left in a topic.
   if (pending.length) {
     for (const p of pending) await bot.api.deleteMessage(p.chat, p.id).catch(() => {})
@@ -1404,4 +1441,5 @@ async function main() {
 // starts polling when this file is run directly, never when it is imported.
 export function _drainQueue(key: string): Promise<unknown> { return queues.get(key) ?? Promise.resolve() }
 
+// Guarded so the module can be imported by a test without starting a poller.
 if (import.meta.main) main().catch(e => { console.error(`[fatal] ${e}`); process.exit(1) })
