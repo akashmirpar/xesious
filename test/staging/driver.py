@@ -479,9 +479,82 @@ async def feature_interrupt_kills_the_tree(client, bot):
             else f"pid {pid} was running, the interrupt took it with the run, and nothing was reported as an error")
 
 
+async def feature_run_alongside(client, bot):
+    """A message sent behind a long run is offered the choice to run alongside it —
+    and taking that offer really does answer it while the first run is still going.
+
+    The reported case was a long job blocking every following message in the topic.
+    The fix is not to background the long job (you rarely know in advance that it
+    will be long) but to unblock the new message at the moment you are stuck.
+
+    This drives the whole thing over real Telegram: start something slow, send a
+    second message, assert the offer appears on THAT message, click the button, and
+    check the second answer arrives while the first is still running."""
+    marker = "313"
+    await _show(client, bot, "/mode auto")
+    print("  → (start something slow, then send a second message behind it)")
+    await client.send_message(bot, f"Using Bash, run exactly: sleep {marker}")
+    await asyncio.sleep(8)                      # let the run get going
+
+    second = await client.send_message(bot, "Reply with only the word ALONGSIDE.")
+    offer = None
+    for _ in range(20):
+        await asyncio.sleep(1)
+        async for m in client.iter_messages(bot, limit=6):
+            if m.reply_markup and getattr(m, "reply_to", None) and \
+               m.reply_to.reply_to_msg_id == second.id:
+                offer = m
+                break
+        if offer:
+            break
+
+    problems = []
+    if not offer:
+        problems.append("no 'run this now' offer appeared on the queued message")
+        return ("a queued message can be run alongside instead", False, "; ".join(problems))
+
+    label = offer.reply_markup.rows[0].buttons[0].text
+    print(f"    offer button: {label!r}")
+    if "Run this now" not in label:
+        problems.append(f"unexpected button label {label!r}")
+
+    got = []
+
+    @client.on(events.NewMessage(from_users=bot))
+    async def handler(ev):
+        if not is_status(reply_text(ev.message)):
+            got.append(ev.message)
+
+    await offer.click(0)                        # tap it for real
+    for _ in range(45):
+        await asyncio.sleep(1)
+        if any("ALONGSIDE" in reply_text(m).upper() for m in got):
+            break
+    client.remove_event_handler(handler)
+
+    answered = any("ALONGSIDE" in reply_text(m).upper() for m in got)
+    print(f"    second answer arrived while the first run was going: {answered}")
+    if not answered:
+        problems.append("the promoted message was never answered while the first run continued")
+
+    # The offer message should be gone once taken — it was an aside about a wait.
+    still_there = False
+    async for m in client.iter_messages(bot, limit=10):
+        if m.id == offer.id:
+            still_there = True
+            break
+    if still_there:
+        problems.append("the offer message was left in the history after being taken")
+
+    await _show(client, bot, "/stop")           # release the slow run
+    return ("a queued message can be run alongside instead", not problems,
+            "; ".join(problems) if problems else
+            "offer appeared on the queued message, tapping it answered alongside, and the offer was withdrawn")
+
+
 FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
                  feature_midturn_text, feature_attribution, feature_reply_threading,
-                 feature_interrupt_kills_the_tree]
+                 feature_interrupt_kills_the_tree, feature_run_alongside]
 
 
 async def main():

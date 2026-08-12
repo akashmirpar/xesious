@@ -111,16 +111,19 @@ const QUIET_NOTE_MS = Number(process.env.TG_QUIET_NOTE_MS || 90 * 1000)
 // its first second — a button that materialises later is a control you have to
 // notice arriving, exactly when you are already waiting on something.
 const INTERRUPT_LABEL = '— Interrupt —'
-// How long a run must have been going before a NEW message is offered the choice to
-// run alongside it rather than queue behind it. Not from the first second: a quick
-// burst of messages would otherwise sprout a button each, and waiting two seconds
-// costs nothing.
+// Every message that will WAIT gets the offer — there is no delay threshold.
+//
+// There used to be one, to keep a burst of messages from sprouting a button each.
+// It made the feature inconsistent in exactly the wrong way: send a message just
+// after a long task starts and it queued silently, while a later message got the
+// offer, so the option appeared to depend on nothing you could see. The threshold
+// existed to limit clutter, and the offer now deletes itself the moment its message
+// is picked up, so there is no clutter left to limit.
 //
 // Deliberately NOT capped in number. These are temporary jobs — each runs and
 // exits — unlike a warm session, which stays resident. The memory ceiling that
 // bounds the warm-sessions item does not apply in the same way here, so a cap would
 // be a restriction without a matching risk.
-const PARALLEL_OFFER_MS = Number(process.env.TG_PARALLEL_OFFER_MS || 15 * 1000)
 const PARALLEL_LABEL = '— Run this now —'
 // How long a graceful shutdown will wait for in-flight runs before giving up on
 // them. A deploy normally waits for idle before signalling, so this is the
@@ -625,7 +628,7 @@ const leftBehind = new Map<number, { id: string; key: string; at: number }>()
 
 // Messages that were offered "run this now" and are still waiting their turn, and
 // those that took the offer (whose queued turn must therefore do nothing).
-const offered = new Map<number, { key: string; threadId?: number; prompt: string }>()
+const offered = new Map<number, { key: string; threadId?: number; prompt: string; offerMsgId?: number }>()
 const skipQueued = new Set<number>()
 
 // What a background job found, held until the topic's next ordinary turn.
@@ -1397,7 +1400,14 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   // A message promoted to run in parallel has already been handled; its turn in the
   // queue must do nothing rather than run it a second time.
   if (replyTo !== undefined && skipQueued.has(replyTo)) { skipQueued.delete(replyTo); return }
-  if (replyTo !== undefined) offered.delete(replyTo)   // its turn came up; too late to promote
+  if (replyTo !== undefined) {
+    // Its turn came up, so the offer is spent. Withdraw the message rather than
+    // leaving it in the history: it was an aside about a wait that is now over, and
+    // a dead button sitting above the answer is worse than no button at all.
+    const o = offered.get(replyTo)
+    if (o?.offerMsgId) await ctx.api.deleteMessage(ctx.chat!.id, o.offerMsgId).catch(() => {})
+    offered.delete(replyTo)
+  }
   const cwd = resolveCwd(ctx, threadId)
   // Attribute the message before it reaches the model. Only here: handlePassthrough
   // and /compact send literal CLI commands, which are not somebody speaking.
@@ -2090,15 +2100,19 @@ bot.on('message', async ctx => {
   // You rarely know in advance that a task will be long; what you know is that you
   // are now stuck behind one. So the choice is offered at that moment rather than
   // requiring /bg up front. Doing nothing queues, exactly as before.
-  const blocking = jobsFor(key).find(j => Date.now() - j.startedAt >= PARALLEL_OFFER_MS)
-  if (blocking) {
-    const mins = Math.max(1, Math.round((Date.now() - blocking.startedAt) / 60000))
-    offered.set(msg.message_id, { key, threadId, prompt: text })
-    await ctx.api.sendMessage(ctx.chat.id,
-      `⏳ Still working on an earlier message (${mins}m). This one will run after it.`,
+  // Anything already queued or running here means this message waits — which is
+  // the only condition that matters, and it is true from the first second.
+  if ((inFlight[key] ?? 0) > 0) {
+    const ahead = jobsFor(key)[0]
+    const waited = ahead ? Math.max(1, Math.round((Date.now() - ahead.startedAt) / 1000)) : 0
+    const how = waited >= 90 ? `${Math.round(waited / 60)}m` : `${waited}s`
+    const offer = await ctx.api.sendMessage(ctx.chat.id,
+      ahead ? `⏳ Still working on an earlier message (${how}). This one will run after it.`
+            : `⏳ Something is already queued here. This one will run after it.`,
       { ...destOpts({ threadId, replyTo: msg.message_id }), disable_notification: true,
         reply_markup: { inline_keyboard: [[{ text: PARALLEL_LABEL, callback_data: `par:${msg.message_id}` }]] } },
-    ).catch(() => {})
+    ).catch(() => null)
+    offered.set(msg.message_id, { key, threadId, prompt: text, offerMsgId: offer?.message_id })
   }
   enqueue(key, () => handlePrompt(ctx, threadId, key, text, undefined, msg.message_id))
     .catch(e => console.error(`[error] task ${key}: ${e}`))
@@ -2130,7 +2144,9 @@ bot.on('callback_query:data', async ctx => {
     offered.delete(id)
     skipQueued.add(id)                       // its queued turn must now do nothing
     await ctx.answerCallbackQuery({ text: 'Starting it now, alongside the other run.' }).catch(() => {})
-    await ctx.editMessageReplyMarkup(undefined).catch(() => {})
+    // Remove the offer entirely; a stripped-but-present aside is still clutter.
+    if (rec.offerMsgId) await ctx.api.deleteMessage(ctx.chat!.id, rec.offerMsgId).catch(() => {})
+    else await ctx.editMessageReplyMarkup(undefined).catch(() => {})
     void enqueue(`${rec.key}#bg-${id}`,
       () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, id, true, true))
       .catch(e => console.error(`[error] parallel ${rec.key}: ${e}`))

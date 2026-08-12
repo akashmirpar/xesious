@@ -25,7 +25,6 @@ process.env.TG_STATE_FILE = STATE_FILE
 process.env.TG_CLAUDE_TIMEOUT_MS = '20000'  // absolute backstop, must not fire first
 process.env.TG_IDLE_TIMEOUT_MS = '1500'    // the idle watchdog is what HANG exercises
 process.env.TG_QUIET_NOTE_MS = '500'
-process.env.TG_PARALLEL_OFFER_MS = '150'  // offer the parallel run almost at once
 // These two must be pinned, not merely left unset: bun auto-loads the repo's .env,
 // so a developer machine with TG_ALLOW_BYPASS=1 in it would otherwise silently turn
 // the bypass safety-gate test green for the wrong reason.
@@ -827,15 +826,48 @@ describe('/bg and running a message alongside instead of behind (D: /bg)', () =>
     await run
   }, 20000)
 
-  test('a quick turn is NOT offered it', async () => {
-    // Every burst of messages would otherwise sprout a button, and waiting two
-    // seconds costs nothing.
+  test('a message with nothing ahead of it is not offered anything', async () => {
+    // The offer is about WAITING. Nothing queued means no wait and nothing to say.
     const before = calls.length
     await incoming(1173, 'hello there')
     const offers = calls.slice(before).filter(c => c.method === 'sendMessage' && btnOf(c)
       && btnOf(c).text === '— Run this now —')
     expect(offers).toHaveLength(0)
   }, 10000)
+
+  test('the FIRST message behind a run is offered it too, not only a later one', async () => {
+    // There used to be a delay threshold, which made the option appear to depend on
+    // nothing you could see: a message sent just after a long task started queued
+    // silently, while a later one got the button.
+    const run = incoming(1176, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 50))     // immediately behind it
+    const before = calls.length
+    await inject(1176, 'right behind it', 98301)
+    const offer = calls.slice(before).find(c => c.method === 'sendMessage' && btnOf(c))
+    expect(offer).toBeTruthy()
+    expect(String(btnOf(offer).callback_data)).toBe('par:98301')
+    await inject(1176, '/interrupt', 98302)
+    await run
+    await bridge._drainQueue('1176:main')
+  }, 20000)
+
+  test('the offer is withdrawn once its message is picked up in order', async () => {
+    // It was an aside about a wait that is now over; a dead button above the answer
+    // is worse than no button at all.
+    const run = incoming(1177, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 50))
+    await inject(1177, 'queued behind it', 98311)
+    const offer = calls.find(c => c.method === 'sendMessage' && btnOf(c)
+      && String(btnOf(c).callback_data) === 'par:98311')
+    expect(offer).toBeTruthy()
+    const offerId = 1000 + calls.filter(c => c.method === 'sendMessage').indexOf(offer!)  // ids are sequential in the fake
+    const before = calls.length
+    await inject(1177, '/interrupt', 98312)       // let the blocking run end
+    await run
+    await bridge._drainQueue('1177:main')
+    expect(calls.slice(before).some(c => c.method === 'deleteMessage')).toBe(true)
+    void offerId
+  }, 25000)
 
   test('taking the offer runs it once, not twice', async () => {
     // The queued turn must do nothing once its message has been promoted, or the
