@@ -95,16 +95,19 @@ def reply_text(msg) -> str:
     return (msg.message or "") or rich_text(msg)
 
 
-async def send_and_wait(client, bot, prompt: str):
-    replies = []
+async def send_and_wait_messages(client, bot, prompt: str):
+    """Like send_and_wait, but hands back the Message objects. Needed wherever the
+    assertion is about how Telegram PARSED the reply (entities) rather than about
+    the characters in it — a strikethrough that should not exist is invisible in
+    the text and obvious in the entity list."""
+    msgs = []
     got = asyncio.Event()
 
     @client.on(events.NewMessage(from_users=bot))
     async def handler(ev):
-        t = reply_text(ev.message)
-        if is_status(t):
+        if is_status(reply_text(ev.message)):
             return
-        replies.append(t)
+        msgs.append(ev.message)
         got.set()
 
     await client.send_message(bot, prompt)
@@ -113,7 +116,11 @@ async def send_and_wait(client, bot, prompt: str):
     except asyncio.TimeoutError:
         pass
     client.remove_event_handler(handler)
-    return replies
+    return msgs
+
+
+async def send_and_wait(client, bot, prompt: str):
+    return [reply_text(m) for m in await send_and_wait_messages(client, bot, prompt)]
 
 
 def topic_cwd():
@@ -190,7 +197,58 @@ async def feature_rich_table(client, bot):
     return ("rich table delivered natively, cells and prices intact", ok, detail)
 
 
-FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table]
+async def feature_tilde_prose(client, bot):
+    """An "approximately-a-price" tilde in ordinary prose must arrive as a literal
+    tilde — not as a strikethrough that swallows the sentence and eats the bold.
+
+    Reported three times in eight days, on ordinary prose about money. This is the
+    end-to-end proof: it asserts on the ENTITIES Telegram returns, because the bug
+    is invisible in the message text. Before the fix, Telegram came back with a
+    real `strikethrough` entity spanning the text between the two tildes, and the
+    bold delimiters arrived as literal asterisks."""
+    # Ask for the emphasis SEMANTICALLY rather than pasting `**` into the prompt.
+    # A first version pasted the markdown and the model reproduced the sentence
+    # without it, so the bold assertion was measuring the model's compliance rather
+    # than the bridge's formatting — the tilde half passed while bold "failed" for
+    # a reason that had nothing to do with the bug.
+    prompt = (
+        "Reply with ONLY the following sentence, no preamble and no commentary. "
+        "Render the phrase '~$8bn of gasoline imports' in bold, and keep every other "
+        "character exactly as written:\n"
+        "gasoline output down to ~110m litres/day. Holding consumption flat means "
+        "~$8bn of gasoline imports — more than the entire military budget."
+    )
+    print(f"  → {prompt.splitlines()[-1][:70]}…")
+    msgs = await send_and_wait_messages(client, bot, prompt)
+    if not msgs:
+        return ("tilde in prose stays literal, no strikethrough", False, "no reply within timeout")
+
+    msg = msgs[-1]
+    text = reply_text(msg)
+    print(f"    ← {text[:110]!r}")
+    kinds = [type(e).__name__ for e in (msg.entities or [])]
+    print(f"    entities: {kinds or 'none'}")
+
+    problems = []
+    # The whole point: no strikethrough may exist anywhere in the reply.
+    if any("Strike" in k for k in kinds):
+        problems.append("Telegram parsed a STRIKETHROUGH — the tilde bug is back")
+    for want in ("~110m", "~$8bn"):
+        if want not in text:
+            problems.append(f"{want!r} did not survive as literal text")
+    # The bold was collateral damage: the stray strikethrough overlapped it, so the
+    # emphasis could not form and the delimiters were emitted as text.
+    if "**" in text:
+        problems.append("literal '**' in the delivered text — the bold was destroyed")
+    if not any("Bold" in k for k in kinds):
+        problems.append("no bold entity — the emphasis did not render")
+
+    ok = not problems
+    return ("tilde in prose stays literal, no strikethrough",
+            ok, "; ".join(problems) if problems else f"entities={kinds}, both tildes literal, bold intact")
+
+
+FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose]
 
 
 async def main():

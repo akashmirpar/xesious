@@ -31,7 +31,7 @@ import {
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
   parseStreamLine, type Step, THINKING, conflictAdvice,
-  needsRich, hasRtl, escapeMoneyDollars,
+  needsRich, hasRtl, sanitizeProse,
   normalizeMode as libNormalizeMode,
   permissionArgs as libPermissionArgs,
   renderSteps as libRenderSteps,
@@ -654,18 +654,22 @@ function mdTablesToCode(text: string): string {
 // flattened to aligned code blocks first, and a chunk Telegram still refuses to
 // parse is resent as plain text.
 async function sendLegacyMd(ctx: Context, opts: any, text: string): Promise<void> {
+  // sanitizeProse runs AFTER mdTablesToCode so a flattened table is already inside
+  // a fence and counts as protected code, and BEFORE telegramify, which is the
+  // thing that mis-handles a lone tilde.
   for (const part of chunk(mdTablesToCode(text))) {
     try {
-      await ctx.api.sendMessage(ctx.chat!.id, telegramify(part, 'escape'), { ...opts, parse_mode: 'MarkdownV2' })
+      await ctx.api.sendMessage(ctx.chat!.id, telegramify(sanitizeProse(part, 'markdownv2'), 'escape'), { ...opts, parse_mode: 'MarkdownV2' })
     } catch {
       await ctx.api.sendMessage(ctx.chat!.id, stripMd(part), opts).catch(e => console.error(`[warn] sendMessage: ${e}`))
     }
   }
 }
 
-// needsRich, hasRtl and escapeMoneyDollars — the rich-vs-MarkdownV2 routing rules
-// and the money-escaping pass — are pure, so they live in ./lib and are unit-tested
-// there. The long note on WHY rich is rationed is on needsRich in that file.
+// needsRich and hasRtl (the rich-vs-MarkdownV2 routing rules) and sanitizeProse
+// (the one escaping stage per dialect) are pure, so they live in ./lib and are
+// unit-tested there. The long note on WHY rich is rationed is on needsRich, and the
+// character table is on PROSE_RULES.
 
 // Send Claude's answer, as a Bot API 10.1 rich message when the content actually
 // needs one. Rich markdown is the dialect the agent already writes, so apart from
@@ -676,7 +680,7 @@ async function sendRich(ctx: Context, threadId: number | undefined, text: string
   for (const part of chunk(text, RICH_MAX)) {
     if (!needsRich(part) || hasRtl(part)) { await sendLegacyMd(ctx, opts, part); continue }
     try {
-      await ctx.api.sendRichMessage(ctx.chat!.id, { markdown: escapeMoneyDollars(part) }, opts)
+      await ctx.api.sendRichMessage(ctx.chat!.id, { markdown: sanitizeProse(part, 'rich') }, opts)
     } catch (e) {
       console.error(`[warn] sendRichMessage, falling back to MarkdownV2: ${e}`)
       await sendLegacyMd(ctx, opts, part)

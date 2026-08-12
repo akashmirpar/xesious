@@ -85,8 +85,16 @@ export function normalizeModel(m: string): string | undefined {
   const s = m.trim().toLowerCase()
   if (s === MODEL_DEFAULT || s === 'reset' || s === 'clear' || s === '') return ''
   if ((MODEL_ALIASES as readonly string[]).includes(s)) return s
-  // A full model id (e.g. claude-opus-4-8) — accept it as given.
-  if (/^claude[\w.-]*$/i.test(m.trim())) return m.trim()
+  // A full model id (e.g. claude-opus-4-8, or claude-opus-4-8[1m]). The bracketed
+  // context-window suffix is a real, current form — it is often the id this bridge
+  // itself runs on — and the old class had no [ or ], so those were rejected with
+  // "Unknown model".
+  //
+  // Widened to admit brackets rather than to "claude followed by anything
+  // non-whitespace": an over-permissive accept just moves the failure to run time,
+  // where a bad id costs a whole turn instead of an instant, obvious rejection.
+  // Anchored and length-bounded against pathological input.
+  if (/^claude[\w.\-\[\]]{0,80}$/i.test(m.trim())) return m.trim()
   return undefined
 }
 
@@ -250,17 +258,75 @@ export const needsRich = (s: string) => { const t = stripCode(s); return RICH_ON
 // mark, and a stray BOM in quoted text is not a reason to reformat the message.
 export const hasRtl = (s: string) => /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFC]/.test(s)
 
-// A rich message reads $...$ as inline LaTeX, and it pairs the dollars line by
-// line — so a sentence carrying two prices ("the $390B figure … a ~$5B/year
-// business") renders everything between them as an unreadable formula, and eats
-// the markdown in there with it. The money isn't what sent the message down this
-// path: one table or task list anywhere in the answer drags every dollar sign in
-// it along, so the escaping has to happen here and not in needsRich.
+// ---------------------------------------------------------------------------
+// prose sanitisation — ONE stage per output dialect
+// ---------------------------------------------------------------------------
 //
-// Same test as the inline-formula detector: a span holding LaTeX punctuation is a
-// formula and is left alone, anything else is money and gets its opening dollar
-// escaped. Escaping only the opener matters — it leaves that dollar's partner free
-// to open a real formula later on the line, so "costs $5 and $x^2$" keeps both.
+// Why this is a table rather than another patch. Three times in eight days the
+// model wrote ordinary prose and a character in it was read as markup by whichever
+// dialect the bridge was about to use: currency ($390B … ~$5B/year became one
+// LaTeX span), then the "approximately" tilde twice, on a different path, where a
+// stray pair struck out a whole sentence and ate the bold with it. Each was fixed
+// where it was found — escapeRich here, telegramify(…, 'escape') there,
+// escapeMoneyDollars bolted on — so nothing in the codebase knew the full set of
+// characters that mean something in a given dialect, and the next one was always
+// found by a user in production.
+//
+// So: one stage, one table, one test per row. Adding a character should be a row
+// and a test, not an incident.
+//
+// The rules only ever see PROSE. Code is split out first and never touched: a
+// shell snippet is full of pipes, dollars and tildes, and "\$HOME" would be wrong
+// to copy out of a fence.
+
+export type Dialect = 'markdownv2' | 'rich'
+
+// Regions a rule must never enter, per dialect. Rich also parses $$…$$ as display
+// math, which is real formatting rather than prose and is passed through whole.
+const PROTECTED: Record<Dialect, RegExp> = {
+  markdownv2: /(```[\s\S]*?```|`[^`\n]+`)/,
+  rich:       /(```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$)/,
+}
+
+type ProseRule = {
+  char: string          // the character, for test names and documentation
+  dialects: Dialect[]
+  why: string
+  apply: (prose: string) => string
+}
+
+// A lone tilde opens GFM strikethrough. GFM needs the closer to be right-flanking:
+// a tilde preceded by a space and followed by a digit ("~110m") can only OPEN,
+// while one sitting between two punctuation characters ("(~$100", "**~$8bn") is
+// both left- and right-flanking and can CLOSE. So the recurring shape is
+// "approximately-a-price after a bracket or a bold marker" — exactly what prose
+// about money writes constantly — and the two tildes can be far apart, crossing
+// sentences, striking out text containing no tilde at all.
+//
+// Note what an earlier diagnosis got wrong: a `**` boundary between two tildes was
+// thought to prevent pairing. It does not. Strikethrough wins, the bold loses, and
+// the delimiters are emitted as literal asterisks.
+const tildeRule: ProseRule = {
+  char: '~',
+  dialects: ['markdownv2', 'rich'],
+  why: 'a lone ~ opens GFM strikethrough and can swallow an unbounded span of prose',
+  // Two lookbehinds: skip a real ~~strikethrough~~, and skip a tilde the model
+  // already escaped — double-escaping shows the user a stray backslash, which is
+  // the same class of bug in the other direction. The money rule has always had
+  // this guard; the first draft of this one did not, and a test caught it.
+  apply: prose => prose.replace(/(?<!~)(?<!\\)~(?!~)/g, '\\~'),
+}
+
+// Rich text reads $…$ as inline LaTeX and pairs the dollars line by line, so a
+// sentence carrying two prices renders everything between them as an unreadable
+// formula. The money is not what sent the message down the rich path — one table
+// anywhere drags every dollar in the answer along — so this belongs here and not
+// in needsRich.
+//
+// A span holding LaTeX punctuation is a formula and is left whole; anything else
+// is money and gets its OPENING dollar escaped. Escaping only the opener leaves
+// its partner free to open a real formula later on the line, so "costs $5 and
+// $x^2$" keeps both.
 const LATEXISH = /[\\^_{}]/
 function escapeMoneyLine(line: string): string {
   let out = '', i = 0
@@ -277,13 +343,54 @@ function escapeMoneyLine(line: string): string {
   }
   return out
 }
-// Code keeps its dollars: Telegram doesn't parse math inside a fence or a code
-// span, and "\$HOME" in a shell snippet would be wrong to copy out. $$…$$ display
-// math is passed through for the same reason the inline formulas are.
+
+const moneyRule: ProseRule = {
+  char: '$',
+  dialects: ['rich'],
+  why: 'rich text pairs $…$ per line as inline LaTeX, so two prices swallow the text between them',
+  // Per line, because Telegram does not pair across a newline and neither should we.
+  apply: prose => prose.split('\n').map(escapeMoneyLine).join('\n'),
+}
+
+export const PROSE_RULES: ProseRule[] = [tildeRule, moneyRule]
+
+// AUDITED, DELIBERATELY NO RULE. Recorded so the audit is a decision rather than
+// an omission, and so nobody re-opens it without new evidence:
+//   #  and  >   at line start — these are a real heading and a real quote far more
+//                often than they are prose. Escaping them would break the common
+//                case to fix a rare one.
+//   ==marked==  a model writing "x==y" outside code is rare, and escaping would
+//                break the legitimate use, which needsRich explicitly routes for.
+//   [^1]        footnote syntax essentially never appears in prose outside code.
+//   |  above --- already handled in needsRich, whose table detector requires the
+//                delimiter row to carry a pipe (a bare --- under a line containing
+//                one is a setext heading, and Telegram agrees).
+//   ||spoiler|| the plausible false positive is "A || B" as logical-or in prose.
+//                Left alone for now: no observed instance, and a rule here would
+//                break real spoilers. THIS IS THE MOST LIKELY NEXT ROW — add it
+//                with evidence, as a row and a test.
+
+// Neutralise prose for one dialect. Code regions are passed through untouched.
+export function sanitizeProse(text: string, dialect: Dialect): string {
+  const rules = PROSE_RULES.filter(r => r.dialects.includes(dialect))
+  if (!rules.length) return text
+  return text
+    .split(PROTECTED[dialect])
+    .map((seg, i) => {
+      if (i % 2) return seg                    // protected: code, or display math
+      let out = seg
+      for (const r of rules) out = r.apply(out)
+      return out
+    })
+    .join('')
+}
+
+// Kept as a named export: the money pass is one row of the table above, and the
+// existing call sites and regression tests refer to it by this name.
 export function escapeMoneyDollars(text: string): string {
   return text
-    .split(/(```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$)/)
-    .map((seg, i) => (i % 2 ? seg : seg.split('\n').map(escapeMoneyLine).join('\n')))
+    .split(PROTECTED.rich)
+    .map((seg, i) => (i % 2 ? seg : moneyRule.apply(seg)))
     .join('')
 }
 
