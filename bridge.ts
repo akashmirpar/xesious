@@ -23,7 +23,7 @@ import telegramify from 'telegramify-markdown'
 import { autoRetry } from '@grammyjs/auto-retry'
 import { apiThrottler } from '@grammyjs/transformer-throttler'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync, copyFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync, copyFileSync, readlinkSync } from 'node:fs'
 import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
@@ -295,6 +295,34 @@ const queues = new Map<string, Promise<unknown>>()
 // is to distinguish "we meant to stop" from "we crashed", which decides whether
 // the updates that arrived while we were down are kept or dropped.
 const CLEAN_EXIT_MARKER = join(dirname(STATE_FILE), '.clean-exit')
+
+// This process's pid, published for the deploy scripts and — more importantly —
+// used as a mutex so a second poller can never start against the same deployment.
+//
+// Scoped to the state file's directory rather than to the working directory, and
+// that distinction is deliberate: what must not be duplicated is a *deployment*
+// (one bot token, one getUpdates stream), not a checkout. The staging harness runs
+// a second bridge from this very directory with its own token and its own
+// TG_STATE_FILE, which is legitimate and must keep working.
+const PID_FILE = join(dirname(STATE_FILE), 'bridge.pid')
+
+// Does a live bridge already hold this deployment? Verified on the same three
+// proofs lib.sh uses — alive, ours, and in this directory — because a pidfile is
+// only a claim: a SIGKILLed or OOM-killed bridge leaves one behind, and pids get
+// reused. A file that fails any proof is stale and gets overwritten.
+function otherLiveBridge(): number | undefined {
+  try {
+    if (!existsSync(PID_FILE)) return undefined
+    const pid = Number(readFileSync(PID_FILE, 'utf8').trim())
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return undefined
+    if (statSync(`/proc/${pid}`).uid !== process.getuid?.()) return undefined
+    if (readlinkSync(`/proc/${pid}/cwd`) !== process.cwd()) return undefined
+    if (readFileSync(`/proc/${pid}/comm`, 'utf8').trim() !== 'bun') return undefined
+    return pid
+  } catch {
+    return undefined   // unreadable is unprovable, and unprovable is not a holder
+  }
+}
 
 // Set by main(). Lets the /restart command trigger the same graceful drain the
 // signal handlers use, without main()'s locals leaking out.
@@ -1429,6 +1457,18 @@ async function main() {
 
   // Clear stale pending updates (e.g. a message buffered before a restart) so
   // we don't reprocess old messages on startup.
+  // Refuse to become a second poller. Telegram allows one getUpdates per token, so
+  // two bridges on one deployment produce the 409 that start.sh's sleeps and
+  // respawn.sh's back-off exist to survive. Declining here makes the collision
+  // impossible for this deployment instead of merely recoverable.
+  const other = otherLiveBridge()
+  if (other) {
+    console.error(`[fatal] another bridge (pid ${other}) is already serving this deployment in ${process.cwd()}`)
+    console.error(`[fatal] refusing to start a second poller — stop it first, or redeploy with ./update.sh`)
+    process.exit(1)
+  }
+  try { mkdirSync(dirname(PID_FILE), { recursive: true }); writeFileSync(PID_FILE, String(process.pid)) } catch {}
+
   // Drop the backlog only when we did NOT shut down cleanly. A deliberate restart
   // is a window in which a user's message would otherwise vanish silently — and
   // /restart makes that window a routine event rather than a rare one. After a
@@ -1486,6 +1526,7 @@ async function main() {
       console.log('[drain] all runs finished and delivered')
     }
     try { writeFileSync(CLEAN_EXIT_MARKER, new Date().toISOString()) } catch {}
+    try { rmSync(PID_FILE, { force: true }) } catch {}
     console.log('[bye]')
     process.exit(0)
   }
@@ -1511,6 +1552,11 @@ async function main() {
 // Test seam (bridge.e2e.test.ts): await a topic's queue so a test can wait out the
 // fire-and-forget handlePrompt chain kicked off by an incoming message. The bot only
 // starts polling when this file is run directly, never when it is imported.
+// Test seam (bridge.e2e.test.ts): the startup mutex's staleness rules decide
+// whether a redeploy is allowed to proceed, so they are worth pinning directly.
+export function _otherLiveBridge(): number | undefined { return otherLiveBridge() }
+export const _PID_FILE = PID_FILE
+
 export function _drainQueue(key: string): Promise<unknown> { return queues.get(key) ?? Promise.resolve() }
 
 // Guarded so the module can be imported by a test without starting a poller.

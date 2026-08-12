@@ -10,7 +10,7 @@
  * We then assert on exactly what the user would have seen. Run with `bun test`.
  */
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -253,5 +253,37 @@ describe('/restart', () => {
     // than reaching process.exit(0) — which would take this test run down with it.
     const cs = await incoming(1040, '/restart')
     expect(finalReply(cs)).toMatch(/not available/i)
+  })
+})
+
+describe('startup mutex (otherLiveBridge)', () => {
+  // A pidfile is only a CLAIM. A SIGKILLed or OOM-killed bridge leaves one behind
+  // and pids get reused, so every one of these must read as "no holder" — if any
+  // returned a pid, a redeploy would refuse to start for no reason.
+  const pf = bridge._PID_FILE as string
+  const clear = () => { try { rmSync(pf, { force: true }) } catch {} }
+
+  test('no pidfile → no holder', () => {
+    clear()
+    expect(bridge._otherLiveBridge()).toBeUndefined()
+  })
+  test('a pid that no longer exists → stale, no holder', () => {
+    writeFileSync(pf, '999999')
+    expect(bridge._otherLiveBridge()).toBeUndefined()
+  })
+  test("another user's pid → not ours, no holder", () => {
+    writeFileSync(pf, '1')          // init: root-owned, cwd unreadable
+    expect(bridge._otherLiveBridge()).toBeUndefined()
+  })
+  test('garbage content → no holder', () => {
+    for (const junk of ['', '   ', 'not-a-pid', '-5', '0']) {
+      writeFileSync(pf, junk)
+      expect(bridge._otherLiveBridge()).toBeUndefined()
+    }
+  })
+  test('our own pid is never treated as a rival', () => {
+    writeFileSync(pf, String(process.pid))
+    expect(bridge._otherLiveBridge()).toBeUndefined()
+    clear()
   })
 })
