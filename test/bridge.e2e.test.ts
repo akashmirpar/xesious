@@ -25,6 +25,7 @@ process.env.TG_STATE_FILE = STATE_FILE
 process.env.TG_CLAUDE_TIMEOUT_MS = '20000'  // absolute backstop, must not fire first
 process.env.TG_IDLE_TIMEOUT_MS = '1500'    // the idle watchdog is what HANG exercises
 process.env.TG_QUIET_NOTE_MS = '500'
+process.env.TG_INTERRUPT_BUTTON_MS = '0'   // offer Interrupt immediately in tests
 // These two must be pinned, not merely left unset: bun auto-loads the repo's .env,
 // so a developer machine with TG_ALLOW_BYPASS=1 in it would otherwise silently turn
 // the bypass safety-gate test green for the wrong reason.
@@ -618,4 +619,109 @@ describe('/effort resolves what "default" means (follow-up)', () => {
     const cs = await incoming(1131, '/effort')
     expect(sends(cs).map(c => String(c.payload.text ?? '')).join('\n')).toContain('high')
   }, 8000)
+})
+
+describe('interrupt vs stop, and the job registry', () => {
+  const btnOf = (c: any) => c.payload?.reply_markup?.inline_keyboard?.[0]?.[0]
+
+  // Send `text` to `chat` while a run is already in flight there.
+  const inject = (chat: number, text: string, id: number) => bridge.bot.handleUpdate({
+    update_id: 95000 + id,
+    message: { message_id: id, date: 0, chat: { id: chat, type: 'private', first_name: 'T' },
+               from: { id: 1, is_bot: false, first_name: 'T' }, text },
+  })
+
+  test('/interrupt on an idle topic says so rather than pretending', async () => {
+    expect(finalReply(await incoming(1140, '/interrupt'))).toMatch(/nothing is running/i)
+  })
+
+  test('/interrupt delivers what the run already produced', async () => {
+    // Before mid-turn text was collected there was nothing to keep and stopping
+    // could only discard. The expensive part is now already in hand.
+    const run = incoming(1141, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    await inject(1141, '/interrupt', 95101)
+    const cs = await run
+    const texts = sends(cs).map(c => String(c.payload.text ?? '')).join('\n')
+    expect(texts).toContain('160 of 245')
+  }, 20000)
+
+  test('/stop discards, and the two are distinguishable in the reply', async () => {
+    const run = incoming(1142, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    await inject(1142, '/stop', 95102)
+    const cs = await run
+    const texts = sends(cs).map(c => String(c.payload.text ?? '')).join('\n')
+    expect(texts).toMatch(/discarded/i)
+    expect(texts).not.toContain('160 of 245')
+  }, 20000)
+
+  test('the status message offers Interrupt, labelled plainly', async () => {
+    const run = incoming(1143, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    const withBtn = calls.find(c => c.method === 'editMessageText' && btnOf(c))
+    expect(withBtn).toBeTruthy()
+    expect(btnOf(withBtn).text).toBe('Interrupt')
+    // Job-scoped, never topic-scoped: the status message is retained after a run
+    // that produced text, so a topic-scoped button would end whatever is running
+    // later.
+    expect(String(btnOf(withBtn).callback_data)).toMatch(/^int:[0-9a-f]{8}$/)
+    await inject(1143, '/interrupt', 95103)
+    await run
+  }, 20000)
+
+  test('the keyboard is stripped when the run ends', async () => {
+    const before = calls.length
+    await incoming(1144, 'hello there')
+    expect(calls.slice(before).some(c => c.method === 'editMessageReplyMarkup')).toBe(true)
+  }, 10000)
+
+  test('/jobs reports an idle topic honestly', async () => {
+    expect(finalReply(await incoming(1145, '/jobs'))).toMatch(/nothing running/i)
+  })
+
+  test('/jobs lists a run in flight, with its id and age', async () => {
+    const run = incoming(1146, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    const cs = await inject(1146, '/jobs', 95104).then(() => calls.slice(-6))
+    const shown = cs.filter(c => c.method === 'sendMessage').map(c => String(c.payload.text ?? '')).join('\n')
+    expect(shown).toMatch(/Jobs in this topic/i)
+    expect(shown).toMatch(/▶ [0-9a-f]{8}/)
+    await inject(1146, '/interrupt', 95105)
+    await run
+  }, 20000)
+})
+
+describe('interrupting a run stops the tree it built', () => {
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true } catch { return false } }
+
+  test('a process the run backgrounded does NOT survive the interrupt', async () => {
+    // The bug this exists for, measured before building it: SIGKILL to the claude
+    // process left every grandchild running, so a `nohup`ed job kept going
+    // invisibly. The fix is spawning the child in its own process group and
+    // signalling the GROUP.
+    const cwd = join(TMP, 'sessions', 'dm-1')
+    const pidfile = join(cwd, 'bgpid.txt')
+    try { rmSync(pidfile, { force: true }) } catch {}
+
+    const run = incoming(1150, 'BGPROC')
+    let bg = 0
+    for (let i = 0; i < 60 && !bg; i++) {
+      await new Promise(r => setTimeout(r, 100))
+      try { bg = Number(readFileSync(pidfile, 'utf8').trim()) } catch {}
+    }
+    expect(bg).toBeGreaterThan(0)
+    expect(alive(bg)).toBe(true)          // it really is running
+
+    await bridge.bot.handleUpdate({
+      update_id: 96000,
+      message: { message_id: 96001, date: 0, chat: { id: 1150, type: 'private', first_name: 'T' },
+                 from: { id: 1, is_bot: false, first_name: 'T' }, text: '/interrupt' },
+    })
+    await run
+    for (let i = 0; i < 40 && alive(bg); i++) await new Promise(r => setTimeout(r, 100))
+
+    expect(alive(bg)).toBe(false)         // …and it is gone
+    if (alive(bg)) { try { process.kill(bg, 'SIGKILL') } catch {} }
+  }, 30000)
 })
