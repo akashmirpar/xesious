@@ -289,5 +289,50 @@ else
 fi
 
 echo
+echo "== respawn.sh: distinguishes a clean exit from a crash =="
+# The bug this pins: the old inline loop was `bun run bridge.ts 2>&1 | tee -a
+# bridge.log`, so $? was TEE's status. Every exit looked identical and every
+# restart — including a deliberate one — paid the full 50s back-off.
+run_respawn() {  # <exit-code> ; sets REPLY to the log contents
+  local rc="$1"
+  local d="$TMP/respawn-$rc"
+  mkdir -p "$d/bin"
+  cp "$ROOT/respawn.sh" "$d/"
+  printf '#!/bin/sh\nexit %s\n' "$rc" > "$d/bin/bun"; chmod +x "$d/bin/bun"
+  ( cd "$d" && PATH="$d/bin:$PATH" TG_RESPAWN_BACKOFF=1 exec bash ./respawn.sh ) >/dev/null 2>&1 &
+  local pid=$!; SPAWNED+=("$pid"); disown "$pid" 2>/dev/null
+  sleep 2
+  kill -9 "$pid" 2>/dev/null
+  pkill -9 -P "$pid" 2>/dev/null
+  REPLY="$(cat "$d/bridge.log" 2>/dev/null)"
+}
+
+run_respawn 0; LOG_CLEAN="$REPLY"
+case "$LOG_CLEAN" in *"clean exit"*) ok "exit 0 is reported as a clean exit" ;;
+                      *) no "exit 0 not recognised — log: $LOG_CLEAN" ;; esac
+case "$LOG_CLEAN" in *"restarting now"*) ok "…and it restarts immediately, no back-off" ;;
+                      *) no "clean exit did not restart immediately" ;; esac
+case "$LOG_CLEAN" in *"restarting in"*) no "a clean exit must not wait out the 409 back-off" ;;
+                      *) ok "a clean exit never waits out the back-off" ;; esac
+
+run_respawn 3; LOG_CRASH="$REPLY"
+case "$LOG_CRASH" in *"rc=3"*) ok "a crash reports the bridge's real exit code" ;;
+                      *) no "exit code not propagated (PIPESTATUS) — log: $LOG_CRASH" ;; esac
+case "$LOG_CRASH" in *"restarting in 1s"*) ok "…and it does back off before retrying" ;;
+                      *) no "a crash did not back off" ;; esac
+
+echo
+echo "== tmux_own_sessions recognises the respawn.sh wrapper too =="
+if command -v tmux >/dev/null 2>&1; then
+  DIR_R="$TMP/respawn-session"; mkdir -p "$DIR_R"
+  S_R="xesious-t0-respawn-$$"
+  tmux new-session -d -s "$S_R" -c "$DIR_R" "bash -c 'while true; do sleep 5; done  # bash /x/respawn.sh'" 2>/dev/null
+  TMUX_SESSIONS+=("$S_R")
+  sleep 1
+  has "a session running respawn.sh is ours" "$(tmux_own_sessions "$DIR_R" | tr '\n' ' ')" "$S_R"
+  tmux kill-session -t "$S_R" 2>/dev/null
+fi
+
+echo
 echo "-- $PASS passed, $FAIL failed --"
 [ "$FAIL" -eq 0 ]

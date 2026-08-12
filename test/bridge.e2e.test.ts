@@ -245,3 +245,13 @@ describe('file delivery: a file staged in ./outbox/ is sent back', () => {
     expect(cs.some(c => c.method === 'sendDocument')).toBe(true)    // the file itself
   })
 })
+
+describe('/restart', () => {
+  test('is inert when the poller was never started (importing must not be able to exit)', async () => {
+    // requestDrain is set by main(), which the import.meta.main guard keeps from
+    // running here. So the command has nothing to trigger and must say so rather
+    // than reaching process.exit(0) — which would take this test run down with it.
+    const cs = await incoming(1040, '/restart')
+    expect(finalReply(cs)).toMatch(/not available/i)
+  })
+})

@@ -86,6 +86,11 @@ const ALLOWED_TOOLS =
 const MODEL = process.env.TG_MODEL?.trim() || ''
 const REQUIRE_MENTION = /^(1|true|yes)$/i.test(process.env.TG_REQUIRE_MENTION || '')
 const CLAUDE_TIMEOUT_MS = Number(process.env.TG_CLAUDE_TIMEOUT_MS || 30 * 60 * 1000)
+// How long a graceful shutdown will wait for in-flight runs before giving up on
+// them. A deploy normally waits for idle before signalling, so this is the
+// backstop for a SIGTERM that lands mid-run — and for the hung-child case, where
+// the child never exits at all.
+const DRAIN_MAX_MS = Number(process.env.TG_DRAIN_MAX_MS || 5 * 60 * 1000)
 const ALLOWED_USERS = parseIdList(process.env.TG_ALLOWED_USERS)
 // See isAllowed(): trust every member of an allowlisted group instead of listing
 // users. Off by default — it widens authorization to whoever is in that group.
@@ -286,6 +291,15 @@ function ensureDir(dir: string): string {
 const queues = new Map<string, Promise<unknown>>()
 // The claude child currently running for a topic (for /stop), and topics whose
 // run was deliberately killed via /stop (so we suppress the error reply).
+// Written on a deliberate shutdown and consumed by the next startup. Its only job
+// is to distinguish "we meant to stop" from "we crashed", which decides whether
+// the updates that arrived while we were down are kept or dropped.
+const CLEAN_EXIT_MARKER = join(dirname(STATE_FILE), '.clean-exit')
+
+// Set by main(). Lets the /restart command trigger the same graceful drain the
+// signal handlers use, without main()'s locals leaking out.
+let requestDrain: ((why: string) => Promise<void>) | undefined
+
 const activeRuns = new Map<string, ChildProcess>()
 const stopped = new Set<string>()
 function enqueue<T>(key: string, task: () => Promise<T>): Promise<T> {
@@ -1018,6 +1032,7 @@ bot.on('message', async ctx => {
       `/resume [id] — restore the previous session, or bind a past session id\n` +
       `/compact [focus] — summarize this topic's history to free up context\n` +
       `/stop — cancel the task currently running in this topic\n` +
+      `/restart — restart the bridge; in-flight tasks finish first\n` +
       `/interrupt [on|off] — new messages cancel the running task instead of queueing\n` +
       `/voice [on|summary|off] — speak answers back; full or summarized (text is always complete)\n` +
       `/live — get a private link to a real-time voice call bound to this session\n` +
@@ -1043,6 +1058,18 @@ bot.on('message', async ctx => {
     if (!mentioned) return
   }
 
+  if (cmd === '/restart') {
+    if (!requestDrain) { await send(ctx, threadId, 'Restart is not available in this process.', true); return }
+    const n = activeRuns.size
+    await send(ctx, threadId, n > 0
+      ? `♻️ Restarting — finishing ${n} run${n === 1 ? '' : 's'} first. Messages you send while I'm down will still be picked up.`
+      : `♻️ Restarting — back in a moment. Messages you send while I'm down will still be picked up.`)
+    // Deliberately not awaited. The drain stops the runner, and the runner waits
+    // for its handlers to return — awaiting our own shutdown from inside a handler
+    // would deadlock.
+    void requestDrain(`/restart from ${ctx.from?.id ?? 'unknown'}`)
+    return
+  }
   if (cmd === '/stop' || cmd === '/cancel') {
     const child = activeRuns.get(key)
     if (child) { stopped.add(key); child.kill('SIGKILL'); await send(ctx, threadId, '🛑 Stopped the running task.') }
@@ -1402,7 +1429,17 @@ async function main() {
 
   // Clear stale pending updates (e.g. a message buffered before a restart) so
   // we don't reprocess old messages on startup.
-  await bot.api.deleteWebhook({ drop_pending_updates: true }).catch(() => {})
+  // Drop the backlog only when we did NOT shut down cleanly. A deliberate restart
+  // is a window in which a user's message would otherwise vanish silently — and
+  // /restart makes that window a routine event rather than a rare one. After a
+  // crash the backlog is still dropped: replaying a queue into a build that just
+  // died is the worse risk.
+  let cleanRestart = false
+  try {
+    if (existsSync(CLEAN_EXIT_MARKER)) { cleanRestart = true; rmSync(CLEAN_EXIT_MARKER, { force: true }) }
+  } catch {}
+  if (cleanRestart) console.log('[ok] clean restart — keeping messages received while down')
+  await bot.api.deleteWebhook({ drop_pending_updates: !cleanRestart }).catch(() => {})
 
   // Delete any "💭 Thinking…" status messages orphaned by a restart that killed
   // a run mid-flight, so no dangling status is left in a topic.
@@ -1418,9 +1455,44 @@ async function main() {
   // (~30s). So on 409 we wait it out and resume — this self-heals the cycle
   // instead of crash-looping. A genuine second poller just keeps it waiting.
   let handle: RunnerHandle | undefined
-  const stop = async () => { console.log('\n[bye]'); try { await handle?.stop() } catch {} ; process.exit(0) }
-  process.once('SIGINT', stop)
-  process.once('SIGTERM', stop)
+
+  // Graceful drain. The previous handler stopped polling and then exited at once,
+  // which abandoned every in-flight `claude` child and threw away replies that had
+  // been paid for but not yet delivered. Nothing in the bridge prevented that — the
+  // only thing that did was update.sh externally polling /proc for an idle moment
+  // before signalling. So the guarantee lived in a shell script inferring state
+  // from the outside, while the process holding activeRuns and queues (the actual
+  // answer) did nothing with them.
+  //
+  // Now: stop accepting new messages, let the runs that are already going finish
+  // and deliver, then exit 0. Exiting 0 matters — respawn.sh reads it to decide
+  // whether to come back immediately or wait out the 409 back-off.
+  let draining = false
+  const drain = async (why: string): Promise<void> => {
+    if (draining) return
+    draining = true
+    console.log(`[drain] ${why} — not accepting new messages; ${activeRuns.size} run(s) in flight`)
+    try { await handle?.stop() } catch {}          // stop fetching updates
+    const deadline = Date.now() + DRAIN_MAX_MS
+    while (activeRuns.size > 0 && Date.now() < deadline) await new Promise(r => setTimeout(r, 250))
+    if (activeRuns.size > 0) {
+      // A hung child never exits, so this cap is the difference between a bounded
+      // shutdown and one that hangs forever holding the token.
+      console.error(`[drain] cap reached with ${activeRuns.size} run(s) still active — exiting anyway`)
+    } else {
+      // A run can be finished while its reply is still being sent; the queue chain
+      // is what tracks that, so wait on it too.
+      await Promise.allSettled([...queues.values()])
+      console.log('[drain] all runs finished and delivered')
+    }
+    try { writeFileSync(CLEAN_EXIT_MARKER, new Date().toISOString()) } catch {}
+    console.log('[bye]')
+    process.exit(0)
+  }
+  requestDrain = drain
+  process.once('SIGINT', () => void drain('SIGINT'))
+  process.once('SIGTERM', () => void drain('SIGTERM'))
+  process.once('SIGHUP', () => void drain('SIGHUP'))
 
   for (let attempt = 1; ; attempt++) {
     handle = run(bot)

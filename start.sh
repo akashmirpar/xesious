@@ -62,12 +62,9 @@ for _ in 1 2 3; do [ -n "$(own_pids bun "$DIR")" ] || break; sleep 1; done
 stop_own "$DIR" KILL >/dev/null 2>&1 || true
 sleep 3  # let Telegram release the previous long-poll lock
 
-# Respawn wrapper with a long restart delay. grammY can't catch a polling 409
-# in-process, so if the bot exits on one (a previous instance's long-poll still
-# reserved server-side), we wait 50s — longer than Telegram's ~30s long-poll
-# expiry — so the NEXT start finds the token free and comes up clean. Once a
-# clean start happens, the bot stays up indefinitely.
-tmux new-session -d -s "$SESSION" -c "$DIR" \
-  "while true; do PATH='$PATH' bun run bridge.ts 2>&1 | tee -a bridge.log; echo \"[respawn] exited \$(date +%H:%M:%S), restarting in 50s\" | tee -a bridge.log; sleep 50; done"
+# The supervisor loop lives in respawn.sh — it needs bash for PIPESTATUS, and tmux
+# runs a session command through /bin/sh. PATH is passed explicitly because the
+# tmux server's environment may predate this shell's.
+tmux new-session -d -s "$SESSION" -c "$DIR" "PATH='$PATH' bash '$DIR/respawn.sh'"
 echo "Started in tmux session '$SESSION'."
 echo "Watch:  tmux attach -t $SESSION     Detach: Ctrl-b then d"
