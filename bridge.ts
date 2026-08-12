@@ -30,7 +30,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import {
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
-  parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock,
+  parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   needsRich, hasRtl, sanitizeProse,
   normalizeMode as libNormalizeMode,
   permissionArgs as libPermissionArgs,
@@ -85,7 +85,17 @@ const ALLOWED_TOOLS =
   'Bash,Read,Edit,Write,Glob,Grep,WebSearch,WebFetch,Agent,TodoWrite,NotebookEdit'
 const MODEL = process.env.TG_MODEL?.trim() || ''
 const REQUIRE_MENTION = /^(1|true|yes)$/i.test(process.env.TG_REQUIRE_MENTION || '')
-const CLAUDE_TIMEOUT_MS = Number(process.env.TG_CLAUDE_TIMEOUT_MS || 30 * 60 * 1000)
+// Absolute backstop only. This used to default to 30 minutes and was the sole
+// watchdog, which SIGKILLed working turns and lost all their work — one real run
+// did 17+ minutes of continuous tool calls. The idle watchdog below is what
+// actually catches a hang, so this can be generous.
+const CLAUDE_TIMEOUT_MS = Number(process.env.TG_CLAUDE_TIMEOUT_MS || 4 * 60 * 60 * 1000)
+// No stream event for this long means the child is hung rather than busy. It must
+// exceed the longest plausible single tool call: events arrive per tool call, and
+// a real one has spent 8+ minutes inside a single Bash step.
+const IDLE_TIMEOUT_MS = Number(process.env.TG_IDLE_TIMEOUT_MS || 15 * 60 * 1000)
+// How long a run may be quiet before the status message says so.
+const QUIET_NOTE_MS = Number(process.env.TG_QUIET_NOTE_MS || 90 * 1000)
 // How long a graceful shutdown will wait for in-flight runs before giving up on
 // them. A deploy normally waits for idle before signalling, so this is the
 // backstop for a SIGTERM that lands mid-run — and for the hung-child case, where
@@ -488,7 +498,7 @@ function voiceEnv(): NodeJS.ProcessEnv {
 // toolStep, the Step type and both status renderers live in ./lib. renderSteps and
 // renderStepsHtml there take progressDetail as a parameter; bind this process's
 // PROGRESS_DETAIL here.
-const renderSteps = (steps: Step[], total: number, headline?: string) => libRenderSteps(steps, total, { progressDetail: PROGRESS_DETAIL, headline })
+const renderSteps = (steps: Step[], total: number, headline?: string, note?: string) => libRenderSteps(steps, total, { progressDetail: PROGRESS_DETAIL, headline, note })
 const renderStepsHtml = (steps: Step[]) => libRenderStepsHtml(steps, { progressDetail: PROGRESS_DETAIL })
 
 // Run a prompt with streaming output, editing a single "status" message in the
@@ -510,6 +520,8 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   if (status) { pending.push({ chat: ctx.chat!.id, id: status.message_id }); saveState() }
   const steps: Step[] = []
   let lastEdit = 0, dirty = false
+  // Reset by every stream event; drives both the staleness note and the watchdog.
+  let lastEventAt = Date.now()
   const editStatus = async (force = false) => {
     if (!status || (!dirty && !force)) return
     const now = Date.now()
@@ -523,8 +535,9 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     // would break the parse and lose the whole update. The summary still counts
     // every step, so trimming never misreports how much work was done.
     let shown = steps.slice(-12)
-    let body = renderSteps(shown, steps.length)
-    while (body.length > 15000 && shown.length > 1) { shown = shown.slice(1); body = renderSteps(shown, steps.length) }
+    const note = stalenessNote(Date.now() - lastEventAt, { quietMs: QUIET_NOTE_MS })
+    let body = renderSteps(shown, steps.length, undefined, note)
+    while (body.length > 15000 && shown.length > 1) { shown = shown.slice(1); body = renderSteps(shown, steps.length, undefined, note) }
     try {
       await ctx.api.raw.editMessageText({ chat_id: ctx.chat!.id, message_id: status.message_id, rich_message: { markdown: body } })
     } catch {
@@ -549,6 +562,17 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
     activeRuns.set(key, child)
     const timer = setTimeout(() => child.kill('SIGKILL'), CLAUDE_TIMEOUT_MS)
+    // Keyed on stream events, not wall-clock: a long turn emits them steadily even
+    // when each step takes minutes, while a hung child emits nothing at all.
+    let stalled = false
+    const idleTimer = setInterval(() => {
+      if (Date.now() - lastEventAt < IDLE_TIMEOUT_MS) return
+      stalled = true
+      console.error(`[warn] no stream activity for ${Math.round((Date.now() - lastEventAt) / 1000)}s — killing a stalled run in ${cwd}`)
+      child.kill('SIGKILL')
+    // Poll relative to the window rather than at a fixed 10s: a short idle timeout
+    // (as tests use) would otherwise never be checked before the deadline.
+    }, Math.max(250, Math.min(10_000, Math.floor(IDLE_TIMEOUT_MS / 4))))
     child.stderr.on('data', d => (err += d))
     child.stdout.on('data', d => {
       buf += d
@@ -557,6 +581,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
         const line = buf.slice(0, nl); buf = buf.slice(nl + 1)
         // Classification lives in ./lib (parseStreamLine); the side effects stay here.
         for (const ev of parseStreamLine(line, { progressDetail: PROGRESS_DETAIL })) {
+          lastEventAt = Date.now()
           if (ev.kind === 'step') { steps.push(ev.step); dirty = true }
           else if (ev.kind === 'text') {
             // Keep every block for the promotion decision, and show it in the
@@ -571,7 +596,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
       void editStatus()
     })
     const finish = async (res: ClaudeResult) => {
-      clearTimeout(timer); clearInterval(ticker)
+      clearTimeout(timer); clearInterval(ticker); clearInterval(idleTimer)
       activeRuns.delete(key)
       if (status) {
         pending = pending.filter(p => !(p.chat === ctx.chat!.id && p.id === status.message_id)); saveState()
@@ -602,6 +627,10 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
         if (noAnswer) console.error(`[warn] no answer for ${key}: ${JSON.stringify(finalText.slice(0, 60))}`)
         void finish({ text: finalText || (isError ? '(claude error)' : ''), sessionId, isError, noAnswer, blocks: textBlocks })
       }
+      else if (stalled) void finish({
+        text: `⚠️ The run stalled — nothing came back for ${Math.round(IDLE_TIMEOUT_MS / 60000)} minutes, so I stopped it. Nothing was delivered. Try again, or send /stop if it happens repeatedly.`,
+        isError: true,
+      })
       else void finish({ text: `Could not parse Claude output.\n\n${(err || `exit ${code}`).slice(-1500)}`, isError: true })
     })
   })
