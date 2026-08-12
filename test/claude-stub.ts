@@ -42,8 +42,15 @@ const rawPrompt = val('-p') ?? ''
 // The bridge wraps a user message in an attribution frame whose first line carries
 // a per-process nonce. Strip it the way the real CLI's model would look past it,
 // or every scenario token below would be shadowed by the marker.
-const framed = /^\[xesious:[0-9a-f]+\] message from [^\n]*\n/.test(rawPrompt)
-const prompt = framed ? rawPrompt.slice(rawPrompt.indexOf('\n') + 1) : rawPrompt
+// The marker is not always the FIRST line: a turn that follows a finished
+// background task carries a bridge-authored preamble ahead of it. Find the marker
+// wherever it is and take everything after it as the user's actual message.
+const frameLine = rawPrompt.match(/\[xesious:[0-9a-f]+\] message from [^\n]*\n/)
+const framed = Boolean(frameLine)
+const carriedBg = /\[xesious:[0-9a-f]+\] a background task/.test(rawPrompt)
+const prompt = frameLine
+  ? rawPrompt.slice(rawPrompt.indexOf(frameLine[0]) + frameLine[0].length)
+  : rawPrompt
 const scenario = prompt.trim().split(/\s+/)[0] ?? ''
 const resumeId = val('--resume')
 const model = val('--model')
@@ -57,7 +64,8 @@ const initLine = () => emit({ type: 'system', subtype: 'init', session_id: sessi
 const result = (extra: Record<string, unknown>) =>
   emit({ type: 'result', subtype: 'success', is_error: false, session_id: sessionId, ...extra })
 
-const tag = `${resumeId ? 'hadResume' : 'noResume'} ${model ? 'modelSet' : 'modelDefault'} ${framed ? 'framed' : 'unframed'} ${effort ? 'effort' + effort : 'effortDefault'}`
+const forked = argv.includes('--fork-session')
+const tag = `${resumeId ? 'hadResume' : 'noResume'} ${model ? 'modelSet' : 'modelDefault'} ${framed ? 'framed' : 'unframed'} ${effort ? 'effort' + effort : 'effortDefault'} ${forked ? 'forked' : 'notForked'} ${carriedBg ? 'sawBgResult' : 'noBgResult'}`
 
 async function main() {
   initLine()

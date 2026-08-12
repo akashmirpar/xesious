@@ -25,6 +25,7 @@ process.env.TG_STATE_FILE = STATE_FILE
 process.env.TG_CLAUDE_TIMEOUT_MS = '20000'  // absolute backstop, must not fire first
 process.env.TG_IDLE_TIMEOUT_MS = '1500'    // the idle watchdog is what HANG exercises
 process.env.TG_QUIET_NOTE_MS = '500'
+process.env.TG_PARALLEL_OFFER_MS = '150'  // offer the parallel run almost at once
 // These two must be pinned, not merely left unset: bun auto-loads the repo's .env,
 // so a developer machine with TG_ALLOW_BYPASS=1 in it would otherwise silently turn
 // the bypass safety-gate test green for the wrong reason.
@@ -779,4 +780,111 @@ describe('job messages point back at what caused them', () => {
     expect(replyTarget(ack)).toBeTruthy()
     await run
   }, 20000)
+})
+
+describe('/bg and running a message alongside instead of behind (D: /bg)', () => {
+  const btnOf = (c: any) => c.payload?.reply_markup?.inline_keyboard?.[0]?.[0]
+  const inject = (chat: number, text: string, id: number) => bridge.bot.handleUpdate({
+    update_id: 98000 + id,
+    message: { message_id: id, date: 0, chat: { id: chat, type: 'private', first_name: 'T' },
+               from: { id: 1, is_bot: false, first_name: 'T' }, text },
+  })
+
+  test('/bg without a task explains itself rather than doing nothing', async () => {
+    expect(finalReply(await incoming(1170, '/bg'))).toMatch(/Usage: \/bg/)
+  })
+
+  test('/bg forks the session, so the topic keeps its own', async () => {
+    // A parallel run sharing the topic's session id would corrupt its ordering, and
+    // persisting the fork's id would quietly steal the topic's binding.
+    await incoming(1171, 'first, to establish a session')
+    const bound = stateNow().sessions['1171:main']?.sessionId
+    expect(bound).toBeTruthy()
+
+    const before = calls.length
+    await incoming(1171, '/bg summarise the logs')
+    await bridge._drainQueue('1171:main#bg-' + (updateId + 5000 - 1)).catch(() => {})
+    await new Promise(r => setTimeout(r, 800))
+    const texts = calls.slice(before).filter(c => c.method === 'sendMessage').map(c => String(c.payload.text ?? '')).join('\n')
+    expect(texts).toContain('background')          // acknowledged up front
+    expect(texts).toContain('forked')              // the stub reports --fork-session
+    expect(stateNow().sessions['1171:main']?.sessionId).toBe(bound)   // binding untouched
+  }, 15000)
+
+  test('a message sent while a long run is going is offered the choice', async () => {
+    const run = incoming(1172, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    const before = calls.length
+    await inject(1172, 'a second, unrelated question', 98101)
+    const offer = calls.slice(before).find(c => c.method === 'sendMessage' && btnOf(c))
+    expect(offer).toBeTruthy()
+    expect(btnOf(offer).text).toBe('— Run this now —')
+    expect(String(btnOf(offer).callback_data)).toBe('par:98101')
+    // The offer quotes the message it is about, and is silent — it is an aside.
+    expect(offer!.payload.reply_parameters?.message_id).toBe(98101)
+    expect(offer!.payload.disable_notification).toBe(true)
+    await inject(1172, '/interrupt', 98102)
+    await run
+  }, 20000)
+
+  test('a quick turn is NOT offered it', async () => {
+    // Every burst of messages would otherwise sprout a button, and waiting two
+    // seconds costs nothing.
+    const before = calls.length
+    await incoming(1173, 'hello there')
+    const offers = calls.slice(before).filter(c => c.method === 'sendMessage' && btnOf(c)
+      && btnOf(c).text === '— Run this now —')
+    expect(offers).toHaveLength(0)
+  }, 10000)
+
+  test('taking the offer runs it once, not twice', async () => {
+    // The queued turn must do nothing once its message has been promoted, or the
+    // same prompt runs in parallel AND again in sequence.
+    const run = incoming(1174, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    await inject(1174, 'promote me', 98201)
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 98999,
+      callback_query: { id: 'cb1', from: { id: 1, is_bot: false, first_name: 'T' },
+        chat_instance: 'x', data: 'par:98201',
+        message: { message_id: 98202, date: 0, chat: { id: 1174, type: 'private' } } },
+    })
+    await new Promise(r => setTimeout(r, 1200))
+    await inject(1174, '/interrupt', 98203)
+    await run
+    await bridge._drainQueue('1174:main')
+    const ran = calls.slice(before).filter(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('okReply'))
+    expect(ran.length).toBe(1)
+  }, 25000)
+
+  test('a stale offer says so rather than forking a second run', async () => {
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 98998,
+      callback_query: { id: 'cb2', from: { id: 1, is_bot: false, first_name: 'T' },
+        chat_instance: 'x', data: 'par:404404',
+        message: { message_id: 1, date: 0, chat: { id: 1175, type: 'private' } } },
+    })
+    const ans = calls.slice(before).find(c => c.method === 'answerCallbackQuery')
+    expect(String(ans?.payload?.text ?? '')).toMatch(/already running/i)
+  }, 10000)
+})
+
+describe('a finished background job is carried into the next turn', () => {
+  test("the topic's next turn is told what the background task found", async () => {
+    // A forked job has its own session id — deliberately — and that id is never
+    // persisted, so the topic's own conversation would otherwise never learn the
+    // job happened: the user gets an answer in Telegram while the next turn has no
+    // idea it exists.
+    await incoming(1180, 'establish the session')
+    await incoming(1180, '/bg go and look something up')
+    await new Promise(r => setTimeout(r, 1200))          // let the bg turn finish
+    const cs = await incoming(1180, 'so what did you find?')
+    expect(finalReply(cs)).toContain('sawBgResult')
+  }, 20000)
+
+  test('an ordinary turn with no background history carries nothing', async () => {
+    expect(finalReply(await incoming(1181, 'just a question'))).toContain('noBgResult')
+  }, 10000)
 })

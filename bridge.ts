@@ -111,6 +111,17 @@ const QUIET_NOTE_MS = Number(process.env.TG_QUIET_NOTE_MS || 90 * 1000)
 // its first second — a button that materialises later is a control you have to
 // notice arriving, exactly when you are already waiting on something.
 const INTERRUPT_LABEL = '— Interrupt —'
+// How long a run must have been going before a NEW message is offered the choice to
+// run alongside it rather than queue behind it. Not from the first second: a quick
+// burst of messages would otherwise sprout a button each, and waiting two seconds
+// costs nothing.
+//
+// Deliberately NOT capped in number. These are temporary jobs — each runs and
+// exits — unlike a warm session, which stays resident. The memory ceiling that
+// bounds the warm-sessions item does not apply in the same way here, so a cap would
+// be a restriction without a matching risk.
+const PARALLEL_OFFER_MS = Number(process.env.TG_PARALLEL_OFFER_MS || 15 * 1000)
+const PARALLEL_LABEL = '— Run this now —'
 // How long a graceful shutdown will wait for in-flight runs before giving up on
 // them. A deploy normally waits for idle before signalling, so this is the
 // backstop for a SIGTERM that lands mid-run — and for the hung-child case, where
@@ -612,6 +623,23 @@ async function endJob(job: Job, outcome: RunOutcome): Promise<void> {
 // work keeps going invisibly on the box.
 const leftBehind = new Map<number, { id: string; key: string; at: number }>()
 
+// Messages that were offered "run this now" and are still waiting their turn, and
+// those that took the offer (whose queued turn must therefore do nothing).
+const offered = new Map<number, { key: string; threadId?: number; prompt: string }>()
+const skipQueued = new Set<number>()
+
+// What a background job found, held until the topic's next ordinary turn.
+//
+// A forked job has its own session id — deliberately, since sharing the topic's
+// would corrupt its ordering — and that id is never persisted, so the topic's own
+// conversation never learns the job happened. Without this the user gets an answer
+// in Telegram while the next turn in that topic has no idea it exists.
+const bgNotes: Record<string, string[]> = {}
+const noteBgResult = (key: string, text: string) => {
+  (bgNotes[key] ??= []).push(text.length > 600 ? `${text.slice(0, 600)}…` : text)
+  if (bgNotes[key].length > 3) bgNotes[key].shift()
+}
+
 const stopped = new Set<string>()
 // How many tasks are queued or running per topic, and the id of the most recent
 // message the user sent there. Both feed needsReplyLink(): an answer only needs to
@@ -705,12 +733,27 @@ const renderStepsHtml = (steps: Step[]) => libRenderStepsHtml(steps, { progressD
 // finishes. Opt-in per caller and NOT done unconditionally here, because
 // handlePassthrough must never bind a topic to the throwaway session that /usage
 // and friends mint — see the note on that function.
-async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL, onInit?: (sessionId: string) => void, effort: string = EFFORT_TIER, askedBy?: number): Promise<ClaudeResult> {
+// The tail parameters became an options object once there were five of them; a
+// twelfth positional argument is how call sites start passing things in the wrong
+// order silently.
+type RunOpts = {
+  onInit?: (sessionId: string) => void
+  effort?: string
+  askedBy?: number
+  // Fork the resumed session instead of continuing it, so this run gets its own
+  // session id and cannot interleave with the topic's own conversation. Required
+  // for anything running in parallel with the topic.
+  fork?: boolean
+  queueKey?: string
+}
+async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL, ro: RunOpts = {}): Promise<ClaudeResult> {
+  const { onInit, effort = EFFORT_TIER, askedBy, fork } = ro
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs(mode)]
   if (TELEGRAM_PROFILE.trim()) args.push('--append-system-prompt', TELEGRAM_PROFILE)
   if (resumeId) args.push('--resume', resumeId)
   if (model) args.push('--model', model)
   if (effort) args.push('--effort', effort)
+  if (fork && resumeId) args.push('--fork-session')
 
   const opts: any = threadId ? { message_thread_id: threadId } : {}
   // Minted before the status message so its keyboard can name this run from the
@@ -1350,11 +1393,21 @@ async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: str
   }).catch(() => {})
 }
 
-async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number, forceReplyLink = false): Promise<void> {
+async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number, forceReplyLink = false, background = false): Promise<void> {
+  // A message promoted to run in parallel has already been handled; its turn in the
+  // queue must do nothing rather than run it a second time.
+  if (replyTo !== undefined && skipQueued.has(replyTo)) { skipQueued.delete(replyTo); return }
+  if (replyTo !== undefined) offered.delete(replyTo)   // its turn came up; too late to promote
   const cwd = resolveCwd(ctx, threadId)
   // Attribute the message before it reaches the model. Only here: handlePassthrough
   // and /compact send literal CLI commands, which are not somebody speaking.
-  const framed = frameUserMessage(prompt, {
+  // Hand over anything a background job found since the last turn, as
+  // bridge-authored context rather than as something the user said.
+  const carried = !background && bgNotes[key]?.length ? bgNotes[key].splice(0) : []
+  const preamble = carried.length
+    ? carried.map(t => `[xesious:${BRIDGE_NONCE}] a background task you started in this topic has finished. Its result:\n${t}`).join('\n\n') + '\n\n'
+    : ''
+  const framed = preamble + frameUserMessage(prompt, {
     nonce: BRIDGE_NONCE,
     name: [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username,
     id: ctx.from?.id,
@@ -1401,7 +1454,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     if (linked) { const l = loadLinks(); if (l[linked.uuid]) { l[linked.uuid].sessionId = sessionId; saveLinks(l) } }
   }
   try {
-    const res = await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), bindSession, effortFor(key), replyTo)
+    const res = await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), { onInit: background ? undefined : bindSession, effort: effortFor(key), askedBy: replyTo, fork: background })
     if (stopped.has(key)) { stopped.delete(key); return } // killed via /stop — status already cleared, no reply
     // Still persist on completion: a resumed turn reports the same id, and this
     // refreshes `updated`. Binding already happened above for a fresh session.
@@ -1416,7 +1469,13 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     // enhancement rather than the mechanism: a miss costs a tap, not a message.
     const promoted = promoteBlock(res.blocks ?? [], res.text)
     if (promoted) await deliver(ctx, threadId, promoted, replyLink())
-    const link = replyLink()
+    // A background result arrives long after it was asked for, with anything in
+    // between, so it always quotes its question and says what it is.
+    const link = background ? replyTo : replyLink()
+    if (background) {
+      noteBgResult(key, res.text)
+      await send(ctx, threadId, `🌿 Background task finished.`, true, link)
+    }
     await deliver(ctx, threadId, res.text, link)
     await flushOutbox(ctx, threadId, cwd, link)
     // Speak the answer too when this topic is in voice mode.
@@ -1622,6 +1681,7 @@ bot.on('message', async ctx => {
       `/compact [focus] — summarize this topic's history to free up context\n` +
       `/stop — cancel the running task and discard its answer\n` +
       `/interrupt — stop it early but keep what it produced (or on|off for the sticky mode)\n` +
+      `/bg <task> — run it alongside this topic instead of blocking it\n` +
       `/jobs — what is running here, and what earlier runs left behind\n` +
       `/restart — restart the bridge; in-flight tasks finish first\n` +
 
@@ -1864,6 +1924,22 @@ bot.on('message', async ctx => {
     }).catch(err => console.error(`[error] compact ${key}: ${err}`))
     return
   }
+  if (cmd === '/bg') {
+    const task = text.slice(text.indexOf(' ') + 1).trim()
+    if (!task || !text.includes(' ')) {
+      await send(ctx, threadId, 'Usage: /bg <task> — runs it alongside this topic instead of blocking it.', true)
+      return
+    }
+    // Its own queue key, so it never joins the topic's serial chain; and forked, so
+    // it gets its own session id rather than interleaving with the topic's
+    // conversation. That id is never persisted — otherwise a parallel job would
+    // quietly steal the topic's binding.
+    await send(ctx, threadId, '🌿 Running that in the background — carry on here, I will report back.', true, msg.message_id)
+    void enqueue(`${key}#bg-${msg.message_id}`,
+      () => handlePrompt(ctx, threadId, key, task, undefined, msg.message_id, true, true))
+      .catch(e => console.error(`[error] bg ${key}: ${e}`))
+    return
+  }
   if (cmd === '/jobs' || cmd === '/ps') {
     const running = jobsFor(key)
     const lines: string[] = []
@@ -2011,6 +2087,19 @@ bot.on('message', async ctx => {
     for (const j of jobsFor(key)) void endJob(j, 'discard')
   }
   noteAsk(key, msg.message_id)
+  // You rarely know in advance that a task will be long; what you know is that you
+  // are now stuck behind one. So the choice is offered at that moment rather than
+  // requiring /bg up front. Doing nothing queues, exactly as before.
+  const blocking = jobsFor(key).find(j => Date.now() - j.startedAt >= PARALLEL_OFFER_MS)
+  if (blocking) {
+    const mins = Math.max(1, Math.round((Date.now() - blocking.startedAt) / 60000))
+    offered.set(msg.message_id, { key, threadId, prompt: text })
+    await ctx.api.sendMessage(ctx.chat.id,
+      `⏳ Still working on an earlier message (${mins}m). This one will run after it.`,
+      { ...destOpts({ threadId, replyTo: msg.message_id }), disable_notification: true,
+        reply_markup: { inline_keyboard: [[{ text: PARALLEL_LABEL, callback_data: `par:${msg.message_id}` }]] } },
+    ).catch(() => {})
+  }
   enqueue(key, () => handlePrompt(ctx, threadId, key, text, undefined, msg.message_id))
     .catch(e => console.error(`[error] task ${key}: ${e}`))
 })
@@ -2031,6 +2120,22 @@ bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   if (!isAllowed(ctx)) { await ctx.answerCallbackQuery({ text: 'Not authorized.', show_alert: true }).catch(() => {}); return }
   const key = keyFor(ctx.chat!.id, ctx.callbackQuery.message?.message_thread_id)
+  if (data.startsWith('par:')) {
+    const id = Number(data.slice(4))
+    const rec = offered.get(id)
+    // The offer goes stale the moment its turn comes up, which is why handlePrompt
+    // drops the entry as it starts. Better to say so than to fork a second run of
+    // something already running.
+    if (!rec) { await ctx.answerCallbackQuery({ text: 'That one is already running.' }).catch(() => {}); return }
+    offered.delete(id)
+    skipQueued.add(id)                       // its queued turn must now do nothing
+    await ctx.answerCallbackQuery({ text: 'Starting it now, alongside the other run.' }).catch(() => {})
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {})
+    void enqueue(`${rec.key}#bg-${id}`,
+      () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, id, true, true))
+      .catch(e => console.error(`[error] parallel ${rec.key}: ${e}`))
+    return
+  }
   if (data.startsWith('int:')) {
     const job = jobs.get(data.slice(4))
     if (!job) { await ctx.answerCallbackQuery({ text: 'That task already finished.', show_alert: true }).catch(() => {}); return }
