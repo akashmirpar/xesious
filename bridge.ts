@@ -32,6 +32,7 @@ import {
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
   EFFORT_LEVELS, EFFORT_DEFAULT, normalizeEffort,
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
+  markdownToHtml, htmlDocument,
   frameUserMessage, attributionProfileLines,
   needsRich, hasRtl, sanitizeProse,
   normalizeMode as libNormalizeMode,
@@ -219,7 +220,17 @@ const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
 const CLAUDE_PROJECTS = join(CLAUDE_DIR, 'projects')
 const IMPORT_BACKFILL = Math.max(0, Number(process.env.TG_IMPORT_BACKFILL || 12))  // turns backfilled per session
 const IMPORT_MAX_SESSIONS = Math.max(1, Number(process.env.TG_IMPORT_MAX || 10))   // cap topics created per /import
-const REPLY_FILE_CHARS = Math.max(0, Number(process.env.TG_REPLY_FILE_CHARS || 6000)) // replies longer than this go as a .md file
+const REPLY_FILE_CHARS = Math.max(0, Number(process.env.TG_REPLY_FILE_CHARS || 6000)) // replies longer than this go as a file
+// Which file(s) a long reply is delivered as: md | html | both (default).
+// Both, rather than swapping one for the other: the .md is the source of truth —
+// it diffs, and it is what other tools want — while the .html is the one that is
+// actually readable when double-clicked, which .md is not on macOS.
+const REPLY_FILE_FORMAT = (() => {
+  const v = (process.env.TG_REPLY_FILE_FORMAT || 'both').toLowerCase()
+  if (v === 'md' || v === 'html' || v === 'both') return v
+  console.error(`[warn] TG_REPLY_FILE_FORMAT="${v}" is not md|html|both — using both`)
+  return 'both'
+})()
 const INTERRUPT_DEFAULT = /^(1|true|yes)$/i.test(process.env.TG_INTERRUPT || '')       // a new message interrupts the running one instead of queueing
 
 // ---------------------------------------------------------------------------
@@ -1014,10 +1025,23 @@ async function flushOutbox(ctx: Context, threadId: number | undefined, cwd: stri
 async function deliver(ctx: Context, threadId: number | undefined, text: string, replyTo?: number): Promise<void> {
   if (REPLY_FILE_CHARS && text.length > REPLY_FILE_CHARS) {
     const dir = mkdtempSync(join(tmpdir(), 'tg-'))
-    const p = join(dir, 'answer.md')
     try {
-      writeFileSync(p, text)
-      await sendFile(ctx, threadId, p, `${text.slice(0, 900).trimEnd()} …\n\n📄 Full answer (${text.length} chars) attached.`, replyTo)
+      // The HTML goes first when both are sent: it is the one the user opens, and
+      // the caption preview belongs on the file they will actually read. The .md
+      // follows as the source of truth.
+      const caption = `${text.slice(0, 900).trimEnd()} …\n\n📄 Full answer (${text.length} chars) attached.`
+      let first = true
+      if (REPLY_FILE_FORMAT !== 'md') {
+        const h = join(dir, 'answer.html')
+        writeFileSync(h, htmlDocument('Answer', markdownToHtml(text)))
+        await sendFile(ctx, threadId, h, first ? caption : undefined, replyTo)
+        first = false
+      }
+      if (REPLY_FILE_FORMAT !== 'html') {
+        const m = join(dir, 'answer.md')
+        writeFileSync(m, text)
+        await sendFile(ctx, threadId, m, first ? caption : undefined, replyTo)
+      }
     } finally { rmSync(dir, { recursive: true, force: true }) }
   } else {
     await sendRich(ctx, threadId, text, replyTo)

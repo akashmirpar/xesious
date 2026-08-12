@@ -12,6 +12,7 @@
  *            queue-layer artefact that used to be posted verbatim as the reply
  *   ERROR  → init + result with is_error:true            → bridge marks the turn failed
  *   HANG   → init, then sleep past the test's timeout     → exercises the SIGKILL path
+ *   LONG   → init + a result past TG_REPLY_FILE_CHARS, with a table in it
  *   TOOLS  → init + two tool_use steps + success
  *   MIDTEXT→ init + a substantive text block + a tool_use + a closing sign-off,
  *            i.e. the shape where the answer is written mid-turn and the bridge
@@ -77,6 +78,11 @@ async function main() {
     const signoff = "I'll report the final ranked sweep when the monitor fires."
     emit({ type: 'assistant', message: { content: [{ type: 'text', text: signoff }] } })
     result({ result: signoff })
+    return
+  }
+  if (scenario === 'LONG') {
+    const table = '| item | value |\n|---|---|\n' + Array.from({ length: 40 }, (_, i) => `| row ${i} | ${i * 7} |`).join('\n')
+    result({ result: `# Report\n\n${table}\n\n` + 'Body text that pushes this past the file threshold. '.repeat(200) })
     return
   }
   if (scenario === 'TOOLS') {

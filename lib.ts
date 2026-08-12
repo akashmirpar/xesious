@@ -607,6 +607,150 @@ export function conflictAdvice(n: number, opts: { ghostLimit: number; waitMs: nu
 }
 
 // ---------------------------------------------------------------------------
+// markdown -> HTML, for the answer file
+// ---------------------------------------------------------------------------
+//
+// A reply longer than TG_REPLY_FILE_CHARS is sent as answer.md. On macOS that is
+// close to unreadable: .md has no default viewer, Telegram Desktop shows no
+// preview, and double-clicking opens a text editor showing raw pipe-tables — which
+// is exactly the content that needed a file in the first place, because it was long
+// and structured.
+//
+// Written here rather than wired to a markdown library, for one reason that
+// outweighs the convenience: THE INPUT IS MODEL OUTPUT AND THE OUTPUT IS A FILE THE
+// USER DOUBLE-CLICKS. An answer containing a <script> tag must not become an
+// executable local page — materially riskier than the same text inside a Telegram
+// message, where the client never executes it. So every piece of text is escaped
+// BEFORE any markup is emitted, and embedded HTML renders as visible text rather
+// than being passed through. Escaping is the default here, not a library option
+// somebody has to remember to set.
+//
+// The scope is deliberately the constructs an ANSWER uses — headings, paragraphs,
+// fenced code, tables, lists, quotes, inline emphasis/code/links. The .md is kept
+// alongside and stays the source of truth, so this is a convenience view: an
+// unsupported construct degrades to visible text rather than to a wrong render.
+
+// Only these schemes may appear in an href. Without this, [x](javascript:...) in an
+// answer becomes a working script link in a file the user opens locally.
+const SAFE_URL = /^(https?:|mailto:|#|\/)/i
+
+// Code spans are lifted out before the emphasis passes so that *, _ and ~ inside
+// code are never treated as markup, then restored. The placeholder is \x00-delimited
+// because escapeHtml() has already removed every character a model could use to
+// forge one.
+function inlineMd(raw: string): string {
+  let t = escapeHtml(raw)
+  const spans: string[] = []
+  t = t.replace(/`([^`]+)`/g, (_m, c) => '\x00' + (spans.push('<code>' + c + '</code>') - 1) + '\x00')
+  t = t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, label, href) =>
+    SAFE_URL.test(href) ? '<a href="' + href + '">' + label + '</a>' : m)
+  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+  t = t.replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>')
+  t = t.replace(/~~([^~]+)~~/g, '<del>$1</del>')
+  return t.replace(/\x00(\d+)\x00/g, (_m, i) => spans[Number(i)])
+}
+
+const isTableDelim = (l: string) => l.includes('|') && /^[ \t:|-]*-[ \t:|-]*$/.test(l)
+const rowCells = (l: string) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim())
+
+export function markdownToHtml(md: string): string {
+  const lines = md.split('\n')
+  const out: string[] = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+
+    if (/^\s*```/.test(line)) {                        // fenced code: verbatim, escaped
+      const lang = line.replace(/^\s*```/, '').trim()
+      const body: string[] = []
+      i++
+      while (i < lines.length && !/^\s*```/.test(lines[i])) body.push(lines[i++])
+      i++
+      const cls = lang ? ' class="lang-' + escapeHtml(lang) + '"' : ''
+      out.push('<pre><code' + cls + '>' + escapeHtml(body.join('\n')) + '</code></pre>')
+      continue
+    }
+    if (line.includes('|') && i + 1 < lines.length && isTableDelim(lines[i + 1])) {
+      const head = rowCells(line)
+      i += 2
+      const rows: string[][] = []
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) rows.push(rowCells(lines[i++]))
+      out.push('<table><thead><tr>' + head.map(c => '<th>' + inlineMd(c) + '</th>').join('') +
+        '</tr></thead><tbody>' +
+        rows.map(r => '<tr>' + r.map(c => '<td>' + inlineMd(c) + '</td>').join('') + '</tr>').join('') +
+        '</tbody></table>')
+      continue
+    }
+    const h = line.match(/^(#{1,6})\s+(.*)$/)
+    if (h) { out.push('<h' + h[1].length + '>' + inlineMd(h[2]) + '</h' + h[1].length + '>'); i++; continue }
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { out.push('<hr>'); i++; continue }
+    if (/^\s*>/.test(line)) {
+      const body: string[] = []
+      while (i < lines.length && /^\s*>/.test(lines[i])) body.push(lines[i++].replace(/^\s*>\s?/, ''))
+      out.push('<blockquote>' + inlineMd(body.join(' ')) + '</blockquote>')
+      continue
+    }
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items: string[] = []
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+        const raw = lines[i++].replace(/^\s*[-*+]\s+/, '')
+        const t = raw.match(/^\[([ xX])\]\s*(.*)$/)
+        // A task list keeps its checkbox, as a real disabled input.
+        items.push(t
+          ? '<input type="checkbox" disabled' + (t[1].trim() ? ' checked' : '') + '> ' + inlineMd(t[2])
+          : inlineMd(raw))
+      }
+      out.push('<ul>' + items.map(x => '<li>' + x + '</li>').join('') + '</ul>')
+      continue
+    }
+    if (/^\s*\d+[.)]\s+/.test(line)) {
+      const items: string[] = []
+      while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) {
+        items.push(inlineMd(lines[i++].replace(/^\s*\d+[.)]\s+/, '')))
+      }
+      out.push('<ol>' + items.map(x => '<li>' + x + '</li>').join('') + '</ol>')
+      continue
+    }
+    if (!line.trim()) { i++; continue }
+    const para: string[] = []
+    while (i < lines.length && lines[i].trim() &&
+           !/^\s*(```|>|#{1,6}\s|[-*+]\s|\d+[.)]\s)/.test(lines[i])) para.push(lines[i++])
+    out.push('<p>' + inlineMd(para.join('\n')).replace(/\n/g, '<br>') + '</p>')
+  }
+  return out.join('\n')
+}
+
+// A self-contained page: inline style, no CDN, no external font. The file is opened
+// from disk and often offline, so anything remote would simply fail to load.
+export function htmlDocument(title: string, bodyHtml: string): string {
+  return [
+    '<!doctype html>',
+    '<html lang="en"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    '<title>' + escapeHtml(title) + '</title>',
+    '<style>',
+    ':root { color-scheme: light dark; }',
+    'body { max-width: 46rem; margin: 2rem auto; padding: 0 1rem;',
+    '  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }',
+    'h1,h2,h3,h4 { line-height: 1.25; margin: 1.6em 0 .5em; }',
+    'code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }',
+    'pre { background: rgba(127,127,127,.12); padding: .8rem 1rem; border-radius: 6px; overflow-x: auto; }',
+    'pre code { font-size: .85em; }',
+    'blockquote { margin: 1em 0; padding: .2em 1em; border-left: 3px solid rgba(127,127,127,.4); }',
+    'table { border-collapse: collapse; margin: 1em 0; display: block; overflow-x: auto; }',
+    'th, td { border: 1px solid rgba(127,127,127,.35); padding: .4rem .6rem; text-align: left; vertical-align: top; }',
+    'th { background: rgba(127,127,127,.12); }',
+    'hr { border: 0; border-top: 1px solid rgba(127,127,127,.35); margin: 2em 0; }',
+    'img { max-width: 100%; }',
+    '</style></head>',
+    '<body>',
+    bodyHtml,
+    '</body></html>',
+    '',
+  ].join('\n')
+}
+
+// ---------------------------------------------------------------------------
 // stream-json parsing
 // ---------------------------------------------------------------------------
 
