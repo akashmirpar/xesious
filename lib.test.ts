@@ -13,7 +13,7 @@ import {
   normalizeModel, MODEL_DEFAULT,
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
-  markdownToHtml, htmlDocument,
+  markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   sanitizeProse, PROSE_RULES, isNonAnswer,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
@@ -808,5 +808,65 @@ describe('htmlDocument', () => {
     const doc = htmlDocument('t', '')
     expect(doc).toContain('charset="utf-8"')
     expect(doc).toContain('name="viewport"')
+  })
+})
+
+describe('lastEffortFrom — resolving what "default" actually means', () => {
+  // The CLI does not report effort in the stream: verified against a live run, the
+  // init event carries model, permissionMode, fast_mode_state and the version, and
+  // assistant events carry none of it. It IS on each assistant record in the
+  // session transcript, which is what this reads.
+  const rec = (o: any) => JSON.stringify(o)
+
+  test('reads the effort off an assistant record', () => {
+    expect(lastEffortFrom(rec({ type: 'assistant', effort: 'high', message: {} }))).toBe('high')
+  })
+  test('takes the MOST RECENT one when it changed mid-session', () => {
+    const tail = [
+      rec({ type: 'assistant', effort: 'low', message: {} }),
+      rec({ type: 'user', message: {} }),
+      rec({ type: 'assistant', effort: 'max', message: {} }),
+    ].join('\n')
+    expect(lastEffortFrom(tail)).toBe('max')
+  })
+  test('ignores records that are not assistant messages', () => {
+    expect(lastEffortFrom(rec({ type: 'user', effort: 'high' }))).toBeUndefined()
+    expect(lastEffortFrom(rec({ type: 'summary', effort: 'high' }))).toBeUndefined()
+  })
+  test('survives a tail that begins mid-record', () => {
+    // Callers read only the last N KB of a file that can be megabytes, so the first
+    // line is usually a fragment.
+    const tail = 'ken":123}\n' + rec({ type: 'assistant', effort: 'xhigh', message: {} })
+    expect(lastEffortFrom(tail)).toBe('xhigh')
+  })
+  test('absent or empty effort yields nothing rather than a wrong answer', () => {
+    expect(lastEffortFrom(rec({ type: 'assistant', message: {} }))).toBeUndefined()
+    expect(lastEffortFrom(rec({ type: 'assistant', effort: '', message: {} }))).toBeUndefined()
+    expect(lastEffortFrom('')).toBeUndefined()
+    expect(lastEffortFrom('not json at all')).toBeUndefined()
+  })
+})
+
+describe('needsReplyLink — quote the question only when it is ambiguous', () => {
+  // Threading every answer is visually noisy on a phone: each quoted header costs a
+  // couple of lines and says nothing when only one question is in flight.
+  test('a single question, answered immediately, needs no link', () => {
+    expect(needsReplyLink({ replyTo: 10, latestIncoming: 10, inFlight: 1 })).toBe(false)
+  })
+  test('another message arrived while this one was running → link', () => {
+    expect(needsReplyLink({ replyTo: 10, latestIncoming: 11, inFlight: 1 })).toBe(true)
+  })
+  test('more than one turn queued or running → link', () => {
+    expect(needsReplyLink({ replyTo: 10, latestIncoming: 10, inFlight: 2 })).toBe(true)
+  })
+  test('out-of-band deliveries always link, however quiet the topic is', () => {
+    // A retry tapped minutes later has nothing on screen tying it to its question.
+    expect(needsReplyLink({ replyTo: 10, latestIncoming: 10, inFlight: 1, force: true })).toBe(true)
+  })
+  test('nothing to quote means no link, whatever else is true', () => {
+    expect(needsReplyLink({ replyTo: undefined, latestIncoming: 11, inFlight: 5, force: true })).toBe(false)
+  })
+  test('an unknown latest message does not invent ambiguity', () => {
+    expect(needsReplyLink({ replyTo: 10, latestIncoming: undefined, inFlight: 1 })).toBe(false)
   })
 })

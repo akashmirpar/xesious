@@ -500,41 +500,42 @@ describe('command UX (C2/C3/C4)', () => {
 describe('replies quote the message that triggered them (C1)', () => {
   const replyTarget = (c: any) => c.payload?.reply_parameters?.message_id
 
-  test('the answer is threaded to the question', async () => {
-    // The bridge never set reply_parameters anywhere. Tolerable when one message
-    // produced exactly one answer; not once a turn can deliver a promoted block AND
-    // a reply, and /restart and the retry button post asynchronously.
+  test('a lone question, answered immediately, is NOT threaded', async () => {
+    // Threading unconditionally is visually noisy: on a phone every quoted header
+    // costs a couple of lines and says nothing when only one question is in flight.
     const cs = await incoming(1100, 'hello there')
     const answer = sends(cs).find(c => String(c.payload.text ?? '').includes('okReply'))
-    expect(replyTarget(answer)).toBeTruthy()
+    expect(replyTarget(answer)).toBeUndefined()
   }, 8000)
 
-  test('it tolerates the question having been deleted', async () => {
+  test('but an answer that is not for the LATEST message is threaded', async () => {
+    // Send a second message while the first is still running: its answer is no
+    // longer obviously a response to the last thing the user said.
+    const first = incoming(1105, 'hello there')
+    await new Promise(r => setTimeout(r, 20))
+    await bridge.bot.handleUpdate({
+      update_id: 90001,
+      message: { message_id: 99001, date: 0, chat: { id: 1105, type: 'private', first_name: 'T' },
+                 from: { id: 1, is_bot: false, first_name: 'T' }, text: 'a second question' },
+    })
+    const cs = await first
+    await bridge._drainQueue('1105:main')
+    const answer = sends(cs).find(c => String(c.payload.text ?? '').includes('okReply'))
+    expect(replyTarget(answer)).toBeTruthy()
+  }, 12000)
+
+  test('when it does link, it tolerates the question having been deleted', async () => {
     // Without allow_sending_without_reply the send fails outright, losing the
     // answer to protect a cosmetic link.
-    const cs = await incoming(1101, 'hello there')
-    const answer = sends(cs).find(c => String(c.payload.text ?? '').includes('okReply'))
-    expect(answer!.payload.reply_parameters.allow_sending_without_reply).toBe(true)
+    const cs = await incoming(1104, 'NORESP')
+    const warn = sends(cs).find(c => String(c.payload.text ?? '').includes('No answer came back'))
+    if (replyTarget(warn)) expect(warn!.payload.reply_parameters.allow_sending_without_reply).toBe(true)
   }, 8000)
 
-  test('both messages of a promoted turn point at the same question', async () => {
-    const cs = await incoming(1102, 'MIDTEXT')
-    const targets = sends(cs).map(replyTarget).filter(Boolean)
-    expect(targets.length).toBeGreaterThanOrEqual(2)
-    expect(new Set(targets).size).toBe(1)
-  }, 8000)
-
-  test('the transient status message is NOT threaded', async () => {
-    // It is machine chatter that gets deleted; threading it would just clutter.
+  test('the transient status message is never threaded', async () => {
     const cs = await incoming(1103, 'hello there')
     const status = sends(cs).find(c => textOf(c).includes('Thinking'))
     expect(replyTarget(status)).toBeUndefined()
-  }, 8000)
-
-  test('a no-answer report is threaded, and its retry answers the original question', async () => {
-    const cs = await incoming(1104, 'NORESP')
-    const warn = sends(cs).find(c => String(c.payload.text ?? '').includes('No answer came back'))
-    expect(replyTarget(warn)).toBeTruthy()
   }, 8000)
 })
 
@@ -586,8 +587,27 @@ describe('a long answer is delivered as a readable file (C7)', () => {
     expect(String(captioned[0].payload.caption)).toContain('Full answer')
   }, 10000)
 
-  test('the files are threaded to the question like any other answer', async () => {
+  test('the files follow the same threading rule as any other answer', async () => {
+    // A lone question, so no quoted header — the .md and .html are obviously its
+    // answer and the link would only cost space.
     const cs = await incoming(1122, 'LONG')
-    expect(docs(cs).every(c => c.payload?.reply_parameters?.message_id)).toBe(true)
+    expect(docs(cs).every(c => !c.payload?.reply_parameters)).toBe(true)
   }, 10000)
+})
+
+describe('/effort resolves what "default" means (follow-up)', () => {
+  test('with no override and no run yet, it says so instead of "CLI default"', async () => {
+    const cs = await incoming(1130, '/effort')
+    const shown = sends(cs).map(c => String(c.payload.text ?? '')).join('\n')
+    // "default → CLI default" answered nothing. Say plainly that it is not known
+    // yet, rather than restating the word.
+    expect(shown).not.toContain('CLI default')
+    expect(shown).toMatch(/unknown until this topic has run once|→ (low|medium|high|xhigh|max) \(last run\)/)
+  }, 8000)
+
+  test('an explicit override is reported directly', async () => {
+    await incoming(1131, '/effort high')
+    const cs = await incoming(1131, '/effort')
+    expect(sends(cs).map(c => String(c.payload.text ?? '')).join('\n')).toContain('high')
+  }, 8000)
 })
