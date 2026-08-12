@@ -534,6 +534,21 @@ const stopped = new Set<string>()
 // quote its question when it could belong to more than one of them.
 const inFlight: Record<string, number> = {}
 const latestIncoming: Record<string, number> = {}
+// Answers delivered per topic, and the value that counter held when each pending
+// question arrived. The difference is "how many other answers landed while you
+// waited", which is what tells a reader whether an answer can be placed on sight.
+// Counted per TURN, not per message: a promoted mid-turn block and its reply both
+// answer the same question, so they must not make each other look ambiguous.
+const answerSeq: Record<string, number> = {}
+const askSeq = new Map<number, number>()
+const noteAsk = (key: string, msgId?: number) => {
+  if (msgId === undefined) return
+  latestIncoming[key] = msgId
+  askSeq.set(msgId, answerSeq[key] ?? 0)
+  // The map only ever holds questions still awaiting an answer; consumed entries
+  // are deleted at delivery. This is the backstop for anything that never gets one.
+  if (askSeq.size > 200) askSeq.delete(askSeq.keys().next().value as number)
+}
 
 function enqueue<T>(key: string, task: () => Promise<T>): Promise<T> {
   const prev = queues.get(key) ?? Promise.resolve()
@@ -1210,12 +1225,29 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   // brand-new session with no history. That is the reported "after /stop the bot
   // doesn't know the history". The id is available from the init event at the
   // start of the run, so there is no reason to wait for the end of it.
-  // Decided at DELIVERY time, not on arrival: whether another message has landed
-  // while this turn ran is exactly what makes the answer ambiguous.
-  const replyLink = () =>
-    needsReplyLink({ replyTo, latestIncoming: latestIncoming[key], inFlight: inFlight[key] ?? 0, force: forceReplyLink })
-      ? replyTo
-      : undefined
+  // Decided once, at DELIVERY time rather than on arrival: what has landed in the
+  // topic while this turn ran is exactly what makes the answer hard to place. Once
+  // per turn, so a promoted block and its reply agree and neither makes the other
+  // look ambiguous.
+  const asked = replyTo !== undefined ? askSeq.get(replyTo) : undefined
+  let linkDecided: number | undefined
+  let linkResolved = false
+  const replyLink = () => {
+    if (!linkResolved) {
+      linkResolved = true
+      linkDecided = needsReplyLink({
+        replyTo,
+        latestIncoming: latestIncoming[key],
+        inFlight: inFlight[key] ?? 0,
+        answersSince: asked === undefined ? 0 : (answerSeq[key] ?? 0) - asked,
+        force: forceReplyLink,
+      }) ? replyTo : undefined
+      // This turn is now one of the answers a later question has to see.
+      answerSeq[key] = (answerSeq[key] ?? 0) + 1
+      if (replyTo !== undefined) askSeq.delete(replyTo)
+    }
+    return linkDecided
+  }
 
   const bindSession = (sessionId: string) => {
     sessions[key] = { ...sessions[key], cwd, sessionId, updated: new Date().toISOString() }
@@ -1615,7 +1647,7 @@ bot.on('message', async ctx => {
     if (!arg || !text.includes(' ')) { await send(ctx, threadId, `Usage: /plan <what you want>\n\nRuns one read-only turn: Claude researches and proposes, without editing. Reply "go ahead" to carry it out in this topic's usual mode (${modeFor(key)}).`); return }
     if (isInterrupt(key) && activeRuns.has(key)) { stopped.add(key); activeRuns.get(key)!.kill('SIGKILL') }
     // One-shot: the topic's sticky mode is untouched, so the follow-up executes.
-    latestIncoming[key] = msg.message_id
+    noteAsk(key, msg.message_id)
     enqueue(key, () => handlePrompt(ctx, threadId, key, arg, 'plan', msg.message_id))
       .catch(e => console.error(`[error] plan task ${key}: ${e}`))
     return
@@ -1770,7 +1802,7 @@ bot.on('message', async ctx => {
     stopped.add(key)
     activeRuns.get(key)!.kill('SIGKILL')
   }
-  latestIncoming[key] = msg.message_id
+  noteAsk(key, msg.message_id)
   enqueue(key, () => handlePrompt(ctx, threadId, key, text, undefined, msg.message_id))
     .catch(e => console.error(`[error] task ${key}: ${e}`))
 })

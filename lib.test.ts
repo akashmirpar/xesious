@@ -848,25 +848,55 @@ describe('lastEffortFrom — resolving what "default" actually means', () => {
 })
 
 describe('needsReplyLink — quote the question only when it is ambiguous', () => {
-  // Threading every answer is visually noisy on a phone: each quoted header costs a
-  // couple of lines and says nothing when only one question is in flight.
-  test('a single question, answered immediately, needs no link', () => {
-    expect(needsReplyLink({ replyTo: 10, latestIncoming: 10, inFlight: 1 })).toBe(false)
+  // Ambiguity is a property of what the READER sees, not of the bridge's state.
+  const q = (o: Partial<Parameters<typeof needsReplyLink>[0]>) =>
+    needsReplyLink({ replyTo: 10, latestIncoming: 10, inFlight: 1, answersSince: 0, ...o })
+
+  test('a lone question, answered immediately, needs no link', () => {
+    expect(q({})).toBe(false)
   })
-  test('another message arrived while this one was running → link', () => {
-    expect(needsReplyLink({ replyTo: 10, latestIncoming: 11, inFlight: 1 })).toBe(true)
+
+  test('another question arrived while this one ran → link', () => {
+    expect(q({ latestIncoming: 11 })).toBe(true)
   })
+
+  test('THE CASE A FIRST VERSION GOT WRONG: another ANSWER landed while we waited', () => {
+    // Two questions back to back. The second answer's own question IS the latest
+    // and nothing else is queued, so the bridge saw no ambiguity — while on screen
+    // it is the fourth message of four, placeable only by noticing that the first
+    // answer was linked elsewhere and reasoning by elimination.
+    expect(q({ latestIncoming: 10, inFlight: 1, answersSince: 1 })).toBe(true)
+  })
+
   test('more than one turn queued or running → link', () => {
-    expect(needsReplyLink({ replyTo: 10, latestIncoming: 10, inFlight: 2 })).toBe(true)
+    expect(q({ inFlight: 2 })).toBe(true)
   })
+
   test('out-of-band deliveries always link, however quiet the topic is', () => {
     // A retry tapped minutes later has nothing on screen tying it to its question.
-    expect(needsReplyLink({ replyTo: 10, latestIncoming: 10, inFlight: 1, force: true })).toBe(true)
+    expect(q({ force: true })).toBe(true)
   })
+
   test('nothing to quote means no link, whatever else is true', () => {
-    expect(needsReplyLink({ replyTo: undefined, latestIncoming: 11, inFlight: 5, force: true })).toBe(false)
+    expect(needsReplyLink({ replyTo: undefined, latestIncoming: 11, inFlight: 5, answersSince: 3, force: true })).toBe(false)
   })
+
   test('an unknown latest message does not invent ambiguity', () => {
     expect(needsReplyLink({ replyTo: 10, latestIncoming: undefined, inFlight: 1 })).toBe(false)
+  })
+
+  test('it decays back to clean once the topic goes quiet', () => {
+    // The whole point of counting rather than latching: a burst links, and the
+    // next lone question afterwards does not.
+    expect(q({ latestIncoming: 11, answersSince: 2 })).toBe(true)   // during the burst
+    expect(q({ latestIncoming: 10, answersSince: 0 })).toBe(false)  // after it settles
+  })
+
+  test('the full two-question sequence: BOTH answers are placeable', () => {
+    // Q1 asked (seq 0), Q2 asked (seq 0), A1 delivered, A2 delivered.
+    const a1 = needsReplyLink({ replyTo: 1, latestIncoming: 2, inFlight: 2, answersSince: 0 })
+    const a2 = needsReplyLink({ replyTo: 2, latestIncoming: 2, inFlight: 1, answersSince: 1 })
+    expect(a1).toBe(true)
+    expect(a2).toBe(true)   // was false before: the reader had to infer it
   })
 })

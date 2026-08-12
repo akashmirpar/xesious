@@ -508,9 +508,12 @@ describe('replies quote the message that triggered them (C1)', () => {
     expect(replyTarget(answer)).toBeUndefined()
   }, 8000)
 
-  test('but an answer that is not for the LATEST message is threaded', async () => {
-    // Send a second message while the first is still running: its answer is no
-    // longer obviously a response to the last thing the user said.
+  test('both answers of an interleaved pair are threaded, not just the first', async () => {
+    // Ask twice in quick succession. BOTH answers must be placeable on sight: the
+    // second used to arrive unlinked, because its own question was the latest and
+    // nothing was queued — leaving the reader to infer it by elimination from the
+    // first, which fails the moment anything else posts into the topic.
+    const start = calls.length
     const first = incoming(1105, 'hello there')
     await new Promise(r => setTimeout(r, 20))
     await bridge.bot.handleUpdate({
@@ -518,10 +521,15 @@ describe('replies quote the message that triggered them (C1)', () => {
       message: { message_id: 99001, date: 0, chat: { id: 1105, type: 'private', first_name: 'T' },
                  from: { id: 1, is_bot: false, first_name: 'T' }, text: 'a second question' },
     })
-    const cs = await first
+    await first
     await bridge._drainQueue('1105:main')
-    const answer = sends(cs).find(c => String(c.payload.text ?? '').includes('okReply'))
-    expect(replyTarget(answer)).toBeTruthy()
+
+    const answers = calls.slice(start)
+      .filter(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('okReply'))
+    expect(answers.length).toBe(2)
+    expect(answers.every(c => replyTarget(c))).toBe(true)
+    // …and they point at DIFFERENT questions, which is the whole point.
+    expect(new Set(answers.map(replyTarget)).size).toBe(2)
   }, 12000)
 
   test('when it does link, it tolerates the question having been deleted', async () => {

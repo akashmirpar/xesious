@@ -564,26 +564,42 @@ export function promoteBlock(blocks: string[], finalText: string, opts?: { minCh
 // ---------------------------------------------------------------------------
 //
 // Threading EVERY reply is visually noisy: on a phone each quoted header eats a
-// couple of lines, and when there is only one question in flight the link says
-// nothing the reader did not already know. It earns its space only when an answer
-// could belong to more than one message.
+// couple of lines, and when only one question is in flight the link says nothing
+// the reader did not already know. It earns its space only when an answer could
+// belong to more than one message.
 //
-// Two things make it ambiguous, and both are knowable at delivery time:
-//   * something else is queued or running for this topic, so more than one answer
-//     is coming; or
-//   * the user has sent another message since the one being answered, so this
-//     answer is NOT a response to the latest thing they said — the case interrupt
-//     mode and a slow turn both produce.
+// The subtlety, and the thing a first version of this got wrong: ambiguity is a
+// property of WHAT THE READER SEES, not of the bridge's state. Consider two
+// questions asked back to back. The first answer is obviously ambiguous — a second
+// question arrived while it ran — so it links. But the SECOND answer looked
+// unambiguous to the bridge (its question is the latest, nothing else is queued)
+// while on screen it is the fourth message in a run of four, and the reader can
+// only place it by noticing that the first answer was linked elsewhere and
+// reasoning by elimination. That is not clarity, and it fails outright as soon as
+// anything else is posting into the topic.
+//
+// So the real question is: was anything INTERLEAVED between the question and its
+// answer? Three things can interleave, and all are knowable at delivery time:
+//   * another question arrived after this one (latestIncoming moved on);
+//   * another ANSWER was delivered in this topic while this one was waiting
+//     (answersSince > 0) — the case that reasoning-by-elimination papered over;
+//   * something else is still queued or running, so more answers are coming.
 // Anything arriving out of band (a retry tapped minutes later) passes force.
+//
+// The counter must be sampled when the question ARRIVES, not when its turn starts:
+// a queued question sits idle while an earlier answer goes out, and sampling late
+// would miss exactly the interleaving this exists to catch.
 export function needsReplyLink(opts: {
   replyTo?: number
   latestIncoming?: number
   inFlight: number
+  answersSince?: number
   force?: boolean
 }): boolean {
   if (!opts.replyTo) return false
   if (opts.force) return true
   if (opts.inFlight > 1) return true
+  if ((opts.answersSince ?? 0) > 0) return true
   return opts.latestIncoming !== undefined && opts.latestIncoming !== opts.replyTo
 }
 
