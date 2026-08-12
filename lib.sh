@@ -157,15 +157,30 @@ tmux_kill_own() {
 }
 
 # session_name_for <dir> — default tmux session name for a deployment.
-# Derived from the directory so two deployments by one user don't share a name.
-# This is COSMETIC: teardown identifies sessions by process, never by this string,
-# so a collision here is confusing rather than dangerous. Override with
-# CLAUDE_TG_SESSION. tmux treats ':' and '.' specially in target names, so the
-# basename is reduced to [A-Za-z0-9_-].
+#
+# Derived from the directory so two deployments by one user don't share a name,
+# and suffixed with a short digest of the FULL path because the basename alone is
+# not unique. Verified: /home/george/xesious and /tmp/xdep-c/xesious both derived
+# `claude-tg-xesious`, and `tmux new-session -d -s <existing>` fails outright —
+#     duplicate session: claude-tg-xesious
+# so the second deployment could not start at all. It failed safe (nothing was
+# signalled, nothing was damaged) but it failed.
+#
+# The name is COSMETIC: teardown identifies sessions by process, never by this
+# string, so a digest collision would be confusing rather than dangerous. tmux
+# treats ':' and '.' specially in target names, so the basename is reduced to
+# [A-Za-z0-9_-]. Override the whole thing with CLAUDE_TG_SESSION.
 session_name_for() {
-  local dir="${1:-$PWD}" base
+  local dir="${1:-$PWD}" base hash
   base=$(basename "$dir" | tr -c 'A-Za-z0-9_-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
-  printf 'claude-tg%s' "${base:+-$base}"
+  if command -v sha1sum >/dev/null 2>&1; then
+    hash=$(printf '%s' "$dir" | sha1sum | cut -c1-6)
+  elif command -v md5sum >/dev/null 2>&1; then
+    hash=$(printf '%s' "$dir" | md5sum | cut -c1-6)
+  else
+    hash=$(printf '%s' "$dir" | cksum | awk '{printf "%06d", $1 % 1000000}')
+  fi
+  printf 'claude-tg%s%s' "${base:+-$base}" "${hash:+-$hash}"
 }
 
 # snapshot_tree <dest_dir> — archive the working tree so a failed deploy can be

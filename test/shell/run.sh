@@ -237,13 +237,24 @@ not_ "restore_tree with no snapshot fails"      restore_tree "$TMP/nonexistent"
 cd "$ROOT"
 
 echo
-echo "== session_name_for: derived from the directory, tmux-safe =="
-is "derives from the basename"            "$(session_name_for /srv/xesious)"      "claude-tg-xesious"
-is "two dirs, two names"                  "$(session_name_for /opt/bridge-two)"   "claude-tg-bridge-two"
+echo "== session_name_for: unique per directory, tmux-safe =="
+N1="$(session_name_for /srv/xesious)"
+N2="$(session_name_for /opt/other/xesious)"      # SAME basename, different path
+N3="$(session_name_for /opt/bridge-two)"
+case "$N1" in claude-tg-xesious-*) ok "keeps the basename, readable" ;;
+              *) no "unexpected shape: $N1" ;; esac
+# The regression: basename alone collided, and tmux refuses a duplicate session
+# name, so the second deployment could not start.
+if [ "$N1" = "$N2" ]; then no "two dirs sharing a basename still collide ($N1)"
+else ok "two dirs sharing a basename get different names"; fi
+if [ "$N1" = "$N3" ]; then no "different dirs collided"; else ok "different basenames differ too"; fi
+is "deterministic for the same path" "$(session_name_for /srv/xesious)" "$N1"
 is "':' and '.' are reduced (tmux treats them specially)" \
-   "$(session_name_for '/tmp/we.ird:name')" "claude-tg-we-ird-name"
-case "$(session_name_for /srv/xesious)" in *:*|*.*) no "derived name contains a tmux metacharacter" ;;
-                                           *) ok "derived name has no tmux metacharacter" ;; esac
+   "$(session_name_for '/tmp/we.ird:name' | sed 's/-[0-9a-f]*$//')" "claude-tg-we-ird-name"
+for n in "$N1" "$N2" "$N3"; do
+  case "$n" in *:*|*.*) no "derived name '$n' contains a tmux metacharacter" ;;
+                *) ok "'$n' has no tmux metacharacter" ;; esac
+done
 
 echo
 echo "== tmux_own_sessions: three proofs, and it spares a decoy in the SAME dir =="
