@@ -106,6 +106,10 @@ const CLAUDE_TIMEOUT_MS = Number(process.env.TG_CLAUDE_TIMEOUT_MS || 4 * 60 * 60
 const IDLE_TIMEOUT_MS = Number(process.env.TG_IDLE_TIMEOUT_MS || 15 * 60 * 1000)
 // How long a run may be quiet before the status message says so.
 const QUIET_NOTE_MS = Number(process.env.TG_QUIET_NOTE_MS || 90 * 1000)
+// How long a run must have been going before the status message offers to end it.
+// Not from the first second: a three-second turn does not need the affordance, and
+// a keyboard flickering in and out of every trivial turn is its own kind of noise.
+const INTERRUPT_BUTTON_MS = Number(process.env.TG_INTERRUPT_BUTTON_MS || 12 * 1000)
 // How long a graceful shutdown will wait for in-flight runs before giving up on
 // them. A deploy normally waits for idle before signalling, so this is the
 // backstop for a SIGTERM that lands mid-run — and for the hung-child case, where
@@ -527,7 +531,82 @@ function otherLiveBridge(): number | undefined {
 // signal handlers use, without main()'s locals leaking out.
 let requestDrain: ((why: string) => Promise<void>) | undefined
 
-const activeRuns = new Map<string, ChildProcess>()
+// A RUN, as a thing with a name — not just "the child process of this topic".
+//
+// activeRuns used to be Map<topicKey, ChildProcess>: exactly one run per topic,
+// addressable only by the topic it lived in. That single shape is why several
+// separate items in FEEDBACK.md were all blocked — you cannot background a task
+// when the queue key IS the topic, cannot interrupt a specific run when there is
+// no handle on one, and cannot list what is running when a run is not an entity.
+//
+// pgid is stored because the child is spawned in its own process group (see the
+// spawn call): signalling the GROUP is what actually stops the work. Verified: a
+// SIGKILL to the claude process alone leaves every grandchild running — the
+// python3 job it started keeps going, invisibly, forever.
+type RunOutcome = 'discard' | 'keep'
+type Job = {
+  id: string
+  key: string
+  threadId?: number
+  prompt: string
+  child: ChildProcess
+  pgid: number
+  startedAt: number
+  outcome?: RunOutcome     // set when a human ends it early
+  statusMsgId?: number
+  steps: () => number
+}
+const jobs = new Map<string, Job>()
+const jobsFor = (key: string) => [...jobs.values()].filter(j => j.key === key)
+// Short, because callback_data caps at 64 bytes and the id has to fit in a button.
+const newJobId = () => randomUUID().replace(/-/g, '').slice(0, 8)
+
+// Signal a run's whole process group, falling back to the bare child if the group
+// is gone. NEVER call this on a child spawned without `detached`: such a child
+// shares the BRIDGE's process group, and a group signal would take the bridge down
+// with it — verified while designing this.
+function signalJob(job: Job, sig: NodeJS.Signals): boolean {
+  try { process.kill(-job.pgid, sig); return true } catch {}
+  try { job.child.kill(sig); return true } catch {}
+  return false
+}
+
+// Members of a run's process group that are still alive. After the run ends these
+// are, by construction, processes it left behind — no command-line guessing.
+function groupSurvivors(pgid: number): number[] {
+  const out: number[] = []
+  try {
+    for (const name of readdirSync('/proc')) {
+      if (!/^\d+$/.test(name)) continue
+      try {
+        const stat = readFileSync(`/proc/${name}/stat`, 'utf8')
+        const after = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+        if (Number(after[2]) === pgid) out.push(Number(name))
+      } catch {}
+    }
+  } catch {}
+  return out.filter(p => p !== pgid)
+}
+
+// End a run early. `keep` stops it but delivers whatever it already produced;
+// `discard` throws the turn away. Escalates politely — SIGINT lets the CLI flush
+// its transcript, and only an unresponsive run earns SIGKILL.
+async function endJob(job: Job, outcome: RunOutcome): Promise<void> {
+  job.outcome = outcome
+  signalJob(job, 'SIGINT')
+  for (const [wait, sig] of [[3000, 'SIGTERM'], [2000, 'SIGKILL']] as const) {
+    await new Promise(r => setTimeout(r, wait))
+    if (!jobs.has(job.id)) return
+    signalJob(job, sig)
+  }
+}
+
+// pgid -> the job that owned it, for runs that ended while something they started
+// is still alive. This is the only reliable way to see work that outlived a turn:
+// a `nohup`ed collector returns instantly, so the step list moves on while the real
+// work keeps going invisibly on the box.
+const leftBehind = new Map<number, { id: string; key: string; at: number }>()
+
 const stopped = new Set<string>()
 // How many tasks are queued or running per topic, and the id of the most recent
 // message the user sent there. Both feed needsReplyLink(): an answer only needs to
@@ -629,6 +708,8 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   let lastEdit = 0, dirty = false
   // Reset by every stream event; drives both the staleness note and the watchdog.
   let lastEventAt = Date.now()
+  // Set once the child is spawned; the status renderer uses it to offer Interrupt.
+  let runningJob: Job | undefined
   const editStatus = async (force = false) => {
     if (!status || (!dirty && !force)) return
     const now = Date.now()
@@ -644,9 +725,18 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     let shown = steps.slice(-12)
     const note = stalenessNote(Date.now() - lastEventAt, { quietMs: QUIET_NOTE_MS })
     let body = renderSteps(shown, steps.length, undefined, note)
+    // Keyed by JOB id, never by topic. The status message is now KEPT after a run
+    // that produced mid-turn text, so a topic-scoped button would sit on an old
+    // record and end whatever is running today. A tap on a finished job is told so.
+    const markup = runningJob && Date.now() - runningJob.startedAt >= INTERRUPT_BUTTON_MS
+      ? { inline_keyboard: [[{ text: 'Interrupt', callback_data: `int:${runningJob.id}` }]] }
+      : undefined
     while (body.length > 15000 && shown.length > 1) { shown = shown.slice(1); body = renderSteps(shown, steps.length, undefined, note) }
     try {
-      await ctx.api.raw.editMessageText({ chat_id: ctx.chat!.id, message_id: status.message_id, rich_message: { markdown: body } })
+      // reply_markup has to ride on EVERY edit: an edit without it drops the
+      // keyboard. Verified against the API that a rich message keeps its keyboard
+      // across editMessageText.
+      await ctx.api.raw.editMessageText({ chat_id: ctx.chat!.id, message_id: status.message_id, rich_message: { markdown: body }, ...(markup ? { reply_markup: markup } : {}) })
     } catch {
       // Same posture as sendRich: formatting is best-effort, the update is not.
       try {
@@ -666,8 +756,17 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     // stdin = 'ignore' (/dev/null) so claude gets immediate EOF instead of waiting
     // for piped input (it otherwise warns "no stdin data received in 3s" and can
     // return without a parseable result).
-    const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
-    activeRuns.set(key, child)
+    // detached: the child leads its OWN process group, so signalling that group
+    // stops the whole tree it built. Without it the child sits in the bridge's
+    // group — where a group signal would kill the bridge — and killing the child
+    // alone orphans every grandchild it spawned.
+    const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+    const job: Job = {
+      id: newJobId(), key, threadId, prompt, child, pgid: child.pid ?? 0,
+      startedAt: Date.now(), statusMsgId: status?.message_id, steps: () => steps.length,
+    }
+    jobs.set(job.id, job)
+    runningJob = job
     const timer = setTimeout(() => child.kill('SIGKILL'), CLAUDE_TIMEOUT_MS)
     // Keyed on stream events, not wall-clock: a long turn emits them steadily even
     // when each step takes minutes, while a hung child emits nothing at all.
@@ -713,7 +812,15 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     })
     const finish = async (res: ClaudeResult) => {
       clearTimeout(timer); clearInterval(ticker); clearInterval(idleTimer)
-      activeRuns.delete(key)
+      jobs.delete(job.id)
+      // Anything still in this run's group outlived it. Record it so /jobs can say
+      // so; a `setsid` escapee will not be here, which is why /jobs presents this
+      // as what it is — what we can prove, not everything that might exist.
+      const left = groupSurvivors(job.pgid)
+      if (left.length) {
+        leftBehind.set(job.pgid, { id: job.id, key, at: Date.now() })
+        console.log(`[job ${job.id}] left ${left.length} process(es) running: ${left.slice(0, 8).join(', ')}`)
+      }
       if (status) {
         pending = pending.filter(p => !(p.chat === ctx.chat!.id && p.id === status.message_id)); saveState()
         // Keep the progress message as the record of the run when it holds
@@ -722,6 +829,9 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
         // phone the user is usually not watching in real time.
         const carriesMore = textBlocks.length > 1 || (textBlocks.length === 1 && !res.text.includes(textBlocks[0]))
         const keep = PROGRESS_KEEP === 'keep' || (PROGRESS_KEEP !== 'off' && carriesMore)
+        // Whatever happens next, the run is over: the Interrupt button must go, or
+        // a retained record keeps a dead control on it.
+        await ctx.api.editMessageReplyMarkup(ctx.chat!.id, status.message_id).catch(() => {})
         if (keep && steps.length) {
           const body = renderSteps(steps.slice(-12), steps.length, RUN_RECORD)
           await ctx.api.raw.editMessageText({ chat_id: ctx.chat!.id, message_id: status.message_id, rich_message: { markdown: body } })
@@ -735,6 +845,22 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     child.on('error', e => void finish({ text: `Failed to launch ${CLAUDE_BIN}: ${e}`, isError: true }))
     child.on('close', code => {
       console.log(`[claude] done (exit ${code}, ${steps.length} steps)`)
+      // Ended early by a human: `keep` delivers what the turn already produced.
+      // Before mid-turn text was collected there was nothing to keep and stopping
+      // could only discard; now the expensive part is already in hand.
+      if (job.outcome === 'keep') {
+        // Deliberately NOT gated on `got`. Interrupting a blocked tool call makes
+        // the CLI emit an error result on its way out, so `got` is true and the
+        // normal path would deliver "(claude error)" — which is what a Tier 3 run
+        // against the real CLI actually produced. A human ending a run early is not
+        // an error, and what they asked for is whatever it had.
+        const partial = textBlocks.join('\n\n').trim()
+        void finish({
+          text: partial || (got && !isError ? finalText : '') || '⏹ Interrupted before it produced anything.',
+          sessionId, isError: false, blocks: textBlocks,
+        })
+        return
+      }
       if (got) {
         // A turn that produced no answer is a failed turn, not a reply. Both the
         // empty result and the CLI queue layer's "No response requested." land
@@ -1414,7 +1540,7 @@ bot.on('message', async ctx => {
     const vKey = keyFor(chatId, threadId)
     const att = pickAttachment(msg)!
     console.log(`[in] chat=${chatId} topic=${threadId ?? '-'} from=${ctx.from.id} 🎙 voice (${fmtBytes(att.size)})`)
-    if (isInterrupt(vKey) && activeRuns.has(vKey)) { stopped.add(vKey); activeRuns.get(vKey)!.kill('SIGKILL') }
+    for (const j of jobsFor(vKey)) if (isInterrupt(vKey)) { stopped.add(vKey); void endJob(j, 'discard') }
     enqueue(vKey, async () => {
       const cwd = resolveCwd(ctx, threadId)
       let saved: string
@@ -1470,9 +1596,11 @@ bot.on('message', async ctx => {
       `/whoami — show ids (for the allowlist)\n/new (or /clear) — fresh session here (old one kept; /resume to undo)\n` +
       `/resume [id] — restore the previous session, or bind a past session id\n` +
       `/compact [focus] — summarize this topic's history to free up context\n` +
-      `/stop — cancel the task currently running in this topic\n` +
+      `/stop — cancel the running task and discard its answer\n` +
+      `/interrupt — stop it early but keep what it produced (or on|off for the sticky mode)\n` +
+      `/jobs — what is running here, and what earlier runs left behind\n` +
       `/restart — restart the bridge; in-flight tasks finish first\n` +
-      `/interrupt [on|off] — new messages cancel the running task instead of queueing\n` +
+
       `/voice [on|summary|off] — speak answers back; full or summarized (text is always complete)\n` +
       `/live — get a private link to a real-time voice call bound to this session\n` +
       `/mode [${MODES.join('|')}] — permission mode for this topic (tap to switch)${ALLOW_BYPASS ? '' : '; bypass exists but is disabled here'}\n` +
@@ -1500,7 +1628,7 @@ bot.on('message', async ctx => {
 
   if (cmd === '/restart') {
     if (!requestDrain) { await send(ctx, threadId, 'Restart is not available in this process.', true); return }
-    const n = activeRuns.size
+    const n = jobs.size
     await send(ctx, threadId, n > 0
       ? `♻️ Restarting — finishing ${n} run${n === 1 ? '' : 's'} first. Messages you send while I'm down will still be picked up.`
       : `♻️ Restarting — back in a moment. Messages you send while I'm down will still be picked up.`)
@@ -1510,14 +1638,29 @@ bot.on('message', async ctx => {
     void requestDrain(`/restart from ${ctx.from?.id ?? 'unknown'}`)
     return
   }
+  // Two different things, which used to be one. /stop throws the turn away;
+  // /interrupt stops it early and delivers what it already produced. The reply says
+  // which happened, because the difference matters and used to be invisible.
   if (cmd === '/stop' || cmd === '/cancel') {
-    const child = activeRuns.get(key)
-    if (child) { stopped.add(key); child.kill('SIGKILL'); await send(ctx, threadId, '🛑 Stopped the running task.') }
-    else await send(ctx, threadId, 'Nothing is running in this topic right now.', true)
+    const running = jobsFor(key)
+    if (!running.length) { await send(ctx, threadId, 'Nothing is running in this topic right now.', true); return }
+    stopped.add(key)
+    for (const j of running) void endJob(j, 'discard')
+    await send(ctx, threadId, `⏹ Cancelled — the run and everything it started are being stopped, and its answer is discarded. Use /interrupt to stop but keep the partial answer.`)
     return
   }
   if (cmd === '/interrupt') {
     const arg = text.split(/\s+/)[1]?.toLowerCase()
+    // Bare /interrupt now DOES something. It used to be a toggle only, which is
+    // the complaint on record: "the name promises an action and delivers a
+    // setting". on|off still sets the sticky mode.
+    if (!arg) {
+      const running = jobsFor(key)
+      if (!running.length) { await send(ctx, threadId, 'Nothing is running in this topic right now.', true); return }
+      for (const j of running) void endJob(j, 'keep')
+      await send(ctx, threadId, '⏹ Interrupting — I will send whatever the run produced before it stopped.')
+      return
+    }
     const next = arg === 'on' ? true : arg === 'off' ? false : !isInterrupt(key)
     interruptMode[key] = next
     saveState()
@@ -1645,7 +1788,7 @@ bot.on('message', async ctx => {
   if (cmd === '/plan') {
     const arg = text.slice(text.indexOf(' ') + 1).trim()
     if (!arg || !text.includes(' ')) { await send(ctx, threadId, `Usage: /plan <what you want>\n\nRuns one read-only turn: Claude researches and proposes, without editing. Reply "go ahead" to carry it out in this topic's usual mode (${modeFor(key)}).`); return }
-    if (isInterrupt(key) && activeRuns.has(key)) { stopped.add(key); activeRuns.get(key)!.kill('SIGKILL') }
+    for (const j of jobsFor(key)) if (isInterrupt(key)) { stopped.add(key); void endJob(j, 'discard') }
     // One-shot: the topic's sticky mode is untouched, so the follow-up executes.
     noteAsk(key, msg.message_id)
     enqueue(key, () => handlePrompt(ctx, threadId, key, arg, 'plan', msg.message_id))
@@ -1690,6 +1833,42 @@ bot.on('message', async ctx => {
         ? `⚠️ Compact failed: ${res.text.slice(0, 300)}`
         : '🗜️ Compacted — this topic’s history is summarized (memory kept). Carry on.')
     }).catch(err => console.error(`[error] compact ${key}: ${err}`))
+    return
+  }
+  if (cmd === '/jobs' || cmd === '/ps') {
+    const running = jobsFor(key)
+    const lines: string[] = []
+    for (const j of running) {
+      const mins = Math.round((Date.now() - j.startedAt) / 60000)
+      const kids = groupSurvivors(j.pgid).length
+      lines.push(`▶ ${j.id} — running ${mins}m, ${j.steps()} steps` + (kids ? `, ${kids} process${kids === 1 ? '' : 'es'}` : '') +
+        `\n   ${j.prompt.replace(/^\[xesious:[^\]]*\][^\n]*\n/, '').slice(0, 80).replace(/\s+/g, ' ')}`)
+    }
+    // Anything still alive in a FINISHED run's group is, by construction, work it
+    // left behind — no command-line pattern matching, no guessing. Reported rather
+    // than killed: ending something we cannot prove we own is how the deploy
+    // scripts used to take down other people's bridges.
+    const leftovers = [...leftBehind.entries()].filter(([, v]) => v.key === key)
+    for (const [pgid, v] of leftovers) {
+      const alive = groupSurvivors(pgid)
+      if (!alive.length) { leftBehind.delete(pgid); continue }
+      lines.push(`⏳ ${alive.length} process${alive.length === 1 ? '' : 'es'} left running by job ${v.id} (pids ${alive.slice(0, 6).join(', ')})` +
+        `\n   /kill ${v.id} to stop them`)
+    }
+    await send(ctx, threadId, lines.length
+      ? `Jobs in this topic:\n\n${lines.join('\n\n')}`
+      : 'Nothing running in this topic, and nothing left behind.', true)
+    return
+  }
+  if (cmd === '/kill') {
+    const id = text.split(/\s+/)[1]
+    const entry = [...leftBehind.entries()].find(([, v]) => v.id === id && v.key === key)
+    if (!entry) { await send(ctx, threadId, `No leftover processes recorded for job "${id ?? ''}" here. /jobs lists them.`, true); return }
+    const [pgid, v] = entry
+    const alive = groupSurvivors(pgid)
+    for (const pid of alive) { try { process.kill(pid, 'SIGTERM') } catch {} }
+    leftBehind.delete(pgid)
+    await send(ctx, threadId, `Sent SIGTERM to ${alive.length} process${alive.length === 1 ? '' : 'es'} left by job ${v.id}.`)
     return
   }
   if (cmd === '/status') {
@@ -1798,9 +1977,9 @@ bot.on('message', async ctx => {
 
   // Interrupt mode: cancel the run in progress so this message starts immediately
   // (its reply arrives as a new message, after the interrupted one stops).
-  if (isInterrupt(key) && activeRuns.has(key)) {
+  if (isInterrupt(key) && jobsFor(key).length) {
     stopped.add(key)
-    activeRuns.get(key)!.kill('SIGKILL')
+    for (const j of jobsFor(key)) void endJob(j, 'discard')
   }
   noteAsk(key, msg.message_id)
   enqueue(key, () => handlePrompt(ctx, threadId, key, text, undefined, msg.message_id))
@@ -1823,6 +2002,14 @@ bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   if (!isAllowed(ctx)) { await ctx.answerCallbackQuery({ text: 'Not authorized.', show_alert: true }).catch(() => {}); return }
   const key = keyFor(ctx.chat!.id, ctx.callbackQuery.message?.message_thread_id)
+  if (data.startsWith('int:')) {
+    const job = jobs.get(data.slice(4))
+    if (!job) { await ctx.answerCallbackQuery({ text: 'That task already finished.', show_alert: true }).catch(() => {}); return }
+    await ctx.answerCallbackQuery({ text: 'Interrupting — sending what it has so far…' }).catch(() => {})
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {})   // one tap only
+    void endJob(job, 'keep')
+    return
+  }
   if (data.startsWith('retry:')) {
     const rec = retryPrompts.get(data.slice(6))
     if (!rec) { await ctx.answerCallbackQuery({ text: 'That request has expired — send it again.', show_alert: true }).catch(() => {}); return }
@@ -1988,7 +2175,7 @@ async function main() {
   // been paid for but not yet delivered. Nothing in the bridge prevented that — the
   // only thing that did was update.sh externally polling /proc for an idle moment
   // before signalling. So the guarantee lived in a shell script inferring state
-  // from the outside, while the process holding activeRuns and queues (the actual
+  // from the outside, while the process holding the job registry and queues (the actual
   // answer) did nothing with them.
   //
   // Now: stop accepting new messages, let the runs that are already going finish
@@ -1998,14 +2185,14 @@ async function main() {
   const drain = async (why: string): Promise<void> => {
     if (draining) return
     draining = true
-    console.log(`[drain] ${why} — not accepting new messages; ${activeRuns.size} run(s) in flight`)
+    console.log(`[drain] ${why} — not accepting new messages; ${jobs.size} run(s) in flight`)
     try { await handle?.stop() } catch {}          // stop fetching updates
     const deadline = Date.now() + DRAIN_MAX_MS
-    while (activeRuns.size > 0 && Date.now() < deadline) await new Promise(r => setTimeout(r, 250))
-    if (activeRuns.size > 0) {
+    while (jobs.size > 0 && Date.now() < deadline) await new Promise(r => setTimeout(r, 250))
+    if (jobs.size > 0) {
       // A hung child never exits, so this cap is the difference between a bounded
       // shutdown and one that hangs forever holding the token.
-      console.error(`[drain] cap reached with ${activeRuns.size} run(s) still active — exiting anyway`)
+      console.error(`[drain] cap reached with ${jobs.size} run(s) still active — exiting anyway`)
     } else {
       // A run can be finished while its reply is still being sent; the queue chain
       // is what tracks that, so wait on it too.

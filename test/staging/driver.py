@@ -393,8 +393,89 @@ async def feature_reply_threading(client, bot):
             f"lone={lone_targets}, contended={busy_targets}")
 
 
+def _sleepers(marker: str) -> set:
+    """pids of our own `sleep <marker>` processes, read from /proc."""
+    out = set()
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/cmdline", "rb") as fh:
+                cl = fh.read().replace(b"\0", b" ").decode(errors="ignore")
+            if cl.strip() == f"sleep {marker}":
+                out.add(int(name))
+        except Exception:
+            pass
+    return out
+
+
+async def feature_interrupt_kills_the_tree(client, bot):
+    """Interrupting a run must stop the WORK, not just the CLI.
+
+    Measured outside the bridge before this was built: SIGKILL to the claude
+    process left every grandchild running, so a job it had started kept going
+    invisibly — which is how a 7.4 GB crunch stayed alive after the user thought
+    they had stopped it. The fix is spawning the child in its own process group and
+    signalling the group.
+
+    A first version of this test asked the model to background a process and block
+    for four minutes. It declined — the turn finished in two steps — so there was
+    nothing to interrupt and the test proved nothing. Asking for one plain blocking
+    command is something it reliably does, and the sleep it starts IS the grandchild
+    whose fate is in question.
+    """
+    marker = "271"                     # distinctive, so /proc scanning cannot collide
+    before = _sleepers(marker)
+    await _show(client, bot, "/mode auto")
+    print("  → (a run whose tool call blocks, so it can be interrupted)")
+    await client.send_message(bot, f"Using Bash, run exactly: sleep {marker}")
+
+    pid = None
+    for _ in range(60):
+        await asyncio.sleep(1)
+        fresh = _sleepers(marker) - before
+        if fresh:
+            pid = sorted(fresh)[0]
+            break
+    if not pid:
+        return ("interrupt stops the whole process tree", False,
+                "the run never started the blocking command, so nothing was under test")
+    print(f"    tool-call process pid {pid} is running")
+
+    msgs, _sent = await send_and_collect(client, bot, "/interrupt", settle=6)
+    texts = [reply_text(m) for m in msgs]
+    for t in texts:
+        print(f"    ← {t[:90]!r}")
+    # A human ending a run early is not an error. Interrupting a blocked tool call
+    # makes the CLI emit an error result on its way out, and the first version of
+    # this delivered "(claude error)" to the user because of it.
+    errored = any("claude error" in t.lower() for t in texts)
+
+    for _ in range(25):                # SIGINT -> SIGTERM -> SIGKILL escalation
+        await asyncio.sleep(1)
+        if not os.path.exists(f"/proc/{pid}"):
+            break
+    survived = os.path.exists(f"/proc/{pid}")
+    print(f"    pid {pid} alive AFTER interrupt: {survived}")
+    if survived:
+        try:
+            os.kill(pid, 9)
+        except Exception:
+            pass
+
+    problems = []
+    if survived:
+        problems.append(f"pid {pid} survived the interrupt — the tree was orphaned again")
+    if errored:
+        problems.append("the interrupt was reported to the user as '(claude error)'")
+    return ("interrupt stops the whole process tree", not problems,
+            "; ".join(problems) if problems
+            else f"pid {pid} was running, the interrupt took it with the run, and nothing was reported as an error")
+
+
 FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
-                 feature_midturn_text, feature_attribution, feature_reply_threading]
+                 feature_midturn_text, feature_attribution, feature_reply_threading,
+                 feature_interrupt_kills_the_tree]
 
 
 async def main():

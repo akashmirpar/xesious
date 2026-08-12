@@ -11,7 +11,11 @@
  *   NORESP → init + a result whose whole text is "No response requested." — the CLI
  *            queue-layer artefact that used to be posted verbatim as the reply
  *   ERROR  → init + result with is_error:true            → bridge marks the turn failed
- *   HANG   → init, then sleep past the test's timeout     → exercises the SIGKILL path
+ *   HANG   → init, then sleep past the test's timeout     → exercises the watchdog path
+ *   BGPROC → init + a REAL backgrounded child process, then sleeps → exercises whether
+ *            interrupting a run stops the tree it built, or orphans it
+ *   PARTIAL→ init + a text block, then sleeps forever    → exercises interrupting a run
+ *            that has already produced something
  *   LONG   → init + a result past TG_REPLY_FILE_CHARS, with a table in it
  *   TOOLS  → init + two tool_use steps + success
  *   MIDTEXT→ init + a substantive text block + a tool_use + a closing sign-off,
@@ -25,6 +29,7 @@
  *   modelSet / modelDefault — was --model passed
  */
 import { mkdirSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 
 const argv = process.argv.slice(2)
@@ -61,6 +66,21 @@ async function main() {
     // Stay genuinely alive (a real timer — a bare pending promise wouldn't keep the
     // event loop up, and Bun would exit immediately) so the bridge's
     // CLAUDE_TIMEOUT_MS is what SIGKILLs us. That is the path under test.
+    setTimeout(() => process.exit(0), 60_000)
+    return
+  }
+  if (scenario === 'BGPROC') {
+    // Stand in for a tool call that backgrounds work: `nohup collector.py &`
+    // returns instantly while the real job keeps running. Killing only this
+    // process would leave it behind — which is the bug under test.
+    const bg = spawn('sleep', ['300'], { stdio: 'ignore' })
+    writeFileSync(join(process.cwd(), 'bgpid.txt'), String(bg.pid ?? 0))
+    emit({ type: 'assistant', message: { content: [{ type: 'text', text: 'Started a background job.' }] } })
+    setTimeout(() => process.exit(0), 60_000)
+    return
+  }
+  if (scenario === 'PARTIAL') {
+    emit({ type: 'assistant', message: { content: [{ type: 'text', text: 'Partway through: the sweep is at 160 of 245.' }] } })
     setTimeout(() => process.exit(0), 60_000)
     return
   }
