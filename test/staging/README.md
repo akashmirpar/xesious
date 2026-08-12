@@ -53,6 +53,11 @@ one part that needs credentials only you can provide.
 . test/staging/.venv/bin/activate        # if you used a venv
 test/staging/run-staging.sh              # deterministic (stub CLI), real Telegram
 STAGING_REAL_CLAUDE=1 test/staging/run-staging.sh   # against the real claude CLI
+
+# While developing one feature, run only its test — the real-CLI cases each cost
+# real turns and real minutes, so re-running all of them per iteration is the main
+# thing that makes this tier feel slow. It prints what it skipped.
+STAGING_ONLY=interrupt STAGING_REAL_CLAUDE=1 test/staging/run-staging.sh
 ```
 
 `run-staging.sh` boots an isolated bridge (`state/staging/`, its own tmux session),

@@ -42,6 +42,12 @@ SESSION = env("TG_TEST_SESSION")
 BOT = env("STAGING_BOT_USERNAME")
 TIMEOUT = float(env("STAGING_REPLY_TIMEOUT", required=False, default="60"))
 REAL_CLAUDE = env("STAGING_REAL_CLAUDE", required=False, default="") in ("1", "true", "yes")
+# Run a SUBSET while developing. Every real-CLI feature test costs real turns and
+# real minutes, so iterating on one of them should not re-run the other six:
+#   STAGING_ONLY=interrupt STAGING_REAL_CLAUDE=1 test/staging/run-staging.sh
+# Matched as a substring of the test's function name (or, in stub mode, of the
+# prompt). Empty runs everything, which is what CI and a pre-commit check want.
+ONLY = env("STAGING_ONLY", required=False, default="").strip().lower()
 
 # Stub mode: single-turn (prompt, expected-substring), mirroring claude-stub.ts.
 CASES = [
@@ -489,7 +495,17 @@ async def main():
 
     failures = total = 0
     if REAL_CLAUDE:
-        for t in FEATURE_TESTS:
+        selected = [t for t in FEATURE_TESTS if not ONLY or ONLY in t.__name__.lower()]
+        # Say what was skipped. A filtered run that looks like a full one is how a
+        # green suite ends up meaning nothing.
+        if ONLY:
+            skipped = [t.__name__ for t in FEATURE_TESTS if t not in selected]
+            print(f"[driver] STAGING_ONLY={ONLY!r} -> running {len(selected)} of {len(FEATURE_TESTS)}"
+                  + (f"; skipped: {', '.join(skipped)}" if skipped else ""))
+            if not selected:
+                sys.exit(f"[driver] STAGING_ONLY={ONLY!r} matched no test; available: "
+                         + ", ".join(t.__name__ for t in FEATURE_TESTS))
+        for t in selected:
             total += 1
             name, ok, detail = await t(client, bot)
             print(f"[{'PASS' if ok else 'FAIL'}] {name}")
@@ -497,7 +513,10 @@ async def main():
             if not ok:
                 failures += 1
     else:
-        for prompt, expect in CASES:
+        cases = [c for c in CASES if not ONLY or ONLY in c[0].lower()]
+        if ONLY and len(cases) != len(CASES):
+            print(f"[driver] STAGING_ONLY={ONLY!r} -> running {len(cases)} of {len(CASES)} stub cases")
+        for prompt, expect in cases:
             total += 1
             replies = await send_and_wait(client, bot, prompt)
             ok = any(expect in r for r in replies)
