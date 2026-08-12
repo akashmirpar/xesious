@@ -25,7 +25,6 @@ process.env.TG_STATE_FILE = STATE_FILE
 process.env.TG_CLAUDE_TIMEOUT_MS = '20000'  // absolute backstop, must not fire first
 process.env.TG_IDLE_TIMEOUT_MS = '1500'    // the idle watchdog is what HANG exercises
 process.env.TG_QUIET_NOTE_MS = '500'
-process.env.TG_INTERRUPT_BUTTON_MS = '0'   // offer Interrupt immediately in tests
 // These two must be pinned, not merely left unset: bun auto-loads the repo's .env,
 // so a developer machine with TG_ALLOW_BYPASS=1 in it would otherwise silently turn
 // the bypass safety-gate test green for the wrong reason.
@@ -142,7 +141,10 @@ describe('degenerate CLI outputs', () => {
   })
   test('…and the report carries a one-tap retry button', async () => {
     const cs = await incoming(1009, 'NORESP')
-    const withKb = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard)
+    // Find the keyboard on the REPORT specifically: the status message now carries
+    // an Interrupt keyboard of its own from the moment it is posted.
+    const withKb = sends(cs).find(c =>
+      c.payload?.reply_markup?.inline_keyboard && String(c.payload.text ?? '').includes('No answer came back'))
     expect(withKb).toBeTruthy()
     const btn = withKb!.payload.reply_markup.inline_keyboard[0][0]
     expect(btn.text).toMatch(/retry/i)
@@ -656,12 +658,18 @@ describe('interrupt vs stop, and the job registry', () => {
     expect(texts).not.toContain('160 of 245')
   }, 20000)
 
-  test('the status message offers Interrupt, labelled plainly', async () => {
+  test('the status message offers Interrupt from the moment it appears', async () => {
+    // Not after a delay: a run is interruptible from its first second, so a control
+    // that materialises later is one you have to notice arriving, exactly while you
+    // are already waiting on something.
+    const before = calls.length
     const run = incoming(1143, 'PARTIAL')
     await new Promise(r => setTimeout(r, 400))
+    const firstStatus = calls.slice(before).find(c => c.method === 'sendMessage' && textOf(c).includes('Thinking'))
+    expect(btnOf(firstStatus)).toBeTruthy()
     const withBtn = calls.find(c => c.method === 'editMessageText' && btnOf(c))
     expect(withBtn).toBeTruthy()
-    expect(btnOf(withBtn).text).toBe('Interrupt')
+    expect(btnOf(withBtn).text).toBe('— Interrupt —')
     // Job-scoped, never topic-scoped: the status message is retained after a run
     // that produced text, so a topic-scoped button would end whatever is running
     // later.

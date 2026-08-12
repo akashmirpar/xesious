@@ -106,10 +106,11 @@ const CLAUDE_TIMEOUT_MS = Number(process.env.TG_CLAUDE_TIMEOUT_MS || 4 * 60 * 60
 const IDLE_TIMEOUT_MS = Number(process.env.TG_IDLE_TIMEOUT_MS || 15 * 60 * 1000)
 // How long a run may be quiet before the status message says so.
 const QUIET_NOTE_MS = Number(process.env.TG_QUIET_NOTE_MS || 90 * 1000)
-// How long a run must have been going before the status message offers to end it.
-// Not from the first second: a three-second turn does not need the affordance, and
-// a keyboard flickering in and out of every trivial turn is its own kind of noise.
-const INTERRUPT_BUTTON_MS = Number(process.env.TG_INTERRUPT_BUTTON_MS || 12 * 1000)
+// The status message carries this from the moment it appears, not after a delay.
+// A run is interruptible from its first second, so the control should be there from
+// its first second — a button that materialises later is a control you have to
+// notice arriving, exactly when you are already waiting on something.
+const INTERRUPT_LABEL = '— Interrupt —'
 // How long a graceful shutdown will wait for in-flight runs before giving up on
 // them. A deploy normally waits for idle before signalling, so this is the
 // backstop for a SIGTERM that lands mid-run — and for the hung-child case, where
@@ -712,9 +713,15 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   if (effort) args.push('--effort', effort)
 
   const opts: any = threadId ? { message_thread_id: threadId } : {}
+  // Minted before the status message so its keyboard can name this run from the
+  // start. If the spawn below fails the id never registers, and a tap on it is told
+  // the task has already finished — which is true.
+  const jobId = newJobId()
+  const interruptKb = { inline_keyboard: [[{ text: INTERRUPT_LABEL, callback_data: `int:${jobId}` }]] }
   // Status is machine chatter, not an answer — post and edit it silently so only
   // the real reply buzzes the user's phone.
-  const status = await ctx.api.sendMessage(ctx.chat!.id, THINKING, { ...opts, disable_notification: true }).catch(() => null)
+  const status = await ctx.api.sendMessage(ctx.chat!.id, THINKING,
+    { ...opts, disable_notification: true, reply_markup: interruptKb }).catch(() => null)
   if (status) { pending.push({ chat: ctx.chat!.id, id: status.message_id }); saveState() }
   const steps: Step[] = []
   let lastEdit = 0, dirty = false
@@ -737,12 +744,10 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     let shown = steps.slice(-12)
     const note = stalenessNote(Date.now() - lastEventAt, { quietMs: QUIET_NOTE_MS })
     let body = renderSteps(shown, steps.length, undefined, note)
-    // Keyed by JOB id, never by topic. The status message is now KEPT after a run
-    // that produced mid-turn text, so a topic-scoped button would sit on an old
-    // record and end whatever is running today. A tap on a finished job is told so.
-    const markup = runningJob && Date.now() - runningJob.startedAt >= INTERRUPT_BUTTON_MS
-      ? { inline_keyboard: [[{ text: 'Interrupt', callback_data: `int:${runningJob.id}` }]] }
-      : undefined
+    // Keyed by JOB id, never by topic. The status message is KEPT after a run that
+    // produced mid-turn text, so a topic-scoped button would sit on an old record
+    // and end whatever is running today. A tap on a finished job is told so.
+    const markup = interruptKb
     while (body.length > 15000 && shown.length > 1) { shown = shown.slice(1); body = renderSteps(shown, steps.length, undefined, note) }
     try {
       // reply_markup has to ride on EVERY edit: an edit without it drops the
@@ -752,7 +757,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     } catch {
       // Same posture as sendRich: formatting is best-effort, the update is not.
       try {
-        await ctx.api.editMessageText(ctx.chat!.id, status.message_id, renderStepsHtml(shown), { parse_mode: 'HTML' })
+        await ctx.api.editMessageText(ctx.chat!.id, status.message_id, renderStepsHtml(shown), { parse_mode: 'HTML', reply_markup: markup })
       } catch {
         const plain = [THINKING, ...shown.map(s => s.label)].join('\n').slice(0, 3500)
         await ctx.api.editMessageText(ctx.chat!.id, status.message_id, plain).catch(() => {})
@@ -774,7 +779,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     // alone orphans every grandchild it spawned.
     const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'], detached: true })
     const job: Job = {
-      id: newJobId(), key, threadId, prompt, child, pgid: child.pid ?? 0, askedBy,
+      id: jobId, key, threadId, prompt, child, pgid: child.pid ?? 0, askedBy,
       startedAt: Date.now(), statusMsgId: status?.message_id, steps: () => steps.length,
     }
     jobs.set(job.id, job)
