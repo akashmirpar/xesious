@@ -90,7 +90,8 @@ off is now a **hard startup error**, not a warning.
 | `/cwd <abs-path>` | Set this topic's working directory (resets its session) |
 | `/status` | Show this topic's session id, cwd and permission mode |
 | `/sessions <dir…>` | List the Claude sessions stored for one or more directories (what the IDE/CLI picker shows) |
-| `/import <dir…>` | Make a topic for each session in the given directories — bound + recent history backfilled |
+| `/import <dir…>` | Make a topic for each newest session in the given directories — bound + recent history backfilled |
+| `/import <dir> <id-or-title>` | Import one specific session (by id prefix or title substring) into its own topic |
 | `/history [N]` | Re-post the last N turns of this topic's bound session |
 | `/help` | Usage |
 
@@ -106,7 +107,14 @@ forum group (paths are space-, comma-, or newline-separated). Across all the
 directories it takes the newest `TG_IMPORT_MAX` (default 10) sessions, creates a
 topic for each (named after the session), binds it, and backfills the last
 `TG_IMPORT_BACKFILL` (default 12) turns. Message the topic to continue that exact
-session from your phone; `/history [N]` re-posts more past turns. `/sessions
+session from your phone; `/history [N]` re-posts more past turns.
+
+Want just **one** session (not the newest N)? Add a selector:
+`/import <dir> <id-or-title>` — e.g. `/import /root/dev/aaron 45cde135` or
+`/import /root/dev/aaron Review config loading`. It matches a session id (exact or
+≥6-char prefix) first, then a case-insensitive title substring; a unique match
+gets its own topic, an ambiguous one lists the candidates so you can narrow it.
+`/sessions
 <dir…>` lists what's there without creating anything.
 
 **One rule:** a session is a single transcript with one writer at a time. Continue
