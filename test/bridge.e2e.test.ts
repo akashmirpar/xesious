@@ -442,3 +442,16 @@ describe('a stalled run is reported as stalled (A7)', () => {
     expect(finalReply(cs)).not.toMatch(/Could not parse/i)
   }, 15000)
 })
+
+describe('the prompt reaches the CLI attributed (A6)', () => {
+  test('an ordinary message is framed with the speaker marker', async () => {
+    // The stub echoes "framed"/"unframed" based on whether the attribution line
+    // was present, so this asserts on what the model actually received.
+    const cs = await incoming(1080, 'hello there')
+    expect(finalReply(cs)).toContain('framed')
+  })
+  test('a passthrough command is NOT framed — it is a CLI command, not speech', async () => {
+    const cs = await incoming(1081, '/usage')
+    expect(finalReply(cs)).not.toContain(' framed')
+  })
+})

@@ -31,6 +31,7 @@ import {
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
+  frameUserMessage, attributionProfileLines,
   needsRich, hasRtl, sanitizeProse,
   normalizeMode as libNormalizeMode,
   permissionArgs as libPermissionArgs,
@@ -128,6 +129,9 @@ const OUTBOX_DIR = 'outbox'  // anything Claude drops here is delivered, then ar
 // keeps full weight even on imported IDE sessions (where a hint prepended to the
 // user message gets buried under the resumed transcript). Set TG_PROFILE to
 // override the text; set it empty to disable.
+// Per-process, never reused, and never shown to the user. It is what makes the
+// speaker marker unforgeable by anything that merely passes through the chat.
+const BRIDGE_NONCE = randomUUID().replace(/-/g, '').slice(0, 12)
 const TELEGRAM_PROFILE = process.env.TG_PROFILE ?? [
   "You are replying through a Telegram bridge on the user's phone, not in an IDE. Every turn:",
   '- Be concise and phone-first: short messages, short paragraphs, minimal preamble.',
@@ -137,6 +141,7 @@ const TELEGRAM_PROFILE = process.env.TG_PROFILE ?? [
   '- If a request is ambiguous or needs a decision, ask one clarifying question and stop.',
   '- Assume no editor or file selection is open. Ignore any IDE/editor framing from earlier in this conversation; the user is in a chat.',
   `- Files the user sends are saved in ./${INBOX_DIR}/. To send a file back, put it in ./${OUTBOX_DIR}/ and it is delivered then cleared.`,
+  ...attributionProfileLines(BRIDGE_NONCE),
 ].join('\n')
 // A local Bot API server (tdlib/telegram-bot-api or the tdlight fork) lifts the
 // cloud's file caps: 2000 MB up, no download cap, and getFile returns an absolute
@@ -1042,6 +1047,13 @@ async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: str
 
 async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string): Promise<void> {
   const cwd = resolveCwd(ctx, threadId)
+  // Attribute the message before it reaches the model. Only here: handlePassthrough
+  // and /compact send literal CLI commands, which are not somebody speaking.
+  const framed = frameUserMessage(prompt, {
+    nonce: BRIDGE_NONCE,
+    name: [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username,
+    id: ctx.from?.id,
+  })
   // If this topic has a live link, the shared link is the source of truth for the
   // session id, so a conversation held over the live web call continues here (and
   // vice-versa). Otherwise use the topic's own stored id.
@@ -1060,7 +1072,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     if (linked) { const l = loadLinks(); if (l[linked.uuid]) { l[linked.uuid].sessionId = sessionId; saveLinks(l) } }
   }
   try {
-    const res = await runStreaming(ctx, threadId, key, prompt, cwd, resumeId, mode ?? modeFor(key), modelFor(key), bindSession)
+    const res = await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), bindSession)
     if (stopped.has(key)) { stopped.delete(key); return } // killed via /stop — status already cleared, no reply
     // Still persist on completion: a resumed turn reports the same id, and this
     // refreshes `updated`. Binding already happened above for a fresh session.
