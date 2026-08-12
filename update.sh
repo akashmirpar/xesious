@@ -10,76 +10,94 @@
 #   * "polling Telegram" was logged while the bot was     -> we health-check what
 #     silently dropping every message (empty allowlist)      actually matters
 #   * and when it did fail, nothing put the old code back -> we snapshot + roll back
+#
+# Knobs (all optional):
+#   UPDATE_SKIP_TESTS=1        skip the test gate in a pinch
+#   UPDATE_MAX_WAIT=<seconds>  cap on waiting for the bridge to go idle (default 1800)
+#   UPDATE_ON_BUSY=abort|force what to do when that cap is hit (default abort)
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 DIR="$PWD"
 SESSION="${CLAUDE_TG_SESSION:-claude-tg}"
+MAX_WAIT="${UPDATE_MAX_WAIT:-1800}"
+ON_BUSY="${UPDATE_ON_BUSY:-abort}"
 
-# "Is this bridge mid-run?" = does THIS instance's bun have a claude child.
-# Matching the command line instead (e.g. 'claude.*--output-format stream-json')
-# also matches the IDE extension's own claude, and any other instance's — which
-# deadlocks this script against the very session running it.
-busy() {
-  local b
-  for b in $(pgrep -x bun 2>/dev/null); do
-    [ "$(readlink /proc/$b/cwd 2>/dev/null)" = "$DIR" ] || continue
-    pgrep -x -P "$b" claude >/dev/null 2>&1 && return 0
-  done
-  return 1
-}
+# busy(), own_pids(), stop_own(), wait_for_idle() and find_bun() live in lib.sh so
+# every deploy script selects processes the same way. The rule they enforce —
+# never signal on a negative match — is documented there.
+# shellcheck source=lib.sh
+. "$DIR/lib.sh"
 
-if ! command -v bun >/dev/null 2>&1; then
-  for d in "$HOME/.bun/bin" "$HOME/.local/bin" "$HOME"/.nvm/versions/node/*/bin; do
-    [ -x "$d/bun" ] && { export PATH="$d:$PATH"; break; }
-  done
-fi
-command -v bun >/dev/null 2>&1 || { echo "ERROR: bun not on PATH" >&2; exit 1; }
+find_bun || { echo "ERROR: bun not on PATH" >&2; exit 1; }
 
 say() { echo "[update] $*"; }
 fail() { echo "[update] FAILED: $*" >&2; }
 
-# 1. Optionally pull, remembering where we were so we can go back.
+PULLED=0
+[ "${1:-}" = "--pull" ] && PULLED=1
+
+# 1. Snapshot BEFORE anything moves, so rollback restores the exact bytes that
+#    were running — including edits that were never committed.
+#
+#    Snapshot the whole tracked tree, not just bridge.ts. bridge.ts used to be
+#    the entire program; it is not any more. lib.ts now holds the stream parser,
+#    the renderers, the mode/model normalisation and the rich-message routing, and
+#    live/server.ts is its own process — so restoring bridge.ts alone puts back a
+#    file that imports a still-broken module and calls it a rollback.
 BEFORE="$(git rev-parse HEAD 2>/dev/null || echo '')"
-if [ "${1:-}" = "--pull" ]; then
+BAK="$(mktemp -d /tmp/xesious-bak-XXXX)"
+snapshot_tree "$BAK" || { fail "could not snapshot the working tree"; exit 1; }
+say "backup: $BAK/tree.tar ($(tar -tf "$BAK/tree.tar" 2>/dev/null | wc -l) files)"
+
+# 2. Optionally pull.
+if [ "$PULLED" = 1 ]; then
   say "pulling…"; git pull --ff-only || { fail "git pull"; exit 1; }
 fi
 
-# 2. Deps + typecheck BEFORE touching the running bot. A syntax error caught here
+# 3. Deps + typecheck BEFORE touching the running bot. A syntax error caught here
 #    costs nothing; caught after the restart it costs an outage.
 say "installing deps…"; bun install >/dev/null 2>&1 || { fail "bun install"; exit 1; }
 say "typechecking…"
 bun build bridge.ts --target=node >/dev/null 2>/tmp/update-build.err || {
   fail "bridge.ts does not compile — NOT restarting. Nothing changed."; cat /tmp/update-build.err >&2; exit 1; }
 
-# 2b. Run the test suite BEFORE touching the running bot. This is the regression
-#     gate: a change that breaks any tested feature stops the deploy here, with the
-#     bot still happily running the old code. --env-file=/dev/null keeps it hermetic
-#     (never loads the production .env). Set UPDATE_SKIP_TESTS=1 to bypass in a pinch.
+# 4. Run the test suite BEFORE touching the running bot. This is the regression
+#    gate: a change that breaks any tested feature stops the deploy here, with the
+#    bot still happily running the old code. --env-file=/dev/null keeps it hermetic
+#    (never loads the production .env). Set UPDATE_SKIP_TESTS=1 to bypass in a pinch.
 if [ "${UPDATE_SKIP_TESTS:-0}" = 1 ]; then
   say "SKIPPING tests (UPDATE_SKIP_TESTS=1)"
 else
   say "running tests…"
   bun --env-file=/dev/null test >/tmp/update-test.err 2>&1 || {
     fail "tests failed — NOT restarting. Nothing changed. See below:"; tail -40 /tmp/update-test.err >&2; exit 1; }
+  # The shell tier covers this script's own process-selection logic, which is
+  # exactly the code that can take down someone else's bridge. Gate on it too.
+  say "running shell tests…"
+  bash test/shell/run.sh >/tmp/update-shelltest.err 2>&1 || {
+    fail "shell tests failed — NOT restarting. Nothing changed. See below:"; tail -30 /tmp/update-shelltest.err >&2; exit 1; }
 fi
 
-# 3. Snapshot the exact file we're replacing, so rollback is a copy, not a git guess
-#    (the working tree may hold edits that were never committed).
-BAK="$(mktemp -d /tmp/bridge-bak-XXXX)"; cp bridge.ts "$BAK/bridge.ts"
-say "backup: $BAK/bridge.ts"
-
-# 4. Wait for idle so we never cut off a reply in flight.
-say "waiting for the bridge to go idle…"
-while true; do
-  for _ in $(seq 1 240); do busy || break; sleep 3; done
-  sleep 8                     # let the finished reply actually get delivered
-  busy || break               # still idle after the grace window -> safe
-done
+# 5. Wait for idle so we never cut off a reply in flight — but bounded.
+#    The old loop's 12-minute limit was the INNER loop, wrapped in `while true`,
+#    so a hung claude child (one that never exits, a documented failure mode)
+#    stalled the deploy forever, detached, with nothing reported.
+say "waiting for the bridge to go idle (cap ${MAX_WAIT}s)…"
+if ! wait_for_idle "$DIR" "$MAX_WAIT"; then
+  if [ "$ON_BUSY" = force ]; then
+    say "still busy after ${MAX_WAIT}s — UPDATE_ON_BUSY=force, restarting anyway (one reply may be lost)"
+  else
+    fail "still busy after ${MAX_WAIT}s — NOT restarting. Nothing changed."
+    fail "the run may be hung; check 'tmux attach -t $SESSION', or re-run with UPDATE_ON_BUSY=force"
+    rm -rf "$BAK"; exit 1
+  fi
+fi
 
 restart() {
-  for p in $(pgrep -x bun); do
-    [ "$(readlink /proc/$p/cwd 2>/dev/null)" = "$DIR" ] && kill -TERM "$p"
-  done
+  # Only ever signals processes proven to be ours AND in this directory, and says
+  # which candidates it declined. The old loop matched on cwd alone, which is a
+  # kernel accident rather than a check the moment this runs as root.
+  stop_own "$DIR" TERM || say "no bridge of ours was running"
   sleep 3
   tmux kill-session -t "$SESSION" 2>/dev/null
   : > bridge.log
@@ -87,15 +105,20 @@ restart() {
   sleep 10
 }
 
-# 5. Health check: does it actually SERVE, not merely run? Each of these has been
+# 6. Health check: does it actually SERVE, not merely run? Each of these has been
 #    a real outage — a crash, a fight over the token, or an auth config that made
 #    the bot ignore everyone while still logging "polling Telegram".
 healthy() {
-  grep -q 'polling Telegram' bridge.log || { fail "never reached 'polling Telegram'"; return 1; }
-  grep -qE '^\[FATAL\]|\[fatal\]' bridge.log && { fail "fatal in log"; return 1; }
-  grep -q '409' bridge.log && { fail "409 conflict — another instance holds the token"; return 1; }
-  pgrep -x bun | while read -r p; do [ "$(readlink /proc/$p/cwd 2>/dev/null)" = "$DIR" ] && exit 0; done
-  pgrep -f "$DIR" >/dev/null || true
+  local why
+  why=$(log_verdict bridge.log) || { fail "$why"; return 1; }
+
+  # Is a bridge of ours actually alive? This must be a command substitution, not
+  # a pipeline: the old form was `pgrep -x bun | while read p; do … exit 0; done`,
+  # whose `exit 0` leaves the SUBSHELL the pipe created, not the function. The
+  # line after it discarded its own status with `|| true` and the function then
+  # returned 0 unconditionally — so this check could never fail, and a bot that
+  # died right after logging 'polling Telegram' was reported healthy.
+  [ -n "$(own_pids bun "$DIR")" ] || { fail "no bridge process of ours is running in $DIR"; return 1; }
   return 0
 }
 
@@ -106,10 +129,16 @@ if healthy; then
   exit 0
 fi
 
-# 6. Roll back to the exact bytes that were running before.
+# 7. Roll back to the exact bytes that were running before.
 fail "health check failed — rolling back"
-cp "$BAK/bridge.ts" bridge.ts
-[ -n "$BEFORE" ] && [ "${1:-}" = "--pull" ] && git reset --hard "$BEFORE" >/dev/null 2>&1
+restore_tree "$BAK"
+if [ "$PULLED" = 1 ] && [ -n "$BEFORE" ]; then
+  # --mixed, never --hard. The snapshot we just restored contains uncommitted
+  # edits — that is the whole reason it is a file snapshot and not a git guess —
+  # and --hard would delete them a second time. --mixed moves HEAD back so it
+  # agrees with the restored files, and leaves the working tree alone.
+  git reset --mixed "$BEFORE" >/dev/null 2>&1 || true
+fi
 restart
 if healthy; then say "rolled back and healthy again (kept $BAK)"; exit 1; fi
 fail "STILL unhealthy after rollback — look at bridge.log:"; tail -20 bridge.log >&2; exit 2
