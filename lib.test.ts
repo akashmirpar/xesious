@@ -13,6 +13,7 @@ import {
   normalizeModel, MODEL_DEFAULT,
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
+  markdownToHtml, htmlDocument,
   sanitizeProse, PROSE_RULES, isNonAnswer,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
@@ -713,5 +714,99 @@ describe('normalizeEffort (C5)', () => {
     // command handlers read the same way.
     expect(typeof normalizeEffort('high')).toBe('string')
     expect(normalizeEffort('nope')).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// markdown -> HTML (C7)
+// ---------------------------------------------------------------------------
+
+describe('markdownToHtml — security first', () => {
+  // This output becomes a FILE the user double-clicks. That is a materially bigger
+  // risk than the same text inside a Telegram message, where the client never
+  // executes anything, and it is the reason this is hand-written rather than
+  // delegated to a library option somebody has to set correctly.
+  test('embedded HTML is shown, never executed', () => {
+    const out = markdownToHtml('Text with <script>alert(1)</script> in it.')
+    expect(out).not.toContain('<script>')
+    expect(out).toContain('&lt;script&gt;')
+  })
+  test('an img onerror payload is inert too', () => {
+    const out = markdownToHtml('<img src=x onerror=alert(1)>')
+    expect(out).not.toMatch(/<img[^>]*onerror/i)
+    expect(out).toContain('&lt;img')
+  })
+  test('a javascript: link is left as plain text, not turned into an href', () => {
+    const out = markdownToHtml('[click](javascript:alert(1))')
+    expect(out).not.toContain('href="javascript:')
+    expect(out).toContain('[click]')
+  })
+  test('data: and vbscript: are refused as well', () => {
+    for (const u of ['data:text/html,<script>x</script>', 'vbscript:msgbox']) {
+      expect(markdownToHtml(`[x](${u})`)).not.toContain('href="' + u)
+    }
+  })
+  test('ordinary links still work', () => {
+    expect(markdownToHtml('[ok](https://x.test/a)')).toContain('<a href="https://x.test/a">ok</a>')
+    expect(markdownToHtml('[m](mailto:a@b.c)')).toContain('<a href="mailto:a@b.c">m</a>')
+  })
+})
+
+describe('markdownToHtml — the constructs an answer actually uses', () => {
+  test('headings', () => {
+    expect(markdownToHtml('# One')).toBe('<h1>One</h1>')
+    expect(markdownToHtml('### Three')).toBe('<h3>Three</h3>')
+  })
+  test('a table becomes a real table — the whole point of the file', () => {
+    const out = markdownToHtml('| a | b |\n|---|---|\n| 1 | 2 |')
+    expect(out).toContain('<th>a</th>')
+    expect(out).toContain('<td>2</td>')
+    expect(out).toContain('</table>')
+  })
+  test('fenced code is verbatim and escaped, with its language recorded', () => {
+    const out = markdownToHtml('```sh\ncd ~ && echo "<b>"\n```')
+    expect(out).toContain('class="lang-sh"')
+    expect(out).toContain('cd ~ &amp;&amp; echo &quot;&lt;b&gt;&quot;'.replace(/&quot;/g, '"'))
+    expect(out).not.toContain('<b>')
+  })
+  test('markdown inside a code fence is NOT interpreted', () => {
+    expect(markdownToHtml('```\n**not bold**\n```')).toContain('**not bold**')
+  })
+  test('markdown inside an inline code span is not interpreted either', () => {
+    expect(markdownToHtml('use `a * b * c` here')).toContain('<code>a * b * c</code>')
+  })
+  test('lists, including task lists with real checkboxes', () => {
+    const out = markdownToHtml('- [x] done\n- [ ] todo\n- plain')
+    expect(out).toContain('checkbox" disabled checked')
+    expect(out).toContain('<li>plain</li>')
+    expect(markdownToHtml('1. first\n2. second')).toContain('<ol><li>first</li>')
+  })
+  test('emphasis, strikethrough and quotes', () => {
+    expect(markdownToHtml('**b** and *i* and ~~s~~')).toContain('<strong>b</strong>')
+    expect(markdownToHtml('**b** and *i* and ~~s~~')).toContain('<em>i</em>')
+    expect(markdownToHtml('**b** and *i* and ~~s~~')).toContain('<del>s</del>')
+    expect(markdownToHtml('> quoted')).toBe('<blockquote>quoted</blockquote>')
+  })
+  test('an unsupported construct degrades to visible text, never to a wrong render', () => {
+    // The .md is kept alongside and stays the source of truth, so this is a
+    // convenience view; being wrong would be worse than being plain.
+    expect(markdownToHtml('$$a^2$$')).toContain('$$a^2$$')
+  })
+})
+
+describe('htmlDocument', () => {
+  test('is self-contained — no CDN, no remote font', () => {
+    const doc = htmlDocument('Answer', '<p>hi</p>')
+    expect(doc).not.toMatch(/https?:\/\//)
+    expect(doc).toContain('<style>')
+    expect(doc).toContain('<p>hi</p>')
+  })
+  test('escapes its own title', () => {
+    expect(htmlDocument('<script>', '')).toContain('<title>&lt;script&gt;</title>')
+  })
+  test('declares a charset and a viewport, since it is opened on a phone too', () => {
+    const doc = htmlDocument('t', '')
+    expect(doc).toContain('charset="utf-8"')
+    expect(doc).toContain('name="viewport"')
   })
 })

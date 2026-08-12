@@ -565,3 +565,29 @@ describe('/effort plumbs --effort through to the CLI (C5)', () => {
     expect(stateNow().efforts['1116:main']).toBe('xhigh')
   })
 })
+
+describe('a long answer is delivered as a readable file (C7)', () => {
+  const docs = (cs: any[]) => cs.filter(c => c.method === 'sendDocument')
+
+  test('both an .html and an .md are sent', async () => {
+    // The .md alone was close to unreadable on macOS: no default viewer, no
+    // preview in Telegram Desktop, and double-clicking shows raw pipe-tables —
+    // exactly the content that needed a file in the first place.
+    const cs = await incoming(1120, 'LONG')
+    const names = docs(cs).map(c => String(c.payload?.document?.filename ?? ''))
+    expect(names.some(n => n.endsWith('.html'))).toBe(true)
+    expect(names.some(n => n.endsWith('.md'))).toBe(true)
+  }, 10000)
+
+  test('the preview caption rides on the first file only', async () => {
+    const cs = await incoming(1121, 'LONG')
+    const captioned = docs(cs).filter(c => c.payload?.caption)
+    expect(captioned).toHaveLength(1)
+    expect(String(captioned[0].payload.caption)).toContain('Full answer')
+  }, 10000)
+
+  test('the files are threaded to the question like any other answer', async () => {
+    const cs = await incoming(1122, 'LONG')
+    expect(docs(cs).every(c => c.payload?.reply_parameters?.message_id)).toBe(true)
+  }, 10000)
+})
