@@ -97,6 +97,74 @@ wait_for_idle() {
   done
 }
 
+# ---------------------------------------------------------------------------
+# tmux identity
+# ---------------------------------------------------------------------------
+#
+# The same rule as for pids, because the same bug was here: `tmux kill-session -t
+# "$SESSION"` trusted a NAME. Two deployments by one user both default to
+# `claude-tg`, so a redeploy in directory B tore down the bridge in directory A —
+# the pid loop would politely decline to touch it and the next line killed its
+# session anyway.
+#
+# Identifying the session by its working directory is NOT sufficient, and on this
+# box it is actively dangerous. Verified: two sessions share /home/george/xesious
+#   claude-tg                    pane_pid 284736  cmdline: bash -c while true; … bridge.ts …
+#   xesious-feature-development  pane_pid 357198  cmdline: -bash
+# Both panes are owned by the same user with the same cwd, and the second is the
+# operator's own interactive session. A directory match would kill it.
+#
+# So a session is ours only on THREE positive proofs: its pane process is owned by
+# us, its cwd is our directory, and its command line is the respawn wrapper (it
+# mentions bridge.ts). That also holds when the bridge itself is momentarily dead
+# between respawns, which a bridge-pid lookup would miss.
+
+# tmux_own_sessions <dir> — names of tmux sessions running OUR bridge in <dir>.
+tmux_own_sessions() {
+  local dir="${1:-}" pane sess
+  [ -n "$dir" ] || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+  tmux list-panes -a -F '#{pane_pid} #{session_name}' 2>/dev/null | while read -r pane sess; do
+    [ -n "$pane" ] && [ -n "$sess" ] || continue
+    owns_pid "$pane" "$dir" || continue
+    tr '\0' ' ' < "/proc/$pane/cmdline" 2>/dev/null | grep -q 'bridge\.ts' || continue
+    printf '%s\n' "$sess"
+  done
+}
+
+# tmux_kill_own <dir> — tear down only the sessions proven to be running our
+# bridge, and say what was left alone. Resolve BEFORE stopping the bridge process
+# where possible; this works either way, since it keys off the pane wrapper.
+tmux_kill_own() {
+  local dir="${1:-}" s killed=0 mine
+  mine=$(tmux_own_sessions "$dir")
+  for s in $mine; do
+    tmux kill-session -t "$s" 2>/dev/null && { echo "[tmux] killed session '$s' (running our bridge in $dir)"; killed=$((killed + 1)); }
+  done
+  if [ "$killed" = 0 ]; then
+    echo "[tmux] no session is running a bridge of ours in $dir — left every session alone"
+  fi
+  # Name every session we declined, so a teardown that spares something says why
+  # rather than looking like it missed.
+  command -v tmux >/dev/null 2>&1 && tmux list-sessions -F '#{session_name}' 2>/dev/null | while read -r s; do
+    case " $mine " in *" $s "*) continue ;; esac
+    echo "[tmux] skipped session '$s' — not running our bridge in $dir"
+  done
+  [ "$killed" -gt 0 ]
+}
+
+# session_name_for <dir> — default tmux session name for a deployment.
+# Derived from the directory so two deployments by one user don't share a name.
+# This is COSMETIC: teardown identifies sessions by process, never by this string,
+# so a collision here is confusing rather than dangerous. Override with
+# CLAUDE_TG_SESSION. tmux treats ':' and '.' specially in target names, so the
+# basename is reduced to [A-Za-z0-9_-].
+session_name_for() {
+  local dir="${1:-$PWD}" base
+  base=$(basename "$dir" | tr -c 'A-Za-z0-9_-' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')
+  printf 'claude-tg%s' "${base:+-$base}"
+}
+
 # snapshot_tree <dest_dir> — archive the working tree so a failed deploy can be
 # undone byte for byte, including edits that were never committed.
 #

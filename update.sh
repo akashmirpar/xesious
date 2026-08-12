@@ -18,7 +18,6 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 DIR="$PWD"
-SESSION="${CLAUDE_TG_SESSION:-claude-tg}"
 MAX_WAIT="${UPDATE_MAX_WAIT:-1800}"
 ON_BUSY="${UPDATE_ON_BUSY:-abort}"
 
@@ -27,6 +26,8 @@ ON_BUSY="${UPDATE_ON_BUSY:-abort}"
 # never signal on a negative match — is documented there.
 # shellcheck source=lib.sh
 . "$DIR/lib.sh"
+
+SESSION="${CLAUDE_TG_SESSION:-$(session_name_for "$DIR")}"
 
 find_bun || { echo "ERROR: bun not on PATH" >&2; exit 1; }
 
@@ -99,7 +100,10 @@ restart() {
   # kernel accident rather than a check the moment this runs as root.
   stop_own "$DIR" TERM || say "no bridge of ours was running"
   sleep 3
-  tmux kill-session -t "$SESSION" 2>/dev/null
+  # Kill only the tmux session proven to be running OUR bridge. The old line was
+  # `tmux kill-session -t "$SESSION"` — a bare name, with no owner or cwd check —
+  # so a redeploy here tore down a same-user deployment in another directory.
+  tmux_kill_own "$DIR" || true
   : > bridge.log
   ./start.sh >/tmp/update-start.log 2>&1
   sleep 10

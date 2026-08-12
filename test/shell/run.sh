@@ -32,10 +32,12 @@ hasnt(){ case " $2 " in *" $3 "*) no "$1 — '$3' unexpectedly in '$2'" ;; *) ok
 TMP=$(mktemp -d /tmp/xesious-shelltest-XXXXXX)
 BIN="$TMP/bin"; DIR_A="$TMP/a"; DIR_B="$TMP/b"
 mkdir -p "$BIN" "$DIR_A" "$DIR_B"
-SPAWNED=()
+SPAWNED=(); TMUX_SESSIONS=()
 cleanup() {
-  local p
+  local p sess
   for p in "${SPAWNED[@]:-}"; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done
+  # Only ever the sessions this file created, by the exact names it chose.
+  for sess in "${TMUX_SESSIONS[@]:-}"; do [ -n "$sess" ] && tmux kill-session -t "$sess" 2>/dev/null; done
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -233,6 +235,58 @@ case "$(cat lib.ts)" in *"UNCOMMITTED WORK"*) ok "uncommitted edits survive snap
 not_ "snapshot_tree with no destination fails"  snapshot_tree ""
 not_ "restore_tree with no snapshot fails"      restore_tree "$TMP/nonexistent"
 cd "$ROOT"
+
+echo
+echo "== session_name_for: derived from the directory, tmux-safe =="
+is "derives from the basename"            "$(session_name_for /srv/xesious)"      "claude-tg-xesious"
+is "two dirs, two names"                  "$(session_name_for /opt/bridge-two)"   "claude-tg-bridge-two"
+is "':' and '.' are reduced (tmux treats them specially)" \
+   "$(session_name_for '/tmp/we.ird:name')" "claude-tg-we-ird-name"
+case "$(session_name_for /srv/xesious)" in *:*|*.*) no "derived name contains a tmux metacharacter" ;;
+                                           *) ok "derived name has no tmux metacharacter" ;; esac
+
+echo
+echo "== tmux_own_sessions: three proofs, and it spares a decoy in the SAME dir =="
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "  (tmux not installed; skipping)"
+else
+  DIR_T="$TMP/tmuxtest"; mkdir -p "$DIR_T"
+  S_MINE="xesious-t0-bridge-$$"; S_DECOY="xesious-t0-decoy-$$"
+  # Ours: a wrapper whose command line mentions bridge.ts, like start.sh's. It has
+  # to be a LOOP, not a bare `sleep`: `bash -c 'sleep 300'` execs into sleep and
+  # replaces itself, so the pane's cmdline loses the bridge.ts marker entirely and
+  # the session stops looking like ours. start.sh's real wrapper is a while-loop
+  # for its own reasons, which is why production does not hit this.
+  tmux new-session -d -s "$S_MINE" -c "$DIR_T" "bash -c 'while true; do sleep 5; done  # bun run bridge.ts'" 2>/dev/null
+  TMUX_SESSIONS+=("$S_MINE")
+  # The decoy reproduces the real hazard on this box: same owner, SAME directory,
+  # but it is an operator shell, not a bridge. A cwd match would kill it.
+  tmux new-session -d -s "$S_DECOY" -c "$DIR_T" "bash -c 'while true; do sleep 5; done'" 2>/dev/null
+  TMUX_SESSIONS+=("$S_DECOY")
+  sleep 1
+
+  MINE="$(tmux_own_sessions "$DIR_T" | tr '\n' ' ')"
+  has   "finds the session running our bridge"        "$MINE" "$S_MINE"
+  hasnt "does NOT claim the decoy in the same dir"    "$MINE" "$S_DECOY"
+  hasnt "does not claim the real production session"  "$MINE" "claude-tg"
+
+  OUT="$(tmux_kill_own "$DIR_T" 2>&1)"
+  sleep 1
+  case "$OUT" in *"killed session '$S_MINE'"*) ok "killed our session" ;;
+                  *) no "did not kill our session — output: $OUT" ;; esac
+  case "$OUT" in *"skipped session '$S_DECOY'"*) ok "reported sparing the decoy" ;;
+                  *) no "did not report sparing the decoy" ;; esac
+  if tmux has-session -t "$S_DECOY" 2>/dev/null; then ok "THE DECOY SURVIVED (this is the fix)"
+  else no "the decoy was killed — a cwd-only match would do this"; fi
+  if tmux has-session -t "$S_MINE" 2>/dev/null; then no "our session should be gone"
+  else ok "our session is gone"; fi
+
+  # A directory with no bridge of ours must produce no kills at all.
+  OUT2="$(tmux_kill_own "$TMP/empty-dir" 2>&1)"
+  case "$OUT2" in *"no session is running a bridge of ours"*) ok "an unknown dir kills nothing, and says so" ;;
+                   *) no "unexpected output for an unknown dir: $OUT2" ;; esac
+  not_ "tmux_own_sessions with no dir returns nothing" test -n "$(tmux_own_sessions '')"
+fi
 
 echo
 echo "-- $PASS passed, $FAIL failed --"

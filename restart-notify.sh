@@ -25,7 +25,7 @@ THREAD_ID="${TG_RESTART_THREAD_ID:-44}"
 # update.sh and apply.sh all honour — so on any deployment that set it, this
 # script killed the wrong session (or none) and then waited three minutes to
 # conclude the bridge never came back.
-SESSION="${CLAUDE_TG_SESSION:-claude-tg}"
+SESSION="${CLAUDE_TG_SESSION:-$(session_name_for "$DIR")}"
 
 log() { echo "[restart-notify $(date +%H:%M:%S)] $*"; }
 
@@ -42,7 +42,7 @@ log "restarting; log offset=$START"
 
 # start.sh no-ops if a session already exists, so kill it first (this also kills
 # the old bridge + any claude subprocess it spawned).
-tmux kill-session -t "$SESSION" 2>/dev/null || true
+tmux_kill_own "$DIR" || true   # by process proof, not by name
 sleep 1
 ( cd "$DIR" && ./start.sh ) >/dev/null 2>&1 || true
 

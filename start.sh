@@ -7,13 +7,16 @@
 #   tmux kill-session -t claude-tg   # stop
 set -euo pipefail
 
-SESSION="${CLAUDE_TG_SESSION:-claude-tg}"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # find_bun(), own_pids() and stop_own() live in lib.sh so every deploy script
 # selects processes the same way. See the rule documented at the top of it.
 # shellcheck source=lib.sh
 . "$DIR/lib.sh"
+
+# Derived from the directory so two deployments by one user never share a name.
+# Cosmetic only — teardown identifies sessions by process, not by this string.
+SESSION="${CLAUDE_TG_SESSION:-$(session_name_for "$DIR")}"
 
 find_bun || { echo "ERROR: bun not on PATH" >&2; exit 1; }
 [ -f "$DIR/.env" ] || { echo "ERROR: $DIR/.env missing (cp .env.example .env)" >&2; exit 1; }
@@ -25,9 +28,22 @@ if grep -qE '^TG_LOCAL_API=(1|true|yes)' "$DIR/.env" 2>/dev/null; then
   "$DIR/local-api.sh" up || { echo "ERROR: local Bot API server failed to start" >&2; exit 1; }
 fi
 
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-  echo "Already running in tmux session '$SESSION'.  Attach: tmux attach -t $SESSION"
-  echo "(to restart: tmux kill-session -t $SESSION && ./start.sh)"
+# "Is it already running?" is a question about the BRIDGE, not about tmux. The old
+# check was `tmux has-session -t "$SESSION"`, which got it wrong twice over: a
+# second deployment by the same user saw the first one's session and refused to
+# start, reporting "Already running" for somebody else's bridge; and a session
+# whose wrapper had died reported running while nothing served, so this script
+# declined to fix the exact situation it exists to fix.
+RUNNING="$(own_pids bun "$DIR")"
+if [ -n "$RUNNING" ]; then
+  OURSESS="$(tmux_own_sessions "$DIR" | head -1)"
+  echo "Already running in $DIR (pid $(echo "$RUNNING" | tr '\n' ' ' | sed 's/ $//'))."
+  if [ -n "$OURSESS" ]; then
+    echo "Attach: tmux attach -t $OURSESS"
+    echo "(to restart safely: ./update.sh)"
+  else
+    echo "(not inside a tmux session of ours — started in the foreground?)"
+  fi
   exit 0
 fi
 
