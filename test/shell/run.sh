@@ -310,7 +310,8 @@ run_respawn() {  # <exit-code> ; sets REPLY to the log contents
   mkdir -p "$d/bin"
   cp "$ROOT/respawn.sh" "$d/"
   printf '#!/bin/sh\nexit %s\n' "$rc" > "$d/bin/bun"; chmod +x "$d/bin/bun"
-  ( cd "$d" && PATH="$d/bin:$PATH" TG_RESPAWN_BACKOFF=1 exec bash ./respawn.sh ) >/dev/null 2>&1 &
+  ( cd "$d" && PATH="$d/bin:$PATH" TG_RESPAWN_BACKOFF=1 \
+      TG_RESPAWN_HELD_BACKOFF="${TG_RESPAWN_HELD_BACKOFF:-1}" exec bash ./respawn.sh ) >/dev/null 2>&1 &
   local pid=$!; SPAWNED+=("$pid"); disown "$pid" 2>/dev/null
   sleep 2
   kill -9 "$pid" 2>/dev/null
@@ -326,11 +327,23 @@ case "$LOG_CLEAN" in *"restarting now"*) ok "…and it restarts immediately, no 
 case "$LOG_CLEAN" in *"restarting in"*) no "a clean exit must not wait out the 409 back-off" ;;
                       *) ok "a clean exit never waits out the back-off" ;; esac
 
-run_respawn 3; LOG_CRASH="$REPLY"
-case "$LOG_CRASH" in *"rc=3"*) ok "a crash reports the bridge's real exit code" ;;
+# NB: not exit 3 — that code is reserved for "another instance holds the token"
+# and is handled separately below. Using it here made this case assert the wrong
+# branch, which the deploy gate caught before it reached production.
+run_respawn 4; LOG_CRASH="$REPLY"
+case "$LOG_CRASH" in *"rc=4"*) ok "a crash reports the bridge's real exit code" ;;
                       *) no "exit code not propagated (PIPESTATUS) — log: $LOG_CRASH" ;; esac
 case "$LOG_CRASH" in *"restarting in 1s"*) ok "…and it does back off before retrying" ;;
                       *) no "a crash did not back off" ;; esac
+
+# Exit 3 means another instance holds the bot token. Retrying is right — it clears
+# when that instance stops — but at the crash cadence it would reprint the same
+# fatal lines every 50s and bury the log, so it gets its own long back-off.
+TG_RESPAWN_HELD_BACKOFF=1 run_respawn 3; LOG_HELD="$REPLY"
+case "$LOG_HELD" in *"holds this bot token"*) ok "exit 3 is recognised as a token conflict" ;;
+                     *) no "exit 3 not handled — log: $LOG_HELD" ;; esac
+case "$LOG_HELD" in *"rc=3"*) no "a token conflict must not be reported as a generic crash" ;;
+                     *) ok "…and not reported as a generic crash" ;; esac
 
 echo
 echo "== tmux_own_sessions recognises the respawn.sh wrapper too =="
