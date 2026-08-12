@@ -46,7 +46,7 @@ const model = val('--model')
 const sessionId = resumeId ?? 'sessTESTAAA'
 
 const emit = (o: unknown) => process.stdout.write(JSON.stringify(o) + '\n')
-const initLine = () => emit({ type: 'system', subtype: 'init', session_id: sessionId, model: model ?? 'claude-test-default' })
+const initLine = () => emit({ type: 'system', subtype: 'init', session_id: sessionId, model: model ?? 'claude-opus-5[1m]', claude_code_version: '2.1.219' })
 const result = (extra: Record<string, unknown>) =>
   emit({ type: 'result', subtype: 'success', is_error: false, session_id: sessionId, ...extra })
 

@@ -597,7 +597,7 @@ export type StreamEvent =
   | { kind: 'step'; step: Step }
   | { kind: 'text'; text: string }
   | { kind: 'result'; text: string; sessionId?: string; isError: boolean }
-  | { kind: 'init'; sessionId: string }
+  | { kind: 'init'; sessionId: string; model?: string; cliVersion?: string }
 
 // Decode one NDJSON line into zero or more events. A blank or unparseable line
 // yields none (the CLI can emit partial/non-JSON lines; the caller skips them).
@@ -633,7 +633,17 @@ export function parseStreamLine(line: string, opts: { progressDetail: boolean })
       isError: Boolean(o.is_error) || o.subtype !== 'success',
     })
   } else if (o.type === 'system' && o.subtype === 'init' && o.session_id) {
-    out.push({ kind: 'init', sessionId: o.session_id })
+    // The init event also states which model the CLI actually resolved to (e.g.
+    // "claude-opus-5[1m]") and its own version. Both were parsed and thrown away,
+    // which is why /model could only ever report the INTENT — the alias you picked
+    // — and never what ran. After a CLI upgrade or a new Opus there was no way to
+    // tell whether your sessions were on it.
+    out.push({
+      kind: 'init',
+      sessionId: o.session_id,
+      model: typeof o.model === 'string' ? o.model : undefined,
+      cliVersion: typeof o.claude_code_version === 'string' ? o.claude_code_version : undefined,
+    })
   }
   return out
 }
