@@ -6,7 +6,9 @@
   "private": true,
   "scripts": {
     "start": "bun run bridge.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "test:shell": "bash test/shell/run.sh",
+    "test:all": "bun test && bash test/shell/run.sh"
   },
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",

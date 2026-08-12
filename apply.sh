@@ -1,43 +1,25 @@
 #!/usr/bin/env bash
-# Safely redeploy the bridge onto the latest code WITHOUT killing an in-flight
-# reply. Run detached:  setsid nohup bash apply.sh >/tmp/apply.log 2>&1 &
+# DEPRECATED — this is now a thin shim over ./update.sh. Use that instead.
 #
-# Why: the bridge answers a Telegram message by spawning
-#   claude ... --output-format stream-json ...
-# If we restart while that child is running, the reply is lost and only the
-# progress steps remain. So we WAIT until no such run is active (idle), give the
-# bot a moment to deliver the finished reply, then gracefully restart.
-set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
-if ! command -v bun >/dev/null 2>&1; then
-  for d in "$HOME/.bun/bin" "$HOME/.local/bin" "$HOME"/.nvm/versions/node/*/bin; do
-    [ -x "$d/bun" ] && { export PATH="$d:$PATH"; break; }
-  done
-fi
-SESSION="${CLAUDE_TG_SESSION:-claude-tg}"
-# Bridge-is-busy = this instance's bun has a claude child. A command-line match
-# would also catch the IDE's own claude and deadlock against it.
-busy() {
-  local b
-  for b in $(pgrep -x bun 2>/dev/null); do
-    [ "$(readlink /proc/$b/cwd 2>/dev/null)" = "$PWD" ] || continue
-    pgrep -x -P "$b" claude >/dev/null 2>&1 && return 0
-  done
-  return 1
-}
-
-# Wait for idle: loop until no run is active through a short grace window (so a
-# message that arrives mid-wait doesn't get its reply cut off either).
-while true; do
-  for _ in $(seq 1 240); do busy || break; sleep 3; done
-  sleep 8                                  # let the bot deliver the just-finished reply
-  busy || break                            # still idle after grace -> safe to restart
-done
-
-# Graceful stop (clean long-poll close -> no ghost), then fresh start.
-for p in $(pgrep -f 'bun run bridge.ts'); do
-  [ "$(cat /proc/$p/comm 2>/dev/null)" = bun ] && kill -TERM "$p"
-done
-sleep 3
-tmux kill-session -t "$SESSION" 2>/dev/null
-./start.sh
+# What was here, and why it had to go. apply.sh redeployed the bridge by waiting
+# for its own instance to go idle and then running:
+#
+#     for p in $(pgrep -f 'bun run bridge.ts'); do
+#       [ "$(cat /proc/$p/comm 2>/dev/null)" = bun ] && kill -TERM "$p"
+#     done
+#
+# `pgrep -f` has no user filter, and /proc/<pid>/comm is world-readable — it only
+# proves the process is bun, it says nothing about who owns it. Verified on this
+# box: that selector matches the bridge running as another user, and the guard
+# passes for it. As a normal user the kill fails with EPERM (noise); as root it
+# succeeds and takes down someone else's bot mid-reply. Worse, the wait above it
+# WAS correctly scoped to this instance, so the script carefully avoided cutting
+# off its own reply and then cut off everyone else's — the exact bug it existed
+# to prevent, inflicted on other people.
+#
+# It also lacked everything update.sh has: no typecheck, no test gate, no
+# snapshot, no rollback, no health check. There is no case left where running
+# apply.sh is better than running update.sh, so it forwards rather than
+# duplicating a second, dumber deploy path. The name is kept because hooks,
+# notes and muscle memory still reach for it.
+exec "$(dirname "${BASH_SOURCE[0]}")/update.sh" "$@"
