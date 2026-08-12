@@ -13,6 +13,7 @@ import {
   normalizeModel, MODEL_DEFAULT,
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice,
+  sanitizeProse, PROSE_RULES,
 } from './lib'
 
 describe('parseIdList', () => {
@@ -125,11 +126,19 @@ describe('normalizeModel', () => {
     expect(normalizeModel('claude-opus-4-8')).toBe('claude-opus-4-8')
     expect(normalizeModel('claude-sonnet-5')).toBe('claude-sonnet-5')
   })
-  test('KNOWN GAP: a bracketed context-window suffix is rejected', () => {
-    // The accept-regex /^claude[\w.-]*$/i has no `[` or `]`, so an id like
-    // `claude-opus-4-8[1m]` (a real, current id) is treated as unknown. Documented
-    // here rather than fixed, since Tier 1 only locks down existing behavior.
-    expect(normalizeModel('claude-opus-4-8[1m]')).toBeUndefined()
+  test('a bracketed context-window suffix is accepted (was a KNOWN GAP)', () => {
+    // `claude-opus-4-8[1m]` is a real, current id — often the one this bridge runs
+    // on — and the old accept-class had no `[` or `]`, so it answered "Unknown
+    // model". This assertion used to pin the broken behaviour.
+    expect(normalizeModel('claude-opus-4-8[1m]')).toBe('claude-opus-4-8[1m]')
+    expect(normalizeModel('claude-sonnet-5[200k]')).toBe('claude-sonnet-5[200k]')
+  })
+  test('…without becoming a rubber stamp', () => {
+    // An over-permissive accept just moves the failure to run time, where a bad id
+    // costs a whole turn instead of an instant rejection.
+    expect(normalizeModel('claude ' + 'x'.repeat(5))).toBeUndefined()   // whitespace
+    expect(normalizeModel('claude-' + 'x'.repeat(200))).toBeUndefined() // length bound
+    expect(normalizeModel('claude/../../etc/passwd')).toBeUndefined()
   })
   test('unknown → undefined', () => {
     expect(normalizeModel('gpt-4')).toBeUndefined()
@@ -433,5 +442,92 @@ describe('conflictAdvice', () => {
   test('ghostLimit is honoured as given', () => {
     expect(conflictAdvice(1, { ghostLimit: 0, waitMs: 40_000 }).join(' ')).toMatch(/no longer explains/i)
     expect(conflictAdvice(9, { ghostLimit: 99, waitMs: 40_000 }).join(' ')).toMatch(/own previous poll/i)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// prose sanitisation
+// ---------------------------------------------------------------------------
+
+describe('sanitizeProse — one row of the table at a time', () => {
+  describe("row: '~' — a lone tilde opens GFM strikethrough", () => {
+    // The shape that keeps firing: "approximately-a-price" after a bracket or a
+    // bold marker. The opener can only open (space then digit); the closer sits
+    // between two punctuation characters, so it can close — and the two can be far
+    // apart, striking out prose that contains no tilde at all.
+    const src = 'output down to ~110m litres/day. Holding consumption flat means **~$8bn of imports** next year.'
+    test('escapes a lone tilde on the MarkdownV2 path', () => {
+      const out = sanitizeProse(src, 'markdownv2')
+      expect(out).toContain('\\~110m')
+      expect(out).toContain('\\~$8bn')
+      expect(out).toContain('**')          // the bold must survive — it did not before
+    })
+    test('escapes it on the rich path too (GFM is the dialect there as well)', () => {
+      expect(sanitizeProse('about ~5 items', 'rich')).toContain('\\~5')
+    })
+    test('leaves a real ~~strikethrough~~ alone', () => {
+      expect(sanitizeProse('this is ~~struck~~ text', 'markdownv2')).toBe('this is ~~struck~~ text')
+    })
+    test('never touches a tilde inside code', () => {
+      expect(sanitizeProse('run `cd ~/x` now', 'markdownv2')).toBe('run `cd ~/x` now')
+      expect(sanitizeProse('```sh\ncd ~ && ls\n```', 'markdownv2')).toBe('```sh\ncd ~ && ls\n```')
+      // …but prose on the far side of a fence is still handled
+      expect(sanitizeProse('```sh\ncd ~\n```\nabout ~5', 'markdownv2')).toContain('\\~5')
+    })
+    test('an already-escaped tilde is not double-escaped', () => {
+      expect(sanitizeProse('a \\~ b', 'markdownv2')).toBe('a \\~ b')
+    })
+  })
+
+  describe("row: '$' — rich pairs $…$ per line as inline LaTeX", () => {
+    test('money is escaped on the rich path only', () => {
+      expect(sanitizeProse('it cost $5', 'rich')).toBe('it cost \\$5')
+      expect(sanitizeProse('it cost $5', 'markdownv2')).toBe('it cost $5')  // MarkdownV2 has no math
+    })
+    test('a real formula survives', () => {
+      expect(sanitizeProse('area is $x^2$ here', 'rich')).toBe('area is $x^2$ here')
+    })
+    test('display math is passed through as a protected region', () => {
+      expect(sanitizeProse('$$a_1 + b^2$$', 'rich')).toBe('$$a_1 + b^2$$')
+    })
+  })
+
+  test('every row in the table is exercised above', () => {
+    // Guards the point of the table: adding a character must come with a test.
+    expect(PROSE_RULES.map(r => r.char).sort()).toEqual(['$', '~'])
+    for (const r of PROSE_RULES) expect(r.why.length).toBeGreaterThan(20)
+  })
+})
+
+describe('regression: the reported strikethrough incidents', () => {
+  // Synthetic, NOT the original transcripts: those are private user conversations
+  // and this repository is public. Each reproduces the exact structural shape of
+  // the reported failure, and the real blocks were verified against this code
+  // out-of-tree.
+  test('Instance 2 — two tildes inside one bold span (polymarket, 2026-08-04)', () => {
+    const src = '**~200 shares (~$100) resting**'
+    const out = sanitizeProse(src, 'markdownv2')
+    expect(out).toBe('**\\~200 shares (\\~$100) resting**')
+  })
+  test('Instance 2 neighbour — spared only by accident, must still be escaped', () => {
+    // This one rendered correctly before the fix, for the wrong reason: a `**`
+    // boundary happened to sit between the tildes. That was thought to prevent
+    // pairing; Instance 3 disproved it. Both must be escaped now.
+    expect(sanitizeProse('**100 shares (~$50)**', 'markdownv2')).toBe('**100 shares (\\~$50)**')
+  })
+  test('Instance 3 — the pair crosses a sentence boundary (scratchpad, 2026-08-11)', () => {
+    const src = 'gasoline output down to ~110m litres/day. Holding consumption flat means **~$8bn of gasoline imports** — more than the entire military budget.'
+    const out = sanitizeProse(src, 'markdownv2')
+    expect(out).toBe('gasoline output down to \\~110m litres/day. Holding consumption flat means **\\~$8bn of gasoline imports** — more than the entire military budget.')
+    // Every surviving tilde must be backslash-escaped. Spelled out rather than
+    // written as a lookbehind regex, which is unreadable at this level of quoting.
+    for (let i = 0; i < out.length; i++) {
+      if (out[i] === '~') expect(out[i - 1]).toBe('\\')
+    }
+  })
+  test('the other 14 tildes in that message were already fine and stay fine', () => {
+    for (const t of ['~25,300', '(~July 2026)', '~24.5m', '~18.3%', '~22×', '~40m', '~$120bn']) {
+      expect(sanitizeProse(`about ${t} total`, 'markdownv2')).toContain('\\~')
+    }
   })
 })
