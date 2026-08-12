@@ -702,8 +702,27 @@ function stripMd(s: string): string {
 }
 // quiet=true sends without a notification — for status, acks and other bookkeeping
 // the user doesn't need buzzed about. Answers and warnings stay loud.
-async function send(ctx: Context, threadId: number | undefined, text: string, quiet = false): Promise<void> {
-  const opts: any = threadId ? { message_thread_id: threadId } : {}
+// Where a message goes, and what it is answering. Every reply used to be a loose
+// message in the thread — the bridge never set reply_parameters anywhere — which
+// was tolerable while runs were strictly serialised and one message produced one
+// answer. It is not any more: a turn can now deliver a promoted mid-turn block AND
+// its reply, /restart and the retry button post asynchronously, and interrupt mode
+// already lets an answer arrive after a newer message. Threading makes the topic
+// self-documenting: tap any answer to jump to the question.
+//
+// allow_sending_without_reply matters — if the user deleted the message we are
+// answering, the send would otherwise fail outright and the answer would be lost
+// to protect a cosmetic link.
+type Dest = { threadId?: number; replyTo?: number }
+function destOpts(d: Dest): any {
+  return {
+    ...(d.threadId ? { message_thread_id: d.threadId } : {}),
+    ...(d.replyTo ? { reply_parameters: { message_id: d.replyTo, allow_sending_without_reply: true } } : {}),
+  }
+}
+
+async function send(ctx: Context, threadId: number | undefined, text: string, quiet = false, replyTo?: number): Promise<void> {
+  const opts: any = destOpts({ threadId, replyTo })
   if (quiet) opts.disable_notification = true
   for (const part of chunk(text)) {
     await ctx.api.sendMessage(ctx.chat!.id, part, opts).catch(e => console.error(`[warn] sendMessage: ${e}`))
@@ -763,8 +782,8 @@ async function sendLegacyMd(ctx: Context, opts: any, text: string): Promise<void
 // needs one. Rich markdown is the dialect the agent already writes, so apart from
 // the dollars above no escaping pass is needed. If the call fails we drop to the
 // MarkdownV2 path — formatting is best-effort, delivery is guaranteed.
-async function sendRich(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
-  const opts: any = threadId ? { message_thread_id: threadId } : {}
+async function sendRich(ctx: Context, threadId: number | undefined, text: string, replyTo?: number): Promise<void> {
+  const opts: any = destOpts({ threadId, replyTo })
   for (const part of chunk(text, RICH_MAX)) {
     if (!needsRich(part) || hasRtl(part)) { await sendLegacyMd(ctx, opts, part); continue }
     try {
@@ -925,7 +944,7 @@ async function receiveFile(ctx: Context, att: { fileId: string; name: string; si
 }
 
 // Send one file from disk to the chat/topic. Returns true on success.
-async function sendFile(ctx: Context, threadId: number | undefined, path: string, caption?: string): Promise<boolean> {
+async function sendFile(ctx: Context, threadId: number | undefined, path: string, caption?: string, replyTo?: number): Promise<boolean> {
   if (!existsSync(path) || !statSync(path).isFile()) { await send(ctx, threadId, `Not a file: ${path}`); return false }
   const size = statSync(path).size
   if (size > TG_UPLOAD_LIMIT) {
@@ -933,7 +952,7 @@ async function sendFile(ctx: Context, threadId: number | undefined, path: string
       (LOCAL_API ? '' : `\nA local Bot API server raises this to 2000 MB (set TG_API_ROOT — see README).`))
     return false
   }
-  const opts: any = threadId ? { message_thread_id: threadId } : {}
+  const opts: any = destOpts({ threadId, replyTo })
   if (caption) opts.caption = caption.slice(0, 1024)
   try {
     await ctx.api.sendDocument(ctx.chat!.id, new InputFile(path, basename(path)), opts)
@@ -944,7 +963,7 @@ async function sendFile(ctx: Context, threadId: number | undefined, path: string
 
 // After a run, deliver anything Claude left in the topic's outbox, then archive
 // each sent file to outbox/.sent so it isn't delivered twice.
-async function flushOutbox(ctx: Context, threadId: number | undefined, cwd: string): Promise<void> {
+async function flushOutbox(ctx: Context, threadId: number | undefined, cwd: string, replyTo?: number): Promise<void> {
   const dir = join(cwd, OUTBOX_DIR)
   if (!existsSync(dir)) return
   let names: string[]
@@ -965,16 +984,16 @@ async function flushOutbox(ctx: Context, threadId: number | undefined, cwd: stri
 // Run one prompt against a topic's session, post the reply, deliver the outbox.
 // Deliver a Claude answer: inline (markdown) if short, else as an answer.md file
 // with a preview caption — so a huge reply isn't a dozen chunked messages.
-async function deliver(ctx: Context, threadId: number | undefined, text: string): Promise<void> {
+async function deliver(ctx: Context, threadId: number | undefined, text: string, replyTo?: number): Promise<void> {
   if (REPLY_FILE_CHARS && text.length > REPLY_FILE_CHARS) {
     const dir = mkdtempSync(join(tmpdir(), 'tg-'))
     const p = join(dir, 'answer.md')
     try {
       writeFileSync(p, text)
-      await sendFile(ctx, threadId, p, `${text.slice(0, 900).trimEnd()} …\n\n📄 Full answer (${text.length} chars) attached.`)
+      await sendFile(ctx, threadId, p, `${text.slice(0, 900).trimEnd()} …\n\n📄 Full answer (${text.length} chars) attached.`, replyTo)
     } finally { rmSync(dir, { recursive: true, force: true }) }
   } else {
-    await sendRich(ctx, threadId, text)
+    await sendRich(ctx, threadId, text, replyTo)
   }
 }
 
@@ -1056,28 +1075,28 @@ async function speakAnswer(ctx: Context, threadId: number | undefined, text: str
 // Prompts kept so a "no answer" can be retried with one tap. In memory only and
 // capped: a retry after a restart is not worth persisting state for, and the
 // button says so rather than silently doing nothing.
-const retryPrompts = new Map<string, { key: string; threadId?: number; prompt: string }>()
+const retryPrompts = new Map<string, { key: string; threadId?: number; prompt: string; replyTo?: number }>()
 const RETRY_MAX = 50
 
 // A turn that came back with nothing is reported as such, with the offer to run it
 // again. Deliberately a button rather than an automatic resend: the turn may
 // already have edited files or run commands, and repeating those without being
 // asked is worse than the missing answer.
-async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: string, prompt: string): Promise<void> {
-  const opts: any = threadId ? { message_thread_id: threadId } : {}
+async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: string, prompt: string, replyTo?: number): Promise<void> {
+  const opts: any = destOpts({ threadId, replyTo })
   const msg = await ctx.api.sendMessage(ctx.chat!.id,
     '⚠️ No answer came back for that message. Nothing was lost — tap to send it again.',
     { ...opts, reply_markup: { inline_keyboard: [[{ text: '🔁 Retry', callback_data: 'retry:pending' }]] } }
   ).catch(() => null)
   if (!msg) return
   if (retryPrompts.size >= RETRY_MAX) retryPrompts.delete(retryPrompts.keys().next().value as string)
-  retryPrompts.set(String(msg.message_id), { key, threadId, prompt })
+  retryPrompts.set(String(msg.message_id), { key, threadId, prompt, replyTo })
   await ctx.api.editMessageReplyMarkup(ctx.chat!.id, msg.message_id, {
     reply_markup: { inline_keyboard: [[{ text: '🔁 Retry', callback_data: `retry:${msg.message_id}` }]] },
   }).catch(() => {})
 }
 
-async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string): Promise<void> {
+async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number): Promise<void> {
   const cwd = resolveCwd(ctx, threadId)
   // Attribute the message before it reaches the model. Only here: handlePassthrough
   // and /compact send literal CLI commands, which are not somebody speaking.
@@ -1110,7 +1129,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     // refreshes `updated`. Binding already happened above for a fresh session.
     if (res.sessionId) bindSession(res.sessionId)
     if (res.noAnswer) {
-      await sendNoAnswer(ctx, threadId, key, prompt)
+      await sendNoAnswer(ctx, threadId, key, prompt, replyTo)
       return
     }
     // When the turn's closing block only promises future work or refers to work
@@ -1118,13 +1137,13 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     // rest of the turn's text is in the run record above, so this is an
     // enhancement rather than the mechanism: a miss costs a tap, not a message.
     const promoted = promoteBlock(res.blocks ?? [], res.text)
-    if (promoted) await deliver(ctx, threadId, promoted)
-    await deliver(ctx, threadId, res.text)
-    await flushOutbox(ctx, threadId, cwd)
+    if (promoted) await deliver(ctx, threadId, promoted, replyTo)
+    await deliver(ctx, threadId, res.text, replyTo)
+    await flushOutbox(ctx, threadId, cwd, replyTo)
     // Speak the answer too when this topic is in voice mode.
     const vm = voiceMode(key); if (vm !== 'off' && !res.isError) await speakAnswer(ctx, threadId, res.text, vm)
   } catch (e) {
-    await send(ctx, threadId, `⚠️ ${e}`)
+    await send(ctx, threadId, `⚠️ ${e}`, false, replyTo)
   }
 }
 
@@ -1288,7 +1307,7 @@ bot.on('message', async ctx => {
       try { saved = await receiveFile(ctx, attachment, cwd) }
       catch (e) { await send(ctx, threadId, `⚠️ couldn't save file: ${e}`); return }
       if (caption) {
-        await handlePrompt(ctx, threadId, aKey, `[The user attached a file, saved at ${saved} (./${relative(cwd, saved)}).]\n\n${caption}`)
+        await handlePrompt(ctx, threadId, aKey, `[The user attached a file, saved at ${saved} (./${relative(cwd, saved)}).]\n\n${caption}`, undefined, ctx.message?.message_id)
       } else {
         await send(ctx, threadId, `📎 Saved → ${saved}\n(in ./${relative(cwd, saved)} — reference it in your next message)`, true)
       }
@@ -1478,7 +1497,7 @@ bot.on('message', async ctx => {
     if (!arg || !text.includes(' ')) { await send(ctx, threadId, `Usage: /plan <what you want>\n\nRuns one read-only turn: Claude researches and proposes, without editing. Reply "go ahead" to carry it out in this topic's usual mode (${modeFor(key)}).`); return }
     if (isInterrupt(key) && activeRuns.has(key)) { stopped.add(key); activeRuns.get(key)!.kill('SIGKILL') }
     // One-shot: the topic's sticky mode is untouched, so the follow-up executes.
-    enqueue(key, () => handlePrompt(ctx, threadId, key, arg, 'plan'))
+    enqueue(key, () => handlePrompt(ctx, threadId, key, arg, 'plan', msg.message_id))
       .catch(e => console.error(`[error] plan task ${key}: ${e}`))
     return
   }
@@ -1631,7 +1650,7 @@ bot.on('message', async ctx => {
     stopped.add(key)
     activeRuns.get(key)!.kill('SIGKILL')
   }
-  enqueue(key, () => handlePrompt(ctx, threadId, key, text))
+  enqueue(key, () => handlePrompt(ctx, threadId, key, text, undefined, msg.message_id))
     .catch(e => console.error(`[error] task ${key}: ${e}`))
 })
 
@@ -1657,7 +1676,7 @@ bot.on('callback_query:data', async ctx => {
     retryPrompts.delete(data.slice(6))
     await ctx.answerCallbackQuery({ text: 'Retrying…' }).catch(() => {})
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})   // one tap only
-    void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt))
+    void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo))
       .catch(e => console.error(`[error] retry ${rec.key}: ${e}`))
     return
   }
