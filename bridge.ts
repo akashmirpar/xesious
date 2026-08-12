@@ -549,6 +549,10 @@ type Job = {
   key: string
   threadId?: number
   prompt: string
+  // The message that asked for this work. Everything the bridge later says ABOUT
+  // this job — the interrupt acknowledgement, the cancellation notice, its files —
+  // quotes it, because by then those messages are far from what caused them.
+  askedBy?: number
   child: ChildProcess
   pgid: number
   startedAt: number
@@ -620,6 +624,14 @@ const latestIncoming: Record<string, number> = {}
 // answer the same question, so they must not make each other look ambiguous.
 const answerSeq: Record<string, number> = {}
 const askSeq = new Map<number, number>()
+// Any message the bridge posts pushes the reader further from the question they
+// asked. Answers were counted; command replies, job acknowledgements and file
+// deliveries were not — so a /interrupt and its reply could sit between a question
+// and its answer while the answer still believed it was adjacent to the question.
+// The transient status message is excluded: it is deleted (or becomes the run
+// record) and never separates anything for long.
+const noteBotMessage = (key: string) => { answerSeq[key] = (answerSeq[key] ?? 0) + 1 }
+
 const noteAsk = (key: string, msgId?: number) => {
   if (msgId === undefined) return
   latestIncoming[key] = msgId
@@ -692,7 +704,7 @@ const renderStepsHtml = (steps: Step[]) => libRenderStepsHtml(steps, { progressD
 // finishes. Opt-in per caller and NOT done unconditionally here, because
 // handlePassthrough must never bind a topic to the throwaway session that /usage
 // and friends mint — see the note on that function.
-async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL, onInit?: (sessionId: string) => void, effort: string = EFFORT_TIER): Promise<ClaudeResult> {
+async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL, onInit?: (sessionId: string) => void, effort: string = EFFORT_TIER, askedBy?: number): Promise<ClaudeResult> {
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs(mode)]
   if (TELEGRAM_PROFILE.trim()) args.push('--append-system-prompt', TELEGRAM_PROFILE)
   if (resumeId) args.push('--resume', resumeId)
@@ -762,7 +774,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     // alone orphans every grandchild it spawned.
     const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'], detached: true })
     const job: Job = {
-      id: newJobId(), key, threadId, prompt, child, pgid: child.pid ?? 0,
+      id: newJobId(), key, threadId, prompt, child, pgid: child.pid ?? 0, askedBy,
       startedAt: Date.now(), statusMsgId: status?.message_id, steps: () => steps.length,
     }
     jobs.set(job.id, job)
@@ -943,6 +955,7 @@ function destOpts(d: Dest): any {
 }
 
 async function send(ctx: Context, threadId: number | undefined, text: string, quiet = false, replyTo?: number): Promise<void> {
+  noteBotMessage(keyFor(ctx.chat!.id, threadId))
   const opts: any = destOpts({ threadId, replyTo })
   if (quiet) opts.disable_notification = true
   for (const part of chunk(text)) {
@@ -1004,6 +1017,7 @@ async function sendLegacyMd(ctx: Context, opts: any, text: string): Promise<void
 // the dollars above no escaping pass is needed. If the call fails we drop to the
 // MarkdownV2 path — formatting is best-effort, delivery is guaranteed.
 async function sendRich(ctx: Context, threadId: number | undefined, text: string, replyTo?: number): Promise<void> {
+  noteBotMessage(keyFor(ctx.chat!.id, threadId))
   const opts: any = destOpts({ threadId, replyTo })
   for (const part of chunk(text, RICH_MAX)) {
     if (!needsRich(part) || hasRtl(part)) { await sendLegacyMd(ctx, opts, part); continue }
@@ -1173,6 +1187,7 @@ async function sendFile(ctx: Context, threadId: number | undefined, path: string
       (LOCAL_API ? '' : `\nA local Bot API server raises this to 2000 MB (set TG_API_ROOT — see README).`))
     return false
   }
+  noteBotMessage(keyFor(ctx.chat!.id, threadId))
   const opts: any = destOpts({ threadId, replyTo })
   if (caption) opts.caption = caption.slice(0, 1024)
   try {
@@ -1381,7 +1396,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     if (linked) { const l = loadLinks(); if (l[linked.uuid]) { l[linked.uuid].sessionId = sessionId; saveLinks(l) } }
   }
   try {
-    const res = await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), bindSession, effortFor(key))
+    const res = await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), bindSession, effortFor(key), replyTo)
     if (stopped.has(key)) { stopped.delete(key); return } // killed via /stop — status already cleared, no reply
     // Still persist on completion: a resumed turn reports the same id, and this
     // refreshes `updated`. Binding already happened above for a fresh session.
@@ -1580,6 +1595,10 @@ bot.on('message', async ctx => {
   console.log(`[in] chat=${chatId}(${ctx.chat.type}) topic=${threadId ?? '-'} from=${ctx.from.id} ${JSON.stringify(text).slice(0, 100)}`)
 
   const cmd = text.startsWith('/') ? text.split(/\s+/)[0].replace(/@.*$/, '').toLowerCase() : ''
+  // Track EVERY inbound message, commands included. A /interrupt typed while a
+  // turn runs is as much of a separator as another question would be, and an
+  // answer arriving after it is no longer adjacent to what it answers.
+  if (cmd) latestIncoming[keyFor(ctx.chat!.id, threadId)] = msg.message_id
 
   // Ungated: only reveals the caller's own ids.
   if (cmd === '/whoami' || cmd === '/id') {
@@ -1646,7 +1665,11 @@ bot.on('message', async ctx => {
     if (!running.length) { await send(ctx, threadId, 'Nothing is running in this topic right now.', true); return }
     stopped.add(key)
     for (const j of running) void endJob(j, 'discard')
-    await send(ctx, threadId, `⏹ Cancelled — the run and everything it started are being stopped, and its answer is discarded. Use /interrupt to stop but keep the partial answer.`)
+    // Quote the question being cancelled. By the time you cancel, that message is
+    // far up the topic, and "cancelled" on its own does not say cancelled WHAT.
+    await send(ctx, threadId,
+      `⏹ Cancelled — the run and everything it started are being stopped, and its answer is discarded.\nUse /interrupt instead to stop but keep the partial answer.`,
+      false, running.length === 1 ? running[0].askedBy : undefined)
     return
   }
   if (cmd === '/interrupt') {
@@ -1658,7 +1681,8 @@ bot.on('message', async ctx => {
       const running = jobsFor(key)
       if (!running.length) { await send(ctx, threadId, 'Nothing is running in this topic right now.', true); return }
       for (const j of running) void endJob(j, 'keep')
-      await send(ctx, threadId, '⏹ Interrupting — I will send whatever the run produced before it stopped.')
+      await send(ctx, threadId, '⏹ Interrupting — I will send whatever the run produced before it stopped.',
+        false, running.length === 1 ? running[0].askedBy : undefined)
       return
     }
     const next = arg === 'on' ? true : arg === 'off' ? false : !isInterrupt(key)

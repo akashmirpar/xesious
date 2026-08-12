@@ -725,3 +725,50 @@ describe('interrupting a run stops the tree it built', () => {
     if (alive(bg)) { try { process.kill(bg, 'SIGKILL') } catch {} }
   }, 30000)
 })
+
+describe('job messages point back at what caused them', () => {
+  const replyTarget = (c: any) => c.payload?.reply_parameters?.message_id
+  const inject = (chat: number, text: string, id: number) => bridge.bot.handleUpdate({
+    update_id: 97000 + id,
+    message: { message_id: id, date: 0, chat: { id: chat, type: 'private', first_name: 'T' },
+               from: { id: 1, is_bot: false, first_name: 'T' }, text },
+  })
+
+  test('the interrupt acknowledgement quotes the question being interrupted', async () => {
+    // By the time you interrupt, the question is far up the topic. "Interrupting…"
+    // on its own does not say interrupting WHAT — which is worse once more than one
+    // thing can be running.
+    const run = incoming(1160, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    const before = calls.length
+    await inject(1160, '/interrupt', 97101)
+    const ack = calls.slice(before).find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Interrupting'))
+    expect(ack).toBeTruthy()
+    expect(replyTarget(ack)).toBeTruthy()
+    expect(replyTarget(ack)).not.toBe(97101)     // the question, not the /interrupt itself
+    await run
+  }, 20000)
+
+  test('and the partial answer links too, because the interrupt interleaved', async () => {
+    // A command typed mid-run separates the answer from its question just as much
+    // as another question would. latestIncoming used to ignore commands entirely.
+    const run = incoming(1161, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    const before = calls.length
+    await inject(1161, '/interrupt', 97102)
+    await run
+    const answer = calls.slice(before).find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('160 of 245'))
+    expect(answer).toBeTruthy()
+    expect(replyTarget(answer)).toBeTruthy()
+  }, 20000)
+
+  test('the cancellation notice quotes its question as well', async () => {
+    const run = incoming(1162, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    const before = calls.length
+    await inject(1162, '/stop', 97103)
+    const ack = calls.slice(before).find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Cancelled'))
+    expect(replyTarget(ack)).toBeTruthy()
+    await run
+  }, 20000)
+})
