@@ -186,7 +186,7 @@ export function renderDetail(s: Step, raw: string, detailMax = DETAIL_MAX): stri
 // one of them are a single tap away without expanding the rest.
 // `total` is the number of steps the run has produced, which may exceed what is
 // shown — trimming the oldest must not silently shrink the run's history.
-export function renderSteps(steps: Step[], total: number, opts: { progressDetail: boolean; detailMax?: number; headline?: string }): string {
+export function renderSteps(steps: Step[], total: number, opts: { progressDetail: boolean; detailMax?: number; headline?: string; note?: string }): string {
   const detailMax = opts.detailMax ?? DETAIL_MAX
   const parts = steps.map(s => {
     const label = escapeRich(s.label)
@@ -196,7 +196,9 @@ export function renderSteps(steps: Step[], total: number, opts: { progressDetail
   })
   const hidden = total - steps.length
   if (hidden > 0) parts.unshift(`_+${hidden} earlier step${hidden === 1 ? '' : 's'}_`)
-  return [escapeRich(opts.headline ?? THINKING), ...parts].join('\n\n')
+  const head = [escapeRich(opts.headline ?? THINKING)]
+  if (opts.note) head.push(`_${escapeRich(opts.note)}_`)
+  return [...head, ...parts].join('\n\n')
 }
 
 // The pre-10.1 rendering, kept as the fallback: one expandable quote per step.
@@ -395,6 +397,32 @@ export function escapeMoneyDollars(text: string): string {
     .split(PROTECTED.rich)
     .map((seg, i) => (i % 2 ? seg : moneyRule.apply(seg)))
     .join('')
+}
+
+// ---------------------------------------------------------------------------
+// stalls
+// ---------------------------------------------------------------------------
+//
+// A hung claude child produced total silence: the delivery paths only fire when
+// the process exits, and a hung one never does, so the ONLY backstop was a flat
+// 30-minute SIGKILL — up to half an hour of dead air with the status message just
+// sitting there, and with interrupt mode off every later message queued behind it.
+//
+// The opposite mistake is just as real. A genuinely long turn looks identical from
+// outside: one investigated report turned out to be a working run whose individual
+// Bash calls each took 8+ minutes, crunching a 7.4 GB dataset. So the watchdog
+// keys off stream events rather than wall-clock, and its window has to be wider
+// than the longest plausible single tool call — killing a working turn loses all
+// of its work, which is worse than waiting.
+//
+// Before any watchdog fires, say so in the status: a stall the user can SEE is
+// half the problem solved, and the status re-renders every few seconds anyway.
+export function stalenessNote(idleMs: number, opts: { quietMs: number }): string | undefined {
+  if (idleMs < opts.quietMs) return undefined
+  const mins = Math.floor(idleMs / 60000)
+  const secs = Math.round(idleMs / 1000)
+  const ago = mins >= 1 ? `${mins}m` : `${secs}s`
+  return `still working — no activity for ${ago}`
 }
 
 // ---------------------------------------------------------------------------

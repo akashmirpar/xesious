@@ -14,7 +14,7 @@ import {
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice,
   sanitizeProse, PROSE_RULES, isNonAnswer,
-  isSignOff, isDanglingReference, promoteBlock,
+  isSignOff, isDanglingReference, promoteBlock, stalenessNote,
 } from './lib'
 
 describe('parseIdList', () => {
@@ -609,5 +609,25 @@ describe('parseStreamLine emits text blocks', () => {
   test('text is emitted regardless of progressDetail (it drives promotion)', () => {
     const line = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } })
     expect(parseStreamLine(line, { progressDetail: false })).toHaveLength(1)
+  })
+})
+
+describe('stalenessNote', () => {
+  const opts = { quietMs: 90_000 }
+  test('says nothing while a run is ticking along', () => {
+    expect(stalenessNote(0, opts)).toBeUndefined()
+    expect(stalenessNote(89_000, opts)).toBeUndefined()
+  })
+  test('reports the gap once a run goes quiet', () => {
+    expect(stalenessNote(95_000, opts)).toMatch(/no activity for 1m/)
+    expect(stalenessNote(7 * 60_000, opts)).toMatch(/no activity for 7m/)
+  })
+  test('says "still working", not "stuck"', () => {
+    // A long single tool call looks exactly like a hang from outside — one real
+    // report turned out to be a working run whose Bash steps took 8+ minutes each.
+    // The note must not accuse the run of being broken.
+    const n = stalenessNote(5 * 60_000, opts) ?? ''
+    expect(n).toMatch(/still working/i)
+    expect(n).not.toMatch(/stuck|hung|frozen|failed/i)
   })
 })

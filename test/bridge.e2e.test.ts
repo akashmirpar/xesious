@@ -22,7 +22,9 @@ process.env.TG_ALLOWED_USERS = '1'
 process.env.CLAUDE_BIN = join(import.meta.dir, 'claude-stub.ts')
 process.env.TG_SESSIONS_BASE = join(TMP, 'sessions')
 process.env.TG_STATE_FILE = STATE_FILE
-process.env.TG_CLAUDE_TIMEOUT_MS = '1500' // keep the HANG scenario fast
+process.env.TG_CLAUDE_TIMEOUT_MS = '20000'  // absolute backstop, must not fire first
+process.env.TG_IDLE_TIMEOUT_MS = '1500'    // the idle watchdog is what HANG exercises
+process.env.TG_QUIET_NOTE_MS = '500'
 // These two must be pinned, not merely left unset: bun auto-loads the repo's .env,
 // so a developer machine with TG_ALLOW_BYPASS=1 in it would otherwise silently turn
 // the bypass safety-gate test green for the wrong reason.
@@ -151,17 +153,18 @@ describe('degenerate CLI outputs', () => {
     const cs = await incoming(1004, 'ERROR')
     expect(finalReply(cs)).toContain('boom')
   })
-  test('a hung child is SIGKILLed at the timeout and reported, not left silent', async () => {
+  test('a hung child is SIGKILLed by the idle watchdog and reported, not left silent', async () => {
     const t0 = performance.now()
     const cs = await incoming(1005, 'HANG')
     const elapsed = performance.now() - t0
-    // Must actually reach the ~1500ms timeout — proves the SIGKILL watchdog fired
-    // rather than the child exiting early (which would pass the text check for the
-    // wrong reason).
+    // Must actually reach the idle timeout — proves the watchdog fired rather than
+    // the child exiting early (which would pass the text check for the wrong reason).
     expect(elapsed).toBeGreaterThan(1000)
     expect(cs.some(c => c.method === 'deleteMessage')).toBe(true) // status cleaned up
-    expect(finalReply(cs)).toContain('Could not parse')          // the timeout path's message
-  }, 8000)
+    // Was "Could not parse Claude output", which blamed the output format for what
+    // is actually a stall, and told the user nothing they could act on.
+    expect(finalReply(cs)).toMatch(/stalled/i)
+  }, 12000)
 })
 
 describe('session persistence round-trip', () => {
@@ -426,4 +429,16 @@ describe('mid-turn text is no longer deleted (A1)', () => {
     const cs = await incoming(1062, 'hello there')
     expect(cs.some(c => c.method === 'deleteMessage')).toBe(true)
   }, 8000)
+})
+
+describe('a stalled run is reported as stalled (A7)', () => {
+  test('the idle watchdog kills it and says so, rather than "could not parse"', async () => {
+    // HANG emits init and then nothing. With TG_IDLE_TIMEOUT_MS set low for the
+    // test, the idle watchdog fires — the flat wall-clock timer used to be the only
+    // backstop, which meant up to 30 minutes of dead air and a message that blamed
+    // output parsing rather than the stall.
+    const cs = await incoming(1070, 'HANG')
+    expect(finalReply(cs)).toMatch(/stalled/i)
+    expect(finalReply(cs)).not.toMatch(/Could not parse/i)
+  }, 15000)
 })
