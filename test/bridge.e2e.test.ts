@@ -496,3 +496,44 @@ describe('command UX (C2/C3/C4)', () => {
     expect(shown).toContain(TMP)   // the topic's own cwd, not a usage string
   }, 8000)
 })
+
+describe('replies quote the message that triggered them (C1)', () => {
+  const replyTarget = (c: any) => c.payload?.reply_parameters?.message_id
+
+  test('the answer is threaded to the question', async () => {
+    // The bridge never set reply_parameters anywhere. Tolerable when one message
+    // produced exactly one answer; not once a turn can deliver a promoted block AND
+    // a reply, and /restart and the retry button post asynchronously.
+    const cs = await incoming(1100, 'hello there')
+    const answer = sends(cs).find(c => String(c.payload.text ?? '').includes('okReply'))
+    expect(replyTarget(answer)).toBeTruthy()
+  }, 8000)
+
+  test('it tolerates the question having been deleted', async () => {
+    // Without allow_sending_without_reply the send fails outright, losing the
+    // answer to protect a cosmetic link.
+    const cs = await incoming(1101, 'hello there')
+    const answer = sends(cs).find(c => String(c.payload.text ?? '').includes('okReply'))
+    expect(answer!.payload.reply_parameters.allow_sending_without_reply).toBe(true)
+  }, 8000)
+
+  test('both messages of a promoted turn point at the same question', async () => {
+    const cs = await incoming(1102, 'MIDTEXT')
+    const targets = sends(cs).map(replyTarget).filter(Boolean)
+    expect(targets.length).toBeGreaterThanOrEqual(2)
+    expect(new Set(targets).size).toBe(1)
+  }, 8000)
+
+  test('the transient status message is NOT threaded', async () => {
+    // It is machine chatter that gets deleted; threading it would just clutter.
+    const cs = await incoming(1103, 'hello there')
+    const status = sends(cs).find(c => textOf(c).includes('Thinking'))
+    expect(replyTarget(status)).toBeUndefined()
+  }, 8000)
+
+  test('a no-answer report is threaded, and its retry answers the original question', async () => {
+    const cs = await incoming(1104, 'NORESP')
+    const warn = sends(cs).find(c => String(c.payload.text ?? '').includes('No answer came back'))
+    expect(replyTarget(warn)).toBeTruthy()
+  }, 8000)
+})
