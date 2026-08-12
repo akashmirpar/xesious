@@ -152,6 +152,9 @@ const clip = (d: string, max: number) => (d.length > max ? `${d.slice(0, max)}�
 // The run's headline. It stays at the top for the whole run and the steps append
 // under it, so an update adds to the status instead of replacing what was there.
 export const THINKING = '💭 Thinking…'
+// What the progress message becomes once the run is over and it is kept as the
+// record of what happened, rather than deleted.
+export const RUN_RECORD = '🧾 What ran'
 
 // Render one step's detail for the rich path.
 // Markdown folds consecutive lines into one paragraph, which would run a todo list
@@ -183,7 +186,7 @@ export function renderDetail(s: Step, raw: string, detailMax = DETAIL_MAX): stri
 // one of them are a single tap away without expanding the rest.
 // `total` is the number of steps the run has produced, which may exceed what is
 // shown — trimming the oldest must not silently shrink the run's history.
-export function renderSteps(steps: Step[], total: number, opts: { progressDetail: boolean; detailMax?: number }): string {
+export function renderSteps(steps: Step[], total: number, opts: { progressDetail: boolean; detailMax?: number; headline?: string }): string {
   const detailMax = opts.detailMax ?? DETAIL_MAX
   const parts = steps.map(s => {
     const label = escapeRich(s.label)
@@ -193,7 +196,7 @@ export function renderSteps(steps: Step[], total: number, opts: { progressDetail
   })
   const hidden = total - steps.length
   if (hidden > 0) parts.unshift(`_+${hidden} earlier step${hidden === 1 ? '' : 's'}_`)
-  return [escapeRich(THINKING), ...parts].join('\n\n')
+  return [escapeRich(opts.headline ?? THINKING), ...parts].join('\n\n')
 }
 
 // The pre-10.1 rendering, kept as the fallback: one expandable quote per step.
@@ -395,6 +398,83 @@ export function escapeMoneyDollars(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// which block is the reply
+// ---------------------------------------------------------------------------
+//
+// The bridge delivers the LAST thing the model said, which treats position as
+// authority. That holds for a conversational turn and breaks for an agentic one:
+// the model answers, keeps working, and signs off — and the sign-off is what gets
+// delivered, so the reply reads as evasive precisely because it is a closing
+// summary of a conversation whose substance was deleted.
+//
+// Every length threshold proposed for this failed against a real case: 590 chars
+// mattered, 415 mattered, 658 was junk. The detectable property is not size, it is
+// that the final block does not stand on its own — it either promises future work,
+// or opens by referring to work the reader never saw.
+//
+// Measured over every transcript on disk (test/replay-text-blocks.ts): of 490
+// multi-block turns, 53 end in a sign-off and 71 in a dangling reference.
+// Promoting the prior block in those cases costs 72 extra messages fleet-wide,
+// against 1,739 if every block were delivered.
+
+// A closing promise reports nothing and commits to the future.
+export function isSignOff(s: string): boolean {
+  return /\b(i'?ll (report|update|let you know|come back|follow up)|will report|report back|when it (lands|finishes|completes)|monitoring|keep you posted|stand by)\b/i.test(s)
+}
+
+// Deixis without an antecedent: only parses if the preceding blocks were seen.
+export function isDanglingReference(s: string): boolean {
+  return /^(recorded|done|that'?s (fixed|done)|fixed|updated|added|removed|committed|restarted|noted)\b/i.test(s.trim())
+}
+
+// The substantive block to deliver BEFORE the reply, or undefined when the reply
+// stands on its own. Deliberately conservative: this is an enhancement on top of
+// keeping the full text in the progress message, so a miss costs the reader a tap
+// rather than the message itself.
+export function promoteBlock(blocks: string[], finalText: string, opts?: { minChars?: number }): string | undefined {
+  const min = opts?.minChars ?? 200
+  if (blocks.length < 2) return undefined
+  const last = blocks[blocks.length - 1]
+  if (!isSignOff(last) && !isDanglingReference(last)) return undefined
+  // Skip anything the reply already contains: the result event usually repeats the
+  // final block, and double-posting is a bug this project has fixed once already.
+  for (let i = blocks.length - 2; i >= 0; i--) {
+    const b = blocks[i]
+    if (b.length >= min && b !== last && !finalText.includes(b)) return b
+  }
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
+// non-answers
+// ---------------------------------------------------------------------------
+
+// Some turns end without producing an answer, and the text they end with must not
+// be shown to the user as though it were one.
+//
+// `No response requested.` is the case that prompted this: found 11 times in a
+// single session, as an assistant message whose ENTIRE text is that sentence,
+// with stop_reason "stop_sequence" and preceded by queue-operation records. It is
+// an artefact of the CLI's queue layer, not a reply — but the bridge took it as
+// the turn's final text and posted it verbatim, so from the phone it read as the
+// question being brushed off. It is not topic-specific and it is not plan mode.
+//
+// Deliberately NOT auto-retried, though a verbatim resend does work. An agentic
+// turn may already have edited files or run commands, so resending re-runs the
+// prompt and can repeat those side effects; "a resend works" describes a HUMAN
+// choosing to resend. The bridge surfaces it and offers the retry instead.
+const NON_ANSWERS = [
+  'no response requested.',
+  'no response requested',
+]
+
+export function isNonAnswer(text: string): boolean {
+  const t = (text ?? '').trim()
+  if (!t) return true                       // an empty turn is a non-answer too
+  return NON_ANSWERS.includes(t.toLowerCase())
+}
+
+// ---------------------------------------------------------------------------
 // polling conflicts (409)
 // ---------------------------------------------------------------------------
 
@@ -444,6 +524,7 @@ export function conflictAdvice(n: number, opts: { ghostLimit: number; waitMs: nu
 // tested against recorded fixtures.
 export type StreamEvent =
   | { kind: 'step'; step: Step }
+  | { kind: 'text'; text: string }
   | { kind: 'result'; text: string; sessionId?: string; isError: boolean }
   | { kind: 'init'; sessionId: string }
 
@@ -458,6 +539,14 @@ export function parseStreamLine(line: string, opts: { progressDetail: boolean })
     for (const b of o.message.content) {
       if (b?.type === 'tool_use') {
         out.push({ kind: 'step', step: toolStep(b) })
+      } else if (b?.type === 'text') {
+        // The model's own words, mid-turn. Previously ignored outright, so in any
+        // turn where the model answered and then kept working, the answer was
+        // discarded and the user received only the closing summary. Measured
+        // across every transcript on disk: 48% of turns that produced text
+        // produced more than one block, 393,916 characters in total.
+        const t = String(b.text ?? '').trim()
+        if (t) out.push({ kind: 'text', text: t })
       } else if (b?.type === 'thinking' && opts.progressDetail) {
         // The reasoning behind the next step — what the model is trying, not just
         // what it ran. Collapsed like any other detail.

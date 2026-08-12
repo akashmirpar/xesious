@@ -46,7 +46,8 @@ REAL_CLAUDE = env("STAGING_REAL_CLAUDE", required=False, default="") in ("1", "t
 # Stub mode: single-turn (prompt, expected-substring), mirroring claude-stub.ts.
 CASES = [
     ("hello staging", "okReply"),   # claude-stub default success reply
-    ("EMPTY", "empty response"),    # stub emits an empty result
+    ("EMPTY", "No answer came back"),  # empty result -> reported as a failed turn
+    ("NORESP", "No answer came back"),  # the CLI queue artefact, never shown verbatim
     ("ERROR", "boom"),              # stub emits is_error with text "boom"
 ]
 
@@ -121,6 +122,35 @@ async def send_and_wait_messages(client, bot, prompt: str):
 
 async def send_and_wait(client, bot, prompt: str):
     return [reply_text(m) for m in await send_and_wait_messages(client, bot, prompt)]
+
+
+async def send_and_collect(client, bot, prompt: str, settle: float = 8.0):
+    """Collect EVERY message the turn produces, not just the first.
+
+    send_and_wait_messages returns as soon as one reply arrives and removes its
+    handler, so anything after that is invisible to it — which silently breaks any
+    assertion about a turn that sends more than one message (a promoted mid-turn
+    answer followed by its sign-off, say). This waits for the first reply and then
+    for the stream to go quiet for `settle` seconds."""
+    msgs = []
+    last = asyncio.get_event_loop().time()
+
+    @client.on(events.NewMessage(from_users=bot))
+    async def handler(ev):
+        nonlocal last
+        if is_status(reply_text(ev.message)):
+            return
+        msgs.append(ev.message)
+        last = asyncio.get_event_loop().time()
+
+    await client.send_message(bot, prompt)
+    deadline = asyncio.get_event_loop().time() + TIMEOUT
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(0.5)
+        if msgs and (asyncio.get_event_loop().time() - last) >= settle:
+            break
+    client.remove_event_handler(handler)
+    return msgs
 
 
 def topic_cwd():
@@ -248,7 +278,43 @@ async def feature_tilde_prose(client, bot):
             ok, "; ".join(problems) if problems else f"entities={kinds}, both tildes literal, bold intact")
 
 
-FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose]
+async def feature_midturn_text(client, bot):
+    """A turn that answers, keeps working, then signs off must deliver the ANSWER —
+    not just the sign-off.
+
+    This is the shape behind "I get unrelated answers": the substance is written
+    mid-turn and the bridge delivered only the closing block, so the reply read as
+    evasive precisely because it was a summary of a conversation whose content had
+    been deleted. Measured across every transcript on disk: 48% of turns that
+    produced text produced more than one block."""
+    prompt = (
+        "Do exactly these three things, in this order, and nothing else. "
+        "(1) Write one paragraph of at least 300 characters about why the number 42 is famous. "
+        "(2) Then run the shell command `echo checked` with Bash. "
+        "(3) Then, as your final message, reply with only this sentence: "
+        "I'll report back when it lands."
+    )
+    print("  → (answer, then a tool call, then a sign-off)")
+    # The promoted answer and the sign-off are SEPARATE messages, so collect until
+    # the turn goes quiet rather than returning on the first one.
+    msgs = await send_and_collect(client, bot, prompt)
+    texts = [reply_text(m) for m in msgs]
+    for t in texts:
+        print(f"    ← {t[:90]!r}")
+
+    joined = " ".join(texts)
+    problems = []
+    if not any(len(t) >= 250 for t in texts):
+        problems.append("no substantive block was delivered — only the sign-off survived")
+    if "report back" not in joined.lower():
+        problems.append("the closing sign-off never arrived")
+    ok = not problems
+    return ("mid-turn answer is delivered, not just the sign-off",
+            ok, "; ".join(problems) if problems else
+            f"{len(texts)} message(s), longest {max((len(t) for t in texts), default=0)}ch")
+
+
+FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose, feature_midturn_text]
 
 
 async def main():

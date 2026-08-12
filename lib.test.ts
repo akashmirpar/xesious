@@ -13,7 +13,8 @@ import {
   normalizeModel, MODEL_DEFAULT,
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice,
-  sanitizeProse, PROSE_RULES,
+  sanitizeProse, PROSE_RULES, isNonAnswer,
+  isSignOff, isDanglingReference, promoteBlock,
 } from './lib'
 
 describe('parseIdList', () => {
@@ -529,5 +530,84 @@ describe('regression: the reported strikethrough incidents', () => {
     for (const t of ['~25,300', '(~July 2026)', '~24.5m', '~18.3%', '~22×', '~40m', '~$120bn']) {
       expect(sanitizeProse(`about ${t} total`, 'markdownv2')).toContain('\\~')
     }
+  })
+})
+
+describe('isNonAnswer', () => {
+  test('the CLI queue artefact is not an answer', () => {
+    expect(isNonAnswer('No response requested.')).toBe(true)
+    expect(isNonAnswer('  no response requested  ')).toBe(true)   // trimmed, case-insensitive
+    expect(isNonAnswer('No response requested')).toBe(true)       // with and without the stop
+  })
+  test('an empty turn is not an answer either', () => {
+    expect(isNonAnswer('')).toBe(true)
+    expect(isNonAnswer('   \n  ')).toBe(true)
+  })
+  test('a real answer that MENTIONS the phrase is still an answer', () => {
+    // Only an entire message matches. A turn explaining the artefact must not be
+    // swallowed by the check meant to catch it.
+    expect(isNonAnswer('The CLI sometimes replies "No response requested." — here is why.')).toBe(false)
+    expect(isNonAnswer('No response requested. But here is the answer anyway: 42')).toBe(false)
+  })
+  test('ordinary answers are answers', () => {
+    expect(isNonAnswer('42')).toBe(false)
+    expect(isNonAnswer('Done — the file is written.')).toBe(false)
+  })
+})
+
+describe('promoteBlock — which block is really the reply', () => {
+  const long = (tag: string) => `${tag}: ` + 'substantive content here. '.repeat(12)
+
+  test('a sign-off does not stand on its own', () => {
+    expect(isSignOff("I'll report back when it lands")).toBe(true)
+    expect(isSignOff('Monitoring for the cache')).toBe(true)
+    expect(isSignOff('The answer is 42.')).toBe(false)
+  })
+  test('a dangling reference points at work the reader never saw', () => {
+    expect(isDanglingReference('Recorded in the skill.')).toBe(true)
+    expect(isDanglingReference('Done — 5 files changed.')).toBe(true)
+    expect(isDanglingReference('Recording studios cost money.')).toBe(false)  // word boundary
+    expect(isDanglingReference('Here is the full breakdown.')).toBe(false)
+  })
+  test('promotes the substantive block behind a sign-off', () => {
+    const blocks = ['Let me check.', long('answer'), "I'll report back when it lands"]
+    expect(promoteBlock(blocks, "I'll report back when it lands")).toBe(long('answer'))
+  })
+  test('promotes behind a dangling reference too', () => {
+    const blocks = [long('diagnosis'), 'Recorded in the skill.']
+    expect(promoteBlock(blocks, 'Recorded in the skill.')).toBe(long('diagnosis'))
+  })
+  test('does nothing when the reply stands on its own', () => {
+    const blocks = ['Let me check.', long('answer')]
+    expect(promoteBlock(blocks, long('answer'))).toBeUndefined()
+  })
+  test('never promotes text the reply already contains (no double-posting)', () => {
+    // The result event usually repeats the final block, and double-posting is a
+    // bug this project has fixed once already.
+    const body = long('answer')
+    expect(promoteBlock([body, 'Done.'], `Done. ${body}`)).toBeUndefined()
+  })
+  test('skips narration and finds the substance further back', () => {
+    const blocks = ['Let me check.', long('real'), 'Now the submit loop:', 'Done.']
+    expect(promoteBlock(blocks, 'Done.')).toBe(long('real'))
+  })
+  test('a single-block turn is left alone', () => {
+    expect(promoteBlock(['Done.'], 'Done.')).toBeUndefined()
+    expect(promoteBlock([], '')).toBeUndefined()
+  })
+})
+
+describe('parseStreamLine emits text blocks', () => {
+  test('an assistant text block becomes a text event', () => {
+    const line = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '  hello  ' }] } })
+    expect(parseStreamLine(line, { progressDetail: false })).toEqual([{ kind: 'text', text: 'hello' }])
+  })
+  test('blank text yields nothing', () => {
+    const line = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '   ' }] } })
+    expect(parseStreamLine(line, { progressDetail: true })).toEqual([])
+  })
+  test('text is emitted regardless of progressDetail (it drives promotion)', () => {
+    const line = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } })
+    expect(parseStreamLine(line, { progressDetail: false })).toHaveLength(1)
   })
 })
