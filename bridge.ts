@@ -23,7 +23,7 @@ import telegramify from 'telegramify-markdown'
 import { autoRetry } from '@grammyjs/auto-retry'
 import { apiThrottler } from '@grammyjs/transformer-throttler'
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync, copyFileSync, readlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync, copyFileSync, readlinkSync, openSync, readSync, closeSync } from 'node:fs'
 import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { randomUUID, createHash } from 'node:crypto'
@@ -32,7 +32,7 @@ import {
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
   EFFORT_LEVELS, EFFORT_DEFAULT, normalizeEffort,
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
-  markdownToHtml, htmlDocument,
+  markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   frameUserMessage, attributionProfileLines,
   needsRich, hasRtl, sanitizeProse,
   normalizeMode as libNormalizeMode,
@@ -240,7 +240,7 @@ const INTERRUPT_DEFAULT = /^(1|true|yes)$/i.test(process.env.TG_INTERRUPT || '')
 
 // lastModel / lastCliVersion are OBSERVED from the previous run's init event, not
 // predicted — hence the "last run" wording wherever they are shown.
-type Entry = { sessionId?: string; prevSessionId?: string; cwd: string; updated?: string; lastModel?: string; lastCliVersion?: string }
+type Entry = { sessionId?: string; prevSessionId?: string; cwd: string; updated?: string; lastModel?: string; lastCliVersion?: string; lastEffort?: string }
 let sessions: Record<string, Entry> = {}
 let names: Record<string, string> = {}
 // "💭 Thinking…" status messages for in-flight runs. If the process is killed
@@ -274,7 +274,40 @@ const modelFor = (key: string) => models[key] ?? MODEL
 // TG_EFFORT; empty means pass no --effort and let the CLI decide.
 let efforts: Record<string, string> = {}
 const effortFor = (key: string) => efforts[key] ?? EFFORT_TIER
-const effortLabel = (key: string) => effortFor(key) || `${EFFORT_DEFAULT} → CLI default`
+// What effort this topic is actually on. An override answers directly; otherwise
+// report what the LAST RUN used, read from the session transcript — "default" on
+// its own tells the user nothing, and the CLI does not report effort in the stream
+// (verified against a live run: init carries model and permissionMode, not effort).
+function effortLabel(key: string): string {
+  const set = effortFor(key)
+  if (set) return set
+  const seen = observedEffort(key)
+  return seen
+    ? `${EFFORT_DEFAULT} → ${seen} (last run)`
+    : `${EFFORT_DEFAULT} → chosen by the CLI (unknown until this topic has run once)`
+}
+
+// Read the tail of this topic's transcript for the effort of its most recent
+// assistant message. Tail only: a transcript reaches megabytes and this is called
+// to render a status line. Cached on the entry so repeated /status calls are free.
+const EFFORT_TAIL_BYTES = 256 * 1024
+function observedEffort(key: string): string | undefined {
+  const e = sessions[key]
+  if (!e?.sessionId || !e.cwd) return undefined
+  try {
+    const file = join(projectDir(e.cwd), `${e.sessionId}.jsonl`)
+    const size = statSync(file).size
+    const fd = openSync(file, 'r')
+    try {
+      const len = Math.min(size, EFFORT_TAIL_BYTES)
+      const buf = Buffer.alloc(len)
+      readSync(fd, buf, 0, len, Math.max(0, size - len))
+      const found = lastEffortFrom(buf.toString('utf8'))
+      if (found && found !== e.lastEffort) { sessions[key] = { ...e, lastEffort: found }; saveState() }
+      return found ?? e.lastEffort
+    } finally { closeSync(fd) }
+  } catch { return e.lastEffort }
+}
 function effortText(key: string): string {
   return `Reasoning effort for this topic: ${effortLabel(key)}\n\n` +
     `Higher spends more thinking per turn — better on hard questions, slower and dearer on easy ones.\n\n` +
@@ -496,9 +529,18 @@ let requestDrain: ((why: string) => Promise<void>) | undefined
 
 const activeRuns = new Map<string, ChildProcess>()
 const stopped = new Set<string>()
+// How many tasks are queued or running per topic, and the id of the most recent
+// message the user sent there. Both feed needsReplyLink(): an answer only needs to
+// quote its question when it could belong to more than one of them.
+const inFlight: Record<string, number> = {}
+const latestIncoming: Record<string, number> = {}
+
 function enqueue<T>(key: string, task: () => Promise<T>): Promise<T> {
   const prev = queues.get(key) ?? Promise.resolve()
-  const next = prev.catch(() => {}).then(task)
+  inFlight[key] = (inFlight[key] ?? 0) + 1
+  const next = prev.catch(() => {}).then(task).finally(() => {
+    inFlight[key] = Math.max(0, (inFlight[key] ?? 1) - 1)
+  })
   queues.set(key, next.catch(() => {}))
   return next
 }
@@ -1147,7 +1189,7 @@ async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: str
   }).catch(() => {})
 }
 
-async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number): Promise<void> {
+async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number, forceReplyLink = false): Promise<void> {
   const cwd = resolveCwd(ctx, threadId)
   // Attribute the message before it reaches the model. Only here: handlePassthrough
   // and /compact send literal CLI commands, which are not somebody speaking.
@@ -1168,6 +1210,13 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   // brand-new session with no history. That is the reported "after /stop the bot
   // doesn't know the history". The id is available from the init event at the
   // start of the run, so there is no reason to wait for the end of it.
+  // Decided at DELIVERY time, not on arrival: whether another message has landed
+  // while this turn ran is exactly what makes the answer ambiguous.
+  const replyLink = () =>
+    needsReplyLink({ replyTo, latestIncoming: latestIncoming[key], inFlight: inFlight[key] ?? 0, force: forceReplyLink })
+      ? replyTo
+      : undefined
+
   const bindSession = (sessionId: string) => {
     sessions[key] = { ...sessions[key], cwd, sessionId, updated: new Date().toISOString() }
     saveState()
@@ -1180,7 +1229,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     // refreshes `updated`. Binding already happened above for a fresh session.
     if (res.sessionId) bindSession(res.sessionId)
     if (res.noAnswer) {
-      await sendNoAnswer(ctx, threadId, key, prompt, replyTo)
+      await sendNoAnswer(ctx, threadId, key, prompt, replyLink())
       return
     }
     // When the turn's closing block only promises future work or refers to work
@@ -1188,13 +1237,14 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     // rest of the turn's text is in the run record above, so this is an
     // enhancement rather than the mechanism: a miss costs a tap, not a message.
     const promoted = promoteBlock(res.blocks ?? [], res.text)
-    if (promoted) await deliver(ctx, threadId, promoted, replyTo)
-    await deliver(ctx, threadId, res.text, replyTo)
-    await flushOutbox(ctx, threadId, cwd, replyTo)
+    if (promoted) await deliver(ctx, threadId, promoted, replyLink())
+    const link = replyLink()
+    await deliver(ctx, threadId, res.text, link)
+    await flushOutbox(ctx, threadId, cwd, link)
     // Speak the answer too when this topic is in voice mode.
     const vm = voiceMode(key); if (vm !== 'off' && !res.isError) await speakAnswer(ctx, threadId, res.text, vm)
   } catch (e) {
-    await send(ctx, threadId, `⚠️ ${e}`, false, replyTo)
+    await send(ctx, threadId, `⚠️ ${e}`, false, replyLink())
   }
 }
 
@@ -1565,6 +1615,7 @@ bot.on('message', async ctx => {
     if (!arg || !text.includes(' ')) { await send(ctx, threadId, `Usage: /plan <what you want>\n\nRuns one read-only turn: Claude researches and proposes, without editing. Reply "go ahead" to carry it out in this topic's usual mode (${modeFor(key)}).`); return }
     if (isInterrupt(key) && activeRuns.has(key)) { stopped.add(key); activeRuns.get(key)!.kill('SIGKILL') }
     // One-shot: the topic's sticky mode is untouched, so the follow-up executes.
+    latestIncoming[key] = msg.message_id
     enqueue(key, () => handlePrompt(ctx, threadId, key, arg, 'plan', msg.message_id))
       .catch(e => console.error(`[error] plan task ${key}: ${e}`))
     return
@@ -1719,6 +1770,7 @@ bot.on('message', async ctx => {
     stopped.add(key)
     activeRuns.get(key)!.kill('SIGKILL')
   }
+  latestIncoming[key] = msg.message_id
   enqueue(key, () => handlePrompt(ctx, threadId, key, text, undefined, msg.message_id))
     .catch(e => console.error(`[error] task ${key}: ${e}`))
 })
@@ -1745,7 +1797,7 @@ bot.on('callback_query:data', async ctx => {
     retryPrompts.delete(data.slice(6))
     await ctx.answerCallbackQuery({ text: 'Retrying…' }).catch(() => {})
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})   // one tap only
-    void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo))
+    void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo, true))
       .catch(e => console.error(`[error] retry ${rec.key}: ${e}`))
     return
   }

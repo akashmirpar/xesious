@@ -349,28 +349,48 @@ async def feature_attribution(client, bot):
 
 
 async def feature_reply_threading(client, bot):
-    """The answer must be a Telegram REPLY to the question that produced it.
+    """An answer quotes its question only when it could belong to more than one.
 
-    The bridge never set reply_parameters anywhere, so every answer was a loose
-    message in the thread. That was tolerable while one message produced exactly one
-    answer; it is not now that a turn can deliver a promoted mid-turn block AND its
-    reply, and that /restart and the retry button post asynchronously."""
-    prompt = "Reply with only the word THREADED."
-    print("  → (checking the answer is a real Telegram reply)")
-    msgs, sent = await send_and_collect(client, bot, prompt, settle=6)
-    if not msgs:
-        return ("answers are threaded to their question", False, "no reply within timeout")
+    Threading unconditionally is visually noisy — on a phone every quoted header
+    costs a couple of lines and says nothing when a single question is in flight.
+    So this asserts BOTH halves of the rule: a lone question gets no link, and a
+    question answered while another is outstanding does."""
+    # --- quiet topic: exactly one question, so no quoted header
+    print("  → (a lone question: expect NO reply link)")
+    msgs, sent = await send_and_collect(client, bot, "Reply with only the word ALONE.", settle=6)
+    lone = [m for m in msgs if not is_status(reply_text(m))]
+    lone_targets = [getattr(getattr(m, "reply_to", None), "reply_to_msg_id", None) for m in lone]
+    print(f"    ← sent id={sent.id}; reply targets={lone_targets}")
 
-    answers = [m for m in msgs if not is_status(reply_text(m))]
-    targets = [getattr(getattr(m, "reply_to", None), "reply_to_msg_id", None) for m in answers]
-    print(f"    ← sent id={sent.id}; reply targets={targets}")
+    # --- two questions in flight: the answers must say which is which
+    print("  → (two questions back to back: expect a reply link)")
+    first = await client.send_message(bot, "Count slowly to three, then reply with only the word FIRST.")
+    await asyncio.sleep(1.5)
+    second = await client.send_message(bot, "Reply with only the word SECOND.")
+    seen = []
+
+    @client.on(events.NewMessage(from_users=bot))
+    async def handler(ev):
+        if not is_status(reply_text(ev.message)):
+            seen.append(ev.message)
+
+    await asyncio.sleep(min(TIMEOUT, 90))
+    client.remove_event_handler(handler)
+    busy_targets = [getattr(getattr(m, "reply_to", None), "reply_to_msg_id", None) for m in seen]
+    print(f"    ← sent ids={first.id},{second.id}; reply targets={busy_targets}")
 
     problems = []
-    if not any(t == sent.id for t in targets):
-        problems.append(f"no answer replied to our message (id {sent.id}); targets={targets}")
+    if any(t == sent.id for t in lone_targets):
+        problems.append("a lone question was threaded — the link costs space and says nothing")
+    if not seen:
+        problems.append("no answers arrived for the two-question case")
+    elif not any(t in (first.id, second.id) for t in busy_targets):
+        problems.append(f"answers were not threaded while two questions were in flight; targets={busy_targets}")
+
     ok = not problems
-    return ("answers are threaded to their question", ok,
-            "; ".join(problems) if problems else f"answer replies to id {sent.id}")
+    return ("answers quote their question only when ambiguous", ok,
+            "; ".join(problems) if problems else
+            f"lone={lone_targets}, contended={busy_targets}")
 
 
 FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,

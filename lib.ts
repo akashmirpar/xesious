@@ -119,6 +119,28 @@ export function normalizeEffort(e: string): string | undefined {
   return (EFFORT_LEVELS as readonly string[]).includes(s) ? s : undefined
 }
 
+// Which effort level a session ACTUALLY ran at.
+//
+// "default" is a useless answer to "what effort am I on?" — and unlike the model
+// id, the CLI does not report effort anywhere in the stream: verified against a
+// live run, the init event carries model, permissionMode, fast_mode_state and the
+// CLI version, and the assistant events carry none of it. It IS recorded on each
+// assistant record in the session transcript, so that is where this reads it.
+//
+// Scans backwards because the answer wanted is the most recent one, and a
+// transcript can be megabytes; callers pass only the tail of the file.
+export function lastEffortFrom(jsonlTail: string): string | undefined {
+  const lines = jsonlTail.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim()
+    if (!line.startsWith('{')) continue        // a tail can begin mid-record
+    let o: any
+    try { o = JSON.parse(line) } catch { continue }
+    if (o?.type === 'assistant' && typeof o.effort === 'string' && o.effort) return o.effort
+  }
+  return undefined
+}
+
 // ---------------------------------------------------------------------------
 // progress rendering
 // ---------------------------------------------------------------------------
@@ -535,6 +557,34 @@ export function promoteBlock(blocks: string[], finalText: string, opts?: { minCh
     if (b.length >= min && b !== last && !finalText.includes(b)) return b
   }
   return undefined
+}
+
+// ---------------------------------------------------------------------------
+// when an answer needs to quote its question
+// ---------------------------------------------------------------------------
+//
+// Threading EVERY reply is visually noisy: on a phone each quoted header eats a
+// couple of lines, and when there is only one question in flight the link says
+// nothing the reader did not already know. It earns its space only when an answer
+// could belong to more than one message.
+//
+// Two things make it ambiguous, and both are knowable at delivery time:
+//   * something else is queued or running for this topic, so more than one answer
+//     is coming; or
+//   * the user has sent another message since the one being answered, so this
+//     answer is NOT a response to the latest thing they said — the case interrupt
+//     mode and a slow turn both produce.
+// Anything arriving out of band (a retry tapped minutes later) passes force.
+export function needsReplyLink(opts: {
+  replyTo?: number
+  latestIncoming?: number
+  inFlight: number
+  force?: boolean
+}): boolean {
+  if (!opts.replyTo) return false
+  if (opts.force) return true
+  if (opts.inFlight > 1) return true
+  return opts.latestIncoming !== undefined && opts.latestIncoming !== opts.replyTo
 }
 
 // ---------------------------------------------------------------------------
