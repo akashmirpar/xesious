@@ -99,6 +99,27 @@ export function normalizeModel(m: string): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// reasoning effort
+// ---------------------------------------------------------------------------
+
+// The CLI takes --effort, but the bridge never exposed it, so a topic was stuck on
+// whatever the default is with no way to spend more thinking on a hard question or
+// less on a trivial one. Deliberately mirrors the model machinery — same shape of
+// setting, same per-topic stickiness, same tap-to-switch — rather than inventing a
+// second idiom for a second knob.
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export const EFFORT_DEFAULT = 'default'   // the label for "clear the override"
+
+// '' clears the override, a level is returned lowercased, undefined means
+// unrecognised. Same contract as normalizeModel so the two call sites can be read
+// against each other.
+export function normalizeEffort(e: string): string | undefined {
+  const s = e.trim().toLowerCase()
+  if (s === EFFORT_DEFAULT || s === 'reset' || s === 'clear' || s === '') return ''
+  return (EFFORT_LEVELS as readonly string[]).includes(s) ? s : undefined
+}
+
+// ---------------------------------------------------------------------------
 // progress rendering
 // ---------------------------------------------------------------------------
 

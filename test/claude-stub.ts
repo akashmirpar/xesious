@@ -41,6 +41,7 @@ const prompt = framed ? rawPrompt.slice(rawPrompt.indexOf('\n') + 1) : rawPrompt
 const scenario = prompt.trim().split(/\s+/)[0] ?? ''
 const resumeId = val('--resume')
 const model = val('--model')
+const effort = val('--effort')
 // A stable-ish session id derived from the resume arg: a new turn mints one, a
 // resumed turn keeps reporting a session so bridge re-persists it.
 const sessionId = resumeId ?? 'sessTESTAAA'
@@ -50,7 +51,7 @@ const initLine = () => emit({ type: 'system', subtype: 'init', session_id: sessi
 const result = (extra: Record<string, unknown>) =>
   emit({ type: 'result', subtype: 'success', is_error: false, session_id: sessionId, ...extra })
 
-const tag = `${resumeId ? 'hadResume' : 'noResume'} ${model ? 'modelSet' : 'modelDefault'} ${framed ? 'framed' : 'unframed'}`
+const tag = `${resumeId ? 'hadResume' : 'noResume'} ${model ? 'modelSet' : 'modelDefault'} ${framed ? 'framed' : 'unframed'} ${effort ? 'effort' + effort : 'effortDefault'}`
 
 async function main() {
   initLine()

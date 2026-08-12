@@ -537,3 +537,31 @@ describe('replies quote the message that triggered them (C1)', () => {
     expect(replyTarget(warn)).toBeTruthy()
   }, 8000)
 })
+
+describe('/effort plumbs --effort through to the CLI (C5)', () => {
+  test('no override means no flag — the CLI keeps its own default', async () => {
+    expect(finalReply(await incoming(1110, 'plain turn'))).toContain('effortDefault')
+  })
+  test('after /effort high, the next turn passes --effort high', async () => {
+    expect(finalReply(await incoming(1111, '/effort high'))).toMatch(/high/i)
+    expect(finalReply(await incoming(1111, 'do something'))).toContain('efforthigh')
+  }, 8000)
+  test('it is sticky per topic, and another topic is unaffected', async () => {
+    await incoming(1112, '/effort max')
+    expect(finalReply(await incoming(1112, 'again'))).toContain('effortmax')
+    expect(finalReply(await incoming(1113, 'elsewhere'))).toContain('effortDefault')
+  }, 12000)
+  test('/effort default clears it', async () => {
+    await incoming(1114, '/effort low')
+    await incoming(1114, '/effort default')
+    expect(finalReply(await incoming(1114, 'after clearing'))).toContain('effortDefault')
+  }, 12000)
+  test('an unknown level is refused, and nothing is persisted', async () => {
+    expect(finalReply(await incoming(1115, '/effort turbo'))).toMatch(/Unknown effort/i)
+    expect(stateNow().efforts?.['1115:main']).toBeUndefined()
+  })
+  test('it survives a state round-trip like the other per-topic settings', async () => {
+    await incoming(1116, '/effort xhigh')
+    expect(stateNow().efforts['1116:main']).toBe('xhigh')
+  })
+})
