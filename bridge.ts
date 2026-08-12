@@ -219,7 +219,9 @@ const INTERRUPT_DEFAULT = /^(1|true|yes)$/i.test(process.env.TG_INTERRUPT || '')
 //                    names[(chat:topic)]    = "human topic name"
 // ---------------------------------------------------------------------------
 
-type Entry = { sessionId?: string; prevSessionId?: string; cwd: string; updated?: string }
+// lastModel / lastCliVersion are OBSERVED from the previous run's init event, not
+// predicted — hence the "last run" wording wherever they are shown.
+type Entry = { sessionId?: string; prevSessionId?: string; cwd: string; updated?: string; lastModel?: string; lastCliVersion?: string }
 let sessions: Record<string, Entry> = {}
 let names: Record<string, string> = {}
 // "💭 Thinking…" status messages for in-flight runs. If the process is killed
@@ -239,6 +241,11 @@ const modeFor = (key: string) => {
   // must not silently keep taking effect once TG_ALLOW_BYPASS is off.
   return m === 'bypass' && !ALLOW_BYPASS ? 'auto' : m
 }
+// True when this topic is STORED as bypass but is being downgraded because the env
+// var is absent. The downgrade is correct; doing it silently is not — a topic you
+// deliberately set to bypass quietly runs in auto after a deploy that drops the
+// var, and nothing ever says so.
+const bypassDowngraded = (key: string) => modes[key] === 'bypass' && !ALLOW_BYPASS
 // Per-topic model override, switchable with /model. Empty string ⇒ fall back to
 // TG_MODEL, and empty TG_MODEL ⇒ the account default (no --model flag at all).
 let models: Record<string, string> = {}
@@ -595,7 +602,16 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
             steps.push({ label: '💬 Said', detail: ev.text }); dirty = true; void editStatus()
           }
           else if (ev.kind === 'result') { got = true; sessionId = ev.sessionId; isError = ev.isError; finalText = ev.text }
-          else if (ev.kind === 'init') { if (!sessionId) { sessionId = ev.sessionId; try { onInit?.(ev.sessionId) } catch {} } }
+          else if (ev.kind === 'init') {
+            if (ev.model || ev.cliVersion) {
+              const prev = sessions[key]?.lastModel
+              sessions[key] = { ...(sessions[key] ?? { cwd }), lastModel: ev.model ?? sessions[key]?.lastModel, lastCliVersion: ev.cliVersion ?? sessions[key]?.lastCliVersion }
+              saveState()
+              // A change here is exactly the "did my upgrade take effect?" signal.
+              if (prev && ev.model && prev !== ev.model) console.log(`[model] ${key}: ${prev} -> ${ev.model}`)
+            }
+            if (!sessionId) { sessionId = ev.sessionId; try { onInit?.(ev.sessionId) } catch {} }
+          }
         }
       }
       void editStatus()
@@ -773,8 +789,15 @@ const MODE_EMOJI: Record<string, string> = { plan: '📋', acceptEdits: '✏️'
 
 function modeText(key: string): string {
   const cur = modeFor(key)
-  return `Permission mode for this topic: ${MODE_EMOJI[cur] ?? ''} ${cur}\n${MODE_HELP[cur] ?? ''}\n\n` +
-    MODES.map(m => `${MODE_EMOJI[m]} ${m} — ${MODE_HELP[m]}`).join('\n') +
+  const warn = bypassDowngraded(key)
+    ? `\n\n⚠️ This topic is set to bypass, but bypass is disabled on this deployment, so it is running as ${cur}. Set TG_ALLOW_BYPASS=1 and restart to restore it.`
+    : ''
+  // Listed as disabled rather than omitted: a gate you cannot see reads as a
+  // missing feature. Kept off the keyboard either way — a mode that removes every
+  // guardrail should cost a typed word, not a mis-tap.
+  const gated = ALLOW_BYPASS ? '' : `\n⚠️ bypass — disabled here (set TG_ALLOW_BYPASS=1)`
+  return `Permission mode for this topic: ${MODE_EMOJI[cur] ?? ''} ${cur}\n${MODE_HELP[cur] ?? ''}${warn}\n\n` +
+    MODES.map(m => `${MODE_EMOJI[m]} ${m} — ${MODE_HELP[m]}`).join('\n') + gated +
     `\n\nTap to switch, or /mode <name>.`
 }
 // One button per row: four side by side get squeezed to unreadable stubs on a
@@ -795,6 +818,15 @@ function modelLabel(key: string): string {
   if (m) return m
   return MODEL ? `${MODEL_DEFAULT} → TG_MODEL (${MODEL})` : `${MODEL_DEFAULT} → system default`
 }
+// Intent AND reality. The label above is what you asked for; this appends what the
+// CLI actually resolved to on the previous run, which is the only way to answer
+// "am I on the new Opus?" — an alias tells you nothing after an upgrade.
+function modelLine(key: string): string {
+  const e = sessions[key]
+  if (!e?.lastModel) return modelLabel(key)
+  const ver = e.lastCliVersion ? `, CLI ${e.lastCliVersion}` : ''
+  return `${modelLabel(key)}  →  ${e.lastModel} (last run${ver})`
+}
 // What "default" resolves to. When TG_MODEL is set it's that; otherwise the bridge
 // passes no --model flag and the CLI uses whatever Claude itself defaults to — the
 // model in ~/.claude/settings.json, or the account/plan default.
@@ -804,7 +836,7 @@ function defaultExplainer(): string {
     : `"${MODEL_DEFAULT}" runs no --model flag, so Claude uses your system default: the model set in ~/.claude/settings.json, or your account default.`
 }
 function modelText(key: string): string {
-  return `Model for this topic: ${modelLabel(key)}\n\n` +
+  return `Model for this topic: ${modelLine(key)}\n\n` +
     `${defaultExplainer()}\n\n` +
     `Every model works in any /mode (plan, auto, …). Tap to switch, or /model <alias|full-id>.`
 }
@@ -1291,7 +1323,7 @@ bot.on('message', async ctx => {
       `/interrupt [on|off] — new messages cancel the running task instead of queueing\n` +
       `/voice [on|summary|off] — speak answers back; full or summarized (text is always complete)\n` +
       `/live — get a private link to a real-time voice call bound to this session\n` +
-      `/mode [${MODES.join('|')}] — permission mode for this topic (tap to switch)\n` +
+      `/mode [${MODES.join('|')}] — permission mode for this topic (tap to switch)${ALLOW_BYPASS ? '' : '; bypass exists but is disabled here'}\n` +
       `/model [${MODEL_ALIASES.join('|')}] — model for this topic (tap to switch)\n` +
       `/plan <task> — one read-only turn: propose without editing\n` +
       `/logo bot|group — set the bot's avatar / this group's photo\n` +
@@ -1401,7 +1433,20 @@ bot.on('message', async ctx => {
     const arg = text.split(/\s+/)[1]
     if (arg) {
       const m = normalizeMode(arg)
-      if (!m) { await send(ctx, threadId, `Unknown mode "${arg}". One of: ${MODES.join(', ')}`); return }
+      if (!m) {
+        // bypass EXISTS and is implemented; it is gated behind TG_ALLOW_BYPASS
+        // because the bot runs as root. Answering "Unknown mode" made a deliberate
+        // gate look like a missing feature, so a user who knew the CLI flag existed
+        // read it as "this bridge can't do that" and stopped. Say which it is.
+        if (/^bypass(permissions)?$/i.test(arg.trim())) {
+          await send(ctx, threadId,
+            '⚠️ bypass exists but is disabled on this deployment.\n\n' +
+            'It removes every permission check (--dangerously-skip-permissions) and this bot runs as root, ' +
+            'so it is opt-in: set TG_ALLOW_BYPASS=1 in .env and restart to enable it.')
+          return
+        }
+        await send(ctx, threadId, `Unknown mode "${arg}". One of: ${MODES.join(', ')}`); return
+      }
       modes[key] = m; saveState()
       await send(ctx, threadId, `${MODE_EMOJI[m]} Mode for this topic: ${m} — ${MODE_HELP[m]}`)
       return
@@ -1482,8 +1527,8 @@ bot.on('message', async ctx => {
     await send(ctx, threadId,
       `directory: ${e?.cwd ?? resolveCwd(ctx, threadId)}\n` +
       `session: ${e?.sessionId ?? '(none yet)'}\n` +
-      `mode: ${modeFor(key)}\n` +
-      `model: ${modelLabel(key)}\n` +
+      `mode: ${modeFor(key)}${bypassDowngraded(key) ? ' (stored: bypass — disabled on this deployment)' : ''}\n` +
+      `model: ${modelLine(key)}\n` +
       `voice: ${voiceMode(key)}\n\n` +
       `resume on the server:\n  cd "${e?.cwd ?? resolveCwd(ctx, threadId)}" && claude --continue`)
     return
@@ -1507,8 +1552,11 @@ bot.on('message', async ctx => {
     return
   }
   if (cmd === '/sessions') {
+    // No argument means this topic's own directory, which is almost always what you
+    // want from inside a topic — seeing what exists here in order to /resume one.
+    // Printing a usage string instead made the common case the unsupported one.
     const dirs = parseDirs(text)
-    if (!dirs.length) { await send(ctx, threadId, 'Usage: /sessions <dir> [dir2 …]  (space-, comma- or newline-separated)'); return }
+    if (!dirs.length) dirs.push(sessions[key]?.cwd ?? resolveCwd(ctx, threadId))
     for (const dir of dirs) {
       if (!isAbsolute(dir) || !existsSync(dir)) { await send(ctx, threadId, `skipped (not an absolute existing path): ${dir}`); continue }
       const list = listSessions(dir)

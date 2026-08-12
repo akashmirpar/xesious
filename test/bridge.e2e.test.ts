@@ -249,8 +249,12 @@ describe('/mode: switch permission posture + bypass safety gate', () => {
 
   test('bypass is REFUSED when TG_ALLOW_BYPASS is off (root-safety guard)', async () => {
     const cs = await incoming(1024, '/mode bypass')
-    expect(finalReply(cs)).toMatch(/Unknown mode/i)           // not accepted
-    expect(stateNow().modes?.['1024:main']).toBeUndefined()   // and not persisted
+    // The safety property is that it is not accepted and not persisted. It used to
+    // be asserted via the string "Unknown mode", which was the BUG (C4): a
+    // deliberate gate that reads as a missing feature. The refusal is unchanged;
+    // only the explanation is.
+    expect(stateNow().modes?.['1024:main']).toBeUndefined()
+    expect(finalReply(cs)).toMatch(/disabled on this deployment/i)
   })
 })
 
@@ -454,4 +458,41 @@ describe('the prompt reaches the CLI attributed (A6)', () => {
     const cs = await incoming(1081, '/usage')
     expect(finalReply(cs)).not.toContain(' framed')
   })
+})
+
+describe('command UX (C2/C3/C4)', () => {
+  test('C3: /status reports the model that actually RAN, not just the alias', async () => {
+    // The init event has always carried the resolved id; it was parsed and dropped,
+    // so /model could only ever report intent. After a CLI upgrade there was no way
+    // to tell whether your sessions were on the new model.
+    await incoming(1090, 'first turn')            // observe an init
+    const cs = await incoming(1090, '/status')
+    expect(finalReply(cs)).toContain('claude-opus-5[1m]')
+    expect(finalReply(cs)).toContain('last run')  // observed, not predicted
+  }, 8000)
+
+  test('C4: /mode bypass explains it is disabled, not that it is unknown', async () => {
+    const cs = await incoming(1091, '/mode bypass')
+    const reply = finalReply(cs) ?? ''
+    expect(reply).not.toMatch(/Unknown mode/i)
+    expect(reply).toMatch(/disabled on this deployment/i)
+    expect(reply).toContain('TG_ALLOW_BYPASS=1')
+  })
+  test('C4: a genuinely unknown mode is still rejected as unknown', async () => {
+    expect(finalReply(await incoming(1092, '/mode yolo'))).toMatch(/Unknown mode/i)
+  })
+  test('C4: /mode lists bypass as disabled rather than omitting it', async () => {
+    const cs = await incoming(1093, '/mode')
+    const shown = sends(cs).map(c => String(c.payload.text ?? '')).join('\n')
+    expect(shown).toMatch(/bypass — disabled here/i)
+  })
+
+  test('C2: /sessions with no argument lists this topic\'s directory', async () => {
+    const cs = await incoming(1094, '/sessions')
+    // The listing and the trailing /import hint are separate messages, so assert
+    // across everything the command sent rather than only the last one.
+    const shown = sends(cs).map(c => String(c.payload.text ?? '')).join('\n')
+    expect(shown).not.toMatch(/Usage: \/sessions/)
+    expect(shown).toContain(TMP)   // the topic's own cwd, not a usage string
+  }, 8000)
 })

@@ -672,3 +672,23 @@ describe('attributionProfileLines', () => {
     expect(attributionProfileLines('x').join(' ')).toMatch(/must never displace/i)
   })
 })
+
+describe('parseStreamLine keeps the resolved model id (C3)', () => {
+  test('init carries the model and the CLI version', () => {
+    const line = JSON.stringify({
+      type: 'system', subtype: 'init', session_id: 's1',
+      model: 'claude-opus-5[1m]', claude_code_version: '2.1.219',
+    })
+    expect(parseStreamLine(line, { progressDetail: false })).toEqual([
+      { kind: 'init', sessionId: 's1', model: 'claude-opus-5[1m]', cliVersion: '2.1.219' },
+    ])
+  })
+  test('an init without them still parses (older CLIs)', () => {
+    const line = JSON.stringify({ type: 'system', subtype: 'init', session_id: 's2' })
+    expect(parseStreamLine(line, { progressDetail: false })[0]).toMatchObject({ kind: 'init', sessionId: 's2' })
+  })
+  test('non-string values are ignored rather than stored', () => {
+    const line = JSON.stringify({ type: 'system', subtype: 'init', session_id: 's3', model: 42 })
+    expect(parseStreamLine(line, { progressDetail: false })[0]).toMatchObject({ model: undefined })
+  })
+})
