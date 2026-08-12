@@ -122,9 +122,30 @@ describe('tool steps render into the status message', () => {
 })
 
 describe('degenerate CLI outputs', () => {
-  test('empty result → "(empty response)"', async () => {
+  test('empty result → reported as no answer, not delivered as one', async () => {
+    // Was "(empty response)", which reads like a reply. A turn that produced
+    // nothing is a failed turn and now says so, with a retry offered.
     const cs = await incoming(1003, 'EMPTY')
-    expect(finalReply(cs)).toContain('empty response')
+    expect(finalReply(cs)).toMatch(/No answer came back/i)
+  })
+  test('"No response requested." is never delivered as the answer (A2)', async () => {
+    // A CLI queue-layer artefact, found 11 times in one real session. The bridge
+    // took it as the turn's final text and posted it verbatim, so from the phone
+    // it read as the question being brushed off.
+    const cs = await incoming(1008, 'NORESP')
+    const reply = finalReply(cs) ?? ''
+    expect(reply).not.toContain('No response requested')
+    expect(reply).toMatch(/No answer came back/i)
+  })
+  test('…and the report carries a one-tap retry button', async () => {
+    const cs = await incoming(1009, 'NORESP')
+    const withKb = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard)
+    expect(withKb).toBeTruthy()
+    const btn = withKb!.payload.reply_markup.inline_keyboard[0][0]
+    expect(btn.text).toMatch(/retry/i)
+    // Deliberately a button, not an automatic resend: an agentic turn may already
+    // have edited files, and repeating that unasked is worse than the lost answer.
+    expect(String(btn.callback_data)).toStartWith('retry:')
   })
   test('is_error result is still delivered (the error text)', async () => {
     const cs = await incoming(1004, 'ERROR')
@@ -355,4 +376,54 @@ describe('token lock (one poller per bot token)', () => {
     await new Promise(r => setTimeout(r, 200))
     expect(bridge._lockHolder(tmpLock)).toBeUndefined()
   }, 10000)
+})
+
+describe('session binding survives a run that never completes (A5)', () => {
+  test('the id from the init event is persisted even when no result arrives', async () => {
+    // HANG emits `init` and then never produces a result, so the turn dies at the
+    // watchdog with res.sessionId undefined. Before the fix nothing reached disk,
+    // and the next message in that topic started a brand-new session — which is
+    // exactly what /stop on a topic's first turn used to do, since its guard
+    // returns before the line that persists.
+    await incoming(1050, 'HANG')
+    const state = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+    expect(state.sessions['1050:main']?.sessionId).toBeTruthy()
+  }, 8000)
+
+  test('a passthrough command still never binds the topic', async () => {
+    // The mirror image: /usage mints a throwaway session, and binding a topic to it
+    // would strand the real conversation. Persisting on init must stay opt-in.
+    await incoming(1051, '/usage')
+    const state = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+    expect(state.sessions['1051:main']?.sessionId).toBeUndefined()
+  }, 8000)
+})
+
+describe('mid-turn text is no longer deleted (A1)', () => {
+  test('a substantive block written mid-turn is delivered, not just the sign-off', async () => {
+    // The reported shape: the model answers, keeps working, then signs off — and
+    // only the sign-off reached the phone, which is what made replies read as
+    // evasive. Measured fleet-wide: 48% of turns that produced text produced more
+    // than one block.
+    const cs = await incoming(1060, 'MIDTEXT')
+    const texts = sends(cs).map(c => String(c.payload.text ?? ''))
+    expect(texts.some(t => t.includes('Timing'))).toBe(true)        // the answer arrived
+    expect(texts.some(t => t.includes('report the final ranked'))).toBe(true)  // and the sign-off
+  }, 8000)
+
+  test('the run record is kept, so nothing the model said is gone', async () => {
+    const cs = await incoming(1061, 'MIDTEXT')
+    // The progress message is edited into a record instead of being deleted…
+    const edits = cs.filter(c => c.method === 'editMessageText').map(textOf)
+    expect(edits.some(t => t.includes('What ran'))).toBe(true)
+    // …and it is NOT deleted.
+    expect(cs.some(c => c.method === 'deleteMessage')).toBe(false)
+  }, 8000)
+
+  test('an ordinary turn still cleans up its progress message', async () => {
+    // Keeping the record for every trivial turn would just be clutter, so the
+    // default only keeps it when it carries something the reply does not.
+    const cs = await incoming(1062, 'hello there')
+    expect(cs.some(c => c.method === 'deleteMessage')).toBe(true)
+  }, 8000)
 })

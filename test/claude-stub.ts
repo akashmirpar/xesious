@@ -7,10 +7,15 @@
  * deterministic output.
  *
  * Scenarios (the first whitespace-delimited word of the prompt):
- *   EMPTY  → init + a successful result with empty text  → bridge shows "(empty response)"
+ *   EMPTY  → init + a successful result with empty text  → bridge reports "no answer"
+ *   NORESP → init + a result whose whole text is "No response requested." — the CLI
+ *            queue-layer artefact that used to be posted verbatim as the reply
  *   ERROR  → init + result with is_error:true            → bridge marks the turn failed
  *   HANG   → init, then sleep past the test's timeout     → exercises the SIGKILL path
  *   TOOLS  → init + two tool_use steps + success
+ *   MIDTEXT→ init + a substantive text block + a tool_use + a closing sign-off,
+ *            i.e. the shape where the answer is written mid-turn and the bridge
+ *            used to deliver only the sign-off
  *   (else) → init + one Bash tool_use + success
  *
  * Every successful result echoes what the stub was invoked with, in letters-only
@@ -53,8 +58,19 @@ async function main() {
     return
   }
   if (scenario === 'EMPTY') { result({ result: '' }); return }
+  if (scenario === 'NORESP') { result({ result: 'No response requested.' }); return }
   if (scenario === 'ERROR') {
     emit({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: sessionId, result: 'boom' })
+    return
+  }
+  if (scenario === 'MIDTEXT') {
+    const answer = 'Timing: the sweep has about one minute left, 160 of 245 done. ' +
+      'The wallet fetch already finished, 2,874 trades. '.repeat(4)
+    emit({ type: 'assistant', message: { content: [{ type: 'text', text: answer }] } })
+    emit({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'sleep 0' } }] } })
+    const signoff = "I'll report the final ranked sweep when the monitor fires."
+    emit({ type: 'assistant', message: { content: [{ type: 'text', text: signoff }] } })
+    result({ result: signoff })
     return
   }
   if (scenario === 'TOOLS') {

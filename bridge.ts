@@ -30,7 +30,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import {
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
-  parseStreamLine, type Step, THINKING, conflictAdvice,
+  parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock,
   needsRich, hasRtl, sanitizeProse,
   normalizeMode as libNormalizeMode,
   permissionArgs as libPermissionArgs,
@@ -91,6 +91,14 @@ const CLAUDE_TIMEOUT_MS = Number(process.env.TG_CLAUDE_TIMEOUT_MS || 30 * 60 * 1
 // backstop for a SIGTERM that lands mid-run — and for the hung-child case, where
 // the child never exits at all.
 const DRAIN_MAX_MS = Number(process.env.TG_DRAIN_MAX_MS || 5 * 60 * 1000)
+
+// What becomes of the live progress message when a run ends.
+//   auto (default) — keep it when the turn said things that are not in the reply,
+//                    delete it otherwise, so a simple turn leaves no clutter
+//   keep / off     — always / never
+// This is what makes mid-turn text safe to route into the status: nothing the
+// model said is thrown away, it is one tap behind the record of the run.
+const PROGRESS_KEEP = (process.env.TG_PROGRESS_KEEP || 'auto').toLowerCase()
 
 // How long to wait out a polling 409, and how many rounds may still be blamed on
 // our own expiring long-poll. 40s clears the ~30s server-side reservation; two
@@ -440,7 +448,7 @@ function enqueue<T>(key: string, task: () => Promise<T>): Promise<T> {
 // Run the Claude Code CLI for one prompt against a topic's session.
 // ---------------------------------------------------------------------------
 
-interface ClaudeResult { text: string; sessionId?: string; isError: boolean }
+interface ClaudeResult { text: string; sessionId?: string; isError: boolean; noAnswer?: boolean; blocks?: string[] }
 
 // The permission postures the bridge offers, in ascending autonomy. `auto` routes
 // each tool call through Claude's classifier (blocks the irreversible/destructive
@@ -480,12 +488,16 @@ function voiceEnv(): NodeJS.ProcessEnv {
 // toolStep, the Step type and both status renderers live in ./lib. renderSteps and
 // renderStepsHtml there take progressDetail as a parameter; bind this process's
 // PROGRESS_DETAIL here.
-const renderSteps = (steps: Step[], total: number) => libRenderSteps(steps, total, { progressDetail: PROGRESS_DETAIL })
+const renderSteps = (steps: Step[], total: number, headline?: string) => libRenderSteps(steps, total, { progressDetail: PROGRESS_DETAIL, headline })
 const renderStepsHtml = (steps: Step[]) => libRenderStepsHtml(steps, { progressDetail: PROGRESS_DETAIL })
 
 // Run a prompt with streaming output, editing a single "status" message in the
 // topic to show live tool-step progress, then return the final result.
-async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL): Promise<ClaudeResult> {
+// onInit fires as soon as the CLI announces its session id, before the turn
+// finishes. Opt-in per caller and NOT done unconditionally here, because
+// handlePassthrough must never bind a topic to the throwaway session that /usage
+// and friends mint — see the note on that function.
+async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL, onInit?: (sessionId: string) => void): Promise<ClaudeResult> {
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs(mode)]
   if (TELEGRAM_PROFILE.trim()) args.push('--append-system-prompt', TELEGRAM_PROFILE)
   if (resumeId) args.push('--resume', resumeId)
@@ -529,6 +541,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
 
   return await new Promise<ClaudeResult>(resolve => {
     let buf = '', err = '', finalText = '', sessionId: string | undefined, isError = false, got = false
+    const textBlocks: string[] = []
     console.log(`[claude] stream in ${cwd}${resumeId ? ` (resume ${resumeId.slice(0, 8)})` : ' (new)'}`)
     // stdin = 'ignore' (/dev/null) so claude gets immediate EOF instead of waiting
     // for piped input (it otherwise warns "no stdin data received in 3s" and can
@@ -545,8 +558,14 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
         // Classification lives in ./lib (parseStreamLine); the side effects stay here.
         for (const ev of parseStreamLine(line, { progressDetail: PROGRESS_DETAIL })) {
           if (ev.kind === 'step') { steps.push(ev.step); dirty = true }
+          else if (ev.kind === 'text') {
+            // Keep every block for the promotion decision, and show it in the
+            // progress message so it is never merely gone.
+            textBlocks.push(ev.text)
+            steps.push({ label: '💬 Said', detail: ev.text }); dirty = true; void editStatus()
+          }
           else if (ev.kind === 'result') { got = true; sessionId = ev.sessionId; isError = ev.isError; finalText = ev.text }
-          else if (ev.kind === 'init') { sessionId ||= ev.sessionId }
+          else if (ev.kind === 'init') { if (!sessionId) { sessionId = ev.sessionId; try { onInit?.(ev.sessionId) } catch {} } }
         }
       }
       void editStatus()
@@ -556,14 +575,33 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
       activeRuns.delete(key)
       if (status) {
         pending = pending.filter(p => !(p.chat === ctx.chat!.id && p.id === status.message_id)); saveState()
-        await ctx.api.deleteMessage(ctx.chat!.id, status.message_id).catch(() => {})
+        // Keep the progress message as the record of the run when it holds
+        // something the reply does not. Deleting it the instant the answer lands
+        // is why the reasoning was unavailable BOTH during and after a run — on a
+        // phone the user is usually not watching in real time.
+        const carriesMore = textBlocks.length > 1 || (textBlocks.length === 1 && !res.text.includes(textBlocks[0]))
+        const keep = PROGRESS_KEEP === 'keep' || (PROGRESS_KEEP !== 'off' && carriesMore)
+        if (keep && steps.length) {
+          const body = renderSteps(steps.slice(-12), steps.length, RUN_RECORD)
+          await ctx.api.raw.editMessageText({ chat_id: ctx.chat!.id, message_id: status.message_id, rich_message: { markdown: body } })
+            .catch(async () => { await ctx.api.editMessageText(ctx.chat!.id, status.message_id, renderStepsHtml(steps.slice(-12)), { parse_mode: 'HTML' }).catch(() => {}) })
+        } else {
+          await ctx.api.deleteMessage(ctx.chat!.id, status.message_id).catch(() => {})
+        }
       }
       resolve(res)
     }
     child.on('error', e => void finish({ text: `Failed to launch ${CLAUDE_BIN}: ${e}`, isError: true }))
     child.on('close', code => {
       console.log(`[claude] done (exit ${code}, ${steps.length} steps)`)
-      if (got) void finish({ text: finalText || (isError ? '(claude error)' : '(empty response)'), sessionId, isError })
+      if (got) {
+        // A turn that produced no answer is a failed turn, not a reply. Both the
+        // empty result and the CLI queue layer's "No response requested." land
+        // here; delivering either verbatim is what made questions look ignored.
+        const noAnswer = !isError && isNonAnswer(finalText)
+        if (noAnswer) console.error(`[warn] no answer for ${key}: ${JSON.stringify(finalText.slice(0, 60))}`)
+        void finish({ text: finalText || (isError ? '(claude error)' : ''), sessionId, isError, noAnswer, blocks: textBlocks })
+      }
       else void finish({ text: `Could not parse Claude output.\n\n${(err || `exit ${code}`).slice(-1500)}`, isError: true })
     })
   })
@@ -949,6 +987,30 @@ async function speakAnswer(ctx: Context, threadId: number | undefined, text: str
   } finally { rmSync(dir, { recursive: true, force: true }) }
 }
 
+// Prompts kept so a "no answer" can be retried with one tap. In memory only and
+// capped: a retry after a restart is not worth persisting state for, and the
+// button says so rather than silently doing nothing.
+const retryPrompts = new Map<string, { key: string; threadId?: number; prompt: string }>()
+const RETRY_MAX = 50
+
+// A turn that came back with nothing is reported as such, with the offer to run it
+// again. Deliberately a button rather than an automatic resend: the turn may
+// already have edited files or run commands, and repeating those without being
+// asked is worse than the missing answer.
+async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: string, prompt: string): Promise<void> {
+  const opts: any = threadId ? { message_thread_id: threadId } : {}
+  const msg = await ctx.api.sendMessage(ctx.chat!.id,
+    '⚠️ No answer came back for that message. Nothing was lost — tap to send it again.',
+    { ...opts, reply_markup: { inline_keyboard: [[{ text: '🔁 Retry', callback_data: 'retry:pending' }]] } }
+  ).catch(() => null)
+  if (!msg) return
+  if (retryPrompts.size >= RETRY_MAX) retryPrompts.delete(retryPrompts.keys().next().value as string)
+  retryPrompts.set(String(msg.message_id), { key, threadId, prompt })
+  await ctx.api.editMessageReplyMarkup(ctx.chat!.id, msg.message_id, {
+    reply_markup: { inline_keyboard: [[{ text: '🔁 Retry', callback_data: `retry:${msg.message_id}` }]] },
+  }).catch(() => {})
+}
+
 async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string): Promise<void> {
   const cwd = resolveCwd(ctx, threadId)
   // If this topic has a live link, the shared link is the source of truth for the
@@ -956,13 +1018,34 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   // vice-versa). Otherwise use the topic's own stored id.
   const linked = linkForKey(key)
   const resumeId = linked?.link.sessionId ?? sessions[key]?.sessionId
+  // Bind the session the moment the CLI announces it, not only when the turn
+  // completes. The completion path below is guarded by `stopped`, and that guard
+  // returns BEFORE the line that persists — so a run killed with /stop on a
+  // topic's very first turn wrote nothing to disk, and the next message started a
+  // brand-new session with no history. That is the reported "after /stop the bot
+  // doesn't know the history". The id is available from the init event at the
+  // start of the run, so there is no reason to wait for the end of it.
+  const bindSession = (sessionId: string) => {
+    sessions[key] = { ...sessions[key], cwd, sessionId, updated: new Date().toISOString() }
+    saveState()
+    if (linked) { const l = loadLinks(); if (l[linked.uuid]) { l[linked.uuid].sessionId = sessionId; saveLinks(l) } }
+  }
   try {
-    const res = await runStreaming(ctx, threadId, key, prompt, cwd, resumeId, mode ?? modeFor(key), modelFor(key))
+    const res = await runStreaming(ctx, threadId, key, prompt, cwd, resumeId, mode ?? modeFor(key), modelFor(key), bindSession)
     if (stopped.has(key)) { stopped.delete(key); return } // killed via /stop — status already cleared, no reply
-    if (res.sessionId) {
-      sessions[key] = { ...sessions[key], cwd, sessionId: res.sessionId, updated: new Date().toISOString() }; saveState()
-      if (linked) { const l = loadLinks(); if (l[linked.uuid]) { l[linked.uuid].sessionId = res.sessionId; saveLinks(l) } }
+    // Still persist on completion: a resumed turn reports the same id, and this
+    // refreshes `updated`. Binding already happened above for a fresh session.
+    if (res.sessionId) bindSession(res.sessionId)
+    if (res.noAnswer) {
+      await sendNoAnswer(ctx, threadId, key, prompt)
+      return
     }
+    // When the turn's closing block only promises future work or refers to work
+    // the user never saw, deliver the substantive block before it as well. The
+    // rest of the turn's text is in the run record above, so this is an
+    // enhancement rather than the mechanism: a miss costs a tap, not a message.
+    const promoted = promoteBlock(res.blocks ?? [], res.text)
+    if (promoted) await deliver(ctx, threadId, promoted)
     await deliver(ctx, threadId, res.text)
     await flushOutbox(ctx, threadId, cwd)
     // Speak the answer too when this topic is in voice mode.
@@ -1479,6 +1562,16 @@ bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   if (!isAllowed(ctx)) { await ctx.answerCallbackQuery({ text: 'Not authorized.', show_alert: true }).catch(() => {}); return }
   const key = keyFor(ctx.chat!.id, ctx.callbackQuery.message?.message_thread_id)
+  if (data.startsWith('retry:')) {
+    const rec = retryPrompts.get(data.slice(6))
+    if (!rec) { await ctx.answerCallbackQuery({ text: 'That request has expired — send it again.', show_alert: true }).catch(() => {}); return }
+    retryPrompts.delete(data.slice(6))
+    await ctx.answerCallbackQuery({ text: 'Retrying…' }).catch(() => {})
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {})   // one tap only
+    void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt))
+      .catch(e => console.error(`[error] retry ${rec.key}: ${e}`))
+    return
+  }
   if (data.startsWith('mode:')) {
     const m = normalizeMode(data.slice(5))
     if (!m) { await ctx.answerCallbackQuery({ text: 'Unknown mode.' }).catch(() => {}); return }
