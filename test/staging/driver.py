@@ -56,8 +56,43 @@ CASES = [
 
 
 def is_status(text: str) -> bool:
-    """The bridge's transient '💭 thinking…' status (or an empty/blank line), not an answer."""
+    """The bridge's transient '💭 Thinking…' status (or an empty/blank line), not an answer."""
     return (not text.strip()) or ("thinking" in text.lower()) or text.strip().startswith("💭")
+
+
+def rich_text(msg) -> str:
+    """Flatten a Bot API 10.1 rich message into plain text, or '' if it isn't one.
+
+    A rich reply arrives with `.message` EMPTY and its content in `.rich_message`, a
+    tree of Instant-View PageBlocks. Read it here or the whole rich path — every
+    table, formula and task list the bridge sends — is invisible to this tier and
+    reads as a timeout. Walks the to_dict() form rather than enumerating the
+    PageBlock*/RichText* subclasses, so a block type we haven't seen still yields
+    its text.
+    """
+    rm = getattr(msg, "rich_message", None)
+    if not rm:
+        return ""
+    out = []
+
+    def walk(o):
+        if isinstance(o, str):
+            out.append(o)
+        elif isinstance(o, dict):
+            for k, v in o.items():
+                if k != "_":            # the type marker, not content
+                    walk(v)
+        elif isinstance(o, (list, tuple)):
+            for v in o:
+                walk(v)
+
+    walk(rm.to_dict() if hasattr(rm, "to_dict") else rm)
+    return " ".join(t for t in out if t.strip())
+
+
+def reply_text(msg) -> str:
+    """What the user actually sees, whichever transport the bridge chose."""
+    return (msg.message or "") or rich_text(msg)
 
 
 async def send_and_wait(client, bot, prompt: str):
@@ -66,7 +101,7 @@ async def send_and_wait(client, bot, prompt: str):
 
     @client.on(events.NewMessage(from_users=bot))
     async def handler(ev):
-        t = ev.message.message or ""
+        t = reply_text(ev.message)
         if is_status(t):
             return
         replies.append(t)
@@ -130,7 +165,32 @@ async def feature_mode_enforcement(client, bot):
         rm_canary()  # clean up the artifact we created — leave the disk as we found it
 
 
-FEATURE_TESTS = [feature_mode_enforcement]
+async def feature_rich_table(client, bot):
+    """A table must arrive as a NATIVE rich message with its cells and its prices
+    intact. Covers both halves of the rich-messages work: needsRich routing a table
+    to sendRichMessage, and escapeMoneyDollars stopping Telegram from pairing the
+    dollar signs and eating everything between two prices as a LaTeX span."""
+    prompt = (
+        "Reply with ONLY a markdown table, no preamble and no commentary. "
+        "Three columns: Item, Price, Note. Three rows exactly: "
+        "Widget with price $390B and note the $5B/year figure; "
+        "Gadget with price $467,095 and note approximately $50 each; "
+        "Doohickey with price $12 and note none."
+    )
+    replies = await _show(client, bot, prompt)
+    blob = " ".join(replies)
+
+    missing = [c for c in ("Item", "Price", "Widget", "Gadget", "Doohickey", "390B", "467,095")
+               if c not in blob]
+    dollars = blob.count("$")
+    leaked = "\\$" in blob
+    ok = not missing and dollars >= 4 and not leaked
+    detail = (f"missing cells={missing or 'none'}; '$' surviving={dollars} (want >=4); "
+              f"visible '\\$' escape leaked={leaked}")
+    return ("rich table delivered natively, cells and prices intact", ok, detail)
+
+
+FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table]
 
 
 async def main():
