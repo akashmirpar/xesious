@@ -154,6 +154,11 @@ OUT=$(stop_own "$DIR_A" TERM 2>&1)
 sleep 0.3
 case "$OUT" in *"signalled TERM -> pid $VICTIM"*) ok "signalled our own bun" ;;
                 *) no "did not signal our own bun — output: $OUT" ;; esac
+# A pid we just signalled is already exiting, so owns_pid can no longer prove it
+# was ours — without an explicit exclusion it gets re-reported as "not provably
+# mine", naming the very process the line above says we killed.
+case "$OUT" in *"skipped pid $VICTIM"*) no "a pid we signalled was ALSO reported as skipped" ;;
+                *) ok "a signalled pid is not also reported as skipped" ;; esac
 if kill -0 "$VICTIM" 2>/dev/null; then no "our bun should have been signalled"; else ok "our bun is gone"; fi
 if [ -n "$FOREIGN" ]; then
   case "$OUT" in *"skipped pid $FOREIGN"*) ok "declined the foreign bun, and said so" ;;

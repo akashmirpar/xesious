@@ -152,14 +152,25 @@ log_verdict() {
 # Prints one line per pid it signals, and per pid it declines to, so a redeploy
 # that quietly does nothing says why instead of looking like it worked.
 stop_own() {
-  local dir="${1:-}" sig="${2:-TERM}" p signalled=0
+  local dir="${1:-}" sig="${2:-TERM}" p signalled="" n=0
   for p in $(own_pids bun "$dir"); do
-    kill "-$sig" "$p" 2>/dev/null && { echo "[stop] signalled $sig -> pid $p ($dir)"; signalled=$((signalled + 1)); }
+    if kill "-$sig" "$p" 2>/dev/null; then
+      echo "[stop] signalled $sig -> pid $p ($dir)"
+      signalled="$signalled $p"; n=$((n + 1))
+    fi
   done
   # Report what was visible but rejected — that is where a cross-user kill would
   # have happened before, so it is worth saying out loud rather than silently.
+  #
+  # Skip anything we just signalled. A process we TERM'd is already exiting by
+  # the time this loop runs, so owns_pid can no longer prove it was ours and it
+  # would be reported as "not provably mine" — naming the very pid the line above
+  # says we killed. Harmless to the kill itself, but the output contradicted
+  # itself, and this reporting exists precisely so a redeploy's process decisions
+  # can be read at a glance.
   for p in $(pgrep -x bun 2>/dev/null); do
+    case " $signalled " in *" $p "*) continue ;; esac
     owns_pid "$p" "$dir" || echo "[stop] skipped pid $p — not provably mine in $dir"
   done
-  [ "$signalled" -gt 0 ]
+  [ "$n" -gt 0 ]
 }
