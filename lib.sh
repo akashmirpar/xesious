@@ -127,7 +127,10 @@ tmux_own_sessions() {
   tmux list-panes -a -F '#{pane_pid} #{session_name}' 2>/dev/null | while read -r pane sess; do
     [ -n "$pane" ] && [ -n "$sess" ] || continue
     owns_pid "$pane" "$dir" || continue
-    tr '\0' ' ' < "/proc/$pane/cmdline" 2>/dev/null | grep -q 'bridge\.ts' || continue
+    # Match either wrapper shape. respawn.sh is the current supervisor; bridge.ts
+    # covers a session still running the older inline loop, which matters during a
+    # deploy — the session being torn down is always the PREVIOUS one.
+    tr '\0' ' ' < "/proc/$pane/cmdline" 2>/dev/null | grep -qE 'respawn\.sh|bridge\.ts' || continue
     printf '%s\n' "$sess"
   done
 }

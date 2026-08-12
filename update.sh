@@ -20,6 +20,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 DIR="$PWD"
 MAX_WAIT="${UPDATE_MAX_WAIT:-1800}"
 ON_BUSY="${UPDATE_ON_BUSY:-abort}"
+# Ceiling on waiting for a signalled bridge to finish draining. Slightly above the
+# bridge's own TG_DRAIN_MAX_MS default (5 min) so the bridge's cap fires first.
+DRAIN_WAIT="${UPDATE_DRAIN_WAIT:-330}"
 
 # busy(), own_pids(), stop_own(), wait_for_idle() and find_bun() live in lib.sh so
 # every deploy script selects processes the same way. The rule they enforce —
@@ -98,8 +101,21 @@ restart() {
   # Only ever signals processes proven to be ours AND in this directory, and says
   # which candidates it declined. The old loop matched on cwd alone, which is a
   # kernel accident rather than a check the moment this runs as root.
+  # Which pids are we actually waiting on? Capture them BEFORE signalling: the
+  # supervisor now brings a cleanly-exited bridge straight back, so "wait until no
+  # bridge is running" would never be true. A freshly respawned one has no
+  # in-flight work, and the session teardown below takes it with the wrapper.
+  local before p waited=0
+  before="$(own_pids bun "$DIR" | tr '\n' ' ')"
   stop_own "$DIR" TERM || say "no bridge of ours was running"
-  sleep 3
+  # The bridge now finishes and delivers in-flight runs on SIGTERM, which can take
+  # longer than the three seconds this used to sleep — and cutting it short would
+  # lose exactly the reply the drain exists to protect.
+  for p in $before; do
+    while [ -d "/proc/$p" ] && [ "$waited" -lt "$DRAIN_WAIT" ]; do sleep 1; waited=$((waited + 1)); done
+    if [ -d "/proc/$p" ]; then say "pid $p still draining after ${waited}s — tearing down anyway"
+    else say "pid $p drained and exited"; fi
+  done
   # Kill only the tmux session proven to be running OUR bridge. The old line was
   # `tmux kill-session -t "$SESSION"` — a bare name, with no owner or cwd check —
   # so a redeploy here tore down a same-user deployment in another directory.
