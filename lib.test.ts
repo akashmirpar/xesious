@@ -12,7 +12,7 @@ import {
   allowedModes, normalizeMode, permissionArgs,
   normalizeModel, MODEL_DEFAULT,
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
-  needsRich, hasRtl, escapeMoneyDollars, conflictAdvice,
+  needsRich, hasRtl, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   sanitizeProse, PROSE_RULES, isNonAnswer,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
@@ -690,5 +690,28 @@ describe('parseStreamLine keeps the resolved model id (C3)', () => {
   test('non-string values are ignored rather than stored', () => {
     const line = JSON.stringify({ type: 'system', subtype: 'init', session_id: 's3', model: 42 })
     expect(parseStreamLine(line, { progressDetail: false })[0]).toMatchObject({ model: undefined })
+  })
+})
+
+describe('normalizeEffort (C5)', () => {
+  test('every documented level is accepted, case-insensitively', () => {
+    for (const e of EFFORT_LEVELS) {
+      expect(normalizeEffort(e)).toBe(e)
+      expect(normalizeEffort(e.toUpperCase())).toBe(e)
+      expect(normalizeEffort(`  ${e} `)).toBe(e)
+    }
+  })
+  test('default / reset / clear / empty clear the override', () => {
+    for (const s of [EFFORT_DEFAULT, 'reset', 'clear', '', '   ']) expect(normalizeEffort(s)).toBe('')
+  })
+  test('anything else is rejected rather than passed to the CLI', () => {
+    // An unrecognised value would reach the CLI as a bad flag and fail every turn.
+    for (const s of ['turbo', 'highest', '9', 'medium-high']) expect(normalizeEffort(s)).toBeUndefined()
+  })
+  test('mirrors normalizeModel\'s contract', () => {
+    // Same three outcomes — value, '' to clear, undefined for unknown — so the two
+    // command handlers read the same way.
+    expect(typeof normalizeEffort('high')).toBe('string')
+    expect(normalizeEffort('nope')).toBeUndefined()
   })
 })

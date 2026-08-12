@@ -30,6 +30,7 @@ import { randomUUID, createHash } from 'node:crypto'
 import {
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
+  EFFORT_LEVELS, EFFORT_DEFAULT, normalizeEffort,
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
   needsRich, hasRtl, sanitizeProse,
@@ -90,6 +91,13 @@ const REQUIRE_MENTION = /^(1|true|yes)$/i.test(process.env.TG_REQUIRE_MENTION ||
 // watchdog, which SIGKILLed working turns and lost all their work — one real run
 // did 17+ minutes of continuous tool calls. The idle watchdog below is what
 // actually catches a hang, so this can be generous.
+// Fleet default for reasoning effort; a topic's /effort overrides it. Validated at
+// startup rather than passed through blindly — an unrecognised value would reach
+// the CLI as a bad flag and fail every turn in every topic.
+const EFFORT_TIER = normalizeEffort(process.env.TG_EFFORT ?? '') ?? (() => {
+  console.error(`[warn] TG_EFFORT="${process.env.TG_EFFORT}" is not one of ${EFFORT_LEVELS.join(', ')} — ignoring it`)
+  return ''
+})()
 const CLAUDE_TIMEOUT_MS = Number(process.env.TG_CLAUDE_TIMEOUT_MS || 4 * 60 * 60 * 1000)
 // No stream event for this long means the child is hung rather than busy. It must
 // exceed the longest plausible single tool call: events arrive per tool call, and
@@ -250,6 +258,23 @@ const bypassDowngraded = (key: string) => modes[key] === 'bypass' && !ALLOW_BYPA
 // TG_MODEL, and empty TG_MODEL ⇒ the account default (no --model flag at all).
 let models: Record<string, string> = {}
 const modelFor = (key: string) => models[key] ?? MODEL
+
+// Per-topic reasoning effort, sticky like /mode and /model. Absent falls back to
+// TG_EFFORT; empty means pass no --effort and let the CLI decide.
+let efforts: Record<string, string> = {}
+const effortFor = (key: string) => efforts[key] ?? EFFORT_TIER
+const effortLabel = (key: string) => effortFor(key) || `${EFFORT_DEFAULT} → CLI default`
+function effortText(key: string): string {
+  return `Reasoning effort for this topic: ${effortLabel(key)}\n\n` +
+    `Higher spends more thinking per turn — better on hard questions, slower and dearer on easy ones.\n\n` +
+    `Tap to switch, or /effort <level>.`
+}
+function effortKeyboard(key: string) {
+  const cur = effortFor(key)
+  const rows = EFFORT_LEVELS.map(e => [{ text: `${e === cur ? '● ' : ''}${e}`, callback_data: `effort:${e}` }])
+  rows.push([{ text: `${cur === '' ? '● ' : ''}${EFFORT_DEFAULT}`, callback_data: `effort:${EFFORT_DEFAULT}` }])
+  return { inline_keyboard: rows }
+}
 // Per-topic voice mode (transcribe voice notes, speak answers). Toggle with /voice.
 // Per-topic voice: 'full' (speak the whole answer) or 'summary' (speak a short
 // summary). Absent falls back to TG_VOICE. Text is always the complete answer.
@@ -271,6 +296,7 @@ function loadState(): void {
       interruptMode = o.interruptMode ?? {}
       modes = o.modes ?? {}
       models = o.models ?? {}
+      efforts = o.efforts ?? {}
       voice = o.voice ?? {}
       // migrate old boolean state: true → 'full', false/other → off
       for (const k of Object.keys(voice)) { const v: any = voice[k]; if (v === true) voice[k] = 'full'; else if (v !== 'full' && v !== 'summary') delete voice[k] }
@@ -280,7 +306,7 @@ function loadState(): void {
 function saveState(): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true })
-    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models, voice }, null, 2))
+    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models, efforts, voice }, null, 2))
   } catch (e) { console.error(`[warn] could not write state: ${e}`) }
 }
 
@@ -519,11 +545,12 @@ const renderStepsHtml = (steps: Step[]) => libRenderStepsHtml(steps, { progressD
 // finishes. Opt-in per caller and NOT done unconditionally here, because
 // handlePassthrough must never bind a topic to the throwaway session that /usage
 // and friends mint — see the note on that function.
-async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL, onInit?: (sessionId: string) => void): Promise<ClaudeResult> {
+async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL, onInit?: (sessionId: string) => void, effort: string = EFFORT_TIER): Promise<ClaudeResult> {
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs(mode)]
   if (TELEGRAM_PROFILE.trim()) args.push('--append-system-prompt', TELEGRAM_PROFILE)
   if (resumeId) args.push('--resume', resumeId)
   if (model) args.push('--model', model)
+  if (effort) args.push('--effort', effort)
 
   const opts: any = threadId ? { message_thread_id: threadId } : {}
   // Status is machine chatter, not an answer — post and edit it silently so only
@@ -1123,7 +1150,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     if (linked) { const l = loadLinks(); if (l[linked.uuid]) { l[linked.uuid].sessionId = sessionId; saveLinks(l) } }
   }
   try {
-    const res = await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), bindSession)
+    const res = await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), bindSession, effortFor(key))
     if (stopped.has(key)) { stopped.delete(key); return } // killed via /stop — status already cleared, no reply
     // Still persist on completion: a resumed turn reports the same id, and this
     // refreshes `updated`. Binding already happened above for a fresh session.
@@ -1344,6 +1371,7 @@ bot.on('message', async ctx => {
       `/live — get a private link to a real-time voice call bound to this session\n` +
       `/mode [${MODES.join('|')}] — permission mode for this topic (tap to switch)${ALLOW_BYPASS ? '' : '; bypass exists but is disabled here'}\n` +
       `/model [${MODEL_ALIASES.join('|')}] — model for this topic (tap to switch)\n` +
+      `/effort [${EFFORT_LEVELS.join('|')}] — reasoning effort for this topic (tap to switch)\n` +
       `/plan <task> — one read-only turn: propose without editing\n` +
       `/logo bot|group — set the bot's avatar / this group's photo\n` +
       `/get <path> — send a file from this topic's directory back to you\n` +
@@ -1476,6 +1504,22 @@ bot.on('message', async ctx => {
     }).catch(e => console.error(`[warn] /mode: ${e}`))
     return
   }
+  if (cmd === '/effort') {
+    const arg = text.split(/\s+/)[1]
+    if (arg) {
+      const e = normalizeEffort(arg)
+      if (e === undefined) { await send(ctx, threadId, `Unknown effort "${arg}". One of: ${EFFORT_LEVELS.join(', ')}, or "${EFFORT_DEFAULT}".`); return }
+      if (e) efforts[key] = e; else delete efforts[key]
+      saveState()
+      await send(ctx, threadId, `🎚️ Reasoning effort for this topic: ${effortLabel(key)}`)
+      return
+    }
+    await ctx.api.sendMessage(ctx.chat.id, effortText(key), {
+      ...(threadId ? { message_thread_id: threadId } : {}),
+      reply_markup: effortKeyboard(key),
+    }).catch(e => console.error(`[warn] /effort: ${e}`))
+    return
+  }
   if (cmd === '/model') {
     const arg = text.split(/\s+/)[1]
     if (arg) {
@@ -1548,6 +1592,7 @@ bot.on('message', async ctx => {
       `session: ${e?.sessionId ?? '(none yet)'}\n` +
       `mode: ${modeFor(key)}${bypassDowngraded(key) ? ' (stored: bypass — disabled on this deployment)' : ''}\n` +
       `model: ${modelLine(key)}\n` +
+      `effort: ${effortLabel(key)}\n` +
       `voice: ${voiceMode(key)}\n\n` +
       `resume on the server:\n  cd "${e?.cwd ?? resolveCwd(ctx, threadId)}" && claude --continue`)
     return
@@ -1678,6 +1723,15 @@ bot.on('callback_query:data', async ctx => {
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})   // one tap only
     void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo))
       .catch(e => console.error(`[error] retry ${rec.key}: ${e}`))
+    return
+  }
+  if (data.startsWith('effort:')) {
+    const e = normalizeEffort(data.slice(7))
+    if (e === undefined) { await ctx.answerCallbackQuery({ text: 'Unknown effort.' }).catch(() => {}); return }
+    if (e) efforts[key] = e; else delete efforts[key]
+    saveState()
+    await ctx.answerCallbackQuery({ text: `Effort: ${effortLabel(key)}` }).catch(() => {})
+    await ctx.editMessageText(effortText(key), { reply_markup: effortKeyboard(key) }).catch(() => {})
     return
   }
   if (data.startsWith('mode:')) {
