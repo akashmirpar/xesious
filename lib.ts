@@ -834,6 +834,32 @@ export function htmlDocument(title: string, bodyHtml: string): string {
 export type FanoutMode = 'read' | 'write'
 export type FanoutPlanItem = { n: number; mode: FanoutMode; title: string; brief: string }
 
+// A short label for the whole fan-out, taken from the request itself. It goes in
+// every child topic's name so a group full of topics still reads as "these five
+// belong together" rather than as five unrelated conversations.
+export function fanoutGoalLabel(task: string, max = 34): string {
+  const flat = task.replace(/\s+/g, ' ').trim().replace(/^[/\\]\S+\s*/, '')
+  if (flat.length <= max) return flat.replace(/[.:;,]+$/, '')
+  return flat.slice(0, max - 1).replace(/\s+\S*$/, '').replace(/[.:;,]+$/, '') + '…'
+}
+
+// Topic names are capped at 128 characters, and the useful information is at both
+// ends — which fan-out this is, and which part. The title is what gets shortened.
+export function fanoutTopicName(goal: string, n: number, total: number, title: string): string {
+  const head = `🌿 ${goal} · ${n}/${total} `
+  const room = Math.max(8, 128 - head.length)
+  return head + (title.length <= room ? title : title.slice(0, room - 1) + '…')
+}
+
+// A tappable link to a topic. Only works for members of the group, which is exactly
+// who is reading. -100 is stripped because t.me/c/ uses the internal id.
+export function topicLink(chatId: number | string, threadId?: number): string | undefined {
+  if (threadId === undefined) return undefined
+  const internal = String(chatId).replace(/^-100/, '')
+  if (!/^\d+$/.test(internal)) return undefined
+  return `https://t.me/c/${internal}/${threadId}`
+}
+
 // The instruction handed to the planning turn. Kept next to the parser so the two
 // cannot drift — a format the model was never told about is the usual reason this
 // kind of thing returns nothing.

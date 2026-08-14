@@ -34,6 +34,7 @@ import {
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
+  fanoutGoalLabel, fanoutTopicName, topicLink,
   type FanoutPlanItem,
   frameUserMessage, attributionProfileLines,
   needsRich, hasRtl, sanitizeProse,
@@ -664,6 +665,10 @@ const FANOUT_MAX = Number(process.env.TG_FANOUT_MAX || 6)
 // by a model, and eight live children is roughly 2.4 GB on a box with 7.9 GB and no
 // swap. Batching is stated in the proposal rather than applied silently.
 const FANOUT_CONCURRENCY = Number(process.env.TG_FANOUT_CONCURRENCY || 3)
+// One of Telegram's six permitted topic colours. Purple, because the default topic
+// icon on this deployment is not, so a fan-out's parts stand out from ordinary
+// topics in a busy group.
+const FANOUT_TOPIC_COLOR = Number(process.env.TG_FANOUT_TOPIC_COLOR || 0xCB86DB)
 
 type FanoutChild = FanoutPlanItem & {
   topicId?: number
@@ -676,6 +681,7 @@ type FanoutChild = FanoutPlanItem & {
 }
 type Fanout = {
   id: string
+  goal: string
   parentKey: string
   parentThreadId?: number
   chatId: number
@@ -1496,8 +1502,13 @@ async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Pr
   // talking to that part's own session.
   let topicId: number | undefined
   try {
-    const t = await ctx.api.createForumTopic(f.chatId, `${child.n}. ${child.title}`.slice(0, 128),
-      TOPIC_ICON ? { icon_custom_emoji_id: TOPIC_ICON } : {})
+    // A distinct colour, deliberately NOT the deployment's usual topic icon: in a
+    // group with other work going on, fan-out children have to be tellable apart at
+    // a glance. icon_color is create-time only — editForumTopic cannot change it —
+    // so it has to be right here.
+    const t = await ctx.api.createForumTopic(f.chatId,
+      fanoutTopicName(f.goal, child.n, f.children.length, child.title),
+      { icon_color: FANOUT_TOPIC_COLOR })
     topicId = t.message_thread_id
   } catch (e) {
     console.error(`[fanout ${f.id}] could not create a topic for part ${child.n}: ${e}`)
@@ -1530,6 +1541,10 @@ async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Pr
   ].join('\n')
 
   await send(ctx, topicId, `🌿 Part ${child.n} of ${f.children.length} — ${child.title}\n\nTalk here to steer this part.`, true)
+  const link = topicLink(f.chatId, topicId)
+  await send(ctx, f.parentThreadId,
+    `▶ Part ${child.n}/${f.children.length}: ${child.title}` + (link ? `\n${link}` : ' (no link — topic could not be created)'),
+    true, f.askedBy)
   const jobKey = `${key}#fanout-${f.id}-${child.n}`
   child.jobKey = jobKey
   void enqueue(jobKey, () => handlePrompt(ctx, topicId, key, brief, undefined, undefined, false, true))
@@ -1566,12 +1581,24 @@ function fanoutBranchReport(f: Fanout): string {
 // history is the record of how the part was reached), and remove a worktree only if
 // git agrees it is clean. A dirty worktree holds uncommitted work, so it is left
 // alone and reported rather than forced away.
+// Closing is offered, not done. The parts' topics are where the working-out lives,
+// and deciding you are finished reading them is a judgement call the person makes,
+// not the bridge.
+async function offerCloseTopics(ctx: Context, f: Fanout): Promise<void> {
+  const open = f.children.filter(c => c.topicId !== undefined)
+  if (!open.length) return
+  await ctx.api.sendMessage(f.chatId,
+    `${open.length} part topic${open.length === 1 ? '' : 's'} from this fan-out are still open.`,
+    { ...destOpts({ threadId: f.parentThreadId, replyTo: f.askedBy }), disable_notification: true,
+      reply_markup: { inline_keyboard: [[{ text: '— Close the part topics —', callback_data: `fanc:${f.id}` }]] } },
+  ).catch(() => {})
+}
+
 async function cleanupFanout(ctx: Context, f: Fanout): Promise<void> {
   const kept: string[] = []
   for (const c of f.children) {
     if (c.topicId !== undefined) {
       await send(ctx, c.topicId, `✅ This part is finished and folded into the answer in the parent topic.`, true).catch(() => {})
-      await ctx.api.closeForumTopic(f.chatId, c.topicId).catch(() => {})
     }
     if (c.worktree) {
       try {
@@ -1604,6 +1631,7 @@ async function maybeSynthesise(ctx: Context, f: Fanout): Promise<void> {
   void enqueue(`${key}#fanout-synth-${f.id}`,
     () => handlePrompt(ctx, f.parentThreadId, key, preamble, undefined, f.askedBy, true, true))
     .then(() => cleanupFanout(ctx, f))
+    .then(() => offerCloseTopics(ctx, f))
     .catch(e => console.error(`[fanout ${f.id}] synthesis: ${e}`))
 }
 
@@ -2189,12 +2217,15 @@ bot.on('message', async ctx => {
       }
       const f: Fanout = {
         id: newJobId(), parentKey: key, parentThreadId: threadId, chatId: ctx.chat!.id,
-        askedBy: msg.message_id, task, synthesised: false,
+        askedBy: msg.message_id, task, goal: fanoutGoalLabel(task), synthesised: false,
         children: items.map(i => ({ ...i, status: 'pending' as const })),
       }
       fanouts.set(f.id, f)
-      await ctx.api.sendMessage(ctx.chat!.id, renderFanoutProposal(items, { cap: FANOUT_CONCURRENCY }), {
-        ...destOpts({ threadId, replyTo: msg.message_id }),
+      // Through telegramify with a parse mode: this text is markdown, and a raw
+      // sendMessage renders its asterisks and underscores literally.
+      await ctx.api.sendMessage(ctx.chat!.id,
+        telegramify(sanitizeProse(renderFanoutProposal(items, { cap: FANOUT_CONCURRENCY }), 'markdownv2'), 'escape'), {
+        ...destOpts({ threadId, replyTo: msg.message_id }), parse_mode: 'MarkdownV2',
         reply_markup: { inline_keyboard: [[
           { text: `— Run these ${items.length} —`, callback_data: `fan:${f.id}` },
           { text: '— Cancel —', callback_data: `fanx:${f.id}` },
@@ -2403,6 +2434,21 @@ bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   if (!isAllowed(ctx)) { await ctx.answerCallbackQuery({ text: 'Not authorized.', show_alert: true }).catch(() => {}); return }
   const key = keyFor(ctx.chat!.id, ctx.callbackQuery.message?.message_thread_id)
+  if (data.startsWith('fanc:')) {
+    const f = fanouts.get(data.slice(5))
+    if (!f) { await ctx.answerCallbackQuery({ text: 'That fan-out is no longer available.', show_alert: true }).catch(() => {}); return }
+    let closed = 0
+    for (const c of f.children) {
+      if (c.topicId === undefined) continue
+      // Closed, never deleted: the history is the record of how that part was
+      // reached, and it can be reopened.
+      const ok = await ctx.api.closeForumTopic(f.chatId, c.topicId).then(() => true).catch(() => false)
+      if (ok) closed++
+    }
+    await ctx.answerCallbackQuery({ text: closed ? `Closed ${closed} topic${closed === 1 ? '' : 's'}.` : 'Could not close them — the bot needs Manage Topics.' , show_alert: !closed }).catch(() => {})
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {})
+    return
+  }
   if (data.startsWith('fanr:')) {
     const f = fanouts.get(data.slice(5))
     if (!f) { await ctx.answerCallbackQuery({ text: 'That fan-out is no longer available.', show_alert: true }).catch(() => {}); return }

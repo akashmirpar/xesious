@@ -15,6 +15,7 @@ import {
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
+  fanoutGoalLabel, fanoutTopicName, topicLink,
   sanitizeProse, PROSE_RULES, isNonAnswer,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
@@ -989,5 +990,36 @@ describe('fan-out: what the synthesis turn is given', () => {
   })
   test('it asks for one answer, not a concatenation', () => {
     expect(buildSynthesisPreamble('t', parts)).toMatch(/[Dd]o not simply concatenate/)
+  })
+})
+
+describe('fan-out: telling the part topics apart in a busy group', () => {
+  test('the goal label is short, and cut on a word boundary', () => {
+    expect(fanoutGoalLabel('audit the deploy scripts')).toBe('audit the deploy scripts')
+    const long = fanoutGoalLabel('look into two separate things about this repository and report')
+    expect(long.length).toBeLessThanOrEqual(35)
+    expect(long).toMatch(/…$/)
+    expect(long).not.toMatch(/\s…$/)            // no dangling space before the ellipsis
+  })
+  test('a leading command is dropped from the label', () => {
+    expect(fanoutGoalLabel('/fanout check the tests')).toBe('check the tests')
+  })
+  test('the topic name says which fan-out and which part', () => {
+    const n = fanoutTopicName('audit the deploys', 2, 3, 'Survey the scripts')
+    expect(n).toContain('audit the deploys')
+    expect(n).toContain('2/3')
+    expect(n).toContain('Survey the scripts')
+  })
+  test('and stays inside Telegram\'s 128-character limit', () => {
+    const n = fanoutTopicName('g'.repeat(40), 1, 2, 't'.repeat(200))
+    expect(n.length).toBeLessThanOrEqual(128)
+    expect(n).toMatch(/…$/)                     // the title is what gets shortened
+  })
+  test('topic links point at the thread, with the -100 prefix stripped', () => {
+    expect(topicLink(-1003744389982, 57)).toBe('https://t.me/c/3744389982/57')
+  })
+  test('no thread, or a chat that cannot have one, yields no link', () => {
+    expect(topicLink(-1003744389982, undefined)).toBeUndefined()
+    expect(topicLink('@somechannel', 5)).toBeUndefined()
   })
 })
