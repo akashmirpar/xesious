@@ -817,6 +817,128 @@ export function htmlDocument(title: string, bodyHtml: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// fan-out: decompose a task, run the parts, put them back together
+// ---------------------------------------------------------------------------
+//
+// The division of labour here is the one lesson from the orphaned-background-work
+// item: DECOMPOSITION can be the model's job, but SPAWNING, TRACKING and REPORTING
+// have to be the bridge's. A one-shot turn that launches its own children orphans
+// them by construction — it exits, and they are gone.
+//
+// So the model is asked for a plan in a format the bridge can parse, the human
+// confirms it, and the bridge does everything after that. The plan format is
+// deliberately line-based rather than JSON: a model that wraps its answer in prose,
+// or emits a trailing comma, should still produce a usable plan rather than a parse
+// error, and the fields here are short enough that quoting never comes up.
+
+export type FanoutMode = 'read' | 'write'
+export type FanoutPlanItem = { n: number; mode: FanoutMode; title: string; brief: string }
+
+// The instruction handed to the planning turn. Kept next to the parser so the two
+// cannot drift — a format the model was never told about is the usual reason this
+// kind of thing returns nothing.
+export function fanoutPlanPrompt(task: string, max: number): string {
+  return [
+    `Break the following task into at most ${max} independent parts that can run in parallel.`,
+    '',
+    'Rules for the split:',
+    '- Each part must stand alone: it cannot see the others or depend on their output.',
+    '- Prefer fewer, larger parts. Two good parts beat six thin ones.',
+    "- Mark a part `write` ONLY if it edits files; anything that just reads, searches or investigates is `read`.",
+    '- If the task genuinely cannot be split, return a single part.',
+    '',
+    'Answer with ONLY these lines and nothing else — no preamble, no code fence:',
+    'FANOUT <n> | <read|write> | <short title> | <the full instruction for that part>',
+    '',
+    'The task:',
+    task,
+  ].join('\n')
+}
+
+// Parse whatever the planning turn produced. Tolerant on purpose: anything that is
+// not a FANOUT line is ignored rather than treated as an error, because the common
+// failure is a model adding a sentence of preamble, not emitting a broken plan.
+export function parseFanoutPlan(text: string, opts?: { max?: number }): FanoutPlanItem[] {
+  const max = opts?.max ?? 8
+  const out: FanoutPlanItem[] = []
+  for (const raw of (text ?? '').split('\n')) {
+    const line = raw.trim().replace(/^[-*]\s*/, '')
+    const m = line.match(/^FANOUT\s*(\d+)?\s*\|\s*(read|write)\s*\|\s*([^|]+?)\s*\|\s*(.+)$/i)
+    if (!m) continue
+    const title = m[3].trim()
+    const brief = m[4].trim()
+    if (!title || !brief) continue
+    out.push({ n: out.length + 1, mode: m[2].toLowerCase() as FanoutMode, title, brief })
+    if (out.length >= max) break
+  }
+  return out
+}
+
+// What the human sees before anything is spawned. FEEDBACK.md asks for exactly
+// this: a confirmation showing the proposed split BEFORE it opens eight topics.
+export function renderFanoutProposal(items: FanoutPlanItem[], opts: { cap: number }): string {
+  const writes = items.filter(i => i.mode === 'write').length
+  const lines = items.map(i => `${i.n}. **${i.title}** _(${i.mode})_\n   ${i.brief}`)
+  const notes: string[] = []
+  if (items.length > opts.cap) {
+    // Never a silent cap. A plan that quietly runs half of itself reads as a plan
+    // that ran.
+    notes.push(`Running ${opts.cap} at a time; the rest start as those finish.`)
+  }
+  if (writes) notes.push(`${writes} part${writes === 1 ? '' : 's'} will edit files, each in its own git worktree.`)
+  return [
+    `Proposed split — ${items.length} part${items.length === 1 ? '' : 's'}:`,
+    '',
+    ...lines,
+    ...(notes.length ? ['', ...notes.map(n => `_${n}_`)] : []),
+  ].join('\n')
+}
+
+// The context handed to the synthesis turn.
+//
+// Two things this must not do. It must not silently drop a part that failed — a
+// summary that looks complete but is not is worse than an obvious gap — and it must
+// not blow the turn's context, which five long reports easily would. Each part gets
+// an allowance; what is cut is stated rather than trimmed away quietly.
+export function buildSynthesisPreamble(
+  task: string,
+  parts: { title: string; status: string; result?: string }[],
+  opts?: { perPart?: number },
+): string {
+  const budget = opts?.perPart ?? 4000
+  const done = parts.filter(p => p.status === 'done')
+  const failed = parts.filter(p => p.status !== 'done')
+  const body = done.map(p => {
+    const r = p.result ?? ''
+    const clipped = r.length > budget
+    return `### ${p.title}\n${clipped ? `${r.slice(0, budget)}\n\n[…truncated, ${r.length - budget} more characters]` : r}`
+  })
+  const head = [
+    `You asked for this to be split up and worked in parallel. The parts have finished.`,
+    `Original request: ${task}`,
+    '',
+    `${done.length} of ${parts.length} part${parts.length === 1 ? '' : 's'} completed.`,
+  ]
+  if (failed.length) {
+    head.push(
+      `The following did NOT complete, and their work is missing from what follows — ` +
+      `say so in your answer rather than presenting it as whole: ` +
+      failed.map(p => `${p.title} (${p.status})`).join('; '),
+    )
+  }
+  return [
+    ...head,
+    '',
+    'Results:',
+    '',
+    ...body,
+    '',
+    'Now write one answer to the original request, drawing on all of the above. ' +
+    'Do not simply concatenate the parts; resolve disagreements between them and say which part each conclusion came from.',
+  ].join('\n')
+}
+
+// ---------------------------------------------------------------------------
 // stream-json parsing
 // ---------------------------------------------------------------------------
 

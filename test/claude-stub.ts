@@ -77,6 +77,20 @@ async function main() {
     setTimeout(() => process.exit(0), 60_000)
     return
   }
+  // A planning turn: the bridge asks for a split and parses FANOUT lines back.
+  if (/Break the following task into at most/.test(prompt)) {
+    result({ result: 'Here is a sensible split:\nFANOUT 1 | read | Survey it | Look at everything and report\nFANOUT 2 | write | Change it | Edit the files that need it' })
+    return
+  }
+  if (/You are one part of a task that was split up/.test(prompt)) {
+    const part = prompt.match(/Your part: ([^\n]+)/)?.[1] ?? 'unknown'
+    result({ result: `PARTDONE ${part}` })
+    return
+  }
+  if (/the parts have finished/i.test(prompt)) {
+    result({ result: 'SYNTHESIS: combined answer' })
+    return
+  }
   if (scenario === 'BGPROC') {
     // Stand in for a tool call that backgrounds work: `nohup collector.py &`
     // returns instantly while the real job keeps running. Killing only this

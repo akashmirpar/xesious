@@ -14,6 +14,7 @@ import {
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
+  parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
   sanitizeProse, PROSE_RULES, isNonAnswer,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
@@ -898,5 +899,95 @@ describe('needsReplyLink — quote the question only when it is ambiguous', () =
     const a2 = needsReplyLink({ replyTo: 2, latestIncoming: 2, inFlight: 1, answersSince: 1 })
     expect(a1).toBe(true)
     expect(a2).toBe(true)   // was false before: the reader had to infer it
+  })
+})
+
+describe('fan-out: parsing the plan', () => {
+  const plan = [
+    'Here is how I would split it:',
+    'FANOUT 1 | read | Survey the API | Read every route file and list the endpoints',
+    'FANOUT 2 | write | Add the tests | Write unit tests for the auth module',
+    '',
+  ].join('\n')
+
+  test('reads the parts and ignores the prose around them', () => {
+    const items = parseFanoutPlan(plan)
+    expect(items).toHaveLength(2)
+    expect(items[0]).toMatchObject({ n: 1, mode: 'read', title: 'Survey the API' })
+    expect(items[1]).toMatchObject({ n: 2, mode: 'write' })
+    expect(items[1].brief).toContain('auth module')
+  })
+  test('tolerates bullets, casing and a missing number', () => {
+    const items = parseFanoutPlan('- fanout | READ | T | B\n* FANOUT|write|U|C')
+    expect(items).toHaveLength(2)
+    expect(items[0].mode).toBe('read')
+    expect(items[1].mode).toBe('write')
+    expect(items.map(i => i.n)).toEqual([1, 2])      // renumbered in order
+  })
+  test('a plan that came back as prose yields nothing, not a wrong plan', () => {
+    expect(parseFanoutPlan('I think we should look at three things.')).toEqual([])
+    expect(parseFanoutPlan('')).toEqual([])
+  })
+  test('malformed lines are skipped rather than half-parsed', () => {
+    expect(parseFanoutPlan('FANOUT 1 | read | onlytitle')).toEqual([])
+    expect(parseFanoutPlan('FANOUT 1 | sideways | T | B')).toEqual([])
+    expect(parseFanoutPlan('FANOUT 1 | read |  | B')).toEqual([])
+  })
+  test('the cap is honoured', () => {
+    const many = Array.from({ length: 12 }, (_, i) => `FANOUT ${i} | read | T${i} | B${i}`).join('\n')
+    expect(parseFanoutPlan(many, { max: 4 })).toHaveLength(4)
+  })
+  test('the prompt tells the model the exact format the parser expects', () => {
+    // A format the model was never told about is the usual reason this returns
+    // nothing, so the two live next to each other and are checked together.
+    const p = fanoutPlanPrompt('do a thing', 5)
+    expect(p).toContain('FANOUT <n> | <read|write> | <short title> |')
+    expect(p).toContain('at most 5')
+    expect(parseFanoutPlan('FANOUT 1 | read | T | B')).toHaveLength(1)
+  })
+})
+
+describe('fan-out: the proposal shown before anything runs', () => {
+  const items = parseFanoutPlan('FANOUT 1 | read | A | do a\nFANOUT 2 | write | B | do b')
+  test('lists every part with its mode', () => {
+    const out = renderFanoutProposal(items, { cap: 3 })
+    expect(out).toContain('**A**')
+    expect(out).toContain('_(write)_')
+    expect(out).toContain('2 part')
+  })
+  test('says when parts will edit files, and that they are isolated', () => {
+    expect(renderFanoutProposal(items, { cap: 3 })).toMatch(/1 part will edit files.*worktree/)
+  })
+  test('never caps silently', () => {
+    const many = parseFanoutPlan(Array.from({ length: 6 }, (_, i) => `FANOUT ${i} | read | T${i} | B`).join('\n'))
+    expect(renderFanoutProposal(many, { cap: 3 })).toMatch(/Running 3 at a time/)
+  })
+})
+
+describe('fan-out: what the synthesis turn is given', () => {
+  const parts = [
+    { title: 'A', status: 'done', result: 'found alpha' },
+    { title: 'B', status: 'done', result: 'found beta' },
+  ]
+  test('carries the original request and every result', () => {
+    const out = buildSynthesisPreamble('the original ask', parts)
+    expect(out).toContain('the original ask')
+    expect(out).toContain('found alpha')
+    expect(out).toContain('found beta')
+    expect(out).toContain('2 of 2 parts completed')
+  })
+  test('a failed part is NAMED, not quietly dropped', () => {
+    // A summary that looks complete but is not is worse than an obvious gap.
+    const out = buildSynthesisPreamble('t', [...parts, { title: 'C', status: 'stopped' }])
+    expect(out).toContain('2 of 3 parts completed')
+    expect(out).toMatch(/did NOT complete/)
+    expect(out).toContain('C (stopped)')
+  })
+  test('a long result is truncated visibly, not silently', () => {
+    const out = buildSynthesisPreamble('t', [{ title: 'A', status: 'done', result: 'x'.repeat(9000) }], { perPart: 100 })
+    expect(out).toMatch(/truncated, 8900 more characters/)
+  })
+  test('it asks for one answer, not a concatenation', () => {
+    expect(buildSynthesisPreamble('t', parts)).toMatch(/[Dd]o not simply concatenate/)
   })
 })

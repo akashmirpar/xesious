@@ -19,6 +19,10 @@ const TMP = mkdtempSync(join(tmpdir(), 'xesious-e2e-'))
 const STATE_FILE = join(TMP, 'state.json')
 process.env.TELEGRAM_BOT_TOKEN = '123:test-token'
 process.env.TG_ALLOWED_USERS = '1'
+// A forum group for the fan-out cases. isAllowed() requires a non-private chat to be
+// listed, so without this the fixture is silently rejected — which is the allowlist
+// working, not a bug.
+process.env.TG_ALLOWED_CHATS = '-100777'
 process.env.CLAUDE_BIN = join(import.meta.dir, 'claude-stub.ts')
 process.env.TG_SESSIONS_BASE = join(TMP, 'sessions')
 process.env.TG_STATE_FILE = STATE_FILE
@@ -919,4 +923,83 @@ describe('a finished background job is carried into the next turn', () => {
   test('an ordinary turn with no background history carries nothing', async () => {
     expect(finalReply(await incoming(1181, 'just a question'))).toContain('noBgResult')
   }, 10000)
+})
+
+describe('fan-out', () => {
+  const btns = (c: any) => c.payload?.reply_markup?.inline_keyboard?.[0] ?? []
+  // A forum group, since each part needs its own topic to be steerable.
+  const group = async (text: string, id: number, threadId?: number) => {
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 99000 + id,
+      message: {
+        message_id: id, date: 0, message_thread_id: threadId,
+        chat: { id: -100777, type: 'supergroup', title: 'G', is_forum: true },
+        from: { id: 1, is_bot: false, first_name: 'T' }, text,
+      },
+    })
+    return { before }
+  }
+
+  test('a DM is refused, with the reason', async () => {
+    // Steering a part means talking in its topic, and a DM has none.
+    expect(finalReply(await incoming(1190, '/fanout do a thing'))).toMatch(/needs a forum group/i)
+  })
+
+  test('/fanout with no task explains itself', async () => {
+    expect(finalReply(await incoming(1191, '/fanout'))).toMatch(/Usage: \/fanout/)
+  })
+
+  test('it proposes a split and waits for confirmation before spawning', async () => {
+    const { before } = await group('/fanout look at the codebase', 99101)
+    await bridge._drainQueue('-100777:main')
+    await new Promise(r => setTimeout(r, 300))
+    const after = calls.slice(before)
+    const proposal = after.find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Proposed split'))
+    expect(proposal).toBeTruthy()
+    expect(btns(proposal).map((b: any) => b.text)).toEqual(['— Run these 2 —', '— Cancel —'])
+    // Nothing has been spawned yet: no topic created, no part started.
+    expect(after.some(c => c.method === 'createForumTopic')).toBe(false)
+  }, 15000)
+
+  test('confirming creates a topic per part and runs them', async () => {
+    const { before } = await group('/fanout investigate the thing', 99102)
+    await bridge._drainQueue('-100777:main')
+    await new Promise(r => setTimeout(r, 300))
+    const proposal = calls.slice(before).find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Proposed split'))
+    const runBtn = btns(proposal).find((b: any) => String(b.text).startsWith('— Run these'))
+    expect(runBtn).toBeTruthy()
+
+    const beforeRun = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 99500,
+      callback_query: { id: 'fb1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: runBtn.callback_data,
+        message: { message_id: 99103, date: 0, chat: { id: -100777, type: 'supergroup' } } },
+    })
+    await new Promise(r => setTimeout(r, 2500))
+    const after = calls.slice(beforeRun)
+    // One topic per part — that is what makes a part steerable.
+    expect(after.filter(c => c.method === 'createForumTopic').length).toBe(2)
+    const texts = after.filter(c => c.method === 'sendMessage').map(c => String(c.payload.text ?? '')).join('\n')
+    expect(texts).toMatch(/Part 1 of 2/)
+    expect(texts).toMatch(/Talk here to steer this part/)
+  }, 25000)
+
+  test('cancelling drops the plan without spawning anything', async () => {
+    const { before } = await group('/fanout something else', 99104)
+    await bridge._drainQueue('-100777:main')
+    await new Promise(r => setTimeout(r, 300))
+    const proposal = calls.slice(before).find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Proposed split'))
+    const cancel = btns(proposal).find((b: any) => String(b.text).includes('Cancel'))
+    const beforeCancel = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 99501,
+      callback_query: { id: 'fb2', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: cancel.callback_data,
+        message: { message_id: 99105, date: 0, chat: { id: -100777, type: 'supergroup' } } },
+    })
+    await new Promise(r => setTimeout(r, 400))
+    expect(calls.slice(beforeCancel).some(c => c.method === 'createForumTopic')).toBe(false)
+  }, 15000)
 })

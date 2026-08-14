@@ -22,7 +22,7 @@ import { run, type RunnerHandle } from '@grammyjs/runner'
 import telegramify from 'telegramify-markdown'
 import { autoRetry } from '@grammyjs/auto-retry'
 import { apiThrottler } from '@grammyjs/transformer-throttler'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync, copyFileSync, readlinkSync, openSync, readSync, closeSync } from 'node:fs'
 import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
@@ -33,6 +33,8 @@ import {
   EFFORT_LEVELS, EFFORT_DEFAULT, normalizeEffort,
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
+  fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
+  type FanoutPlanItem,
   frameUserMessage, attributionProfileLines,
   needsRich, hasRtl, sanitizeProse,
   normalizeMode as libNormalizeMode,
@@ -642,6 +644,49 @@ const noteBgResult = (key: string, text: string) => {
   (bgNotes[key] ??= []).push(text.length > 600 ? `${text.slice(0, 600)}…` : text)
   if (bgNotes[key].length > 3) bgNotes[key].shift()
 }
+
+// ---------------------------------------------------------------------------
+// fan-out
+// ---------------------------------------------------------------------------
+//
+// One request, split into parts that run at once, each in its own forum topic so it
+// can be STEERED mid-flight — that is the whole reason children get topics rather
+// than being N background jobs in one place. A topic is already bound to a session
+// and a directory, so talking to a child needs no new machinery: you type in its
+// topic and you are talking to that part.
+//
+// Parts that edit files get a git worktree each, because parallel agents in one
+// checkout trample each other's edits and git state. Read-only parts share the
+// parent directory, which is safe and avoids the setup cost for the common case.
+const FANOUT_MAX = Number(process.env.TG_FANOUT_MAX || 6)
+// Concurrency IS capped here, unlike /bg. The difference is who chooses the number:
+// a /bg job is one deliberate act by a person, while a fan-out's width is proposed
+// by a model, and eight live children is roughly 2.4 GB on a box with 7.9 GB and no
+// swap. Batching is stated in the proposal rather than applied silently.
+const FANOUT_CONCURRENCY = Number(process.env.TG_FANOUT_CONCURRENCY || 3)
+
+type FanoutChild = FanoutPlanItem & {
+  topicId?: number
+  key?: string
+  jobKey?: string
+  worktree?: string
+  branch?: string
+  result?: string
+  status: 'pending' | 'running' | 'done' | 'failed' | 'stopped'
+}
+type Fanout = {
+  id: string
+  parentKey: string
+  parentThreadId?: number
+  chatId: number
+  askedBy?: number
+  task: string
+  children: FanoutChild[]
+  synthesised: boolean
+}
+const fanouts = new Map<string, Fanout>()
+// child topic key -> the fan-out it belongs to, so a child finishing can find home.
+const childOf = new Map<string, { fanoutId: string; n: number }>()
 
 const stopped = new Set<string>()
 // How many tasks are queued or running per topic, and the id of the most recent
@@ -1396,6 +1441,122 @@ async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: str
   }).catch(() => {})
 }
 
+// Create the worktree a write-part runs in. Isolation is the point: without it,
+// two parts editing the same checkout corrupt each other's work and git state.
+// Returns undefined when the directory is not a git repo, which the caller reports
+// rather than silently running the part in the parent directory.
+function makeWorktree(baseDir: string, fanoutId: string, n: number): { path: string; branch: string } | undefined {
+  try {
+    execFileSync('git', ['-C', baseDir, 'rev-parse', '--git-dir'], { stdio: 'ignore' })
+  } catch { return undefined }
+  const branch = `fanout/${fanoutId}-${n}`
+  const path = join(baseDir, '.fanout', `${fanoutId}-${n}`)
+  try {
+    mkdirSync(dirname(path), { recursive: true })
+    execFileSync('git', ['-C', baseDir, 'worktree', 'add', '-b', branch, path], { stdio: 'ignore' })
+    return { path, branch }
+  } catch (e) {
+    console.error(`[fanout] worktree for part ${n} failed: ${e}`)
+    return undefined
+  }
+}
+
+// Start whichever parts are next, up to the concurrency cap.
+async function pumpFanout(ctx: Context, f: Fanout): Promise<void> {
+  const running = f.children.filter(c => c.status === 'running').length
+  let slots = Math.max(0, FANOUT_CONCURRENCY - running)
+  for (const child of f.children) {
+    if (slots <= 0) break
+    if (child.status !== 'pending') continue
+    slots--
+    child.status = 'running'
+    void startFanoutChild(ctx, f, child).catch(e => {
+      console.error(`[fanout ${f.id}] part ${child.n} failed to start: ${e}`)
+      child.status = 'failed'
+      void maybeSynthesise(ctx, f)
+    })
+  }
+}
+
+// Give a part its own topic, its own directory if it writes, and set it running.
+async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Promise<void> {
+  const parentCwd = sessions[f.parentKey]?.cwd ?? resolveCwd(ctx, f.parentThreadId)
+  let cwd = parentCwd
+  if (child.mode === 'write') {
+    const wt = makeWorktree(parentCwd, f.id, child.n)
+    if (wt) { cwd = wt.path; child.worktree = wt.path; child.branch = wt.branch }
+    else {
+      // Say so rather than quietly running a write-part in the shared checkout,
+      // where it would collide with every other part.
+      await send(ctx, f.parentThreadId, `⚠️ Part ${child.n} (${child.title}) needs a git worktree and ${parentCwd} is not a git repository — running it read-only in place instead.`, true)
+    }
+  }
+
+  // A topic per part is what makes steering possible: type in it and you are
+  // talking to that part's own session.
+  let topicId: number | undefined
+  try {
+    const t = await ctx.api.createForumTopic(f.chatId, `${child.n}. ${child.title}`.slice(0, 128),
+      TOPIC_ICON ? { icon_custom_emoji_id: TOPIC_ICON } : {})
+    topicId = t.message_thread_id
+  } catch (e) {
+    console.error(`[fanout ${f.id}] could not create a topic for part ${child.n}: ${e}`)
+  }
+  const key = keyFor(f.chatId, topicId)
+  child.topicId = topicId
+  child.key = key
+  sessions[key] = { ...(sessions[key] ?? {}), cwd }
+  saveState()
+  childOf.set(key, { fanoutId: f.id, n: child.n })
+
+  const brief = [
+    `You are one part of a task that was split up and is being worked in parallel.`,
+    `Your part only — do not attempt the others, and do not wait for them.`,
+    child.mode === 'write' && child.worktree
+      ? `You are in your own git worktree on branch ${child.branch}; edit freely here.`
+      : `Treat this as read-only: investigate and report, do not edit files.`,
+    ``,
+    `The overall request was: ${f.task}`,
+    ``,
+    `Your part: ${child.brief}`,
+    ``,
+    `Finish with a self-contained summary of what you found or did. It will be read`,
+    `on its own, alongside the other parts, by a final step that writes the answer.`,
+  ].join('\n')
+
+  await send(ctx, topicId, `🌿 Part ${child.n} of ${f.children.length} — ${child.title}\n\nTalk here to steer this part.`, true)
+  const jobKey = `${key}#fanout-${f.id}-${child.n}`
+  child.jobKey = jobKey
+  void enqueue(jobKey, () => handlePrompt(ctx, topicId, key, brief, undefined, undefined, false, true))
+    .then(() => finishFanoutChild(ctx, f, child))
+    .catch(e => { console.error(`[fanout ${f.id}] part ${child.n}: ${e}`); child.status = 'failed'; void maybeSynthesise(ctx, f) })
+}
+
+// A part is done when its job chain settles; its result was captured on the way out.
+async function finishFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Promise<void> {
+  if (child.status === 'running') child.status = child.result ? 'done' : 'failed'
+  await pumpFanout(ctx, f)
+  await maybeSynthesise(ctx, f)
+}
+
+// When every part has settled, write the single answer — automatically, in the
+// parent topic, from the parts' own summaries.
+async function maybeSynthesise(ctx: Context, f: Fanout): Promise<void> {
+  if (f.synthesised) return
+  if (f.children.some(c => c.status === 'pending' || c.status === 'running')) return
+  f.synthesised = true
+  const parts = f.children.map(c => ({ title: c.title, status: c.status, result: c.result }))
+  const okCount = parts.filter(p => p.status === 'done').length
+  await send(ctx, f.parentThreadId,
+    `🧩 All ${f.children.length} parts have finished (${okCount} completed). Putting it together…`,
+    true, f.askedBy)
+  const preamble = buildSynthesisPreamble(f.task, parts)
+  const key = f.parentKey
+  void enqueue(`${key}#fanout-synth-${f.id}`,
+    () => handlePrompt(ctx, f.parentThreadId, key, preamble, undefined, f.askedBy, true, true))
+    .catch(e => console.error(`[fanout ${f.id}] synthesis: ${e}`))
+}
+
 async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number, forceReplyLink = false, background = false): Promise<void> {
   // A message promoted to run in parallel has already been handled; its turn in the
   // queue must do nothing rather than run it a second time.
@@ -1482,7 +1643,13 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     // A background result arrives long after it was asked for, with anything in
     // between, so it always quotes its question and says what it is.
     const link = background ? replyTo : replyLink()
-    if (background) {
+    const owner = childOf.get(key)
+    if (owner) {
+      const f = fanouts.get(owner.fanoutId)
+      const child = f?.children.find(c => c.n === owner.n)
+      if (child && child.status === 'running') { child.result = res.text; child.status = 'done' }
+    }
+    if (background && !owner) {
       noteBgResult(key, res.text)
       await send(ctx, threadId, `🌿 Background task finished.`, true, link)
     }
@@ -1692,6 +1859,7 @@ bot.on('message', async ctx => {
       `/stop — cancel the running task and discard its answer\n` +
       `/interrupt — stop it early but keep what it produced (or on|off for the sticky mode)\n` +
       `/bg <task> — run it alongside this topic instead of blocking it\n` +
+      `/fanout <task> — split it into parts, run them in parallel topics, then combine\n` +
       `/jobs — what is running here, and what earlier runs left behind\n` +
       `/restart — restart the bridge; in-flight tasks finish first\n` +
 
@@ -1934,6 +2102,46 @@ bot.on('message', async ctx => {
     }).catch(err => console.error(`[error] compact ${key}: ${err}`))
     return
   }
+  if (cmd === '/fanout' || cmd === '/split') {
+    const task = text.slice(text.indexOf(' ') + 1).trim()
+    if (!task || !text.includes(' ')) {
+      await send(ctx, threadId, 'Usage: /fanout <task> — I will propose a split, you confirm, then the parts run in parallel in their own topics.', true)
+      return
+    }
+    if (ctx.chat.type === 'private') {
+      // Each part needs its own topic to be steerable, and a DM has none.
+      await send(ctx, threadId, 'Fan-out needs a forum group: each part gets its own topic so you can steer it. In a DM, use /bg instead.', true)
+      return
+    }
+    // A PLANNING turn first. Decomposition is the model's job; spawning, tracking
+    // and reporting are the bridge's — a turn that launches its own children
+    // orphans them when it exits.
+    await send(ctx, threadId, '🧠 Working out how to split that…', true, msg.message_id)
+    void enqueue(key, async () => {
+      const cwd = resolveCwd(ctx, threadId)
+      const res = await runStreaming(ctx, threadId, key, fanoutPlanPrompt(task, FANOUT_MAX), cwd,
+        sessions[key]?.sessionId, 'plan', modelFor(key), { effort: effortFor(key), fork: true })
+      const items = parseFanoutPlan(res.text, { max: FANOUT_MAX })
+      if (!items.length) {
+        await send(ctx, threadId, `I could not turn that into a parallel split. Here is what came back:\n\n${res.text.slice(0, 1500)}`, false, msg.message_id)
+        return
+      }
+      const f: Fanout = {
+        id: newJobId(), parentKey: key, parentThreadId: threadId, chatId: ctx.chat!.id,
+        askedBy: msg.message_id, task, synthesised: false,
+        children: items.map(i => ({ ...i, status: 'pending' as const })),
+      }
+      fanouts.set(f.id, f)
+      await ctx.api.sendMessage(ctx.chat!.id, renderFanoutProposal(items, { cap: FANOUT_CONCURRENCY }), {
+        ...destOpts({ threadId, replyTo: msg.message_id }),
+        reply_markup: { inline_keyboard: [[
+          { text: `— Run these ${items.length} —`, callback_data: `fan:${f.id}` },
+          { text: '— Cancel —', callback_data: `fanx:${f.id}` },
+        ]] },
+      }).catch(() => {})
+    }).catch(e => console.error(`[error] fanout plan ${key}: ${e}`))
+    return
+  }
   if (cmd === '/bg') {
     const task = text.slice(text.indexOf(' ') + 1).trim()
     if (!task || !text.includes(' ')) {
@@ -2134,6 +2342,22 @@ bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   if (!isAllowed(ctx)) { await ctx.answerCallbackQuery({ text: 'Not authorized.', show_alert: true }).catch(() => {}); return }
   const key = keyFor(ctx.chat!.id, ctx.callbackQuery.message?.message_thread_id)
+  if (data.startsWith('fanx:')) {
+    const f = fanouts.get(data.slice(5))
+    if (f) fanouts.delete(f.id)
+    await ctx.answerCallbackQuery({ text: 'Dropped.' }).catch(() => {})
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {})
+    return
+  }
+  if (data.startsWith('fan:')) {
+    const f = fanouts.get(data.slice(4))
+    if (!f) { await ctx.answerCallbackQuery({ text: 'That plan is no longer available.', show_alert: true }).catch(() => {}); return }
+    if (f.children.some(c => c.status !== 'pending')) { await ctx.answerCallbackQuery({ text: 'Already running.' }).catch(() => {}); return }
+    await ctx.answerCallbackQuery({ text: `Starting ${f.children.length} parts…` }).catch(() => {})
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {})
+    await pumpFanout(ctx, f)
+    return
+  }
   if (data.startsWith('par:')) {
     const id = Number(data.slice(4))
     const rec = offered.get(id)
