@@ -15,7 +15,7 @@ import {
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
-  fanoutBadge, fanoutTopicName, topicLink,
+  FANOUT_MARK, fanoutTopicName, topicLink,
   sanitizeProse, PROSE_RULES, isNonAnswer,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
@@ -994,23 +994,20 @@ describe('fan-out: what the synthesis turn is given', () => {
 })
 
 describe('fan-out: telling the part topics apart in a busy group', () => {
-  test('every part of one fan-out carries the same badge', () => {
-    // A topic list is scanned, not read: the badge is what groups the parts.
-    expect(fanoutBadge('abc123')).toBe(fanoutBadge('abc123'))
-    expect(fanoutBadge('abc123')).toHaveLength(2)          // one emoji
-  })
-  test('different fan-outs usually get different badges', () => {
-    const seen = new Set(['a1', 'b2', 'c3', 'd4', 'e5', 'f6', 'g7', 'h8'].map(fanoutBadge))
-    expect(seen.size).toBeGreaterThan(1)
+  test('one mark for every part, and it is a leaf', () => {
+    // It replaced a per-fan-out palette of coloured circles: a red circle reads as
+    // an error, and the circle emoji did not render in topic names on every client
+    // — they arrived as a question mark beside a circle.
+    expect(FANOUT_MARK).toBe('🍃')
   })
   test('the topic name leads with the badge and position, not a restated task', () => {
     // The task used to be restated in every name, which made them all long and
     // similar — the opposite of scannable.
-    const n = fanoutTopicName('🌿', 2, 3, 'Survey the scripts')
-    expect(n).toBe('🌿 2/3 Survey the scripts')
+    const n = fanoutTopicName('', 2, 3, 'Survey the scripts')
+    expect(n).toBe('🍃 2/3 Survey the scripts')
   })
   test("and stays inside Telegram's 128-character limit", () => {
-    const n = fanoutTopicName('🌿', 1, 2, 't'.repeat(200))
+    const n = fanoutTopicName('', 1, 2, 't'.repeat(200))
     expect(n.length).toBeLessThanOrEqual(128)
     expect(n).toMatch(/…$/)                     // the title is what gets shortened
   })

@@ -1089,7 +1089,10 @@ describe('fan-out: steering a part changes the combined answer', () => {
 
   test('the combined answer is produced automatically once the parts settle', async () => {
     const texts = calls.filter(c => c.method === 'sendMessage').map(c => String(c.payload.text ?? '')).join('\n')
-    expect(texts).toMatch(/parts have finished/i)
+    // The combined answer arrives on its own. There is deliberately no "all parts
+    // finished" banner when nothing failed — it announced work that was about to
+    // speak for itself. A failure or a branch report still gets said.
     expect(texts).toContain('SYNTHESIS')
+    expect(texts).not.toMatch(/Background task finished[\s\S]{0,40}SYNTHESIS/)
   }, 15000)
 })

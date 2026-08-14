@@ -34,7 +34,7 @@ import {
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
-  fanoutBadge, fanoutTopicName, topicLink,
+  FANOUT_MARK, fanoutTopicName, topicLink,
   type FanoutPlanItem,
   frameUserMessage, attributionProfileLines,
   needsRich, hasRtl, sanitizeProse,
@@ -1541,15 +1541,7 @@ async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Pr
   ].join('\n')
 
   await send(ctx, topicId, `🌿 Part ${child.n} of ${f.children.length} — ${child.title}\n\nTalk here to steer this part.`, true)
-  // The label carries the link rather than showing it: a bare t.me/c/… URL is
-  // noise, and the useful thing is a tappable name.
-  const link = topicLink(f.chatId, topicId)
-  const label = `${f.badge} Part ${child.n}/${f.children.length}: ${child.title}`
-  const md = link ? `[${label}](${link})` : `${label} — no link, its topic could not be created`
-  await ctx.api.sendMessage(f.chatId, telegramify(sanitizeProse(md, 'markdownv2'), 'escape'), {
-    ...destOpts({ threadId: f.parentThreadId, replyTo: f.askedBy }),
-    parse_mode: 'MarkdownV2', disable_notification: true,
-  }).catch(() => {})
+
   const jobKey = `${key}#fanout-${f.id}-${child.n}`
   child.jobKey = jobKey
   void enqueue(jobKey, () => handlePrompt(ctx, topicId, key, brief, undefined, undefined, false, true))
@@ -1562,6 +1554,22 @@ async function finishFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): P
   if (child.status === 'running') child.status = child.result ? 'done' : 'failed'
   await pumpFanout(ctx, f)
   await maybeSynthesise(ctx, f)
+}
+
+// One message listing every part, rather than one message per part. N separate
+// announcements bury the topic they are posted in, which is the topic you are
+// trying to keep usable.
+async function announceFanoutParts(ctx: Context, f: Fanout): Promise<void> {
+  const lines = f.children.map(c => {
+    const label = `${FANOUT_MARK} ${c.n}/${f.children.length} ${c.title}`
+    const link = topicLink(f.chatId, c.topicId)
+    return link ? `[${label}](${link})` : `${label} — no topic could be created`
+  })
+  const md = `Running ${f.children.length} parts:\n${lines.join('\n')}`
+  await ctx.api.sendMessage(f.chatId, telegramify(sanitizeProse(md, 'markdownv2'), 'escape'), {
+    ...destOpts({ threadId: f.parentThreadId, replyTo: f.askedBy }),
+    parse_mode: 'MarkdownV2', disable_notification: true,
+  }).catch(() => {})
 }
 
 // A part changed after the answer was written. Say so and offer to redo it.
@@ -1586,14 +1594,24 @@ function fanoutBranchReport(f: Fanout): string {
 // history is the record of how the part was reached), and remove a worktree only if
 // git agrees it is clean. A dirty worktree holds uncommitted work, so it is left
 // alone and reported rather than forced away.
-// Closing is offered, not done. The parts' topics are where the working-out lives,
-// and deciding you are finished reading them is a judgement call the person makes,
-// not the bridge.
-async function offerCloseTopics(ctx: Context, f: Fanout): Promise<void> {
+// Close the part topics once the answer is written. They are CLOSED, never
+// deleted: the working-out stays readable and a closed topic can be reopened from
+// the topic list. Left open they simply pile up, which is what a group full of
+// abandoned "2/3 …" topics looks like after a few fan-outs.
+//
+// If closing fails — usually the bot lacking Manage Topics — fall back to offering
+// the button rather than leaving the mess with no way out.
+async function closeFanoutTopics(ctx: Context, f: Fanout): Promise<void> {
   const open = f.children.filter(c => c.topicId !== undefined)
   if (!open.length) return
+  let closed = 0
+  for (const c of open) {
+    const ok = await ctx.api.closeForumTopic(f.chatId, c.topicId!).then(() => true).catch(() => false)
+    if (ok) closed++
+  }
+  if (closed === open.length) return
   await ctx.api.sendMessage(f.chatId,
-    `${open.length} part topic${open.length === 1 ? '' : 's'} from this fan-out are still open.`,
+    `${open.length - closed} part topic${open.length - closed === 1 ? '' : 's'} could not be closed automatically.`,
     { ...destOpts({ threadId: f.parentThreadId, replyTo: f.askedBy }), disable_notification: true,
       reply_markup: { inline_keyboard: [[{ text: '— Close the part topics —', callback_data: `fanc:${f.id}` }]] } },
   ).catch(() => {})
@@ -1628,19 +1646,27 @@ async function maybeSynthesise(ctx: Context, f: Fanout): Promise<void> {
   f.synthesised = true
   const parts = f.children.map(c => ({ title: c.title, status: c.status, result: c.result }))
   const okCount = parts.filter(p => p.status === 'done').length
-  await send(ctx, f.parentThreadId,
-    `🧩 All ${f.children.length} parts have finished (${okCount} completed). Putting it together…` + fanoutBranchReport(f),
-    true, f.askedBy)
+  // Only say anything when there is something to say. "All parts finished" adds
+  // nothing when the combined answer is about to arrive anyway — but a part that
+  // FAILED, or a branch holding work, must not be silent, which is why this is
+  // conditional rather than simply deleted.
+  const failed = f.children.length - okCount
+  const branches = fanoutBranchReport(f)
+  if (failed > 0 || branches) {
+    await send(ctx, f.parentThreadId,
+      (failed > 0 ? `⚠️ ${failed} of ${f.children.length} parts did not complete; the answer below is missing their work.` : '') + branches,
+      true, f.askedBy)
+  }
   const preamble = buildSynthesisPreamble(f.task, parts)
   const key = f.parentKey
   void enqueue(`${key}#fanout-synth-${f.id}`,
-    () => handlePrompt(ctx, f.parentThreadId, key, preamble, undefined, f.askedBy, true, true))
+    () => handlePrompt(ctx, f.parentThreadId, key, preamble, undefined, f.askedBy, true, true, true))
     .then(() => cleanupFanout(ctx, f))
-    .then(() => offerCloseTopics(ctx, f))
+    .then(() => closeFanoutTopics(ctx, f))
     .catch(e => console.error(`[fanout ${f.id}] synthesis: ${e}`))
 }
 
-async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number, forceReplyLink = false, background = false): Promise<void> {
+async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number, forceReplyLink = false, background = false, isSynthesis = false): Promise<void> {
   // A message promoted to run in parallel has already been handled; its turn in the
   // queue must do nothing rather than run it a second time.
   if (replyTo !== undefined && skipQueued.has(replyTo)) { skipQueued.delete(replyTo); return }
@@ -1743,7 +1769,9 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
         else if (f && f.synthesised) await offerRecombine(ctx, f, child)
       }
     }
-    if (background && !owner) {
+    // A fan-out's synthesis IS the answer and needs no banner announcing itself. An
+    // ordinary /bg result does: it arrives long after it was asked for.
+    if (background && !owner && !isSynthesis) {
       noteBgResult(key, res.text)
       await send(ctx, threadId, `🌿 Background task finished.`, true, link)
     }
@@ -2226,10 +2254,9 @@ bot.on('message', async ctx => {
       }
       const f: Fanout = {
         id: newJobId(), parentKey: key, parentThreadId: threadId, chatId: ctx.chat!.id,
-        askedBy: msg.message_id, task, badge: '', synthesised: false,
+        askedBy: msg.message_id, task, badge: FANOUT_MARK, synthesised: false,
         children: items.map(i => ({ ...i, status: 'pending' as const })),
       }
-      f.badge = fanoutBadge(f.id)
       fanouts.set(f.id, f)
       // Through telegramify with a parse mode: this text is markdown, and a raw
       // sendMessage renders its asterisks and underscores literally.
@@ -2482,6 +2509,7 @@ bot.on('callback_query:data', async ctx => {
     await ctx.answerCallbackQuery({ text: `Starting ${f.children.length} parts…` }).catch(() => {})
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})
     await pumpFanout(ctx, f)
+    await announceFanoutParts(ctx, f)
     return
   }
   if (data.startsWith('par:')) {

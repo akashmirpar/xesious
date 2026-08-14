@@ -834,25 +834,20 @@ export function htmlDocument(title: string, bodyHtml: string): string {
 export type FanoutMode = 'read' | 'write'
 export type FanoutPlanItem = { n: number; mode: FanoutMode; title: string; brief: string }
 
-// One emoji per fan-out, shared by all of its parts. A topic list is scanned, not
-// read: a badge groups the parts of one request at a glance, where a truncated
-// restatement of the task just made every name long and similar. Chosen from the
-// id so every part of a fan-out gets the same one, and two fan-outs running at once
-// usually differ.
-const FANOUT_BADGES = ['🌿', '🔷', '🟣', '🟠', '🔵', '🟢', '🔴', '🟡'] as const
-export function fanoutBadge(id: string): string {
-  // FNV-1a, not the usual h*31: with a power-of-two palette the low bits are what
-  // pick the badge, and h*31 barely moves them for short similar ids — every id in
-  // a test batch came out with the same emoji.
-  let h = 0x811c9dc5
-  for (const ch of id) { h ^= ch.charCodeAt(0); h = Math.imul(h, 0x01000193) }
-  return FANOUT_BADGES[(h >>> 0) % FANOUT_BADGES.length]
-}
+// One mark for every fan-out part, everywhere: the topic name, the part list, the
+// finish note. A leaf, because these are branches of one request.
+//
+// It replaced a palette of coloured circles chosen per fan-out. Two things were
+// wrong with that: a red circle reads as an error rather than as an identifier,
+// and the coloured-circle emoji did not render in topic names on every client —
+// they came through as a question mark next to a circle, which is worse than no
+// badge at all. One well-supported glyph beats a clever scheme nobody can read.
+export const FANOUT_MARK = '🍃'
 
 // Topic names are capped at 128 characters and are read at a glance in a list, so
 // the badge and the position come first and the title is what gets shortened.
-export function fanoutTopicName(badge: string, n: number, total: number, title: string): string {
-  const head = `${badge} ${n}/${total} `
+export function fanoutTopicName(_badge: string, n: number, total: number, title: string): string {
+  const head = `${FANOUT_MARK} ${n}/${total} `
   const room = Math.max(8, 128 - head.length)
   return head + (title.length <= room ? title : title.slice(0, room - 1) + '…')
 }
