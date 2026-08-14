@@ -34,7 +34,7 @@ import {
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
-  fanoutGoalLabel, fanoutTopicName, topicLink,
+  fanoutBadge, fanoutTopicName, topicLink,
   type FanoutPlanItem,
   frameUserMessage, attributionProfileLines,
   needsRich, hasRtl, sanitizeProse,
@@ -681,7 +681,7 @@ type FanoutChild = FanoutPlanItem & {
 }
 type Fanout = {
   id: string
-  goal: string
+  badge: string
   parentKey: string
   parentThreadId?: number
   chatId: number
@@ -1507,7 +1507,7 @@ async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Pr
     // a glance. icon_color is create-time only — editForumTopic cannot change it —
     // so it has to be right here.
     const t = await ctx.api.createForumTopic(f.chatId,
-      fanoutTopicName(f.goal, child.n, f.children.length, child.title),
+      fanoutTopicName(f.badge, child.n, f.children.length, child.title),
       { icon_color: FANOUT_TOPIC_COLOR })
     topicId = t.message_thread_id
   } catch (e) {
@@ -1541,10 +1541,15 @@ async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Pr
   ].join('\n')
 
   await send(ctx, topicId, `🌿 Part ${child.n} of ${f.children.length} — ${child.title}\n\nTalk here to steer this part.`, true)
+  // The label carries the link rather than showing it: a bare t.me/c/… URL is
+  // noise, and the useful thing is a tappable name.
   const link = topicLink(f.chatId, topicId)
-  await send(ctx, f.parentThreadId,
-    `▶ Part ${child.n}/${f.children.length}: ${child.title}` + (link ? `\n${link}` : ' (no link — topic could not be created)'),
-    true, f.askedBy)
+  const label = `${f.badge} Part ${child.n}/${f.children.length}: ${child.title}`
+  const md = link ? `[${label}](${link})` : `${label} — no link, its topic could not be created`
+  await ctx.api.sendMessage(f.chatId, telegramify(sanitizeProse(md, 'markdownv2'), 'escape'), {
+    ...destOpts({ threadId: f.parentThreadId, replyTo: f.askedBy }),
+    parse_mode: 'MarkdownV2', disable_notification: true,
+  }).catch(() => {})
   const jobKey = `${key}#fanout-${f.id}-${child.n}`
   child.jobKey = jobKey
   void enqueue(jobKey, () => handlePrompt(ctx, topicId, key, brief, undefined, undefined, false, true))
@@ -2205,21 +2210,26 @@ bot.on('message', async ctx => {
     // A PLANNING turn first. Decomposition is the model's job; spawning, tracking
     // and reporting are the bridge's — a turn that launches its own children
     // orphans them when it exits.
-    await send(ctx, threadId, '🧠 Working out how to split that…', true, msg.message_id)
+    // Kept so it can be withdrawn: it describes work that is over the moment the
+    // proposal appears, and leaving it behind is the same clutter as a spent offer.
+    const thinking = await ctx.api.sendMessage(ctx.chat.id, '🧠 Working out how to split that…',
+      { ...destOpts({ threadId, replyTo: msg.message_id }), disable_notification: true }).catch(() => null)
     void enqueue(key, async () => {
       const cwd = resolveCwd(ctx, threadId)
       const res = await runStreaming(ctx, threadId, key, fanoutPlanPrompt(task, FANOUT_MAX), cwd,
         sessions[key]?.sessionId, 'plan', modelFor(key), { effort: effortFor(key), fork: true })
       const items = parseFanoutPlan(res.text, { max: FANOUT_MAX })
+      if (thinking) await ctx.api.deleteMessage(ctx.chat!.id, thinking.message_id).catch(() => {})
       if (!items.length) {
         await send(ctx, threadId, `I could not turn that into a parallel split. Here is what came back:\n\n${res.text.slice(0, 1500)}`, false, msg.message_id)
         return
       }
       const f: Fanout = {
         id: newJobId(), parentKey: key, parentThreadId: threadId, chatId: ctx.chat!.id,
-        askedBy: msg.message_id, task, goal: fanoutGoalLabel(task), synthesised: false,
+        askedBy: msg.message_id, task, badge: '', synthesised: false,
         children: items.map(i => ({ ...i, status: 'pending' as const })),
       }
+      f.badge = fanoutBadge(f.id)
       fanouts.set(f.id, f)
       // Through telegramify with a parse mode: this text is markdown, and a raw
       // sendMessage renders its asterisks and underscores literally.

@@ -834,19 +834,25 @@ export function htmlDocument(title: string, bodyHtml: string): string {
 export type FanoutMode = 'read' | 'write'
 export type FanoutPlanItem = { n: number; mode: FanoutMode; title: string; brief: string }
 
-// A short label for the whole fan-out, taken from the request itself. It goes in
-// every child topic's name so a group full of topics still reads as "these five
-// belong together" rather than as five unrelated conversations.
-export function fanoutGoalLabel(task: string, max = 34): string {
-  const flat = task.replace(/\s+/g, ' ').trim().replace(/^[/\\]\S+\s*/, '')
-  if (flat.length <= max) return flat.replace(/[.:;,]+$/, '')
-  return flat.slice(0, max - 1).replace(/\s+\S*$/, '').replace(/[.:;,]+$/, '') + '…'
+// One emoji per fan-out, shared by all of its parts. A topic list is scanned, not
+// read: a badge groups the parts of one request at a glance, where a truncated
+// restatement of the task just made every name long and similar. Chosen from the
+// id so every part of a fan-out gets the same one, and two fan-outs running at once
+// usually differ.
+const FANOUT_BADGES = ['🌿', '🔷', '🟣', '🟠', '🔵', '🟢', '🔴', '🟡'] as const
+export function fanoutBadge(id: string): string {
+  // FNV-1a, not the usual h*31: with a power-of-two palette the low bits are what
+  // pick the badge, and h*31 barely moves them for short similar ids — every id in
+  // a test batch came out with the same emoji.
+  let h = 0x811c9dc5
+  for (const ch of id) { h ^= ch.charCodeAt(0); h = Math.imul(h, 0x01000193) }
+  return FANOUT_BADGES[(h >>> 0) % FANOUT_BADGES.length]
 }
 
-// Topic names are capped at 128 characters, and the useful information is at both
-// ends — which fan-out this is, and which part. The title is what gets shortened.
-export function fanoutTopicName(goal: string, n: number, total: number, title: string): string {
-  const head = `🌿 ${goal} · ${n}/${total} `
+// Topic names are capped at 128 characters and are read at a glance in a list, so
+// the badge and the position come first and the title is what gets shortened.
+export function fanoutTopicName(badge: string, n: number, total: number, title: string): string {
+  const head = `${badge} ${n}/${total} `
   const room = Math.max(8, 128 - head.length)
   return head + (title.length <= room ? title : title.slice(0, room - 1) + '…')
 }
@@ -904,7 +910,9 @@ export function parseFanoutPlan(text: string, opts?: { max?: number }): FanoutPl
 // this: a confirmation showing the proposed split BEFORE it opens eight topics.
 export function renderFanoutProposal(items: FanoutPlanItem[], opts: { cap: number }): string {
   const writes = items.filter(i => i.mode === 'write').length
-  const lines = items.map(i => `${i.n}. **${i.title}** _(${i.mode})_\n   ${i.brief}`)
+  // No hanging indent on the brief: Telegram renders the leading spaces literally
+  // and the block ends up looking mis-aligned rather than structured.
+  const lines = items.map(i => `${i.n}. **${i.title}** _(${i.mode})_\n${i.brief}`)
   const notes: string[] = []
   if (items.length > opts.cap) {
     // Never a silent cap. A plan that quietly runs half of itself reads as a plan

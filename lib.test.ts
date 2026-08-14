@@ -15,7 +15,7 @@ import {
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
-  fanoutGoalLabel, fanoutTopicName, topicLink,
+  fanoutBadge, fanoutTopicName, topicLink,
   sanitizeProse, PROSE_RULES, isNonAnswer,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
@@ -994,24 +994,23 @@ describe('fan-out: what the synthesis turn is given', () => {
 })
 
 describe('fan-out: telling the part topics apart in a busy group', () => {
-  test('the goal label is short, and cut on a word boundary', () => {
-    expect(fanoutGoalLabel('audit the deploy scripts')).toBe('audit the deploy scripts')
-    const long = fanoutGoalLabel('look into two separate things about this repository and report')
-    expect(long.length).toBeLessThanOrEqual(35)
-    expect(long).toMatch(/…$/)
-    expect(long).not.toMatch(/\s…$/)            // no dangling space before the ellipsis
+  test('every part of one fan-out carries the same badge', () => {
+    // A topic list is scanned, not read: the badge is what groups the parts.
+    expect(fanoutBadge('abc123')).toBe(fanoutBadge('abc123'))
+    expect(fanoutBadge('abc123')).toHaveLength(2)          // one emoji
   })
-  test('a leading command is dropped from the label', () => {
-    expect(fanoutGoalLabel('/fanout check the tests')).toBe('check the tests')
+  test('different fan-outs usually get different badges', () => {
+    const seen = new Set(['a1', 'b2', 'c3', 'd4', 'e5', 'f6', 'g7', 'h8'].map(fanoutBadge))
+    expect(seen.size).toBeGreaterThan(1)
   })
-  test('the topic name says which fan-out and which part', () => {
-    const n = fanoutTopicName('audit the deploys', 2, 3, 'Survey the scripts')
-    expect(n).toContain('audit the deploys')
-    expect(n).toContain('2/3')
-    expect(n).toContain('Survey the scripts')
+  test('the topic name leads with the badge and position, not a restated task', () => {
+    // The task used to be restated in every name, which made them all long and
+    // similar — the opposite of scannable.
+    const n = fanoutTopicName('🌿', 2, 3, 'Survey the scripts')
+    expect(n).toBe('🌿 2/3 Survey the scripts')
   })
-  test('and stays inside Telegram\'s 128-character limit', () => {
-    const n = fanoutTopicName('g'.repeat(40), 1, 2, 't'.repeat(200))
+  test("and stays inside Telegram's 128-character limit", () => {
+    const n = fanoutTopicName('🌿', 1, 2, 't'.repeat(200))
     expect(n.length).toBeLessThanOrEqual(128)
     expect(n).toMatch(/…$/)                     // the title is what gets shortened
   })
@@ -1021,5 +1020,14 @@ describe('fan-out: telling the part topics apart in a busy group', () => {
   test('no thread, or a chat that cannot have one, yields no link', () => {
     expect(topicLink(-1003744389982, undefined)).toBeUndefined()
     expect(topicLink('@somechannel', 5)).toBeUndefined()
+  })
+})
+
+describe('fan-out: the proposal reads cleanly', () => {
+  test('no hanging indent before a brief', () => {
+    // Telegram renders leading spaces literally, so the block looked mis-aligned.
+    const out = renderFanoutProposal(parseFanoutPlan('FANOUT 1 | read | T | the brief'), { cap: 3 })
+    expect(out).toContain('\nthe brief')
+    expect(out).not.toContain('\n   the brief')
   })
 })
