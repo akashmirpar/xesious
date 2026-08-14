@@ -20,6 +20,7 @@ Env (set by run-staging.sh from .env.staging):
 """
 import asyncio
 import os
+import subprocess
 import sys
 
 try:
@@ -667,7 +668,117 @@ async def feature_fanout_end_to_end(client, bot):
             f"plan accepted, {len(part_topics)} parts ran in their own topics, and the parent got a combined answer")
 
 
-FEATURE_TESTS = [feature_fanout_end_to_end, feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
+async def feature_fanout_worktrees(client, bot):
+    """A fan-out whose parts EDIT FILES, each in its own git worktree.
+
+    This is the half that had only ever been tested by calling the worktree helper
+    directly. Here a real model plans two write-parts, the bridge creates a worktree
+    per part, each part edits inside its own tree, and the isolation is checked the
+    only way that means anything: the files must exist in their own worktrees and
+    NOT in the shared parent checkout.
+    """
+    if not GROUP_ID:
+        return ("fan-out write-parts get isolated worktrees", False, "STAGING_GROUP_ID is not set")
+    group = int(GROUP_ID)
+    base = os.path.join(os.environ.get("TG_SESSIONS_BASE", ""), f"{GROUP_ID}-general")
+
+    # Worktrees need a git repo. The parent topic's directory is a fresh session dir,
+    # so make it one — otherwise write-parts correctly fall back to read-only and
+    # this would test the fallback rather than the isolation.
+    os.makedirs(base, exist_ok=True)
+    def git(*a, cwd=base):
+        return subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True)
+    if git("rev-parse", "--git-dir").returncode != 0:
+        git("init", "-q")
+        git("config", "user.email", "t@t")
+        git("config", "user.name", "T")
+        with open(os.path.join(base, "seed.txt"), "w") as fh:
+            fh.write("seed\n")
+        git("add", "-A")
+        git("commit", "-qm", "seed")
+    for stale in ("alpha.txt", "beta.txt"):
+        pth = os.path.join(base, stale)
+        if os.path.exists(pth):
+            os.remove(pth)
+    print(f"  (repo for the fan-out: {base})")
+
+    await _show(client, bot, "/mode auto")
+    task = ("Make two independent file edits, one per part: "
+            "(1) create a file named alpha.txt containing exactly ALPHA, "
+            "(2) create a file named beta.txt containing exactly BETA. "
+            "Each part edits only its own file.")
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    print("  → /fanout with two write-parts")
+    await client.send_message(group, f"/fanout {task}")
+    proposal = None
+    for _ in range(90):
+        await asyncio.sleep(1)
+        proposal = next((m for m in seen if m.reply_markup and "Proposed split" in (reply_text(m) or "")), None)
+        if proposal:
+            break
+    if not proposal:
+        client.remove_event_handler(handler)
+        return ("fan-out write-parts get isolated worktrees", False, "no proposal arrived")
+    text = reply_text(proposal)
+    print(f"    proposal mentions worktrees: {'worktree' in text}")
+    await proposal.click(0)
+
+    done = None
+    for _ in range(300):
+        await asyncio.sleep(1)
+        done = next((m for m in seen if "parts have finished" in (reply_text(m) or "")), None)
+        if done:
+            break
+    client.remove_event_handler(handler)
+
+    problems = []
+    if not done:
+        problems.append("the parts never converged")
+    finish_text = reply_text(done) if done else ""
+
+    # --- the isolation, checked on disk ---------------------------------------
+    branches = [b.strip().lstrip("* ") for b in git("branch", "--list", "fanout/*").stdout.splitlines() if b.strip()]
+    wt_root = os.path.join(base, ".fanout")
+    trees = sorted(os.listdir(wt_root)) if os.path.isdir(wt_root) else []
+    print(f"    branches: {branches}")
+    print(f"    worktrees: {trees}")
+
+    if len(trees) < 2:
+        problems.append(f"expected a worktree per write-part, found {len(trees)}")
+    if len(branches) < 2:
+        problems.append(f"expected a branch per write-part, found {len(branches)}")
+
+    found = {}
+    for t in trees:
+        d = os.path.join(wt_root, t)
+        for name in ("alpha.txt", "beta.txt"):
+            if os.path.exists(os.path.join(d, name)):
+                found.setdefault(name, []).append(t)
+    print(f"    files by worktree: {found}")
+    if not found:
+        problems.append("neither part actually wrote its file inside a worktree")
+    # THE point of the isolation: a part's edit must not appear in the shared checkout.
+    for name in found:
+        if os.path.exists(os.path.join(base, name)):
+            problems.append(f"{name} leaked into the shared parent checkout — the parts were not isolated")
+    # …nor in each other's tree.
+    for name, where in found.items():
+        if len(where) > 1:
+            problems.append(f"{name} appears in {len(where)} worktrees, so they are not separate")
+    if done and "Branches created" not in finish_text:
+        problems.append("the finish message did not say where the work landed")
+
+    return ("fan-out write-parts get isolated worktrees", not problems,
+            "; ".join(problems) if problems else
+            f"{len(trees)} worktrees on {len(branches)} branches, each part's file only in its own tree, none in the parent")
+
+
+FEATURE_TESTS = [feature_fanout_worktrees, feature_fanout_end_to_end, feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
                  feature_midturn_text, feature_attribution, feature_reply_threading,
                  feature_interrupt_kills_the_tree, feature_run_alongside,
                  feature_fanout_guard]
