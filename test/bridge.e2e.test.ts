@@ -1095,4 +1095,21 @@ describe('fan-out: steering a part changes the combined answer', () => {
     expect(texts).toContain('SYNTHESIS')
     expect(texts).not.toMatch(/Background task finished[\s\S]{0,40}SYNTHESIS/)
   }, 15000)
+
+  test('a correction after the answer reopens that part and offers to combine again', async () => {
+    // The parts' topics are closed once the answer is written, and a closed topic is
+    // read-only for everyone but an admin — so a part that is being corrected has to
+    // be reopened, or the first correction is also the last one possible.
+    const child = calls.find(c => c.method === 'sendMessage'
+      && String(c.payload.text ?? '').includes('Talk here to steer'))!.payload.message_thread_id as number
+    expect(calls.some(c => c.method === 'closeForumTopic')).toBe(true)
+    const before = calls.length
+    await group('correction: the answer is CORRECTED', 99301, child)
+    await bridge._drainQueue(`-100777:${child}`)
+    await new Promise(r => setTimeout(r, 1500))
+    const after = calls.slice(before)
+    expect(after.some(c => c.method === 'reopenForumTopic'
+      && c.payload.message_thread_id === child)).toBe(true)
+    expect(after.some(c => btns(c).some((b: any) => String(b.text).includes('Combine again')))).toBe(true)
+  }, 20000)
 })

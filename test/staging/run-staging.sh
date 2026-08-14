@@ -19,8 +19,12 @@ set -a; . "$ENVF"; set +a
 : "${STAGING_BOT_TOKEN:?set STAGING_BOT_TOKEN in $ENVF}"
 : "${TEST_ACCOUNT_USER_ID:?set TEST_ACCOUNT_USER_ID in $ENVF (from gen_session.py)}"
 
+# Driver deps live beside the driver (test/staging/.deps) so this harness does not
+# depend on what happens to be installed system-wide, which is a thing that changes
+# under you. A system install still works; this only adds a fallback.
+[ -d "$ROOT/test/staging/.deps" ] && export PYTHONPATH="$ROOT/test/staging/.deps${PYTHONPATH:+:$PYTHONPATH}"
 python3 -c "import telethon" 2>/dev/null || {
-  echo "driver deps missing — pip install -r test/staging/requirements.txt" >&2; exit 1; }
+  echo "driver deps missing — pip install -t test/staging/.deps -r test/staging/requirements.txt" >&2; exit 1; }
 
 # bun on PATH (same portable lookup as start.sh)
 if ! command -v bun >/dev/null 2>&1; then

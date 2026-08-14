@@ -1574,6 +1574,10 @@ async function announceFanoutParts(ctx: Context, f: Fanout): Promise<void> {
 
 // A part changed after the answer was written. Say so and offer to redo it.
 async function offerRecombine(ctx: Context, f: Fanout, child: FanoutChild): Promise<void> {
+  // Its topic was closed when the answer was written, and a closed topic is
+  // read-only for everyone but an admin. Steering it makes it live again, so reopen
+  // it — otherwise the first correction is also the last one you can make.
+  if (child.topicId !== undefined) await ctx.api.reopenForumTopic(f.chatId, child.topicId).catch(() => {})
   await ctx.api.sendMessage(f.chatId,
     `↻ Part ${child.n} (${child.title}) changed after the combined answer was written.`,
     { ...destOpts({ threadId: f.parentThreadId, replyTo: f.askedBy }), disable_notification: true,
