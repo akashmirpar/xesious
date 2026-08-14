@@ -10,7 +10,8 @@
  * We then assert on exactly what the user would have seen. Run with `bun test`.
  */
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -57,6 +58,11 @@ bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
   if (method === 'sendMessage' || method === 'editMessageText') {
     // editMessageText's real result can be a Message or true; bridge ignores it.
     return { ok: true, result: { message_id: nextMessageId++, date: 0, chat: { id: payload.chat_id, type: 'private' }, text: payload.text } }
+  }
+  if (method === 'createForumTopic') {
+    // The real API returns a thread id, and the fan-out code depends on it: without
+    // one, every part would fall back to the parent's key.
+    return { ok: true, result: { message_thread_id: nextMessageId++, name: payload.name, icon_color: 0 } }
   }
   // deleteMessage, deleteWebhook, setMyCommands, everything else.
   return { ok: true, result: true }
@@ -1001,5 +1007,89 @@ describe('fan-out', () => {
     })
     await new Promise(r => setTimeout(r, 400))
     expect(calls.slice(beforeCancel).some(c => c.method === 'createForumTopic')).toBe(false)
+  }, 15000)
+})
+
+describe('fan-out: worktree isolation for write-parts', () => {
+  // Parallel agents in one checkout trample each other's edits and git state, so a
+  // write-part gets its own worktree. This exercises it against a REAL repo rather
+  // than asserting the code path exists.
+  const repo = join(TMP, 'wt-repo')
+
+  beforeAll(() => {
+    mkdirSync(repo, { recursive: true })
+    const git = (...a: string[]) => execFileSync('git', ['-C', repo, ...a], { stdio: 'ignore' })
+    git('init', '-q')
+    git('config', 'user.email', 't@t')
+    git('config', 'user.name', 'T')
+    writeFileSync(join(repo, 'a.txt'), 'one\n')
+    git('add', '-A')
+    git('commit', '-qm', 'init')
+  })
+
+  test('a real worktree is created, on its own branch', () => {
+    const wt = bridge._makeWorktree(repo, 'fan1', 1)
+    expect(wt).toBeTruthy()
+    expect(existsSync(join(wt!.path, 'a.txt'))).toBe(true)   // the checkout is real
+    expect(wt!.branch).toBe('fanout/fan1-1')
+    const branches = execFileSync('git', ['-C', repo, 'branch', '--list'], { encoding: 'utf8' })
+    expect(branches).toContain('fanout/fan1-1')
+  })
+
+  test('two parts get separate trees, so edits cannot collide', () => {
+    const a = bridge._makeWorktree(repo, 'fan2', 1)
+    const b = bridge._makeWorktree(repo, 'fan2', 2)
+    expect(a!.path).not.toBe(b!.path)
+    writeFileSync(join(a!.path, 'a.txt'), 'edited by part 1\n')
+    // Part 2 is untouched by part 1's edit — the whole point of the isolation.
+    expect(readFileSync(join(b!.path, 'a.txt'), 'utf8')).toBe('one\n')
+  })
+
+  test('a directory that is not a repo yields nothing, rather than a broken tree', () => {
+    // The caller reports this and runs the part read-only instead of quietly
+    // writing into the shared checkout beside every other part.
+    const plain = join(TMP, 'not-a-repo')
+    mkdirSync(plain, { recursive: true })
+    expect(bridge._makeWorktree(plain, 'fan3', 1)).toBeUndefined()
+  })
+})
+
+describe('fan-out: steering a part changes the combined answer', () => {
+  const btns = (c: any) => c.payload?.reply_markup?.inline_keyboard?.[0] ?? []
+  const group = (text: string, id: number, threadId?: number) => bridge.bot.handleUpdate({
+    update_id: 99700 + id,
+    message: {
+      message_id: id, date: 0, message_thread_id: threadId,
+      chat: { id: -100777, type: 'supergroup', title: 'G', is_forum: true },
+      from: { id: 1, is_bot: false, first_name: 'T' }, text,
+    },
+  })
+
+  test('parts get DISTINCT topics, so they never share a session', async () => {
+    const before = calls.length
+    await group('/fanout look into things', 99201)
+    await bridge._drainQueue('-100777:main')
+    await new Promise(r => setTimeout(r, 300))
+    const proposal = calls.slice(before).find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Proposed split'))
+    const run = btns(proposal).find((b: any) => String(b.text).startsWith('— Run these'))
+    await bridge.bot.handleUpdate({
+      update_id: 99801,
+      callback_query: { id: 'fs1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: run.callback_data, message: { message_id: 99202, date: 0, chat: { id: -100777, type: 'supergroup' } } },
+    })
+    await new Promise(r => setTimeout(r, 3000))
+    const created = calls.filter(c => c.method === 'createForumTopic')
+    expect(created.length).toBeGreaterThanOrEqual(2)
+    // Each part was addressed in its own thread, not all in the parent.
+    const threads = new Set(calls.filter(c => c.method === 'sendMessage'
+      && String(c.payload.text ?? '').includes('Talk here to steer')).map(c => c.payload.message_thread_id))
+    expect(threads.size).toBeGreaterThanOrEqual(2)
+    expect([...threads].every(t => t !== undefined)).toBe(true)
+  }, 30000)
+
+  test('the combined answer is produced automatically once the parts settle', async () => {
+    const texts = calls.filter(c => c.method === 'sendMessage').map(c => String(c.payload.text ?? '')).join('\n')
+    expect(texts).toMatch(/parts have finished/i)
+    expect(texts).toContain('SYNTHESIS')
   }, 15000)
 })

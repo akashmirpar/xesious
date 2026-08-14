@@ -1502,7 +1502,12 @@ async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Pr
   } catch (e) {
     console.error(`[fanout ${f.id}] could not create a topic for part ${child.n}: ${e}`)
   }
-  const key = keyFor(f.chatId, topicId)
+  // If the topic could not be created, the parts must still be kept apart. Falling
+  // back to keyFor(chat, undefined) would give every part the PARENT's key: they
+  // would share one session, overwrite each other's bookkeeping, and the last one
+  // to finish would be the only result. A synthetic key keeps their sessions and
+  // directories distinct; only the delivery lands in the parent topic.
+  const key = topicId !== undefined ? keyFor(f.chatId, topicId) : `${f.parentKey}#part-${f.id}-${child.n}`
   child.topicId = topicId
   child.key = key
   sessions[key] = { ...(sessions[key] ?? {}), cwd }
@@ -1539,6 +1544,50 @@ async function finishFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): P
   await maybeSynthesise(ctx, f)
 }
 
+// A part changed after the answer was written. Say so and offer to redo it.
+async function offerRecombine(ctx: Context, f: Fanout, child: FanoutChild): Promise<void> {
+  await ctx.api.sendMessage(f.chatId,
+    `↻ Part ${child.n} (${child.title}) changed after the combined answer was written.`,
+    { ...destOpts({ threadId: f.parentThreadId, replyTo: f.askedBy }), disable_notification: true,
+      reply_markup: { inline_keyboard: [[{ text: '— Combine again —', callback_data: `fanr:${f.id}` }]] } },
+  ).catch(() => {})
+}
+
+// Where a write-part's work actually lives. Without this the branches are invisible
+// and the whole point of isolating them is lost — you cannot merge what you cannot
+// find.
+function fanoutBranchReport(f: Fanout): string {
+  const wrote = f.children.filter(c => c.branch)
+  if (!wrote.length) return ''
+  return '\n\nBranches created:\n' + wrote.map(c => `• \`${c.branch}\` — ${c.title}  (${c.worktree})`).join('\n')
+}
+
+// Tidy up once the answer is written: close each child topic (never delete — the
+// history is the record of how the part was reached), and remove a worktree only if
+// git agrees it is clean. A dirty worktree holds uncommitted work, so it is left
+// alone and reported rather than forced away.
+async function cleanupFanout(ctx: Context, f: Fanout): Promise<void> {
+  const kept: string[] = []
+  for (const c of f.children) {
+    if (c.topicId !== undefined) {
+      await send(ctx, c.topicId, `✅ This part is finished and folded into the answer in the parent topic.`, true).catch(() => {})
+      await ctx.api.closeForumTopic(f.chatId, c.topicId).catch(() => {})
+    }
+    if (c.worktree) {
+      try {
+        execFileSync('git', ['-C', c.worktree, 'worktree', 'remove', c.worktree], { stdio: 'ignore' })
+      } catch {
+        kept.push(`\`${c.branch}\` (${c.worktree})`)   // uncommitted work lives here
+      }
+    }
+  }
+  if (kept.length) {
+    await send(ctx, f.parentThreadId,
+      `Left these worktrees in place because they still have uncommitted changes:\n` +
+      kept.map(k => `• ${k}`).join('\n'), true, f.askedBy)
+  }
+}
+
 // When every part has settled, write the single answer — automatically, in the
 // parent topic, from the parts' own summaries.
 async function maybeSynthesise(ctx: Context, f: Fanout): Promise<void> {
@@ -1548,12 +1597,13 @@ async function maybeSynthesise(ctx: Context, f: Fanout): Promise<void> {
   const parts = f.children.map(c => ({ title: c.title, status: c.status, result: c.result }))
   const okCount = parts.filter(p => p.status === 'done').length
   await send(ctx, f.parentThreadId,
-    `🧩 All ${f.children.length} parts have finished (${okCount} completed). Putting it together…`,
+    `🧩 All ${f.children.length} parts have finished (${okCount} completed). Putting it together…` + fanoutBranchReport(f),
     true, f.askedBy)
   const preamble = buildSynthesisPreamble(f.task, parts)
   const key = f.parentKey
   void enqueue(`${key}#fanout-synth-${f.id}`,
     () => handlePrompt(ctx, f.parentThreadId, key, preamble, undefined, f.askedBy, true, true))
+    .then(() => cleanupFanout(ctx, f))
     .catch(e => console.error(`[fanout ${f.id}] synthesis: ${e}`))
 }
 
@@ -1643,11 +1693,22 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     // A background result arrives long after it was asked for, with anything in
     // between, so it always quotes its question and says what it is.
     const link = background ? replyTo : replyLink()
+    // Every turn in a child topic updates that part's result, not just its first
+    // one. Steering a part is the reason parts get their own topics at all — if the
+    // correction did not replace the answer, the combined result would be built
+    // from what the part said BEFORE you fixed it, which is worse than not being
+    // able to steer.
     const owner = childOf.get(key)
     if (owner) {
       const f = fanouts.get(owner.fanoutId)
       const child = f?.children.find(c => c.n === owner.n)
-      if (child && child.status === 'running') { child.result = res.text; child.status = 'done' }
+      if (child && res.text.trim()) {
+        child.result = res.text
+        if (child.status === 'running') child.status = 'done'
+        // Corrected after the answer was already written: offer to redo it rather
+        // than silently leaving a combined answer that no longer matches its parts.
+        else if (f && f.synthesised) await offerRecombine(ctx, f, child)
+      }
     }
     if (background && !owner) {
       noteBgResult(key, res.text)
@@ -2342,6 +2403,15 @@ bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   if (!isAllowed(ctx)) { await ctx.answerCallbackQuery({ text: 'Not authorized.', show_alert: true }).catch(() => {}); return }
   const key = keyFor(ctx.chat!.id, ctx.callbackQuery.message?.message_thread_id)
+  if (data.startsWith('fanr:')) {
+    const f = fanouts.get(data.slice(5))
+    if (!f) { await ctx.answerCallbackQuery({ text: 'That fan-out is no longer available.', show_alert: true }).catch(() => {}); return }
+    await ctx.answerCallbackQuery({ text: 'Combining again…' }).catch(() => {})
+    await ctx.editMessageReplyMarkup(undefined).catch(() => {})
+    f.synthesised = false
+    await maybeSynthesise(ctx, f)
+    return
+  }
   if (data.startsWith('fanx:')) {
     const f = fanouts.get(data.slice(5))
     if (f) fanouts.delete(f.id)
@@ -2616,6 +2686,8 @@ export const _tokenLockPath = tokenLockPath
 export const _lockHolder = lockHolder
 export const _procStartTime = procStartTime
 export const _PID_FILE = PID_FILE
+
+export const _makeWorktree = makeWorktree
 
 export function _drainQueue(key: string): Promise<unknown> { return queues.get(key) ?? Promise.resolve() }
 

@@ -552,9 +552,35 @@ async def feature_run_alongside(client, bot):
             "offer appeared on the queued message, tapping it answered alongside, and the offer was withdrawn")
 
 
+async def feature_fanout_guard(client, bot):
+    """Fan-out refuses a DM, and says why.
+
+    Each part needs its own forum topic to be steerable, and a DM has none. This is
+    the only part of fan-out Tier 3 can reach today: the staging bot talks to a test
+    ACCOUNT, not a forum group, so the spawning path has no group to spawn into.
+    Covering the guard is worth doing anyway — it is the boundary a user hits first,
+    and a silent no-op there would look like the feature is broken."""
+    print("  → /fanout in a DM (expect a clear refusal, not silence)")
+    msgs, _sent = await send_and_collect(client, bot, "/fanout look into three separate things", settle=5)
+    texts = [reply_text(m) for m in msgs]
+    for t in texts:
+        print(f"    ← {t[:100]!r}")
+    joined = " ".join(texts).lower()
+    problems = []
+    if not texts:
+        problems.append("no reply at all — the command was silently dropped")
+    elif "forum group" not in joined:
+        problems.append("refused without explaining that it needs a forum group")
+    if "/bg" not in " ".join(texts):
+        problems.append("did not point at the alternative that does work in a DM")
+    return ("fan-out refuses a DM and explains why", not problems,
+            "; ".join(problems) if problems else "refused with the reason and the alternative")
+
+
 FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
                  feature_midturn_text, feature_attribution, feature_reply_threading,
-                 feature_interrupt_kills_the_tree, feature_run_alongside]
+                 feature_interrupt_kills_the_tree, feature_run_alongside,
+                 feature_fanout_guard]
 
 
 async def main():
