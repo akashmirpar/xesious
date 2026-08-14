@@ -48,6 +48,10 @@ REAL_CLAUDE = env("STAGING_REAL_CLAUDE", required=False, default="") in ("1", "t
 # Matched as a substring of the test's function name (or, in stub mode, of the
 # prompt). Empty runs everything, which is what CI and a pre-commit check want.
 ONLY = env("STAGING_ONLY", required=False, default="").strip().lower()
+# A forum GROUP, for the tests that need topics. Fan-out gives each part its own
+# topic so it can be steered, which a DM cannot do — without this the spawning path
+# is untestable, and the case says so rather than passing vacuously.
+GROUP_ID = env("STAGING_GROUP_ID", required=False, default="")
 
 # Stub mode: single-turn (prompt, expected-substring), mirroring claude-stub.ts.
 CASES = [
@@ -577,7 +581,93 @@ async def feature_fanout_guard(client, bot):
             "; ".join(problems) if problems else "refused with the reason and the alternative")
 
 
-FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
+async def feature_fanout_end_to_end(client, bot):
+    """Drive a real fan-out in a real forum group: plan, confirm, spawn, combine.
+
+    Everything about fan-out below the guard had only ever run against a faked
+    Telegram API. This is the first time a real model produces the plan, the parser
+    reads it, real topics are created, the parts run in parallel, and the parent
+    receives a combined answer.
+    """
+    if not GROUP_ID:
+        return ("fan-out end to end in a real forum group", False,
+                "STAGING_GROUP_ID is not set, so the spawning path was never exercised")
+    group = int(GROUP_ID)
+    # Deliberately trivial. What is under test is the MACHINERY — plan, confirm,
+    # spawn, converge — not the model's research stamina. A first version asked for
+    # real investigation of the repo; one part finished at 15 steps while the other
+    # was still going at 26 when the harness tore down (exit 143), so the case
+    # failed on its own timeout while the code was working.
+    task = ("Do two tiny independent things and report each briefly: "
+            "(1) run `date` and report the output, "
+            "(2) run `ls -1 | wc -l` in the current directory and report the number.")
+
+    print("  → /fanout in the forum group (expect a proposal, then confirmation)")
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    await client.send_message(group, f"/fanout {task}")
+
+    # 1) the proposal, with its buttons, before anything is spawned
+    proposal = None
+    for _ in range(90):
+        await asyncio.sleep(1)
+        for m in list(seen):
+            if m.reply_markup and "Proposed split" in (reply_text(m) or ""):
+                proposal = m
+                break
+        if proposal:
+            break
+    if not proposal:
+        client.remove_event_handler(handler)
+        return ("fan-out end to end in a real forum group", False,
+                f"no proposal arrived; saw {[reply_text(m)[:60] for m in seen[-4:]]}")
+    labels = [b.text for row in proposal.reply_markup.rows for b in row.buttons]
+    print(f"    proposal buttons: {labels}")
+
+    topics_before = 0
+    async for _t in client.iter_messages(group, limit=1):
+        pass
+
+    # 2) confirm — this is what actually spawns the parts
+    await proposal.click(0)
+    print("    confirmed; waiting for the parts and the combined answer…")
+
+    combined = None
+    part_topics = set()
+    for _ in range(300):
+        await asyncio.sleep(1)
+        for m in list(seen):
+            tid = getattr(m, "reply_to", None)
+            tid = getattr(tid, "reply_to_top_id", None) or getattr(tid, "reply_to_msg_id", None)
+            t = reply_text(m) or ""
+            if "Talk here to steer this part" in t and tid:
+                part_topics.add(tid)
+            if "parts have finished" in t:
+                combined = combined or m
+        if combined and len(part_topics) >= 2:
+            break
+    client.remove_event_handler(handler)
+
+    texts = [reply_text(m) for m in seen]
+    problems = []
+    if not any("Proposed split" in t for t in texts):
+        problems.append("no proposal")
+    if len(part_topics) < 2:
+        problems.append(f"expected at least 2 part topics, saw {len(part_topics)}")
+    if not combined:
+        problems.append("the parts never converged into a combined answer")
+    print(f"    part topics seen: {len(part_topics)}; combined answer: {bool(combined)}")
+
+    return ("fan-out end to end in a real forum group", not problems,
+            "; ".join(problems) if problems else
+            f"plan accepted, {len(part_topics)} parts ran in their own topics, and the parent got a combined answer")
+
+
+FEATURE_TESTS = [feature_fanout_end_to_end, feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
                  feature_midturn_text, feature_attribution, feature_reply_threading,
                  feature_interrupt_kills_the_tree, feature_run_alongside,
                  feature_fanout_guard]

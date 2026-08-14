@@ -45,6 +45,9 @@ LOG="$STAGE_DIR/bridge.log"; : > "$LOG"
 export TG_ENV_FILE=/dev/null
 export TELEGRAM_BOT_TOKEN="$STAGING_BOT_TOKEN"
 export TG_ALLOWED_USERS="$TEST_ACCOUNT_USER_ID"
+# The fan-out tests drive a forum group; isAllowed() requires a non-private chat to
+# be listed, so an unset value here makes those cases look broken rather than skipped.
+[ -n "${STAGING_GROUP_ID:-}" ] && export TG_ALLOWED_CHATS="$STAGING_GROUP_ID"
 export TG_SESSIONS_BASE="$STAGE_DIR/sessions"
 export TG_STATE_FILE="$STAGE_DIR/state.json"
 # Real-Claude mode drives the actual `claude` CLI (real model, real answer);
