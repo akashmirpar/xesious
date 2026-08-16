@@ -972,6 +972,10 @@ describe('fan-out: what the synthesis turn is given', () => {
   ]
   test('carries the original request and every result', () => {
     const out = buildSynthesisPreamble('the original ask', parts)
+    // The parts' results are the input, not a first draft to be checked: re-running
+    // their work discards any correction made in a part's own topic, and redoes in
+    // series what was just done in parallel.
+    expect(out).toMatch(/Do not re-run their work/)
     expect(out).toContain('the original ask')
     expect(out).toContain('found alpha')
     expect(out).toContain('found beta')

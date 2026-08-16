@@ -974,6 +974,15 @@ export function buildSynthesisPreamble(
     '',
     'Now write one answer to the original request, drawing on all of the above. ' +
     'Do not simply concatenate the parts; resolve disagreements between them and say which part each conclusion came from.',
+    '',
+    // Left to itself the model re-runs the parts' work to check it, then reports what
+    // IT found instead of what they did. That silently discards a correction made in
+    // a part's own topic — the steering is real work, and this step is not entitled
+    // to overrule it — and on a real task it would redo in series everything that was
+    // just done in parallel, which is the whole point of splitting it up.
+    'Combine what the parts reported. Do not re-run their work to verify it, and do not ' +
+    'replace a part\'s result with your own. If a result looks wrong, say so and attribute ' +
+    'it, but still report what that part said.',
   ].join('\n')
 }
 

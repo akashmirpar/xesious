@@ -690,6 +690,11 @@ async def feature_fanout_steering(client, bot):
         client.remove_event_handler(handler)
         return ("steering a fan-out part changes the combined answer", False, why)
 
+    # A clean session per case. They all share the group's General topic, so without
+    # this the planner reads a previous case's corrections as context and starts
+    # answering conversationally instead of producing a plan.
+    await client.send_message(group, "/new")
+    await asyncio.sleep(3)
     print("  → /fanout, then steer one part while it is still running")
     await client.send_message(group, f"/fanout {task}")
 
@@ -800,6 +805,11 @@ async def feature_fanout_end_to_end(client, bot):
             "(1) run `echo ALPHA` and report its output verbatim, "
             "(2) run `echo BETA` and report its output verbatim.")
 
+    # A clean session per case. They all share the group's General topic, so without
+    # this the planner reads a previous case's corrections as context and starts
+    # answering conversationally instead of producing a plan.
+    await client.send_message(group, "/new")
+    await asyncio.sleep(3)
     print("  → /fanout in the forum group (expect a proposal, then confirmation)")
     seen = []
 
@@ -937,6 +947,11 @@ async def feature_fanout_worktrees(client, bot):
     async def handler(ev):
         seen.append(ev.message)
 
+    # A clean session per case. They all share the group's General topic, so without
+    # this the planner reads a previous case's corrections as context and starts
+    # answering conversationally instead of producing a plan.
+    await client.send_message(group, "/new")
+    await asyncio.sleep(3)
     print("  → /fanout with two write-parts")
     await client.send_message(group, f"/fanout {task}")
     proposal = None
