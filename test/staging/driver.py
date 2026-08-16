@@ -633,12 +633,19 @@ async def _until(fn, secs):
     return None
 
 
-async def _topic_is_closed(client, group, topic_id):
-    """Ask Telegram, not the bridge, whether a part's topic is actually closed."""
+async def _topic_gone(client, group, topic_id):
+    """Ask Telegram, not the bridge, whether a part's topic is really gone.
+
+    A deleted topic comes back either as nothing at all or as a ForumTopicDeleted
+    marker, depending on how it was removed; both mean the same thing to the person
+    looking at their topic list.
+    """
     from telethon.tl import functions
     res = await client(functions.messages.GetForumTopicsByIDRequest(
         peer=await client.get_input_entity(group), topics=[topic_id]))
-    return bool(getattr(res.topics[0], "closed", False)) if res.topics else None
+    if not res.topics:
+        return True
+    return type(res.topics[0]).__name__ == "ForumTopicDeleted"
 
 
 async def _reopen_topic(client, group, topic_id):
@@ -648,28 +655,31 @@ async def _reopen_topic(client, group, topic_id):
 
 
 async def feature_fanout_steering(client, bot):
-    """Correct ONE part after the answer is written, and recombine.
+    """Correct ONE part while the fan-out is still running, and check the answer.
 
-    This is the whole reason parts get their own topics: you can talk to one of them.
-    Everything below the surface of that — a later turn in a child topic replacing
-    that part's result, the offer to redo the combination, and the recombine building
-    the new answer from the CORRECTED part — had only ever run against a faked
-    Telegram. Here a real correction is typed into a real topic and the second
-    combined answer has to carry it.
+    This is the whole reason parts get their own topics: you can talk to one of them
+    mid-flight. Everything under that — a later turn in a child topic replacing that
+    part's result, and the combination being built from the CORRECTED result — had
+    only ever run against a faked Telegram.
 
-    It also checks the auto-close on the way through, by asking Telegram whether the
-    part topics are closed rather than by trusting the bridge's own message.
+    One part is made slow on purpose so the other can be corrected while the fan-out
+    is still open. If the timing slips and the answer is written first, the bridge
+    offers to combine again, and the case takes that route instead rather than
+    failing on a race it does not care about.
+
+    It also checks that the part topics are DELETED afterwards — by asking Telegram,
+    not by trusting the bridge's own message.
     """
     if not GROUP_ID:
         return ("steering a fan-out part changes the combined answer", False,
                 "STAGING_GROUP_ID is not set, so the steering path was never exercised")
     group = int(GROUP_ID)
-    # Deliberately trivial and token-shaped: what is under test is whether a
-    # correction reaches the combined answer, not the model's research stamina, and
-    # a one-word result makes "did the correction land" a fact rather than a reading.
+    # Token-shaped and trivial: what is under test is whether a correction reaches
+    # the combined answer, not the model's research stamina. The second part is slow
+    # so there is a window in which the first can be steered.
     task = ("Do two tiny independent things and report the result of each: "
             "(1) run `echo ALPHA` and report its output verbatim, "
-            "(2) run `echo BETA` and report its output verbatim.")
+            "(2) run `sleep 75` and then run `echo BETA`, reporting BETA verbatim.")
     seen = []
 
     @client.on(events.NewMessage(chats=group))
@@ -680,7 +690,7 @@ async def feature_fanout_steering(client, bot):
         client.remove_event_handler(handler)
         return ("steering a fan-out part changes the combined answer", False, why)
 
-    print("  → /fanout, then steer one part after it has answered")
+    print("  → /fanout, then steer one part while it is still running")
     await client.send_message(group, f"/fanout {task}")
 
     proposal = await _until(
@@ -689,7 +699,7 @@ async def feature_fanout_steering(client, bot):
         return fail(f"no proposal arrived; saw {[(reply_text(m) or '')[:50] for m in seen[-4:]]}")
     await proposal.click(0)
 
-    # The part topics announce themselves; remember which topic is which part.
+    # Each part introduces itself in its own topic; remember which topic is which.
     parts = {}
 
     def scan_parts():
@@ -697,79 +707,76 @@ async def feature_fanout_steering(client, bot):
             t = reply_text(m) or ""
             if "Talk here to steer this part" in t and _topic_of(m):
                 n = t.split("Part ", 1)[1].split(" ", 1)[0] if "Part " in t else "?"
-                parts[n] = _topic_of(m)
+                parts[n] = (_topic_of(m), t)
         return len(parts) >= 2 or None
 
     if not await _until(scan_parts, 120):
         return fail(f"expected 2 part topics, saw {parts}")
-    print(f"    part topics: {parts}")
+    print(f"    part topics: { {n: tid for n, (tid, _) in parts.items()} }")
 
-    mine = set(parts.values())
-    first = await _until(lambda: combined_answer(seen, ("ALPHA", "BETA"), not_in=mine), 300)
-    if not first:
-        return fail("the parts never converged into a first combined answer; last saw "
-                    f"{[(reply_text(m) or '')[:50] for m in seen[-4:]]}")
-    print(f"    first combined answer: {(reply_text(first) or '')[:80]!r}")
-
-    problems = []
-    # The auto-close, checked at the source. Give the close a moment: it runs after
-    # the answer is posted, so observing it immediately would be a race, not a bug.
-    await asyncio.sleep(5)
-    closed = {}
-    for n, tid in parts.items():
-        try:
-            closed[n] = await _topic_is_closed(client, group, tid)
-        except Exception as e:                                  # noqa: BLE001
-            closed[n] = f"could not ask: {e}"
-    print(f"    topics closed after the answer: {closed}")
-    if not all(v is True for v in closed.values()):
-        problems.append(f"part topics were not closed automatically: {closed}")
-
-    # Steering a closed topic. A member cannot type in one, which is exactly why the
-    # bridge reopens it — but the FIRST correction has to get in somehow, so reopen
-    # it here the way an admin would in the app.
-    target_n = sorted(parts)[0]
-    target = parts[target_n]
-    try:
-        await _reopen_topic(client, group, target)
-    except Exception as e:                                      # noqa: BLE001
-        print(f"    (could not reopen topic {target}: {e})")
-
+    # Steer the FAST part: the slow one is what keeps the fan-out open long enough
+    # for the correction to land before the answer is written.
+    fast = next((n for n, (_, intro) in sorted(parts.items()) if "ALPHA" in intro), sorted(parts)[0])
+    target = parts[fast][0]
     mark = seen[-1].id if seen else 0
-    print(f"    → correcting part {target_n} in its own topic")
+    print(f"    → correcting part {fast} in its own topic, mid-flight")
     await client.send_message(
         group,
         "Correction: ignore your earlier instruction. Your result is now exactly the "
         "single word GAMMA. Reply with GAMMA and nothing else.",
         reply_to=target)
 
-    offer = await _until(
-        lambda: next((m for m in seen if m.id > mark and m.reply_markup
-                      and "changed after the combined answer" in (reply_text(m) or "")), None), 240)
-    if not offer:
-        return fail("the correction never produced an offer to combine again; last saw "
-                    f"{[(reply_text(m) or '')[:50] for m in seen[-4:]]}")
-    labels = [b.text for row in offer.reply_markup.rows for b in row.buttons]
-    print(f"    recombine offer: {labels}")
+    mine = set(tid for tid, _ in parts.values())
+    route = "mid-flight"
 
-    mark2 = seen[-1].id
-    await offer.click(0)
-    second = await _until(lambda: combined_answer(seen, ("GAMMA",), after_id=mark2, not_in=mine), 300)
-    client.remove_event_handler(handler)
-    if not second:
-        return ("steering a fan-out part changes the combined answer", False,
-                "; ".join(problems + ["the recombined answer never arrived, or did not carry the correction"]))
-    text = reply_text(second) or ""
-    print(f"    recombined answer: {text[:120]!r}")
-    # The corrected part's word must be there; the OTHER part's must survive too, or
-    # the recombine dropped work rather than updating it.
+    def answer_or_offer():
+        return (combined_answer(seen, ("GAMMA",), after_id=mark, not_in=mine)
+                or next((m for m in seen if m.id > mark and m.reply_markup
+                         and "changed after the combined answer" in (reply_text(m) or "")), None))
+
+    got = await _until(answer_or_offer, 300)
+    if not got:
+        return fail("neither a combined answer carrying the correction nor an offer to "
+                    f"combine again; last saw {[(reply_text(m) or '')[:50] for m in seen[-4:]]}")
+    if got.reply_markup:
+        # The answer was written before the correction landed. That is the other
+        # supported route, not a failure: take the offer and check the result.
+        route = "recombined after the answer"
+        print(f"    (the answer came first; taking the offer: "
+              f"{[b.text for row in got.reply_markup.rows for b in row.buttons]})")
+        mark2 = seen[-1].id
+        await got.click(0)
+        got = await _until(lambda: combined_answer(seen, ("GAMMA",), after_id=mark2, not_in=mine), 300)
+        if not got:
+            return fail("the recombined answer never arrived, or did not carry the correction")
+
+    text = reply_text(got) or ""
+    print(f"    combined answer ({route}): {text[:120]!r}")
+    problems = []
+    # The corrected part's word is there by construction; the OTHER part's must have
+    # survived, or the combination dropped work rather than updating it.
     if "BETA" not in text and "ALPHA" not in text:
-        problems.append("the recombined answer lost the part that was not corrected")
+        problems.append("the combined answer lost the part that was not corrected")
 
+    # The topics are removed once the answer is written — closing them would leave
+    # them in the topic list, which is the mess this is meant to avoid. Give the
+    # removal a moment: it runs after the answer is posted.
+    await asyncio.sleep(6)
+    gone = {}
+    for n, (tid, _) in parts.items():
+        try:
+            gone[n] = await _topic_gone(client, group, tid)
+        except Exception as e:                                  # noqa: BLE001
+            gone[n] = f"could not ask: {e}"
+    print(f"    topics gone after the answer: {gone}")
+    if not all(v is True for v in gone.values()):
+        problems.append(f"part topics were not deleted automatically: {gone}")
+
+    client.remove_event_handler(handler)
     return ("steering a fan-out part changes the combined answer", not problems,
             "; ".join(problems) if problems else
-            f"part {target_n} was corrected in its own topic, its topic reopened, "
-            "and the recombined answer carried GAMMA alongside the untouched part")
+            f"part {fast} was corrected in its own topic ({route}), the combined answer "
+            "carried GAMMA alongside the untouched part, and both topics were deleted")
 
 
 async def feature_fanout_end_to_end(client, bot):

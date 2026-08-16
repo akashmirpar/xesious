@@ -1598,33 +1598,52 @@ function fanoutBranchReport(f: Fanout): string {
 // history is the record of how the part was reached), and remove a worktree only if
 // git agrees it is clean. A dirty worktree holds uncommitted work, so it is left
 // alone and reported rather than forced away.
-// Close the part topics once the answer is written. They are CLOSED, never
-// deleted: the working-out stays readable and a closed topic can be reopened from
-// the topic list. Left open they simply pile up, which is what a group full of
-// abandoned "2/3 …" topics looks like after a few fan-outs.
+// What becomes of the part topics once the answer is written.
 //
-// If closing fails — usually the bot lacking Manage Topics — fall back to offering
-// the button rather than leaving the mess with no way out.
-async function closeFanoutTopics(ctx: Context, f: Fanout): Promise<void> {
-  const open = f.children.filter(c => c.topicId !== undefined)
-  if (!open.length) return
-  let closed = 0
-  for (const c of open) {
-    const ok = await ctx.api.closeForumTopic(f.chatId, c.topicId!).then(() => true).catch(() => false)
-    if (ok) closed++
+//   delete (default) — remove them. A closed topic still sits in the topic list, so
+//                      after a few fan-outs the list is mostly spent scaffolding.
+//   close            — keep them, closed and read-only, for their working-out.
+//   keep             — leave them open.
+//
+// Deleting is destructive and worth being clear about: the part's reasoning goes
+// with it, and the combined answer is then the only record. `close` is there for
+// anyone who would rather keep the transcript than the tidy list. Read at call time
+// so it can be changed without a restart being the only way to see it.
+function topicDisposal(): 'delete' | 'close' | 'keep' {
+  const v = (process.env.TG_FANOUT_TOPICS || 'delete').toLowerCase()
+  return v === 'close' || v === 'keep' ? v : 'delete'
+}
+
+// Dispose of the part topics, falling back rather than giving up: deleting needs
+// Delete Messages and closing needs Manage Topics, and a bot that has neither must
+// still leave a way to clear up by hand instead of an unexplained mess.
+async function disposeFanoutTopics(ctx: Context, f: Fanout): Promise<void> {
+  const mode = topicDisposal()
+  if (mode === 'keep') return
+  const live = f.children.filter(c => c.topicId !== undefined)
+  if (!live.length) return
+  let done = 0
+  for (const c of live) {
+    if (mode === 'delete'
+      && await ctx.api.deleteForumTopic(f.chatId, c.topicId!).then(() => true).catch(() => false)) { done++; continue }
+    if (await ctx.api.closeForumTopic(f.chatId, c.topicId!).then(() => true).catch(() => false)) done++
   }
-  if (closed === open.length) return
+  if (done === live.length) return
+  const left = live.length - done
   await ctx.api.sendMessage(f.chatId,
-    `${open.length - closed} part topic${open.length - closed === 1 ? '' : 's'} could not be closed automatically.`,
+    `${left} part topic${left === 1 ? '' : 's'} could not be cleared up automatically — the bot needs Delete Messages, or Manage Topics to close them.`,
     { ...destOpts({ threadId: f.parentThreadId, replyTo: f.askedBy }), disable_notification: true,
-      reply_markup: { inline_keyboard: [[{ text: '— Close the part topics —', callback_data: `fanc:${f.id}` }]] } },
+      reply_markup: { inline_keyboard: [[{ text: '— Remove the part topics —', callback_data: `fanc:${f.id}` }]] } },
   ).catch(() => {})
 }
 
 async function cleanupFanout(ctx: Context, f: Fanout): Promise<void> {
   const kept: string[] = []
+  const keeping = topicDisposal() !== 'delete'
   for (const c of f.children) {
-    if (c.topicId !== undefined) {
+    // Only worth saying where the topic will survive to be read. Posting it into a
+    // topic that is about to be deleted is a message written to be thrown away.
+    if (c.topicId !== undefined && keeping) {
       await send(ctx, c.topicId, `✅ This part is finished and folded into the answer in the parent topic.`, true).catch(() => {})
     }
     if (c.worktree) {
@@ -1666,7 +1685,7 @@ async function maybeSynthesise(ctx: Context, f: Fanout): Promise<void> {
   void enqueue(`${key}#fanout-synth-${f.id}`,
     () => handlePrompt(ctx, f.parentThreadId, key, preamble, undefined, f.askedBy, true, true, true))
     .then(() => cleanupFanout(ctx, f))
-    .then(() => closeFanoutTopics(ctx, f))
+    .then(() => disposeFanoutTopics(ctx, f))
     .catch(e => console.error(`[fanout ${f.id}] synthesis: ${e}`))
 }
 
@@ -2478,15 +2497,9 @@ bot.on('callback_query:data', async ctx => {
   if (data.startsWith('fanc:')) {
     const f = fanouts.get(data.slice(5))
     if (!f) { await ctx.answerCallbackQuery({ text: 'That fan-out is no longer available.', show_alert: true }).catch(() => {}); return }
-    let closed = 0
-    for (const c of f.children) {
-      if (c.topicId === undefined) continue
-      // Closed, never deleted: the history is the record of how that part was
-      // reached, and it can be reopened.
-      const ok = await ctx.api.closeForumTopic(f.chatId, c.topicId).then(() => true).catch(() => false)
-      if (ok) closed++
-    }
-    await ctx.answerCallbackQuery({ text: closed ? `Closed ${closed} topic${closed === 1 ? '' : 's'}.` : 'Could not close them — the bot needs Manage Topics.' , show_alert: !closed }).catch(() => {})
+    const before = f.children.filter(c => c.topicId !== undefined).length
+    await disposeFanoutTopics(ctx, f)
+    await ctx.answerCallbackQuery({ text: `Cleared up ${before} part topic${before === 1 ? '' : 's'}.` }).catch(() => {})
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})
     return
   }
@@ -2776,6 +2789,7 @@ export const _procStartTime = procStartTime
 export const _PID_FILE = PID_FILE
 
 export const _makeWorktree = makeWorktree
+export const _disposeFanoutTopics = disposeFanoutTopics
 
 export function _drainQueue(key: string): Promise<unknown> { return queues.get(key) ?? Promise.resolve() }
 

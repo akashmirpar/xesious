@@ -43,6 +43,10 @@ const bridge: any = await import('../bridge')
 type Call = { method: string; payload: any }
 const calls: Call[] = []
 let nextMessageId = 1000
+// A bot without Delete Messages: the API refuses deleteForumTopic. Switchable
+// because the fallback to merely closing is the interesting half — a fallback that
+// no test ever reaches is a fallback nobody knows is broken.
+let denyDelete = false
 
 bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
   calls.push({ method, payload })
@@ -58,6 +62,9 @@ bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
   if (method === 'sendMessage' || method === 'editMessageText') {
     // editMessageText's real result can be a Message or true; bridge ignores it.
     return { ok: true, result: { message_id: nextMessageId++, date: 0, chat: { id: payload.chat_id, type: 'private' }, text: payload.text } }
+  }
+  if (method === 'deleteForumTopic' && denyDelete) {
+    return { ok: false, error_code: 400, description: 'Bad Request: not enough rights to delete messages' }
   }
   if (method === 'createForumTopic') {
     // The real API returns a thread id, and the fan-out code depends on it: without
@@ -1102,7 +1109,10 @@ describe('fan-out: steering a part changes the combined answer', () => {
     // be reopened, or the first correction is also the last one possible.
     const child = calls.find(c => c.method === 'sendMessage'
       && String(c.payload.text ?? '').includes('Talk here to steer'))!.payload.message_thread_id as number
-    expect(calls.some(c => c.method === 'closeForumTopic')).toBe(true)
+    // Deleted, not closed: a closed topic still sits in the topic list, and after a
+    // few fan-outs the list is mostly spent scaffolding.
+    expect(calls.some(c => c.method === 'deleteForumTopic')).toBe(true)
+    expect(calls.some(c => c.method === 'closeForumTopic')).toBe(false)
     const before = calls.length
     await group('correction: the answer is CORRECTED', 99301, child)
     await bridge._drainQueue(`-100777:${child}`)
@@ -1112,4 +1122,33 @@ describe('fan-out: steering a part changes the combined answer', () => {
       && c.payload.message_thread_id === child)).toBe(true)
     expect(after.some(c => btns(c).some((b: any) => String(b.text).includes('Combine again')))).toBe(true)
   }, 20000)
+
+  test('a bot without Delete Messages closes the topics instead of leaving them', async () => {
+    // The fallback chain, driven directly: delete refused → close → and only if that
+    // fails too does the person get a button. A bot missing one right must not turn
+    // "tidy up after yourself" into silence.
+    const fake = { api: bridge.bot.api, chat: { id: -100777 } }
+    const f = { id: 'fanD', chatId: -100777, parentThreadId: undefined, askedBy: 1,
+                children: [{ n: 1, topicId: 4001 }, { n: 2, topicId: 4002 }] }
+    denyDelete = true
+    const before = calls.length
+    await bridge._disposeFanoutTopics(fake, f)
+    denyDelete = false
+    const after = calls.slice(before)
+    expect(after.filter(c => c.method === 'deleteForumTopic').length).toBe(2)
+    expect(after.filter(c => c.method === 'closeForumTopic').length).toBe(2)
+    // Both were dealt with, so there is nothing to ask the person to do.
+    expect(after.some(c => btns(c).some((b: any) => String(b.text).includes('Remove the part topics')))).toBe(false)
+  })
+
+  test('TG_FANOUT_TOPICS=keep leaves the topics exactly as they are', async () => {
+    const fake = { api: bridge.bot.api, chat: { id: -100777 } }
+    const f = { id: 'fanK', chatId: -100777, parentThreadId: undefined, askedBy: 1,
+                children: [{ n: 1, topicId: 4003 }] }
+    process.env.TG_FANOUT_TOPICS = 'keep'
+    const before = calls.length
+    await bridge._disposeFanoutTopics(fake, f)
+    delete process.env.TG_FANOUT_TOPICS
+    expect(calls.slice(before).length).toBe(0)
+  })
 })
