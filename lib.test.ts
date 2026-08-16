@@ -998,16 +998,18 @@ describe('fan-out: telling the part topics apart in a busy group', () => {
     // It replaced a per-fan-out palette of coloured circles: a red circle reads as
     // an error, and the circle emoji did not render in topic names on every client
     // — they arrived as a question mark beside a circle.
-    expect(FANOUT_MARK).toBe('🍃')
+    // The topic ICON has to come from Telegram's approved set, and 🧪 is in it while
+    // no leaf is; the list mark matches the icon so the two read as one thing.
+    expect(FANOUT_MARK).toBe('🧪')
   })
-  test('the topic name leads with the badge and position, not a restated task', () => {
-    // The task used to be restated in every name, which made them all long and
-    // similar — the opposite of scannable.
-    const n = fanoutTopicName('', 2, 3, 'Survey the scripts')
-    expect(n).toBe('🍃 2/3 Survey the scripts')
+  test('the topic name is a plain "---" lead-in and the title', () => {
+    // ASCII, not an emoji: the name is rendered by the client's own font, which is
+    // where 🍃 turned into a question mark. The topic ICON carries the identity.
+    // No position either — every part already sits beside its siblings.
+    expect(fanoutTopicName('Survey the scripts')).toBe('--- Survey the scripts')
   })
   test("and stays inside Telegram's 128-character limit", () => {
-    const n = fanoutTopicName('', 1, 2, 't'.repeat(200))
+    const n = fanoutTopicName('t'.repeat(200))
     expect(n.length).toBeLessThanOrEqual(128)
     expect(n).toMatch(/…$/)                     // the title is what gets shortened
   })

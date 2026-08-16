@@ -665,10 +665,9 @@ const FANOUT_MAX = Number(process.env.TG_FANOUT_MAX || 6)
 // by a model, and eight live children is roughly 2.4 GB on a box with 7.9 GB and no
 // swap. Batching is stated in the proposal rather than applied silently.
 const FANOUT_CONCURRENCY = Number(process.env.TG_FANOUT_CONCURRENCY || 3)
-// One of Telegram's six permitted topic colours. Purple, because the default topic
-// icon on this deployment is not, so a fan-out's parts stand out from ordinary
-// topics in a busy group.
-const FANOUT_TOPIC_COLOR = Number(process.env.TG_FANOUT_TOPIC_COLOR || 0xCB86DB)
+// 🧪, from Telegram's approved topic-icon set. Only ids from that set are accepted,
+// which is also why there is no leaf here: the set has no plant of any kind.
+const FANOUT_TOPIC_ICON = process.env.TG_FANOUT_TOPIC_ICON || '5411138633765757782'
 
 type FanoutChild = FanoutPlanItem & {
   topicId?: number
@@ -1502,13 +1501,13 @@ async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Pr
   // talking to that part's own session.
   let topicId: number | undefined
   try {
-    // A distinct colour, deliberately NOT the deployment's usual topic icon: in a
-    // group with other work going on, fan-out children have to be tellable apart at
-    // a glance. icon_color is create-time only — editForumTopic cannot change it —
-    // so it has to be right here.
-    const t = await ctx.api.createForumTopic(f.chatId,
-      fanoutTopicName(f.badge, child.n, f.children.length, child.title),
-      { icon_color: FANOUT_TOPIC_COLOR })
+    // A custom emoji from Telegram's OWN approved set (getForumTopicIconStickers),
+    // deliberately not the deployment's usual topic icon: in a group with other work
+    // going on, fan-out parts have to be tellable apart at a glance. It has to be
+    // one of those ids — an arbitrary emoji is rejected — and it is create-time only,
+    // since editForumTopic cannot change it afterwards.
+    const t = await ctx.api.createForumTopic(f.chatId, fanoutTopicName(child.title),
+      { icon_custom_emoji_id: FANOUT_TOPIC_ICON })
     topicId = t.message_thread_id
   } catch (e) {
     console.error(`[fanout ${f.id}] could not create a topic for part ${child.n}: ${e}`)
@@ -1540,13 +1539,22 @@ async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Pr
     `on its own, alongside the other parts, by a final step that writes the answer.`,
   ].join('\n')
 
-  await send(ctx, topicId, `🌿 Part ${child.n} of ${f.children.length} — ${child.title}\n\nTalk here to steer this part.`, true)
+  // Issued before the part's turn so it heads the topic, but deliberately NOT
+  // awaited before it: awaiting here yields to the event loop, and a message typed
+  // into the topic in that gap landed in the queue AHEAD of the part's own work.
+  // The part then ran second and overwrote the correction with its original task.
+  const intro = send(ctx, topicId, `${FANOUT_MARK} Part ${child.n} of ${f.children.length} — ${child.title}\n\nTalk here to steer this part.`, true)
 
-  const jobKey = `${key}#fanout-${f.id}-${child.n}`
-  child.jobKey = jobKey
-  void enqueue(jobKey, () => handlePrompt(ctx, topicId, key, brief, undefined, undefined, false, true))
+  // The part's own turn goes in the TOPIC's queue, not a private one of its own.
+  // With a separate queue, a message typed in the topic ran CONCURRENTLY with the
+  // part — two turns against one session, and the later one to finish won, which is
+  // how a correction could vanish. Sharing the queue makes a correction what it
+  // looks like: the next turn.
+  child.jobKey = key
+  void enqueue(key, () => handlePrompt(ctx, topicId, key, brief, undefined, undefined, false, true))
     .then(() => finishFanoutChild(ctx, f, child))
     .catch(e => { console.error(`[fanout ${f.id}] part ${child.n}: ${e}`); child.status = 'failed'; void maybeSynthesise(ctx, f) })
+  await intro
 }
 
 // A part is done when its job chain settles; its result was captured on the way out.

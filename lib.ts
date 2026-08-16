@@ -834,22 +834,32 @@ export function htmlDocument(title: string, bodyHtml: string): string {
 export type FanoutMode = 'read' | 'write'
 export type FanoutPlanItem = { n: number; mode: FanoutMode; title: string; brief: string }
 
-// One mark for every fan-out part, everywhere: the topic name, the part list, the
-// finish note. A leaf, because these are branches of one request.
+// One mark for every fan-out part, in the part list and the finish note. It matches
+// the topic ICON so a row in the list and a topic in the sidebar are visibly the
+// same thing.
 //
-// It replaced a palette of coloured circles chosen per fan-out. Two things were
-// wrong with that: a red circle reads as an error rather than as an identifier,
-// and the coloured-circle emoji did not render in topic names on every client —
-// they came through as a question mark next to a circle, which is worse than no
-// badge at all. One well-supported glyph beats a clever scheme nobody can read.
-export const FANOUT_MARK = '🍃'
+// It was a leaf, and before that a palette of coloured circles picked per fan-out.
+// The circles read as errors; the leaf could not be used where it mattered, because
+// a topic icon must be a custom emoji from Telegram's approved set and that set has
+// no plant of any kind. Matching the one glyph that CAN appear in both places beats
+// a nicer glyph that only works in one.
+export const FANOUT_MARK = '🧪'
 
-// Topic names are capped at 128 characters and are read at a glance in a list, so
-// the badge and the position come first and the title is what gets shortened.
-export function fanoutTopicName(_badge: string, n: number, total: number, title: string): string {
-  const head = `${FANOUT_MARK} ${n}/${total} `
-  const room = Math.max(8, 128 - head.length)
-  return head + (title.length <= room ? title : title.slice(0, room - 1) + '…')
+// A part topic's name: a "---" lead-in, then the part's own title.
+//
+// The lead-in is plain ASCII on purpose. An emoji here is at the mercy of the
+// client's font — 🍃 came through as a question mark — while the topic ICON is a
+// custom emoji from Telegram's own approved set and always renders. So the icon
+// carries the identity and the name carries the words.
+//
+// No "2/3": the position was noise in a list where every part already sits beside
+// its siblings, and the title is the thing being looked for. Names are capped at
+// 128 characters, so the title is what gets shortened.
+export function fanoutTopicName(title: string): string {
+  const head = '--- '
+  const room = 128 - head.length
+  const t = title.trim() || 'part'
+  return head + (t.length <= room ? t : t.slice(0, room - 1) + '…')
 }
 
 // A tappable link to a topic. Only works for members of the group, which is exactly

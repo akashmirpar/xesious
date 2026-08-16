@@ -834,26 +834,41 @@ async def feature_fanout_end_to_end(client, bot):
     await proposal.click(0)
     print("    confirmed; waiting for the parts and the combined answer…")
 
-    combined = None
     part_topics = set()
-    for _ in range(300):
-        await asyncio.sleep(1)
+
+    def scan():
         for m in list(seen):
-            tid = getattr(m, "reply_to", None)
-            tid = getattr(tid, "reply_to_top_id", None) or getattr(tid, "reply_to_msg_id", None)
-            t = reply_text(m) or ""
-            if "Talk here to steer this part" in t and tid:
+            tid = _topic_of(m)
+            if "Talk here to steer this part" in (reply_text(m) or "") and tid:
                 part_topics.add(tid)
-        # The synthesis used to be preceded by an "All N parts have finished" note.
-        # That note now only speaks when it has something to report (a failure, or a
-        # branch), so the answer itself is what to wait for.
-        combined = combined or combined_answer(seen, ("ALPHA", "BETA"), not_in=part_topics)
-        if combined and len(part_topics) >= 2:
-            break
+        return len(part_topics) >= 2 or None
+
+    await _until(scan, 180)
+    problems = []
+
+    # Read the topics WHILE THE PARTS ARE ALIVE. They are deleted once the answer is
+    # written, and a deleted topic comes back with no name and no icon — which reads
+    # exactly like a rejected icon id, so checking afterwards would report a failure
+    # that isn't one and hide the one that is.
+    from telethon.tl import functions
+    peer = await client.get_input_entity(group)
+    for tid in sorted(part_topics):
+        try:
+            res = await client(functions.messages.GetForumTopicsByIDRequest(peer=peer, topics=[tid]))
+            t = res.topics[0]
+            name, icon = getattr(t, "title", ""), getattr(t, "icon_emoji_id", None)
+            print(f"    topic {tid}: name={name!r} icon_emoji_id={icon}")
+            if not str(name).startswith("--- "):
+                problems.append(f"topic {tid} is named {name!r}, not '--- <title>'")
+            if not icon:
+                problems.append(f"topic {tid} has no custom icon — Telegram rejected the id")
+        except Exception as e:                                  # noqa: BLE001
+            print(f"    (could not read topic {tid}: {e})")
+
+    combined = await _until(lambda: combined_answer(seen, ("ALPHA", "BETA"), not_in=part_topics), 300)
     client.remove_event_handler(handler)
 
     texts = [reply_text(m) for m in seen]
-    problems = []
     if not any("Proposed split" in t for t in texts):
         problems.append("no proposal")
     if len(part_topics) < 2:

@@ -1087,6 +1087,13 @@ describe('fan-out: steering a part changes the combined answer', () => {
     await new Promise(r => setTimeout(r, 3000))
     const created = calls.filter(c => c.method === 'createForumTopic')
     expect(created.length).toBeGreaterThanOrEqual(2)
+    // The identity is carried by a custom emoji from Telegram's approved set, which
+    // always renders — an emoji in the NAME is drawn by the client's own font, and
+    // that is where 🍃 became a question mark. So: icon yes, emoji in the name no.
+    expect(created.every(c => typeof c.payload.icon_custom_emoji_id === 'string'
+      && c.payload.icon_custom_emoji_id.length > 0)).toBe(true)
+    expect(created.every(c => String(c.payload.name).startsWith('--- '))).toBe(true)
+    expect(created.some(c => /[\u{1F300}-\u{1FAFF}]/u.test(String(c.payload.name)))).toBe(false)
     // Each part was addressed in its own thread, not all in the parent.
     const threads = new Set(calls.filter(c => c.method === 'sendMessage'
       && String(c.payload.text ?? '').includes('Talk here to steer')).map(c => c.payload.message_thread_id))
