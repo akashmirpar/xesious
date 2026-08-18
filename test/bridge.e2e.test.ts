@@ -1110,6 +1110,31 @@ describe('fan-out: steering a part changes the combined answer', () => {
     expect(texts).not.toMatch(/Background task finished[\s\S]{0,40}SYNTHESIS/)
   }, 15000)
 
+  test('a plan proposed before a restart is still runnable afterwards', async () => {
+    // The bug: fan-out plans lived only in memory, so restarting the bridge left
+    // every proposal's button answering "that plan is no longer available" for
+    // something the person had just been offered. A plan is only text until it is
+    // confirmed, so it belongs in the state file.
+    const before = calls.length
+    await group('/fanout look into two things', 99401)
+    await bridge._drainQueue('-100777:main')
+    await new Promise(r => setTimeout(r, 300))
+    const proposal = calls.slice(before).find(c => c.method === 'sendMessage'
+      && String(c.payload.text ?? '').includes('Proposed split'))
+    const run = btns(proposal).find((b: any) => String(b.text).startsWith('— Run these'))
+    const id = String(run.callback_data).slice(4)
+
+    const saved = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+    const plan = (saved.fanoutPlans ?? []).find((f: any) => f.id === id)
+    expect(plan).toBeDefined()
+    expect(plan.task).toContain('look into two things')
+    expect(plan.children.length).toBeGreaterThanOrEqual(2)
+    // A fan-out already running is NOT stored: its parts were child processes and
+    // died with the bridge, so a button offering to run it could not honour itself.
+    expect((saved.fanoutPlans ?? []).some((f: any) =>
+      f.children.some((c: any) => c.status !== 'pending'))).toBe(false)
+  }, 30000)
+
   test('a correction after the answer reopens that part and offers to combine again', async () => {
     // The parts' topics are closed once the answer is written, and a closed topic is
     // read-only for everyone but an admin — so a part that is being corrected has to

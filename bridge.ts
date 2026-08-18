@@ -364,6 +364,11 @@ function loadState(): void {
       models = o.models ?? {}
       efforts = o.efforts ?? {}
       voice = o.voice ?? {}
+      // Plans proposed but not yet confirmed. A plan is just text until you tap
+      // "run", and losing it to a restart made the button answer "that plan is no
+      // longer available" for something the person had only just been offered.
+      // Restored as pending: nothing was ever started, so there is nothing to adopt.
+      for (const f of (o.fanoutPlans ?? []) as Fanout[]) fanouts.set(f.id, f)
       // migrate old boolean state: true → 'full', false/other → off
       for (const k of Object.keys(voice)) { const v: any = voice[k]; if (v === true) voice[k] = 'full'; else if (v !== 'full' && v !== 'summary') delete voice[k] }
     }
@@ -372,7 +377,12 @@ function loadState(): void {
 function saveState(): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true })
-    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models, efforts, voice }, null, 2))
+    writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models, efforts, voice,
+      // Only the ones still awaiting a decision. A fan-out that has started cannot be
+      // resumed — its parts were child processes and died with the bridge — so
+      // persisting it would offer a button that could not honour itself.
+      fanoutPlans: [...fanouts.values()].filter(f => f.children.every(c => c.status === 'pending')),
+    }, null, 2))
   } catch (e) { console.error(`[warn] could not write state: ${e}`) }
 }
 
@@ -2307,6 +2317,7 @@ bot.on('message', async ctx => {
         children: items.map(i => ({ ...i, status: 'pending' as const })),
       }
       fanouts.set(f.id, f)
+      saveState()
       // Through telegramify with a parse mode: this text is markdown, and a raw
       // sendMessage renders its asterisks and underscores literally.
       await ctx.api.sendMessage(ctx.chat!.id,
@@ -2541,18 +2552,26 @@ bot.on('callback_query:data', async ctx => {
   }
   if (data.startsWith('fanx:')) {
     const f = fanouts.get(data.slice(5))
-    if (f) fanouts.delete(f.id)
+    if (f) { fanouts.delete(f.id); saveState() }
     await ctx.answerCallbackQuery({ text: 'Dropped.' }).catch(() => {})
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})
     return
   }
   if (data.startsWith('fan:')) {
     const f = fanouts.get(data.slice(4))
-    if (!f) { await ctx.answerCallbackQuery({ text: 'That plan is no longer available.', show_alert: true }).catch(() => {}); return }
+    if (!f) {
+      // Plans made before this version were only ever in memory, so a restart lost
+      // them. Say which it is rather than leaving it looking arbitrary.
+      await ctx.answerCallbackQuery({
+        text: 'That plan is gone — it was proposed before the bridge last restarted, or it has already been run. Send /fanout again to get a fresh plan.',
+        show_alert: true }).catch(() => {})
+      return
+    }
     if (f.children.some(c => c.status !== 'pending')) { await ctx.answerCallbackQuery({ text: 'Already running.' }).catch(() => {}); return }
     await ctx.answerCallbackQuery({ text: `Starting ${f.children.length} parts…` }).catch(() => {})
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})
     await pumpFanout(ctx, f)
+    saveState()          // no longer pending, so no longer restorable — drop it
     await announceFanoutParts(ctx, f)
     return
   }
