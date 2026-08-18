@@ -10,7 +10,8 @@
  * We then assert on exactly what the user would have seen. Run with `bun test`.
  */
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -19,6 +20,10 @@ const TMP = mkdtempSync(join(tmpdir(), 'xesious-e2e-'))
 const STATE_FILE = join(TMP, 'state.json')
 process.env.TELEGRAM_BOT_TOKEN = '123:test-token'
 process.env.TG_ALLOWED_USERS = '1'
+// A forum group for the fan-out cases. isAllowed() requires a non-private chat to be
+// listed, so without this the fixture is silently rejected — which is the allowlist
+// working, not a bug.
+process.env.TG_ALLOWED_CHATS = '-100777'
 process.env.CLAUDE_BIN = join(import.meta.dir, 'claude-stub.ts')
 process.env.TG_SESSIONS_BASE = join(TMP, 'sessions')
 process.env.TG_STATE_FILE = STATE_FILE
@@ -38,6 +43,10 @@ const bridge: any = await import('../bridge')
 type Call = { method: string; payload: any }
 const calls: Call[] = []
 let nextMessageId = 1000
+// A bot without Delete Messages: the API refuses deleteForumTopic. Switchable
+// because the fallback to merely closing is the interesting half — a fallback that
+// no test ever reaches is a fallback nobody knows is broken.
+let denyDelete = false
 
 bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
   calls.push({ method, payload })
@@ -53,6 +62,14 @@ bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
   if (method === 'sendMessage' || method === 'editMessageText') {
     // editMessageText's real result can be a Message or true; bridge ignores it.
     return { ok: true, result: { message_id: nextMessageId++, date: 0, chat: { id: payload.chat_id, type: 'private' }, text: payload.text } }
+  }
+  if (method === 'deleteForumTopic' && denyDelete) {
+    return { ok: false, error_code: 400, description: 'Bad Request: not enough rights to delete messages' }
+  }
+  if (method === 'createForumTopic') {
+    // The real API returns a thread id, and the fan-out code depends on it: without
+    // one, every part would fall back to the parent's key.
+    return { ok: true, result: { message_thread_id: nextMessageId++, name: payload.name, icon_color: 0 } }
   }
   // deleteMessage, deleteWebhook, setMyCommands, everything else.
   return { ok: true, result: true }
@@ -919,4 +936,326 @@ describe('a finished background job is carried into the next turn', () => {
   test('an ordinary turn with no background history carries nothing', async () => {
     expect(finalReply(await incoming(1181, 'just a question'))).toContain('noBgResult')
   }, 10000)
+})
+
+describe('fan-out', () => {
+  const btns = (c: any) => c.payload?.reply_markup?.inline_keyboard?.[0] ?? []
+  // A forum group, since each part needs its own topic to be steerable.
+  const group = async (text: string, id: number, threadId?: number) => {
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 99000 + id,
+      message: {
+        message_id: id, date: 0, message_thread_id: threadId,
+        chat: { id: -100777, type: 'supergroup', title: 'G', is_forum: true },
+        from: { id: 1, is_bot: false, first_name: 'T' }, text,
+      },
+    })
+    return { before }
+  }
+
+  test('a DM is refused, with the reason', async () => {
+    // Steering a part means talking in its topic, and a DM has none.
+    expect(finalReply(await incoming(1190, '/fanout do a thing'))).toMatch(/needs a forum group/i)
+  })
+
+  test('/fanout with no task explains itself', async () => {
+    expect(finalReply(await incoming(1191, '/fanout'))).toMatch(/Usage: \/fanout/)
+  })
+
+  test('it proposes a split and waits for confirmation before spawning', async () => {
+    const { before } = await group('/fanout look at the codebase', 99101)
+    await bridge._drainQueue('-100777:main')
+    await new Promise(r => setTimeout(r, 300))
+    const after = calls.slice(before)
+    const proposal = after.find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Proposed split'))
+    expect(proposal).toBeTruthy()
+    expect(btns(proposal).map((b: any) => b.text)).toEqual(['— Run these 2 —', '— Cancel —'])
+    // Nothing has been spawned yet: no topic created, no part started.
+    expect(after.some(c => c.method === 'createForumTopic')).toBe(false)
+  }, 15000)
+
+  test('confirming creates a topic per part and runs them', async () => {
+    const { before } = await group('/fanout investigate the thing', 99102)
+    await bridge._drainQueue('-100777:main')
+    await new Promise(r => setTimeout(r, 300))
+    const proposal = calls.slice(before).find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Proposed split'))
+    const runBtn = btns(proposal).find((b: any) => String(b.text).startsWith('— Run these'))
+    expect(runBtn).toBeTruthy()
+
+    const beforeRun = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 99500,
+      callback_query: { id: 'fb1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: runBtn.callback_data,
+        message: { message_id: 99103, date: 0, chat: { id: -100777, type: 'supergroup' } } },
+    })
+    await new Promise(r => setTimeout(r, 2500))
+    const after = calls.slice(beforeRun)
+    // One topic per part — that is what makes a part steerable.
+    expect(after.filter(c => c.method === 'createForumTopic').length).toBe(2)
+    const texts = after.filter(c => c.method === 'sendMessage').map(c => String(c.payload.text ?? '')).join('\n')
+    expect(texts).toMatch(/Part 1 of 2/)
+    expect(texts).toMatch(/Talk here to steer this part/)
+  }, 25000)
+
+  test('cancelling drops the plan without spawning anything', async () => {
+    const { before } = await group('/fanout something else', 99104)
+    await bridge._drainQueue('-100777:main')
+    await new Promise(r => setTimeout(r, 300))
+    const proposal = calls.slice(before).find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Proposed split'))
+    const cancel = btns(proposal).find((b: any) => String(b.text).includes('Cancel'))
+    const beforeCancel = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 99501,
+      callback_query: { id: 'fb2', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: cancel.callback_data,
+        message: { message_id: 99105, date: 0, chat: { id: -100777, type: 'supergroup' } } },
+    })
+    await new Promise(r => setTimeout(r, 400))
+    expect(calls.slice(beforeCancel).some(c => c.method === 'createForumTopic')).toBe(false)
+  }, 15000)
+})
+
+describe('fan-out: worktree isolation for write-parts', () => {
+  // Parallel agents in one checkout trample each other's edits and git state, so a
+  // write-part gets its own worktree. This exercises it against a REAL repo rather
+  // than asserting the code path exists.
+  const repo = join(TMP, 'wt-repo')
+
+  beforeAll(() => {
+    mkdirSync(repo, { recursive: true })
+    const git = (...a: string[]) => execFileSync('git', ['-C', repo, ...a], { stdio: 'ignore' })
+    git('init', '-q')
+    git('config', 'user.email', 't@t')
+    git('config', 'user.name', 'T')
+    writeFileSync(join(repo, 'a.txt'), 'one\n')
+    git('add', '-A')
+    git('commit', '-qm', 'init')
+  })
+
+  test('a real worktree is created, on its own branch', () => {
+    const wt = bridge._makeWorktree(repo, 'fan1', 1)
+    expect(wt).toBeTruthy()
+    expect(existsSync(join(wt!.path, 'a.txt'))).toBe(true)   // the checkout is real
+    expect(wt!.branch).toBe('fanout/fan1-1')
+    const branches = execFileSync('git', ['-C', repo, 'branch', '--list'], { encoding: 'utf8' })
+    expect(branches).toContain('fanout/fan1-1')
+  })
+
+  test('two parts get separate trees, so edits cannot collide', () => {
+    const a = bridge._makeWorktree(repo, 'fan2', 1)
+    const b = bridge._makeWorktree(repo, 'fan2', 2)
+    expect(a!.path).not.toBe(b!.path)
+    writeFileSync(join(a!.path, 'a.txt'), 'edited by part 1\n')
+    // Part 2 is untouched by part 1's edit — the whole point of the isolation.
+    expect(readFileSync(join(b!.path, 'a.txt'), 'utf8')).toBe('one\n')
+  })
+
+  test('a directory that is not a repo yields nothing, rather than a broken tree', () => {
+    // The caller reports this and runs the part read-only instead of quietly
+    // writing into the shared checkout beside every other part.
+    const plain = join(TMP, 'not-a-repo')
+    mkdirSync(plain, { recursive: true })
+    expect(bridge._makeWorktree(plain, 'fan3', 1)).toBeUndefined()
+  })
+})
+
+describe('fan-out: steering a part changes the combined answer', () => {
+  const btns = (c: any) => c.payload?.reply_markup?.inline_keyboard?.[0] ?? []
+  const group = (text: string, id: number, threadId?: number) => bridge.bot.handleUpdate({
+    update_id: 99700 + id,
+    message: {
+      message_id: id, date: 0, message_thread_id: threadId,
+      chat: { id: -100777, type: 'supergroup', title: 'G', is_forum: true },
+      from: { id: 1, is_bot: false, first_name: 'T' }, text,
+    },
+  })
+
+  test('parts get DISTINCT topics, so they never share a session', async () => {
+    const before = calls.length
+    await group('/fanout look into things', 99201)
+    await bridge._drainQueue('-100777:main')
+    await new Promise(r => setTimeout(r, 300))
+    const proposal = calls.slice(before).find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Proposed split'))
+    const run = btns(proposal).find((b: any) => String(b.text).startsWith('— Run these'))
+    await bridge.bot.handleUpdate({
+      update_id: 99801,
+      callback_query: { id: 'fs1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: run.callback_data, message: { message_id: 99202, date: 0, chat: { id: -100777, type: 'supergroup' } } },
+    })
+    await new Promise(r => setTimeout(r, 3000))
+    const created = calls.filter(c => c.method === 'createForumTopic')
+    expect(created.length).toBeGreaterThanOrEqual(2)
+    // The identity is carried by a custom emoji from Telegram's approved set, which
+    // always renders — an emoji in the NAME is drawn by the client's own font, and
+    // that is where 🍃 became a question mark. So: icon yes, emoji in the name no.
+    expect(created.every(c => typeof c.payload.icon_custom_emoji_id === 'string'
+      && c.payload.icon_custom_emoji_id.length > 0)).toBe(true)
+    expect(created.every(c => String(c.payload.name).startsWith('--- '))).toBe(true)
+    expect(created.some(c => /[\u{1F300}-\u{1FAFF}]/u.test(String(c.payload.name)))).toBe(false)
+    // Each part was addressed in its own thread, not all in the parent.
+    const threads = new Set(calls.filter(c => c.method === 'sendMessage'
+      && String(c.payload.text ?? '').includes('Talk here to steer')).map(c => c.payload.message_thread_id))
+    expect(threads.size).toBeGreaterThanOrEqual(2)
+    expect([...threads].every(t => t !== undefined)).toBe(true)
+  }, 30000)
+
+  test('the part list ends up linking every part, not accusing Telegram of failing', async () => {
+    // It used to be written the instant the parts were told to start — before their
+    // topics existed — so a part whose topic had not been created YET was reported
+    // as one that COULD NOT be created. Nothing had failed; the message was early.
+    const sent = calls.find(c => c.method === 'sendMessage'
+      && String(c.payload.text ?? '').includes('Running 2 parts'))
+    expect(sent).toBeDefined()
+    const edits = calls.filter(c => c.method === 'editMessageText'
+      && String(c.payload.text ?? '').includes('Running 2 parts'))
+    const finalList = String((edits[edits.length - 1] ?? sent)!.payload.text)
+    expect(finalList).not.toMatch(/no topic could be created/)
+    // Both parts are links by the end, whatever order their topics arrived in.
+    // Matched on the chat path rather than the host: MarkdownV2 escaping puts a
+    // backslash in "t.me", so a regex for the domain finds nothing and the test
+    // would fail on its own escaping.
+    expect(finalList.match(/\/c\/777\//g)?.length).toBe(2)
+  }, 15000)
+
+  test('the combined answer is produced automatically once the parts settle', async () => {
+    const texts = calls.filter(c => c.method === 'sendMessage').map(c => String(c.payload.text ?? '')).join('\n')
+    // The combined answer arrives on its own. There is deliberately no "all parts
+    // finished" banner when nothing failed — it announced work that was about to
+    // speak for itself. A failure or a branch report still gets said.
+    expect(texts).toContain('SYNTHESIS')
+    expect(texts).not.toMatch(/Background task finished[\s\S]{0,40}SYNTHESIS/)
+  }, 15000)
+
+  test('a plan proposed before a restart is still runnable afterwards', async () => {
+    // The bug: fan-out plans lived only in memory, so restarting the bridge left
+    // every proposal's button answering "that plan is no longer available" for
+    // something the person had just been offered. A plan is only text until it is
+    // confirmed, so it belongs in the state file.
+    const before = calls.length
+    await group('/fanout look into two things', 99401)
+    await bridge._drainQueue('-100777:main')
+    await new Promise(r => setTimeout(r, 300))
+    const proposal = calls.slice(before).find(c => c.method === 'sendMessage'
+      && String(c.payload.text ?? '').includes('Proposed split'))
+    const run = btns(proposal).find((b: any) => String(b.text).startsWith('— Run these'))
+    const id = String(run.callback_data).slice(4)
+
+    const saved = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+    const plan = (saved.fanoutPlans ?? []).find((f: any) => f.id === id)
+    expect(plan).toBeDefined()
+    expect(plan.task).toContain('look into two things')
+    expect(plan.children.length).toBeGreaterThanOrEqual(2)
+    // A fan-out already running is NOT stored: its parts were child processes and
+    // died with the bridge, so a button offering to run it could not honour itself.
+    expect((saved.fanoutPlans ?? []).some((f: any) =>
+      f.children.some((c: any) => c.status !== 'pending'))).toBe(false)
+  }, 30000)
+
+  test('an interrupted part holds the answer back until it is dealt with', async () => {
+    // Interrupting a part from its own topic means you are taking it over. Treating
+    // that as "the part finished" wrote the combined answer from work that had just
+    // been cut off, while the topic was still mid-conversation.
+    const fake = { api: bridge.bot.api, chat: { id: -100777 } }
+    const f: any = {
+      id: 'fanS', badge: '', parentKey: '-100777:main', chatId: -100777, askedBy: 1,
+      task: 'two things', synthesised: false,
+      children: [
+        { n: 1, title: 'A', brief: 'b', mode: 'read', status: 'done', result: 'one' },
+        { n: 2, title: 'B', brief: 'b', mode: 'read', status: 'stopped' },
+      ],
+    }
+    bridge._fanouts.set(f.id, f)
+    const before = calls.length
+    await bridge._maybeSynthesise(fake, f)
+    expect(calls.slice(before).length).toBe(0)
+    expect(f.synthesised).toBe(false)
+
+    // …but it can never strand the fan-out: the button combines what there is.
+    await bridge.bot.handleUpdate({
+      update_id: 99806,
+      callback_query: { id: 'ff1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: `fanf:${f.id}`, message: { message_id: 99291, date: 0, chat: { id: -100777, type: 'supergroup' } } },
+    })
+    await new Promise(r => setTimeout(r, 1500))
+    expect(f.synthesised).toBe(true)
+    // A part that was cut off before saying anything is reported, not dropped.
+    expect(f.children[1].status).toBe('failed')
+    const said = calls.filter(c => c.method === 'sendMessage').map(c => String(c.payload.text ?? '')).join('\n')
+    expect(said).toMatch(/did not complete/)
+  }, 20000)
+
+  test('a correction after the answer reopens that part and offers to combine again', async () => {
+    // The parts' topics are closed once the answer is written, and a closed topic is
+    // read-only for everyone but an admin — so a part that is being corrected has to
+    // be reopened, or the first correction is also the last one possible.
+    const child = calls.find(c => c.method === 'sendMessage'
+      && String(c.payload.text ?? '').includes('Talk here to steer'))!.payload.message_thread_id as number
+    // Nothing is destroyed on its own: the topics are left exactly as they are and
+    // the parent topic gets a button. Whether a part is still worth reading is a
+    // judgement only the person reading it can make.
+    expect(calls.some(c => c.method === 'deleteForumTopic')).toBe(false)
+    expect(calls.some(c => c.method === 'closeForumTopic')).toBe(false)
+    expect(calls.some(c => btns(c).some((b: any) => /delete subtopics/i.test(String(b.text))))).toBe(true)
+    const before = calls.length
+    await group('correction: the answer is CORRECTED', 99301, child)
+    await bridge._drainQueue(`-100777:${child}`)
+    await new Promise(r => setTimeout(r, 1500))
+    const after = calls.slice(before)
+    expect(after.some(c => c.method === 'reopenForumTopic'
+      && c.payload.message_thread_id === child)).toBe(true)
+    expect(after.some(c => btns(c).some((b: any) => String(b.text).includes('Combine again')))).toBe(true)
+  }, 20000)
+
+  test('the button deletes the topics, and only when it is tapped', async () => {
+    const offer = calls.filter(c => c.method === 'sendMessage')
+      .find(c => btns(c).some((b: any) => /delete subtopics/i.test(String(b.text))))
+    const data = btns(offer!)[0].callback_data
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 99805,
+      callback_query: { id: 'fd1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data, message: { message_id: 99290, date: 0, chat: { id: -100777, type: 'supergroup' } } },
+    })
+    const after = calls.slice(before)
+    // Forced by the button rather than by the default, which is 'ask'.
+    expect(after.filter(c => c.method === 'deleteForumTopic').length).toBeGreaterThanOrEqual(2)
+    // The offer becomes the record instead of vanishing: deleting it would leave
+    // "where did those topics go" with no answer anywhere in the chat.
+    const rewritten = after.find(c => c.method === 'editMessageText' && c.payload.message_id === 99290)
+    expect(rewritten).toBeDefined()
+    expect(String(rewritten!.payload.text)).toMatch(/you deleted 2 part topics/i)
+    expect(rewritten!.payload.reply_markup?.inline_keyboard).toEqual([])
+    expect(after.some(c => c.method === 'deleteMessage' && c.payload.message_id === 99290)).toBe(false)
+  }, 15000)
+
+  test('a bot without Delete Messages closes the topics instead of leaving them', async () => {
+    // The fallback chain, driven directly: delete refused → close → and only if that
+    // fails too does the person get a button. A bot missing one right must not turn
+    // "tidy up after yourself" into silence.
+    const fake = { api: bridge.bot.api, chat: { id: -100777 } }
+    const f = { id: 'fanD', chatId: -100777, parentThreadId: undefined, askedBy: 1,
+                children: [{ n: 1, topicId: 4001 }, { n: 2, topicId: 4002 }] }
+    denyDelete = true
+    const before = calls.length
+    await bridge._disposeFanoutTopics(fake, f, 'delete')
+    denyDelete = false
+    const after = calls.slice(before)
+    expect(after.filter(c => c.method === 'deleteForumTopic').length).toBe(2)
+    expect(after.filter(c => c.method === 'closeForumTopic').length).toBe(2)
+    // Both were dealt with, so there is nothing to ask the person to do.
+    expect(after.some(c => btns(c).some((b: any) => String(b.text).includes('Remove the part topics')))).toBe(false)
+  })
+
+  test('TG_FANOUT_TOPICS=keep leaves the topics exactly as they are', async () => {
+    const fake = { api: bridge.bot.api, chat: { id: -100777 } }
+    const f = { id: 'fanK', chatId: -100777, parentThreadId: undefined, askedBy: 1,
+                children: [{ n: 1, topicId: 4003 }] }
+    process.env.TG_FANOUT_TOPICS = 'keep'
+    const before = calls.length
+    await bridge._disposeFanoutTopics(fake, f)
+    delete process.env.TG_FANOUT_TOPICS
+    expect(calls.slice(before).length).toBe(0)
+  })
 })

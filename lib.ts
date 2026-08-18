@@ -817,6 +817,183 @@ export function htmlDocument(title: string, bodyHtml: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// fan-out: decompose a task, run the parts, put them back together
+// ---------------------------------------------------------------------------
+//
+// The division of labour here is the one lesson from the orphaned-background-work
+// item: DECOMPOSITION can be the model's job, but SPAWNING, TRACKING and REPORTING
+// have to be the bridge's. A one-shot turn that launches its own children orphans
+// them by construction — it exits, and they are gone.
+//
+// So the model is asked for a plan in a format the bridge can parse, the human
+// confirms it, and the bridge does everything after that. The plan format is
+// deliberately line-based rather than JSON: a model that wraps its answer in prose,
+// or emits a trailing comma, should still produce a usable plan rather than a parse
+// error, and the fields here are short enough that quoting never comes up.
+
+export type FanoutMode = 'read' | 'write'
+export type FanoutPlanItem = { n: number; mode: FanoutMode; title: string; brief: string }
+
+// One mark for every fan-out part, in the part list and the finish note. It matches
+// the topic ICON so a row in the list and a topic in the sidebar are visibly the
+// same thing.
+//
+// It was a leaf, and before that a palette of coloured circles picked per fan-out.
+// The circles read as errors; the leaf could not be used where it mattered, because
+// a topic icon must be a custom emoji from Telegram's approved set and that set has
+// no plant of any kind. Matching the one glyph that CAN appear in both places beats
+// a nicer glyph that only works in one.
+export const FANOUT_MARK = '🧪'
+
+// A part topic's name: a "---" lead-in, then the part's own title.
+//
+// The lead-in is plain ASCII on purpose. An emoji here is at the mercy of the
+// client's font — 🍃 came through as a question mark — while the topic ICON is a
+// custom emoji from Telegram's own approved set and always renders. So the icon
+// carries the identity and the name carries the words.
+//
+// No "2/3": the position was noise in a list where every part already sits beside
+// its siblings, and the title is the thing being looked for. Names are capped at
+// 128 characters, so the title is what gets shortened.
+export function fanoutTopicName(title: string): string {
+  const head = '--- '
+  const room = 128 - head.length
+  const t = title.trim() || 'part'
+  return head + (t.length <= room ? t : t.slice(0, room - 1) + '…')
+}
+
+// A tappable link to a topic. Only works for members of the group, which is exactly
+// who is reading. -100 is stripped because t.me/c/ uses the internal id.
+export function topicLink(chatId: number | string, threadId?: number): string | undefined {
+  if (threadId === undefined) return undefined
+  const internal = String(chatId).replace(/^-100/, '')
+  if (!/^\d+$/.test(internal)) return undefined
+  return `https://t.me/c/${internal}/${threadId}`
+}
+
+// The instruction handed to the planning turn. Kept next to the parser so the two
+// cannot drift — a format the model was never told about is the usual reason this
+// kind of thing returns nothing.
+export function fanoutPlanPrompt(task: string, max: number): string {
+  return [
+    `Break the following task into at most ${max} independent parts that can run in parallel.`,
+    '',
+    'Rules for the split:',
+    '- Each part must stand alone: it cannot see the others or depend on their output.',
+    '- Prefer fewer, larger parts. Two good parts beat six thin ones.',
+    "- Mark a part `write` ONLY if it edits files; anything that just reads, searches or investigates is `read`.",
+    '- If the task genuinely cannot be split, return a single part.',
+    '',
+    'Answer with ONLY these lines and nothing else — no preamble, no code fence:',
+    'FANOUT <n> | <read|write> | <short title> | <the full instruction for that part>',
+    '',
+    'The task:',
+    task,
+  ].join('\n')
+}
+
+// Parse whatever the planning turn produced. Tolerant on purpose: anything that is
+// not a FANOUT line is ignored rather than treated as an error, because the common
+// failure is a model adding a sentence of preamble, not emitting a broken plan.
+export function parseFanoutPlan(text: string, opts?: { max?: number }): FanoutPlanItem[] {
+  const max = opts?.max ?? 8
+  const out: FanoutPlanItem[] = []
+  for (const raw of (text ?? '').split('\n')) {
+    const line = raw.trim().replace(/^[-*]\s*/, '')
+    const m = line.match(/^FANOUT\s*(\d+)?\s*\|\s*(read|write)\s*\|\s*([^|]+?)\s*\|\s*(.+)$/i)
+    if (!m) continue
+    const title = m[3].trim()
+    const brief = m[4].trim()
+    if (!title || !brief) continue
+    out.push({ n: out.length + 1, mode: m[2].toLowerCase() as FanoutMode, title, brief })
+    if (out.length >= max) break
+  }
+  return out
+}
+
+// What the human sees before anything is spawned. FEEDBACK.md asks for exactly
+// this: a confirmation showing the proposed split BEFORE it opens eight topics.
+export function renderFanoutProposal(items: FanoutPlanItem[], opts: { cap: number; isolated?: boolean }): string {
+  const writes = items.filter(i => i.mode === 'write').length
+  // No hanging indent on the brief: Telegram renders the leading spaces literally
+  // and the block ends up looking mis-aligned rather than structured.
+  const lines = items.map(i => `${i.n}. **${i.title}** _(${i.mode})_\n${i.brief}`)
+  const notes: string[] = []
+  if (items.length > opts.cap) {
+    // Never a silent cap. A plan that quietly runs half of itself reads as a plan
+    // that ran.
+    notes.push(`Running ${opts.cap} at a time; the rest start as those finish.`)
+  }
+  // Say what will ACTUALLY happen. Promising a worktree per part where there is no
+  // repo to make one from described a safety net that was not there, and the reader
+  // has no way to tell — the difference only shows up when two parts edit one file.
+  if (writes) {
+    notes.push(opts.isolated === false
+      ? `${writes} part${writes === 1 ? '' : 's'} will edit files in this directory. It is not a git repository, so they are NOT isolated from each other.`
+      : `${writes} part${writes === 1 ? '' : 's'} will edit files, each in its own git worktree.`)
+  }
+  return [
+    `Proposed split — ${items.length} part${items.length === 1 ? '' : 's'}:`,
+    '',
+    ...lines,
+    ...(notes.length ? ['', ...notes.map(n => `_${n}_`)] : []),
+  ].join('\n')
+}
+
+// The context handed to the synthesis turn.
+//
+// Two things this must not do. It must not silently drop a part that failed — a
+// summary that looks complete but is not is worse than an obvious gap — and it must
+// not blow the turn's context, which five long reports easily would. Each part gets
+// an allowance; what is cut is stated rather than trimmed away quietly.
+export function buildSynthesisPreamble(
+  task: string,
+  parts: { title: string; status: string; result?: string }[],
+  opts?: { perPart?: number },
+): string {
+  const budget = opts?.perPart ?? 4000
+  const done = parts.filter(p => p.status === 'done')
+  const failed = parts.filter(p => p.status !== 'done')
+  const body = done.map(p => {
+    const r = p.result ?? ''
+    const clipped = r.length > budget
+    return `### ${p.title}\n${clipped ? `${r.slice(0, budget)}\n\n[…truncated, ${r.length - budget} more characters]` : r}`
+  })
+  const head = [
+    `You asked for this to be split up and worked in parallel. The parts have finished.`,
+    `Original request: ${task}`,
+    '',
+    `${done.length} of ${parts.length} part${parts.length === 1 ? '' : 's'} completed.`,
+  ]
+  if (failed.length) {
+    head.push(
+      `The following did NOT complete, and their work is missing from what follows — ` +
+      `say so in your answer rather than presenting it as whole: ` +
+      failed.map(p => `${p.title} (${p.status})`).join('; '),
+    )
+  }
+  return [
+    ...head,
+    '',
+    'Results:',
+    '',
+    ...body,
+    '',
+    'Now write one answer to the original request, drawing on all of the above. ' +
+    'Do not simply concatenate the parts; resolve disagreements between them and say which part each conclusion came from.',
+    '',
+    // Left to itself the model re-runs the parts' work to check it, then reports what
+    // IT found instead of what they did. That silently discards a correction made in
+    // a part's own topic — the steering is real work, and this step is not entitled
+    // to overrule it — and on a real task it would redo in series everything that was
+    // just done in parallel, which is the whole point of splitting it up.
+    'Combine what the parts reported. Do not re-run their work to verify it, and do not ' +
+    'replace a part\'s result with your own. If a result looks wrong, say so and attribute ' +
+    'it, but still report what that part said.',
+  ].join('\n')
+}
+
+// ---------------------------------------------------------------------------
 // stream-json parsing
 // ---------------------------------------------------------------------------
 

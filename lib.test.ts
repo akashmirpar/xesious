@@ -14,6 +14,8 @@ import {
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
+  parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
+  FANOUT_MARK, fanoutTopicName, topicLink,
   sanitizeProse, PROSE_RULES, isNonAnswer,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
@@ -898,5 +900,142 @@ describe('needsReplyLink — quote the question only when it is ambiguous', () =
     const a2 = needsReplyLink({ replyTo: 2, latestIncoming: 2, inFlight: 1, answersSince: 1 })
     expect(a1).toBe(true)
     expect(a2).toBe(true)   // was false before: the reader had to infer it
+  })
+})
+
+describe('fan-out: parsing the plan', () => {
+  const plan = [
+    'Here is how I would split it:',
+    'FANOUT 1 | read | Survey the API | Read every route file and list the endpoints',
+    'FANOUT 2 | write | Add the tests | Write unit tests for the auth module',
+    '',
+  ].join('\n')
+
+  test('reads the parts and ignores the prose around them', () => {
+    const items = parseFanoutPlan(plan)
+    expect(items).toHaveLength(2)
+    expect(items[0]).toMatchObject({ n: 1, mode: 'read', title: 'Survey the API' })
+    expect(items[1]).toMatchObject({ n: 2, mode: 'write' })
+    expect(items[1].brief).toContain('auth module')
+  })
+  test('tolerates bullets, casing and a missing number', () => {
+    const items = parseFanoutPlan('- fanout | READ | T | B\n* FANOUT|write|U|C')
+    expect(items).toHaveLength(2)
+    expect(items[0].mode).toBe('read')
+    expect(items[1].mode).toBe('write')
+    expect(items.map(i => i.n)).toEqual([1, 2])      // renumbered in order
+  })
+  test('a plan that came back as prose yields nothing, not a wrong plan', () => {
+    expect(parseFanoutPlan('I think we should look at three things.')).toEqual([])
+    expect(parseFanoutPlan('')).toEqual([])
+  })
+  test('malformed lines are skipped rather than half-parsed', () => {
+    expect(parseFanoutPlan('FANOUT 1 | read | onlytitle')).toEqual([])
+    expect(parseFanoutPlan('FANOUT 1 | sideways | T | B')).toEqual([])
+    expect(parseFanoutPlan('FANOUT 1 | read |  | B')).toEqual([])
+  })
+  test('the cap is honoured', () => {
+    const many = Array.from({ length: 12 }, (_, i) => `FANOUT ${i} | read | T${i} | B${i}`).join('\n')
+    expect(parseFanoutPlan(many, { max: 4 })).toHaveLength(4)
+  })
+  test('the prompt tells the model the exact format the parser expects', () => {
+    // A format the model was never told about is the usual reason this returns
+    // nothing, so the two live next to each other and are checked together.
+    const p = fanoutPlanPrompt('do a thing', 5)
+    expect(p).toContain('FANOUT <n> | <read|write> | <short title> |')
+    expect(p).toContain('at most 5')
+    expect(parseFanoutPlan('FANOUT 1 | read | T | B')).toHaveLength(1)
+  })
+})
+
+describe('fan-out: the proposal shown before anything runs', () => {
+  const items = parseFanoutPlan('FANOUT 1 | read | A | do a\nFANOUT 2 | write | B | do b')
+  test('lists every part with its mode', () => {
+    const out = renderFanoutProposal(items, { cap: 3 })
+    expect(out).toContain('**A**')
+    expect(out).toContain('_(write)_')
+    expect(out).toContain('2 part')
+  })
+  test('says when parts will edit files, and that they are isolated', () => {
+    expect(renderFanoutProposal(items, { cap: 3, isolated: true })).toMatch(/1 part will edit files.*worktree/)
+    // …and says the opposite where there is no repo, rather than promising a safety
+    // net that is not there. The reader cannot tell the difference from the outside.
+    const shared = renderFanoutProposal(items, { cap: 3, isolated: false })
+    expect(shared).toMatch(/not a git repository/)
+    expect(shared).not.toMatch(/worktree/)
+  })
+  test('never caps silently', () => {
+    const many = parseFanoutPlan(Array.from({ length: 6 }, (_, i) => `FANOUT ${i} | read | T${i} | B`).join('\n'))
+    expect(renderFanoutProposal(many, { cap: 3 })).toMatch(/Running 3 at a time/)
+  })
+})
+
+describe('fan-out: what the synthesis turn is given', () => {
+  const parts = [
+    { title: 'A', status: 'done', result: 'found alpha' },
+    { title: 'B', status: 'done', result: 'found beta' },
+  ]
+  test('carries the original request and every result', () => {
+    const out = buildSynthesisPreamble('the original ask', parts)
+    // The parts' results are the input, not a first draft to be checked: re-running
+    // their work discards any correction made in a part's own topic, and redoes in
+    // series what was just done in parallel.
+    expect(out).toMatch(/Do not re-run their work/)
+    expect(out).toContain('the original ask')
+    expect(out).toContain('found alpha')
+    expect(out).toContain('found beta')
+    expect(out).toContain('2 of 2 parts completed')
+  })
+  test('a failed part is NAMED, not quietly dropped', () => {
+    // A summary that looks complete but is not is worse than an obvious gap.
+    const out = buildSynthesisPreamble('t', [...parts, { title: 'C', status: 'stopped' }])
+    expect(out).toContain('2 of 3 parts completed')
+    expect(out).toMatch(/did NOT complete/)
+    expect(out).toContain('C (stopped)')
+  })
+  test('a long result is truncated visibly, not silently', () => {
+    const out = buildSynthesisPreamble('t', [{ title: 'A', status: 'done', result: 'x'.repeat(9000) }], { perPart: 100 })
+    expect(out).toMatch(/truncated, 8900 more characters/)
+  })
+  test('it asks for one answer, not a concatenation', () => {
+    expect(buildSynthesisPreamble('t', parts)).toMatch(/[Dd]o not simply concatenate/)
+  })
+})
+
+describe('fan-out: telling the part topics apart in a busy group', () => {
+  test('one mark for every part, and it is a leaf', () => {
+    // It replaced a per-fan-out palette of coloured circles: a red circle reads as
+    // an error, and the circle emoji did not render in topic names on every client
+    // — they arrived as a question mark beside a circle.
+    // The topic ICON has to come from Telegram's approved set, and 🧪 is in it while
+    // no leaf is; the list mark matches the icon so the two read as one thing.
+    expect(FANOUT_MARK).toBe('🧪')
+  })
+  test('the topic name is a plain "---" lead-in and the title', () => {
+    // ASCII, not an emoji: the name is rendered by the client's own font, which is
+    // where 🍃 turned into a question mark. The topic ICON carries the identity.
+    // No position either — every part already sits beside its siblings.
+    expect(fanoutTopicName('Survey the scripts')).toBe('--- Survey the scripts')
+  })
+  test("and stays inside Telegram's 128-character limit", () => {
+    const n = fanoutTopicName('t'.repeat(200))
+    expect(n.length).toBeLessThanOrEqual(128)
+    expect(n).toMatch(/…$/)                     // the title is what gets shortened
+  })
+  test('topic links point at the thread, with the -100 prefix stripped', () => {
+    expect(topicLink(-1003744389982, 57)).toBe('https://t.me/c/3744389982/57')
+  })
+  test('no thread, or a chat that cannot have one, yields no link', () => {
+    expect(topicLink(-1003744389982, undefined)).toBeUndefined()
+    expect(topicLink('@somechannel', 5)).toBeUndefined()
+  })
+})
+
+describe('fan-out: the proposal reads cleanly', () => {
+  test('no hanging indent before a brief', () => {
+    // Telegram renders leading spaces literally, so the block looked mis-aligned.
+    const out = renderFanoutProposal(parseFanoutPlan('FANOUT 1 | read | T | the brief'), { cap: 3 })
+    expect(out).toContain('\nthe brief')
+    expect(out).not.toContain('\n   the brief')
   })
 })

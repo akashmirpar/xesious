@@ -19,8 +19,12 @@ set -a; . "$ENVF"; set +a
 : "${STAGING_BOT_TOKEN:?set STAGING_BOT_TOKEN in $ENVF}"
 : "${TEST_ACCOUNT_USER_ID:?set TEST_ACCOUNT_USER_ID in $ENVF (from gen_session.py)}"
 
+# Driver deps live beside the driver (test/staging/.deps) so this harness does not
+# depend on what happens to be installed system-wide, which is a thing that changes
+# under you. A system install still works; this only adds a fallback.
+[ -d "$ROOT/test/staging/.deps" ] && export PYTHONPATH="$ROOT/test/staging/.deps${PYTHONPATH:+:$PYTHONPATH}"
 python3 -c "import telethon" 2>/dev/null || {
-  echo "driver deps missing — pip install -r test/staging/requirements.txt" >&2; exit 1; }
+  echo "driver deps missing — pip install -t test/staging/.deps -r test/staging/requirements.txt" >&2; exit 1; }
 
 # bun on PATH (same portable lookup as start.sh)
 if ! command -v bun >/dev/null 2>&1; then
@@ -45,6 +49,9 @@ LOG="$STAGE_DIR/bridge.log"; : > "$LOG"
 export TG_ENV_FILE=/dev/null
 export TELEGRAM_BOT_TOKEN="$STAGING_BOT_TOKEN"
 export TG_ALLOWED_USERS="$TEST_ACCOUNT_USER_ID"
+# The fan-out tests drive a forum group; isAllowed() requires a non-private chat to
+# be listed, so an unset value here makes those cases look broken rather than skipped.
+[ -n "${STAGING_GROUP_ID:-}" ] && export TG_ALLOWED_CHATS="$STAGING_GROUP_ID"
 export TG_SESSIONS_BASE="$STAGE_DIR/sessions"
 export TG_STATE_FILE="$STAGE_DIR/state.json"
 # Real-Claude mode drives the actual `claude` CLI (real model, real answer);

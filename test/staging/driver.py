@@ -20,6 +20,7 @@ Env (set by run-staging.sh from .env.staging):
 """
 import asyncio
 import os
+import subprocess
 import sys
 
 try:
@@ -48,6 +49,10 @@ REAL_CLAUDE = env("STAGING_REAL_CLAUDE", required=False, default="") in ("1", "t
 # Matched as a substring of the test's function name (or, in stub mode, of the
 # prompt). Empty runs everything, which is what CI and a pre-commit check want.
 ONLY = env("STAGING_ONLY", required=False, default="").strip().lower()
+# A forum GROUP, for the tests that need topics. Fan-out gives each part its own
+# topic so it can be steered, which a DM cannot do — without this the spawning path
+# is untestable, and the case says so rather than passing vacuously.
+GROUP_ID = env("STAGING_GROUP_ID", required=False, default="")
 
 # Stub mode: single-turn (prompt, expected-substring), mirroring claude-stub.ts.
 CASES = [
@@ -110,7 +115,11 @@ async def send_and_wait_messages(client, bot, prompt: str):
     msgs = []
     got = asyncio.Event()
 
-    @client.on(events.NewMessage(from_users=bot))
+    # chats=bot, not just from_users=bot: without it this handler also catches what
+    # the bot says in the fan-out GROUP, and a case waiting for its own reply in the
+    # DM happily accepts "✅ This part is finished…" from a fan-out that is still
+    # winding down. Every DM assertion then reads a message meant for somewhere else.
+    @client.on(events.NewMessage(from_users=bot, chats=bot))
     async def handler(ev):
         if is_status(reply_text(ev.message)):
             return
@@ -141,7 +150,7 @@ async def send_and_collect(client, bot, prompt: str, settle: float = 8.0):
     msgs = []
     last = asyncio.get_event_loop().time()
 
-    @client.on(events.NewMessage(from_users=bot))
+    @client.on(events.NewMessage(from_users=bot, chats=bot))
     async def handler(ev):
         nonlocal last
         if is_status(reply_text(ev.message)):
@@ -552,9 +561,491 @@ async def feature_run_alongside(client, bot):
             "offer appeared on the queued message, tapping it answered alongside, and the offer was withdrawn")
 
 
+async def feature_fanout_guard(client, bot):
+    """Fan-out refuses a DM, and says why.
+
+    Each part needs its own forum topic to be steerable, and a DM has none. This is
+    the only part of fan-out Tier 3 can reach today: the staging bot talks to a test
+    ACCOUNT, not a forum group, so the spawning path has no group to spawn into.
+    Covering the guard is worth doing anyway — it is the boundary a user hits first,
+    and a silent no-op there would look like the feature is broken."""
+    print("  → /fanout in a DM (expect a clear refusal, not silence)")
+    msgs, _sent = await send_and_collect(client, bot, "/fanout look into three separate things", settle=5)
+    texts = [reply_text(m) for m in msgs]
+    for t in texts:
+        print(f"    ← {t[:100]!r}")
+    joined = " ".join(texts).lower()
+    problems = []
+    if not texts:
+        problems.append("no reply at all — the command was silently dropped")
+    elif "forum group" not in joined:
+        problems.append("refused without explaining that it needs a forum group")
+    if "/bg" not in " ".join(texts):
+        problems.append("did not point at the alternative that does work in a DM")
+    return ("fan-out refuses a DM and explains why", not problems,
+            "; ".join(problems) if problems else "refused with the reason and the alternative")
+
+
+def _topic_of(msg):
+    """Which forum topic a message landed in (None for the group's General)."""
+    r = getattr(msg, "reply_to", None)
+    if not r:
+        return None
+    return getattr(r, "reply_to_top_id", None) or getattr(r, "reply_to_msg_id", None)
+
+
+# Everything the bridge says about a fan-out that is NOT the answer. The combined
+# answer carries no marker — it is just the answer — so it has to be told apart from
+# the bookkeeping by content, and guessing at that is how a test starts passing on
+# the wrong message.
+_FANOUT_NOISE = ("Proposed split", "Running ", "Talk here to steer",
+                 "changed after the combined answer", "Branches created",
+                 "did not complete", "could not be closed")
+
+
+def combined_answer(msgs, tokens, after_id=0, not_in=()):
+    """The fan-out's combined answer: the one message that carries EVERY part.
+
+    `not_in` is the set of part topic ids, and skipping them is not optional: a part
+    answering IN ITS OWN TOPIC says the same words the synthesis will, so without
+    this the assertion passes on the part's own reply and proves nothing about the
+    combination. `after_id` scopes the search to messages newer than a point, which
+    is what tells a recombined answer from the first one.
+    """
+    for m in msgs:
+        t = reply_text(m) or ""
+        # Our own /fanout message quotes the whole task, tokens and all, so without
+        # this the search matches the REQUEST and everything after it runs early.
+        if m.out or m.id <= after_id or m.reply_markup or is_status(t):
+            continue
+        if _topic_of(m) in not_in:
+            continue
+        if any(n in t for n in _FANOUT_NOISE):
+            continue
+        if all(tok in t for tok in tokens):
+            return m
+    return None
+
+
+async def _until(fn, secs):
+    """Poll a predicate once a second; hand back its first truthy value, or None."""
+    for _ in range(int(secs)):
+        await asyncio.sleep(1)
+        v = fn()
+        if v:
+            return v
+    return None
+
+
+async def _topic_gone(client, group, topic_id):
+    """Ask Telegram, not the bridge, whether a part's topic is really gone.
+
+    A deleted topic comes back either as nothing at all or as a ForumTopicDeleted
+    marker, depending on how it was removed; both mean the same thing to the person
+    looking at their topic list.
+    """
+    from telethon.tl import functions
+    res = await client(functions.messages.GetForumTopicsByIDRequest(
+        peer=await client.get_input_entity(group), topics=[topic_id]))
+    if not res.topics:
+        return True
+    return type(res.topics[0]).__name__ == "ForumTopicDeleted"
+
+
+async def _reopen_topic(client, group, topic_id):
+    from telethon.tl import functions
+    await client(functions.messages.EditForumTopicRequest(
+        peer=await client.get_input_entity(group), topic_id=topic_id, closed=False))
+
+
+async def feature_fanout_steering(client, bot):
+    """Correct ONE part while the fan-out is still running, and check the answer.
+
+    This is the whole reason parts get their own topics: you can talk to one of them
+    mid-flight. Everything under that — a later turn in a child topic replacing that
+    part's result, and the combination being built from the CORRECTED result — had
+    only ever run against a faked Telegram.
+
+    One part is made slow on purpose so the other can be corrected while the fan-out
+    is still open. If the timing slips and the answer is written first, the bridge
+    offers to combine again, and the case takes that route instead rather than
+    failing on a race it does not care about.
+
+    It also checks that the part topics are DELETED afterwards — by asking Telegram,
+    not by trusting the bridge's own message.
+    """
+    if not GROUP_ID:
+        return ("steering a fan-out part changes the combined answer", False,
+                "STAGING_GROUP_ID is not set, so the steering path was never exercised")
+    group = int(GROUP_ID)
+    # Token-shaped and trivial: what is under test is whether a correction reaches
+    # the combined answer, not the model's research stamina. The second part is slow
+    # so there is a window in which the first can be steered.
+    task = ("Do two tiny independent things and report the result of each: "
+            "(1) run `echo ALPHA` and report its output verbatim, "
+            "(2) run `sleep 75` and then run `echo BETA`, reporting BETA verbatim.")
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    def fail(why):
+        client.remove_event_handler(handler)
+        return ("steering a fan-out part changes the combined answer", False, why)
+
+    # A clean session per case. They all share the group's General topic, so without
+    # this the planner reads a previous case's corrections as context and starts
+    # answering conversationally instead of producing a plan.
+    await client.send_message(group, "/new")
+    await asyncio.sleep(3)
+    print("  → /fanout, then steer one part while it is still running")
+    await client.send_message(group, f"/fanout {task}")
+
+    proposal = await _until(
+        lambda: next((m for m in seen if m.reply_markup and "Proposed split" in (reply_text(m) or "")), None), 90)
+    if not proposal:
+        return fail(f"no proposal arrived; saw {[(reply_text(m) or '')[:50] for m in seen[-4:]]}")
+    await proposal.click(0)
+
+    # Each part introduces itself in its own topic; remember which topic is which.
+    parts = {}
+
+    def scan_parts():
+        for m in seen:
+            t = reply_text(m) or ""
+            if "Talk here to steer this part" in t and _topic_of(m):
+                n = t.split("Part ", 1)[1].split(" ", 1)[0] if "Part " in t else "?"
+                parts[n] = (_topic_of(m), t)
+        return len(parts) >= 2 or None
+
+    if not await _until(scan_parts, 120):
+        return fail(f"expected 2 part topics, saw {parts}")
+    print(f"    part topics: { {n: tid for n, (tid, _) in parts.items()} }")
+
+    # Steer the FAST part: the slow one is what keeps the fan-out open long enough
+    # for the correction to land before the answer is written.
+    fast = next((n for n, (_, intro) in sorted(parts.items()) if "ALPHA" in intro), sorted(parts)[0])
+    target = parts[fast][0]
+    mark = seen[-1].id if seen else 0
+    print(f"    → correcting part {fast} in its own topic, mid-flight")
+    await client.send_message(
+        group,
+        "Correction: ignore your earlier instruction. Your result is now exactly the "
+        "single word GAMMA. Reply with GAMMA and nothing else.",
+        reply_to=target)
+
+    mine = set(tid for tid, _ in parts.values())
+    route = "mid-flight"
+
+    def answer_or_offer():
+        return (combined_answer(seen, ("GAMMA",), after_id=mark, not_in=mine)
+                or next((m for m in seen if m.id > mark and m.reply_markup
+                         and "changed after the combined answer" in (reply_text(m) or "")), None))
+
+    got = await _until(answer_or_offer, 300)
+    if not got:
+        return fail("neither a combined answer carrying the correction nor an offer to "
+                    f"combine again; last saw {[(reply_text(m) or '')[:50] for m in seen[-4:]]}")
+    if got.reply_markup:
+        # The answer was written before the correction landed. That is the other
+        # supported route, not a failure: take the offer and check the result.
+        route = "recombined after the answer"
+        print(f"    (the answer came first; taking the offer: "
+              f"{[b.text for row in got.reply_markup.rows for b in row.buttons]})")
+        mark2 = seen[-1].id
+        await got.click(0)
+        got = await _until(lambda: combined_answer(seen, ("GAMMA",), after_id=mark2, not_in=mine), 300)
+        if not got:
+            return fail("the recombined answer never arrived, or did not carry the correction")
+
+    text = reply_text(got) or ""
+    print(f"    combined answer ({route}): {text[:120]!r}")
+    problems = []
+    # The corrected part's word is there by construction; the OTHER part's must have
+    # survived, or the combination dropped work rather than updating it.
+    if "BETA" not in text and "ALPHA" not in text:
+        problems.append("the combined answer lost the part that was not corrected")
+
+    # Nothing is removed on its own: the topics stay, and the parent topic gets a
+    # button. Both halves are the feature — the survival AND the button working —
+    # so check the topics are still there, tap it, and check they are gone.
+    await asyncio.sleep(6)
+    alive = {}
+    for n, (tid, _) in parts.items():
+        alive[n] = not await _topic_gone(client, group, tid)
+    print(f"    topics still there after the answer: {alive}")
+    if not all(alive.values()):
+        problems.append(f"part topics were removed without being asked for: {alive}")
+
+    offer = next((m for m in reversed(seen) if m.reply_markup
+                  and any("delete subtopics" in b.text.lower()
+                          for row in m.reply_markup.rows for b in row.buttons)), None)
+    if not offer:
+        problems.append("no button was offered to delete the part topics")
+    else:
+        print(f"    tapping {[b.text for row in offer.reply_markup.rows for b in row.buttons]}")
+        await offer.click(0)
+        await asyncio.sleep(6)
+        gone = {}
+        for n, (tid, _) in parts.items():
+            gone[n] = await _topic_gone(client, group, tid)
+        print(f"    topics gone after tapping: {gone}")
+        if not all(v is True for v in gone.values()):
+            problems.append(f"the button did not delete the part topics: {gone}")
+
+    client.remove_event_handler(handler)
+    return ("steering a fan-out part changes the combined answer", not problems,
+            "; ".join(problems) if problems else
+            f"part {fast} was corrected in its own topic ({route}), the combined answer "
+            "carried GAMMA alongside the untouched part, the topics survived it, and the "
+            "button deleted them")
+
+
+async def feature_fanout_end_to_end(client, bot):
+    """Drive a real fan-out in a real forum group: plan, confirm, spawn, combine.
+
+    Everything about fan-out below the guard had only ever run against a faked
+    Telegram API. This is the first time a real model produces the plan, the parser
+    reads it, real topics are created, the parts run in parallel, and the parent
+    receives a combined answer.
+    """
+    if not GROUP_ID:
+        return ("fan-out end to end in a real forum group", False,
+                "STAGING_GROUP_ID is not set, so the spawning path was never exercised")
+    group = int(GROUP_ID)
+    # Deliberately trivial. What is under test is the MACHINERY — plan, confirm,
+    # spawn, converge — not the model's research stamina. A first version asked for
+    # real investigation of the repo; one part finished at 15 steps while the other
+    # was still going at 26 when the harness tore down (exit 143), so the case
+    # failed on its own timeout while the code was working.
+    task = ("Do two tiny independent things and report the result of each: "
+            "(1) run `echo ALPHA` and report its output verbatim, "
+            "(2) run `echo BETA` and report its output verbatim.")
+
+    # A clean session per case. They all share the group's General topic, so without
+    # this the planner reads a previous case's corrections as context and starts
+    # answering conversationally instead of producing a plan.
+    await client.send_message(group, "/new")
+    await asyncio.sleep(3)
+    print("  → /fanout in the forum group (expect a proposal, then confirmation)")
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    await client.send_message(group, f"/fanout {task}")
+
+    # 1) the proposal, with its buttons, before anything is spawned
+    proposal = None
+    for _ in range(90):
+        await asyncio.sleep(1)
+        for m in list(seen):
+            if m.reply_markup and "Proposed split" in (reply_text(m) or ""):
+                proposal = m
+                break
+        if proposal:
+            break
+    if not proposal:
+        client.remove_event_handler(handler)
+        return ("fan-out end to end in a real forum group", False,
+                f"no proposal arrived; saw {[reply_text(m)[:60] for m in seen[-4:]]}")
+    labels = [b.text for row in proposal.reply_markup.rows for b in row.buttons]
+    print(f"    proposal buttons: {labels}")
+
+    topics_before = 0
+    async for _t in client.iter_messages(group, limit=1):
+        pass
+
+    # 2) confirm — this is what actually spawns the parts
+    await proposal.click(0)
+    print("    confirmed; waiting for the parts and the combined answer…")
+
+    part_topics = set()
+
+    def scan():
+        for m in list(seen):
+            tid = _topic_of(m)
+            if "Talk here to steer this part" in (reply_text(m) or "") and tid:
+                part_topics.add(tid)
+        return len(part_topics) >= 2 or None
+
+    await _until(scan, 180)
+    problems = []
+
+    # Read the topics WHILE THE PARTS ARE ALIVE. They are deleted once the answer is
+    # written, and a deleted topic comes back with no name and no icon — which reads
+    # exactly like a rejected icon id, so checking afterwards would report a failure
+    # that isn't one and hide the one that is.
+    from telethon.tl import functions
+    peer = await client.get_input_entity(group)
+    for tid in sorted(part_topics):
+        try:
+            res = await client(functions.messages.GetForumTopicsByIDRequest(peer=peer, topics=[tid]))
+            t = res.topics[0]
+            name, icon = getattr(t, "title", ""), getattr(t, "icon_emoji_id", None)
+            print(f"    topic {tid}: name={name!r} icon_emoji_id={icon}")
+            if not str(name).startswith("--- "):
+                problems.append(f"topic {tid} is named {name!r}, not '--- <title>'")
+            if not icon:
+                problems.append(f"topic {tid} has no custom icon — Telegram rejected the id")
+        except Exception as e:                                  # noqa: BLE001
+            print(f"    (could not read topic {tid}: {e})")
+
+    combined = await _until(lambda: combined_answer(seen, ("ALPHA", "BETA"), not_in=part_topics), 300)
+    client.remove_event_handler(handler)
+
+    texts = [reply_text(m) for m in seen]
+    if not any("Proposed split" in t for t in texts):
+        problems.append("no proposal")
+    if len(part_topics) < 2:
+        problems.append(f"expected at least 2 part topics, saw {len(part_topics)}")
+    if not combined:
+        problems.append("the parts never converged into a combined answer")
+    print(f"    part topics seen: {len(part_topics)}; combined answer: {bool(combined)}")
+
+    return ("fan-out end to end in a real forum group", not problems,
+            "; ".join(problems) if problems else
+            f"plan accepted, {len(part_topics)} parts ran in their own topics, and the parent got a combined answer")
+
+
+async def feature_fanout_worktrees(client, bot):
+    """A fan-out whose parts EDIT FILES, each in its own git worktree.
+
+    This is the half that had only ever been tested by calling the worktree helper
+    directly. Here a real model plans two write-parts, the bridge creates a worktree
+    per part, each part edits inside its own tree, and the isolation is checked the
+    only way that means anything: the files must exist in their own worktrees and
+    NOT in the shared parent checkout.
+    """
+    if not GROUP_ID:
+        return ("fan-out write-parts get isolated worktrees", False, "STAGING_GROUP_ID is not set")
+    group = int(GROUP_ID)
+    base = os.path.join(os.environ.get("TG_SESSIONS_BASE", ""), f"{GROUP_ID}-general")
+
+    # Worktrees need a git repo. The parent topic's directory is a fresh session dir,
+    # so make it one — otherwise write-parts correctly fall back to read-only and
+    # this would test the fallback rather than the isolation.
+    os.makedirs(base, exist_ok=True)
+    def git(*a, cwd=base):
+        return subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True)
+    # It must be ITS OWN repo. `rev-parse --git-dir` succeeds from any subdirectory
+    # of an enclosing repo, so the first version of this check quietly let the test
+    # run against the xesious checkout itself — creating fanout/* branches in it and
+    # comparing the parts' files against the wrong "parent". Compare the toplevel.
+    top = git("rev-parse", "--show-toplevel").stdout.strip()
+    if os.path.realpath(top or "/nowhere") != os.path.realpath(base):
+        git("init", "-q")
+        git("config", "user.email", "t@t")
+        git("config", "user.name", "T")
+        with open(os.path.join(base, "seed.txt"), "w") as fh:
+            fh.write("seed\n")
+        git("add", "-A")
+        git("commit", "-qm", "seed")
+    # A previous run's leftovers would otherwise read as this run's work.
+    for stale in ("alpha.txt", "beta.txt"):
+        pth = os.path.join(base, stale)
+        if os.path.exists(pth):
+            os.remove(pth)
+    subprocess.run(["rm", "-rf", os.path.join(base, ".fanout")])
+    git("worktree", "prune")
+    for b in [x.strip().lstrip("* +") for x in git("branch", "--list", "fanout/*").stdout.splitlines() if x.strip()]:
+        git("branch", "-D", b)
+    print(f"  (repo for the fan-out: {base})")
+
+    await _show(client, bot, "/mode auto")
+    task = ("Make two independent file edits, one per part: "
+            "(1) create a file named alpha.txt containing exactly ALPHA, "
+            "(2) create a file named beta.txt containing exactly BETA. "
+            "Each part edits only its own file.")
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    # A clean session per case. They all share the group's General topic, so without
+    # this the planner reads a previous case's corrections as context and starts
+    # answering conversationally instead of producing a plan.
+    await client.send_message(group, "/new")
+    await asyncio.sleep(3)
+    print("  → /fanout with two write-parts")
+    await client.send_message(group, f"/fanout {task}")
+    proposal = None
+    for _ in range(90):
+        await asyncio.sleep(1)
+        proposal = next((m for m in seen if m.reply_markup and "Proposed split" in (reply_text(m) or "")), None)
+        if proposal:
+            break
+    if not proposal:
+        client.remove_event_handler(handler)
+        return ("fan-out write-parts get isolated worktrees", False, "no proposal arrived")
+    text = reply_text(proposal)
+    print(f"    proposal mentions worktrees: {'worktree' in text}")
+    await proposal.click(0)
+
+    # Write-parts always produce branches, and the branch report is the one message
+    # the finish note still always sends for them — and it arrives before the
+    # worktrees are cleaned up, which is when the isolation below is still checkable.
+    done = await _until(
+        lambda: next((m for m in seen if "Branches created" in (reply_text(m) or "")), None), 300)
+    client.remove_event_handler(handler)
+
+    problems = []
+    if not done:
+        problems.append("the parts never converged")
+    finish_text = reply_text(done) if done else ""
+
+    # --- the isolation, checked on disk ---------------------------------------
+    branches = [b.strip().lstrip("* ") for b in git("branch", "--list", "fanout/*").stdout.splitlines() if b.strip()]
+    wt_root = os.path.join(base, ".fanout")
+    trees = sorted(os.listdir(wt_root)) if os.path.isdir(wt_root) else []
+    print(f"    branches: {branches}")
+    print(f"    worktrees: {trees}")
+
+    if len(trees) < 2:
+        problems.append(f"expected a worktree per write-part, found {len(trees)}")
+    if len(branches) < 2:
+        problems.append(f"expected a branch per write-part, found {len(branches)}")
+
+    WANT = ("alpha.txt", "beta.txt")
+    found = {}
+    for t in trees:
+        d = os.path.join(wt_root, t)
+        for name in WANT:
+            if os.path.exists(os.path.join(d, name)):
+                found.setdefault(name, []).append(t)
+    print(f"    files by worktree: {found}")
+    for name in WANT:
+        if name not in found:
+            problems.append(f"no part wrote {name} inside a worktree")
+        # THE point of the isolation, and checked for BOTH files rather than only for
+        # the ones that turned up in a worktree: a file missing from every worktree
+        # AND sitting in the shared checkout is precisely the failure being hunted,
+        # and keying this off `found` made that case invisible.
+        if os.path.exists(os.path.join(base, name)):
+            problems.append(f"{name} was written in the shared parent checkout — that part was not isolated")
+    # …nor in each other's tree.
+    for name, where in found.items():
+        if len(where) > 1:
+            problems.append(f"{name} appears in {len(where)} worktrees, so they are not separate")
+    if done and "Branches created" not in finish_text:
+        problems.append("the finish message did not say where the work landed")
+
+    return ("fan-out write-parts get isolated worktrees", not problems,
+            "; ".join(problems) if problems else
+            f"{len(trees)} worktrees on {len(branches)} branches, each part's file only in its own tree, none in the parent")
+
+
 FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
                  feature_midturn_text, feature_attribution, feature_reply_threading,
-                 feature_interrupt_kills_the_tree, feature_run_alongside]
+                 feature_interrupt_kills_the_tree, feature_run_alongside,
+                 feature_fanout_guard,
+                 # Last, and in this order: they drive a group, spawn several sessions and
+                 # keep talking for a while after they return. Ahead of the DM cases they
+                 # simply make more noise for those to trip over.
+                 feature_fanout_steering, feature_fanout_worktrees, feature_fanout_end_to_end]
 
 
 async def main():
