@@ -957,7 +957,12 @@ describe('fan-out: the proposal shown before anything runs', () => {
     expect(out).toContain('2 part')
   })
   test('says when parts will edit files, and that they are isolated', () => {
-    expect(renderFanoutProposal(items, { cap: 3 })).toMatch(/1 part will edit files.*worktree/)
+    expect(renderFanoutProposal(items, { cap: 3, isolated: true })).toMatch(/1 part will edit files.*worktree/)
+    // …and says the opposite where there is no repo, rather than promising a safety
+    // net that is not there. The reader cannot tell the difference from the outside.
+    const shared = renderFanoutProposal(items, { cap: 3, isolated: false })
+    expect(shared).toMatch(/not a git repository/)
+    expect(shared).not.toMatch(/worktree/)
   })
   test('never caps silently', () => {
     const many = parseFanoutPlan(Array.from({ length: 6 }, (_, i) => `FANOUT ${i} | read | T${i} | B`).join('\n'))

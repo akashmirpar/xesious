@@ -1101,6 +1101,24 @@ describe('fan-out: steering a part changes the combined answer', () => {
     expect([...threads].every(t => t !== undefined)).toBe(true)
   }, 30000)
 
+  test('the part list ends up linking every part, not accusing Telegram of failing', async () => {
+    // It used to be written the instant the parts were told to start — before their
+    // topics existed — so a part whose topic had not been created YET was reported
+    // as one that COULD NOT be created. Nothing had failed; the message was early.
+    const sent = calls.find(c => c.method === 'sendMessage'
+      && String(c.payload.text ?? '').includes('Running 2 parts'))
+    expect(sent).toBeDefined()
+    const edits = calls.filter(c => c.method === 'editMessageText'
+      && String(c.payload.text ?? '').includes('Running 2 parts'))
+    const finalList = String((edits[edits.length - 1] ?? sent)!.payload.text)
+    expect(finalList).not.toMatch(/no topic could be created/)
+    // Both parts are links by the end, whatever order their topics arrived in.
+    // Matched on the chat path rather than the host: MarkdownV2 escaping puts a
+    // backslash in "t.me", so a regex for the domain finds nothing and the test
+    // would fail on its own escaping.
+    expect(finalList.match(/\/c\/777\//g)?.length).toBe(2)
+  }, 15000)
+
   test('the combined answer is produced automatically once the parts settle', async () => {
     const texts = calls.filter(c => c.method === 'sendMessage').map(c => String(c.payload.text ?? '')).join('\n')
     // The combined answer arrives on its own. There is deliberately no "all parts
@@ -1134,6 +1152,39 @@ describe('fan-out: steering a part changes the combined answer', () => {
     expect((saved.fanoutPlans ?? []).some((f: any) =>
       f.children.some((c: any) => c.status !== 'pending'))).toBe(false)
   }, 30000)
+
+  test('an interrupted part holds the answer back until it is dealt with', async () => {
+    // Interrupting a part from its own topic means you are taking it over. Treating
+    // that as "the part finished" wrote the combined answer from work that had just
+    // been cut off, while the topic was still mid-conversation.
+    const fake = { api: bridge.bot.api, chat: { id: -100777 } }
+    const f: any = {
+      id: 'fanS', badge: '', parentKey: '-100777:main', chatId: -100777, askedBy: 1,
+      task: 'two things', synthesised: false,
+      children: [
+        { n: 1, title: 'A', brief: 'b', mode: 'read', status: 'done', result: 'one' },
+        { n: 2, title: 'B', brief: 'b', mode: 'read', status: 'stopped' },
+      ],
+    }
+    bridge._fanouts.set(f.id, f)
+    const before = calls.length
+    await bridge._maybeSynthesise(fake, f)
+    expect(calls.slice(before).length).toBe(0)
+    expect(f.synthesised).toBe(false)
+
+    // …but it can never strand the fan-out: the button combines what there is.
+    await bridge.bot.handleUpdate({
+      update_id: 99806,
+      callback_query: { id: 'ff1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: `fanf:${f.id}`, message: { message_id: 99291, date: 0, chat: { id: -100777, type: 'supergroup' } } },
+    })
+    await new Promise(r => setTimeout(r, 1500))
+    expect(f.synthesised).toBe(true)
+    // A part that was cut off before saying anything is reported, not dropped.
+    expect(f.children[1].status).toBe('failed')
+    const said = calls.filter(c => c.method === 'sendMessage').map(c => String(c.payload.text ?? '')).join('\n')
+    expect(said).toMatch(/did not complete/)
+  }, 20000)
 
   test('a correction after the answer reopens that part and offers to combine again', async () => {
     // The parts' topics are closed once the answer is written, and a closed topic is
@@ -1170,6 +1221,13 @@ describe('fan-out: steering a part changes the combined answer', () => {
     const after = calls.slice(before)
     // Forced by the button rather than by the default, which is 'ask'.
     expect(after.filter(c => c.method === 'deleteForumTopic').length).toBeGreaterThanOrEqual(2)
+    // The offer becomes the record instead of vanishing: deleting it would leave
+    // "where did those topics go" with no answer anywhere in the chat.
+    const rewritten = after.find(c => c.method === 'editMessageText' && c.payload.message_id === 99290)
+    expect(rewritten).toBeDefined()
+    expect(String(rewritten!.payload.text)).toMatch(/you deleted 2 part topics/i)
+    expect(rewritten!.payload.reply_markup?.inline_keyboard).toEqual([])
+    expect(after.some(c => c.method === 'deleteMessage' && c.payload.message_id === 99290)).toBe(false)
   }, 15000)
 
   test('a bot without Delete Messages closes the topics instead of leaving them', async () => {

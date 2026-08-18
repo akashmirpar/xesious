@@ -913,7 +913,7 @@ export function parseFanoutPlan(text: string, opts?: { max?: number }): FanoutPl
 
 // What the human sees before anything is spawned. FEEDBACK.md asks for exactly
 // this: a confirmation showing the proposed split BEFORE it opens eight topics.
-export function renderFanoutProposal(items: FanoutPlanItem[], opts: { cap: number }): string {
+export function renderFanoutProposal(items: FanoutPlanItem[], opts: { cap: number; isolated?: boolean }): string {
   const writes = items.filter(i => i.mode === 'write').length
   // No hanging indent on the brief: Telegram renders the leading spaces literally
   // and the block ends up looking mis-aligned rather than structured.
@@ -924,7 +924,14 @@ export function renderFanoutProposal(items: FanoutPlanItem[], opts: { cap: numbe
     // that ran.
     notes.push(`Running ${opts.cap} at a time; the rest start as those finish.`)
   }
-  if (writes) notes.push(`${writes} part${writes === 1 ? '' : 's'} will edit files, each in its own git worktree.`)
+  // Say what will ACTUALLY happen. Promising a worktree per part where there is no
+  // repo to make one from described a safety net that was not there, and the reader
+  // has no way to tell — the difference only shows up when two parts edit one file.
+  if (writes) {
+    notes.push(opts.isolated === false
+      ? `${writes} part${writes === 1 ? '' : 's'} will edit files in this directory. It is not a git repository, so they are NOT isolated from each other.`
+      : `${writes} part${writes === 1 ? '' : 's'} will edit files, each in its own git worktree.`)
+  }
   return [
     `Proposed split — ${items.length} part${items.length === 1 ? '' : 's'}:`,
     '',

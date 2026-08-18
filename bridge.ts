@@ -697,6 +697,9 @@ type Fanout = {
   askedBy?: number
   task: string
   children: FanoutChild[]
+  // The one message listing every part, kept so it can be re-rendered as the parts
+  // get their topics rather than frozen at the moment it was first sent.
+  listMsgId?: number
   synthesised: boolean
 }
 const fanouts = new Map<string, Fanout>()
@@ -1460,10 +1463,12 @@ async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: str
 // two parts editing the same checkout corrupt each other's work and git state.
 // Returns undefined when the directory is not a git repo, which the caller reports
 // rather than silently running the part in the parent directory.
+function isGitRepo(dir: string): boolean {
+  try { execFileSync('git', ['-C', dir, 'rev-parse', '--git-dir'], { stdio: 'ignore' }); return true } catch { return false }
+}
+
 function makeWorktree(baseDir: string, fanoutId: string, n: number): { path: string; branch: string } | undefined {
-  try {
-    execFileSync('git', ['-C', baseDir, 'rev-parse', '--git-dir'], { stdio: 'ignore' })
-  } catch { return undefined }
+  if (!isGitRepo(baseDir)) return undefined
   const branch = `fanout/${fanoutId}-${n}`
   const path = join(baseDir, '.fanout', `${fanoutId}-${n}`)
   try {
@@ -1530,6 +1535,7 @@ async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Pr
   const key = topicId !== undefined ? keyFor(f.chatId, topicId) : `${f.parentKey}#part-${f.id}-${child.n}`
   child.topicId = topicId
   child.key = key
+  void refreshFanoutParts(ctx, f)
   sessions[key] = { ...(sessions[key] ?? {}), cwd }
   saveState()
   childOf.set(key, { fanoutId: f.id, n: child.n })
@@ -1583,16 +1589,72 @@ async function finishFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): P
 // announcements bury the topic they are posted in, which is the topic you are
 // trying to keep usable.
 async function announceFanoutParts(ctx: Context, f: Fanout): Promise<void> {
+  const m = await ctx.api.sendMessage(f.chatId,
+    telegramify(sanitizeProse(renderFanoutParts(f), 'markdownv2'), 'escape'), {
+      ...destOpts({ threadId: f.parentThreadId, replyTo: f.askedBy }),
+      parse_mode: 'MarkdownV2', disable_notification: true,
+    }).catch(() => null)
+  if (m) f.listMsgId = m.message_id
+}
+
+// The list as it stands right now.
+//
+// A part has no topic yet for two ordinary reasons: it is queued behind the
+// concurrency cap, or its topic is still being created. Neither is a failure, and
+// reporting them as "no topic could be created" was wrong twice over — the message
+// was written before the topics existed, so it accused Telegram of failing at
+// something it had not been asked to do yet.
+function renderFanoutParts(f: Fanout): string {
   const lines = f.children.map(c => {
     const label = `${FANOUT_MARK} ${c.n}/${f.children.length} ${c.title}`
     const link = topicLink(f.chatId, c.topicId)
-    return link ? `[${label}](${link})` : `${label} — no topic could be created`
+    if (link) return `[${label}](${link})`
+    // Settled without ever getting one: it really did run outside a topic, on its
+    // own synthetic key, and there is nothing to link to.
+    const ran = c.status === 'done' || c.status === 'failed' || c.status === 'stopped'
+    return `${label} — ${ran ? 'ran without a topic of its own' : 'starting…'}`
   })
-  const md = `Running ${f.children.length} parts:\n${lines.join('\n')}`
-  await ctx.api.sendMessage(f.chatId, telegramify(sanitizeProse(md, 'markdownv2'), 'escape'), {
-    ...destOpts({ threadId: f.parentThreadId, replyTo: f.askedBy }),
-    parse_mode: 'MarkdownV2', disable_notification: true,
-  }).catch(() => {})
+  return `Running ${f.children.length} parts:\n${lines.join('\n')}`
+}
+
+// Re-render the list in place as parts get their topics. Parts start in waves when
+// there are more of them than the concurrency cap, so this message is only ever
+// complete some time after it is first posted.
+async function refreshFanoutParts(ctx: Context, f: Fanout): Promise<void> {
+  if (f.listMsgId === undefined) return
+  await ctx.api.editMessageText(f.chatId, f.listMsgId,
+    telegramify(sanitizeProse(renderFanoutParts(f), 'markdownv2'), 'escape'),
+    { parse_mode: 'MarkdownV2' },
+  ).catch(() => {})   // unchanged text is an error to Telegram, and is fine here
+}
+
+// Put a part back in flight. Called before every turn in a part's topic: a part you
+// are talking to is not a part that has finished, whatever it said last time.
+function markFanoutChildLive(key: string): void {
+  const owner = childOf.get(key)
+  if (!owner) return
+  const f = fanouts.get(owner.fanoutId)
+  const child = f?.children.find(c => c.n === owner.n)
+  if (child && child.status !== 'pending' && child.status !== 'running') child.status = 'running'
+}
+
+// A part was interrupted from its own topic. The parent stops waiting for it to
+// finish on its own, but must not treat it as done either — the work was cut off
+// mid-way, and an answer built from it would be built from half a part.
+async function noteFanoutChildInterrupted(ctx: Context, key: string): Promise<void> {
+  const owner = childOf.get(key)
+  if (!owner) return
+  const f = fanouts.get(owner.fanoutId)
+  const child = f?.children.find(c => c.n === owner.n)
+  if (!f || !child || f.synthesised) return
+  child.status = 'stopped'
+  // Without the button an abandoned part would hold the whole fan-out open forever,
+  // which is a worse failure than an incomplete answer you asked for.
+  await ctx.api.sendMessage(f.chatId,
+    `⏸ Part ${child.n} (${child.title}) was interrupted, so the answer is waiting on it. Steer it in its own topic and it will be included when it finishes.`,
+    { ...destOpts({ threadId: f.parentThreadId, replyTo: f.askedBy }), disable_notification: true,
+      reply_markup: { inline_keyboard: [[{ text: '— Combine without it —', callback_data: `fanf:${f.id}` }]] } },
+  ).catch(() => {})
 }
 
 // A part changed after the answer was written. Say so and offer to redo it.
@@ -1654,7 +1716,7 @@ async function disposeFanoutTopics(ctx: Context, f: Fanout, force?: 'delete' | '
     await ctx.api.sendMessage(f.chatId,
       `The ${live.length} part topic${live.length === 1 ? '' : 's'} from this fan-out are still open.`,
       { ...destOpts({ threadId: f.parentThreadId, replyTo: f.askedBy }), disable_notification: true,
-        reply_markup: { inline_keyboard: [[{ text: '— Done and delete subtopics —', callback_data: `fanc:${f.id}` }]] } },
+        reply_markup: { inline_keyboard: [[{ text: '— Done, delete subtopics —', callback_data: `fanc:${f.id}` }]] } },
     ).catch(() => {})
     return
   }
@@ -1701,7 +1763,9 @@ async function cleanupFanout(ctx: Context, f: Fanout): Promise<void> {
 // parent topic, from the parts' own summaries.
 async function maybeSynthesise(ctx: Context, f: Fanout): Promise<void> {
   if (f.synthesised) return
-  if (f.children.some(c => c.status === 'pending' || c.status === 'running')) return
+  // 'stopped' waits too: it means a part was interrupted and is being taken over by
+  // hand, and the answer would otherwise be written from work that was cut off.
+  if (f.children.some(c => c.status === 'pending' || c.status === 'running' || c.status === 'stopped')) return
   f.synthesised = true
   const parts = f.children.map(c => ({ title: c.title, status: c.status, result: c.result }))
   const okCount = parts.filter(p => p.status === 'done').length
@@ -1737,6 +1801,12 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     if (o?.offerMsgId) await ctx.api.deleteMessage(ctx.chat!.id, o.offerMsgId).catch(() => {})
     offered.delete(replyTo)
   }
+  // A turn in a part's topic means that part is live again — you are steering it, or
+  // picking it up after interrupting it. Mark it before the turn, not after: while it
+  // is settled the parent is free to write the answer, and it would be writing from
+  // the result you are in the middle of replacing.
+  markFanoutChildLive(key)
+
   const cwd = resolveCwd(ctx, threadId)
   // Attribute the message before it reaches the model. Only here: handlePassthrough
   // and /compact send literal CLI commands, which are not somebody speaking.
@@ -1794,7 +1864,15 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   }
   try {
     const res = await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), { onInit: background ? undefined : bindSession, effort: effortFor(key), askedBy: replyTo, fork: background })
-    if (stopped.has(key)) { stopped.delete(key); return } // killed via /stop — status already cleared, no reply
+    if (stopped.has(key)) {
+      stopped.delete(key)
+      // Interrupting a part is not the same as the part finishing. It means you are
+      // taking it over, so the parent waits instead of writing an answer from work
+      // you just stopped — with a way out, so an abandoned part cannot strand the
+      // whole fan-out.
+      await noteFanoutChildInterrupted(ctx, key)
+      return
+    }
     // Still persist on completion: a resumed turn reports the same id, and this
     // refreshes `updated`. Binding already happened above for a fresh session.
     if (res.sessionId) bindSession(res.sessionId)
@@ -1820,12 +1898,18 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     if (owner) {
       const f = fanouts.get(owner.fanoutId)
       const child = f?.children.find(c => c.n === owner.n)
-      if (child && res.text.trim()) {
-        child.result = res.text
-        if (child.status === 'running') child.status = 'done'
-        // Corrected after the answer was already written: offer to redo it rather
-        // than silently leaving a combined answer that no longer matches its parts.
-        else if (f && f.synthesised) await offerRecombine(ctx, f, child)
+      if (f && child) {
+        if (res.text.trim()) child.result = res.text
+        if (f.synthesised) {
+          // Corrected after the answer was already written: offer to redo it rather
+          // than silently leaving a combined answer that no longer matches its parts.
+          child.status = 'done'
+          if (res.text.trim()) await offerRecombine(ctx, f, child)
+        } else {
+          // Settle it through the normal path, so a steering turn can be what
+          // completes the fan-out — the parent was waiting on this part.
+          await finishFanoutChild(ctx, f, child)
+        }
       }
     }
     // A fan-out's synthesis IS the answer and needs no banner announcing itself. An
@@ -2321,7 +2405,7 @@ bot.on('message', async ctx => {
       // Through telegramify with a parse mode: this text is markdown, and a raw
       // sendMessage renders its asterisks and underscores literally.
       await ctx.api.sendMessage(ctx.chat!.id,
-        telegramify(sanitizeProse(renderFanoutProposal(items, { cap: FANOUT_CONCURRENCY }), 'markdownv2'), 'escape'), {
+        telegramify(sanitizeProse(renderFanoutProposal(items, { cap: FANOUT_CONCURRENCY, isolated: isGitRepo(resolveCwd(ctx, threadId)) }), 'markdownv2'), 'escape'), {
         ...destOpts({ threadId, replyTo: msg.message_id }), parse_mode: 'MarkdownV2',
         reply_markup: { inline_keyboard: [[
           { text: `— Run these ${items.length} —`, callback_data: `fan:${f.id}` },
@@ -2538,7 +2622,25 @@ bot.on('callback_query:data', async ctx => {
     // Forced: the button says delete, so it deletes regardless of the default.
     await disposeFanoutTopics(ctx, f, 'delete')
     await ctx.answerCallbackQuery({ text: `Deleted ${before} part topic${before === 1 ? '' : 's'}.` }).catch(() => {})
+    // Rewritten rather than removed. It said the topics were still open, which your
+    // tap has just made false — but deleting it takes the record with it, and weeks
+    // later "where did those topics go" has no answer in the chat. So it becomes the
+    // record: what happened, who decided it, and how many went.
+    const done = `✅ Fan-out finished — you deleted ${before} part topic${before === 1 ? '' : 's'}. The combined answer above is what remains of them.`
+    const edited = await ctx.editMessageText(done, { reply_markup: { inline_keyboard: [] } })
+      .then(() => true).catch(() => false)
+    if (!edited) await ctx.editMessageReplyMarkup(undefined).catch(() => {})
+    return
+  }
+  if (data.startsWith('fanf:')) {
+    const f = fanouts.get(data.slice(5))
+    if (!f) { await ctx.answerCallbackQuery({ text: 'That fan-out is no longer available.', show_alert: true }).catch(() => {}); return }
+    // Whatever an interrupted part managed to say still counts; one that said
+    // nothing is reported as not completed rather than quietly dropped.
+    for (const c of f.children) if (c.status === 'stopped') c.status = c.result ? 'done' : 'failed'
+    await ctx.answerCallbackQuery({ text: 'Combining what the parts have.' }).catch(() => {})
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})
+    await maybeSynthesise(ctx, f)
     return
   }
   if (data.startsWith('fanr:')) {
@@ -2570,9 +2672,13 @@ bot.on('callback_query:data', async ctx => {
     if (f.children.some(c => c.status !== 'pending')) { await ctx.answerCallbackQuery({ text: 'Already running.' }).catch(() => {}); return }
     await ctx.answerCallbackQuery({ text: `Starting ${f.children.length} parts…` }).catch(() => {})
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})
+    // Announce BEFORE starting anything. The parts get their topics as they start,
+    // and each one re-renders this message — but a re-render that happens before the
+    // message exists is a no-op, which left the list frozen on its first draft.
+    await announceFanoutParts(ctx, f)
     await pumpFanout(ctx, f)
     saveState()          // no longer pending, so no longer restorable — drop it
-    await announceFanoutParts(ctx, f)
+    await refreshFanoutParts(ctx, f)   // catch any part that started before its turn
     return
   }
   if (data.startsWith('par:')) {
@@ -2836,6 +2942,8 @@ export const _PID_FILE = PID_FILE
 
 export const _makeWorktree = makeWorktree
 export const _disposeFanoutTopics = disposeFanoutTopics
+export const _fanouts = fanouts
+export const _maybeSynthesise = maybeSynthesise
 
 export function _drainQueue(key: string): Promise<unknown> { return queues.get(key) ?? Promise.resolve() }
 
