@@ -115,7 +115,11 @@ async def send_and_wait_messages(client, bot, prompt: str):
     msgs = []
     got = asyncio.Event()
 
-    @client.on(events.NewMessage(from_users=bot))
+    # chats=bot, not just from_users=bot: without it this handler also catches what
+    # the bot says in the fan-out GROUP, and a case waiting for its own reply in the
+    # DM happily accepts "✅ This part is finished…" from a fan-out that is still
+    # winding down. Every DM assertion then reads a message meant for somewhere else.
+    @client.on(events.NewMessage(from_users=bot, chats=bot))
     async def handler(ev):
         if is_status(reply_text(ev.message)):
             return
@@ -146,7 +150,7 @@ async def send_and_collect(client, bot, prompt: str, settle: float = 8.0):
     msgs = []
     last = asyncio.get_event_loop().time()
 
-    @client.on(events.NewMessage(from_users=bot))
+    @client.on(events.NewMessage(from_users=bot, chats=bot))
     async def handler(ev):
         nonlocal last
         if is_status(reply_text(ev.message)):
@@ -1034,10 +1038,14 @@ async def feature_fanout_worktrees(client, bot):
             f"{len(trees)} worktrees on {len(branches)} branches, each part's file only in its own tree, none in the parent")
 
 
-FEATURE_TESTS = [feature_fanout_steering, feature_fanout_worktrees, feature_fanout_end_to_end, feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
+FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
                  feature_midturn_text, feature_attribution, feature_reply_threading,
                  feature_interrupt_kills_the_tree, feature_run_alongside,
-                 feature_fanout_guard]
+                 feature_fanout_guard,
+                 # Last, and in this order: they drive a group, spawn several sessions and
+                 # keep talking for a while after they return. Ahead of the DM cases they
+                 # simply make more noise for those to trip over.
+                 feature_fanout_steering, feature_fanout_worktrees, feature_fanout_end_to_end]
 
 
 async def main():
