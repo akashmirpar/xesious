@@ -1116,10 +1116,12 @@ describe('fan-out: steering a part changes the combined answer', () => {
     // be reopened, or the first correction is also the last one possible.
     const child = calls.find(c => c.method === 'sendMessage'
       && String(c.payload.text ?? '').includes('Talk here to steer'))!.payload.message_thread_id as number
-    // Deleted, not closed: a closed topic still sits in the topic list, and after a
-    // few fan-outs the list is mostly spent scaffolding.
-    expect(calls.some(c => c.method === 'deleteForumTopic')).toBe(true)
+    // Nothing is destroyed on its own: the topics are left exactly as they are and
+    // the parent topic gets a button. Whether a part is still worth reading is a
+    // judgement only the person reading it can make.
+    expect(calls.some(c => c.method === 'deleteForumTopic')).toBe(false)
     expect(calls.some(c => c.method === 'closeForumTopic')).toBe(false)
+    expect(calls.some(c => btns(c).some((b: any) => /delete subtopics/i.test(String(b.text))))).toBe(true)
     const before = calls.length
     await group('correction: the answer is CORRECTED', 99301, child)
     await bridge._drainQueue(`-100777:${child}`)
@@ -1130,6 +1132,21 @@ describe('fan-out: steering a part changes the combined answer', () => {
     expect(after.some(c => btns(c).some((b: any) => String(b.text).includes('Combine again')))).toBe(true)
   }, 20000)
 
+  test('the button deletes the topics, and only when it is tapped', async () => {
+    const offer = calls.filter(c => c.method === 'sendMessage')
+      .find(c => btns(c).some((b: any) => /delete subtopics/i.test(String(b.text))))
+    const data = btns(offer!)[0].callback_data
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 99805,
+      callback_query: { id: 'fd1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data, message: { message_id: 99290, date: 0, chat: { id: -100777, type: 'supergroup' } } },
+    })
+    const after = calls.slice(before)
+    // Forced by the button rather than by the default, which is 'ask'.
+    expect(after.filter(c => c.method === 'deleteForumTopic').length).toBeGreaterThanOrEqual(2)
+  }, 15000)
+
   test('a bot without Delete Messages closes the topics instead of leaving them', async () => {
     // The fallback chain, driven directly: delete refused → close → and only if that
     // fails too does the person get a button. A bot missing one right must not turn
@@ -1139,7 +1156,7 @@ describe('fan-out: steering a part changes the combined answer', () => {
                 children: [{ n: 1, topicId: 4001 }, { n: 2, topicId: 4002 }] }
     denyDelete = true
     const before = calls.length
-    await bridge._disposeFanoutTopics(fake, f)
+    await bridge._disposeFanoutTopics(fake, f, 'delete')
     denyDelete = false
     const after = calls.slice(before)
     expect(after.filter(c => c.method === 'deleteForumTopic').length).toBe(2)

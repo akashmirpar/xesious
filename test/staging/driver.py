@@ -763,25 +763,39 @@ async def feature_fanout_steering(client, bot):
     if "BETA" not in text and "ALPHA" not in text:
         problems.append("the combined answer lost the part that was not corrected")
 
-    # The topics are removed once the answer is written — closing them would leave
-    # them in the topic list, which is the mess this is meant to avoid. Give the
-    # removal a moment: it runs after the answer is posted.
+    # Nothing is removed on its own: the topics stay, and the parent topic gets a
+    # button. Both halves are the feature — the survival AND the button working —
+    # so check the topics are still there, tap it, and check they are gone.
     await asyncio.sleep(6)
-    gone = {}
+    alive = {}
     for n, (tid, _) in parts.items():
-        try:
+        alive[n] = not await _topic_gone(client, group, tid)
+    print(f"    topics still there after the answer: {alive}")
+    if not all(alive.values()):
+        problems.append(f"part topics were removed without being asked for: {alive}")
+
+    offer = next((m for m in reversed(seen) if m.reply_markup
+                  and any("delete subtopics" in b.text.lower()
+                          for row in m.reply_markup.rows for b in row.buttons)), None)
+    if not offer:
+        problems.append("no button was offered to delete the part topics")
+    else:
+        print(f"    tapping {[b.text for row in offer.reply_markup.rows for b in row.buttons]}")
+        await offer.click(0)
+        await asyncio.sleep(6)
+        gone = {}
+        for n, (tid, _) in parts.items():
             gone[n] = await _topic_gone(client, group, tid)
-        except Exception as e:                                  # noqa: BLE001
-            gone[n] = f"could not ask: {e}"
-    print(f"    topics gone after the answer: {gone}")
-    if not all(v is True for v in gone.values()):
-        problems.append(f"part topics were not deleted automatically: {gone}")
+        print(f"    topics gone after tapping: {gone}")
+        if not all(v is True for v in gone.values()):
+            problems.append(f"the button did not delete the part topics: {gone}")
 
     client.remove_event_handler(handler)
     return ("steering a fan-out part changes the combined answer", not problems,
             "; ".join(problems) if problems else
             f"part {fast} was corrected in its own topic ({route}), the combined answer "
-            "carried GAMMA alongside the untouched part, and both topics were deleted")
+            "carried GAMMA alongside the untouched part, the topics survived it, and the "
+            "button deleted them")
 
 
 async def feature_fanout_end_to_end(client, bot):

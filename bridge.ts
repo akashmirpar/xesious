@@ -1488,13 +1488,13 @@ async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Pr
   const parentCwd = sessions[f.parentKey]?.cwd ?? resolveCwd(ctx, f.parentThreadId)
   let cwd = parentCwd
   if (child.mode === 'write') {
+    // A worktree where there is a repo to make one from, and otherwise nothing —
+    // the part still runs, and still writes, in the shared directory. Downgrading it
+    // to read-only meant a directory that is not a repo could not use fan-out for
+    // the thing fan-out is for, and the warning explained a refusal nobody asked
+    // for. Isolation is a nicety here; doing the work is the point.
     const wt = makeWorktree(parentCwd, f.id, child.n)
     if (wt) { cwd = wt.path; child.worktree = wt.path; child.branch = wt.branch }
-    else {
-      // Say so rather than quietly running a write-part in the shared checkout,
-      // where it would collide with every other part.
-      await send(ctx, f.parentThreadId, `⚠️ Part ${child.n} (${child.title}) needs a git worktree and ${parentCwd} is not a git repository — running it read-only in place instead.`, true)
-    }
   }
 
   // A topic per part is what makes steering possible: type in it and you are
@@ -1529,7 +1529,12 @@ async function startFanoutChild(ctx: Context, f: Fanout, child: FanoutChild): Pr
     `Your part only — do not attempt the others, and do not wait for them.`,
     child.mode === 'write' && child.worktree
       ? `You are in your own git worktree on branch ${child.branch}; edit freely here.`
-      : `Treat this as read-only: investigate and report, do not edit files.`,
+      : child.mode === 'write'
+        // No repo, so no worktree, so no isolation: the other parts are writing in
+        // this same directory. It has to know that, or two parts will edit one file
+        // and the last write wins silently.
+        ? `Edit freely, but this directory is NOT isolated — the other parts are working in it too. Touch only the files your part needs, and do not reorganise anything shared.`
+        : `Treat this as read-only: investigate and report, do not edit files.`,
     ``,
     `The overall request was: ${f.task}`,
     ``,
@@ -1608,28 +1613,41 @@ function fanoutBranchReport(f: Fanout): string {
 // alone and reported rather than forced away.
 // What becomes of the part topics once the answer is written.
 //
-//   delete (default) — remove them. A closed topic still sits in the topic list, so
-//                      after a few fan-outs the list is mostly spent scaffolding.
-//   close            — keep them, closed and read-only, for their working-out.
-//   keep             — leave them open.
+//   ask (default) — leave them alone and offer a button in the parent topic. You
+//                   decide when you are finished reading them; nothing is destroyed
+//                   behind your back.
+//   delete        — remove them as soon as the answer is written.
+//   close         — keep them, closed and read-only.
+//   keep          — leave them open and say nothing.
 //
-// Deleting is destructive and worth being clear about: the part's reasoning goes
-// with it, and the combined answer is then the only record. `close` is there for
-// anyone who would rather keep the transcript than the tidy list. Read at call time
-// so it can be changed without a restart being the only way to see it.
-function topicDisposal(): 'delete' | 'close' | 'keep' {
-  const v = (process.env.TG_FANOUT_TOPICS || 'delete').toLowerCase()
-  return v === 'close' || v === 'keep' ? v : 'delete'
+// Deleting used to be automatic. It is destructive — the part's working-out goes
+// with it, and the combined answer becomes the only record — and whether a part is
+// worth reading is a judgement only the person reading it can make. Read at call
+// time so it can be changed without a restart.
+function topicDisposal(): 'ask' | 'delete' | 'close' | 'keep' {
+  const v = (process.env.TG_FANOUT_TOPICS || 'ask').toLowerCase()
+  return v === 'delete' || v === 'close' || v === 'keep' ? v : 'ask'
 }
 
 // Dispose of the part topics, falling back rather than giving up: deleting needs
 // Delete Messages and closing needs Manage Topics, and a bot that has neither must
 // still leave a way to clear up by hand instead of an unexplained mess.
-async function disposeFanoutTopics(ctx: Context, f: Fanout): Promise<void> {
-  const mode = topicDisposal()
+async function disposeFanoutTopics(ctx: Context, f: Fanout, force?: 'delete' | 'close'): Promise<void> {
+  const mode = force ?? topicDisposal()
   if (mode === 'keep') return
   const live = f.children.filter(c => c.topicId !== undefined)
   if (!live.length) return
+  // The default: leave the topics exactly as they are and put the decision in the
+  // parent topic, where the answer is. Tapping it comes back through here with the
+  // disposal forced, so there is one code path rather than two.
+  if (mode === 'ask') {
+    await ctx.api.sendMessage(f.chatId,
+      `The ${live.length} part topic${live.length === 1 ? '' : 's'} from this fan-out are still open.`,
+      { ...destOpts({ threadId: f.parentThreadId, replyTo: f.askedBy }), disable_notification: true,
+        reply_markup: { inline_keyboard: [[{ text: '— Done and delete subtopics —', callback_data: `fanc:${f.id}` }]] } },
+    ).catch(() => {})
+    return
+  }
   let done = 0
   for (const c of live) {
     if (mode === 'delete'
@@ -1647,7 +1665,7 @@ async function disposeFanoutTopics(ctx: Context, f: Fanout): Promise<void> {
 
 async function cleanupFanout(ctx: Context, f: Fanout): Promise<void> {
   const kept: string[] = []
-  const keeping = topicDisposal() !== 'delete'
+  const keeping = topicDisposal() !== 'delete'   // 'ask' keeps them until you say otherwise
   for (const c of f.children) {
     // Only worth saying where the topic will survive to be read. Posting it into a
     // topic that is about to be deleted is a message written to be thrown away.
@@ -2506,8 +2524,9 @@ bot.on('callback_query:data', async ctx => {
     const f = fanouts.get(data.slice(5))
     if (!f) { await ctx.answerCallbackQuery({ text: 'That fan-out is no longer available.', show_alert: true }).catch(() => {}); return }
     const before = f.children.filter(c => c.topicId !== undefined).length
-    await disposeFanoutTopics(ctx, f)
-    await ctx.answerCallbackQuery({ text: `Cleared up ${before} part topic${before === 1 ? '' : 's'}.` }).catch(() => {})
+    // Forced: the button says delete, so it deletes regardless of the default.
+    await disposeFanoutTopics(ctx, f, 'delete')
+    await ctx.answerCallbackQuery({ text: `Deleted ${before} part topic${before === 1 ? '' : 's'}.` }).catch(() => {})
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})
     return
   }
