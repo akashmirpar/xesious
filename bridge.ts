@@ -34,7 +34,7 @@ import {
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
-  FANOUT_MARK, fanoutTopicName, topicLink,
+  FANOUT_MARK, fanoutTopicName, topicLink, topicTag,
   type FanoutPlanItem,
   frameUserMessage, attributionProfileLines,
   needsRich, hasRtl, sanitizeProse,
@@ -1232,6 +1232,27 @@ function isAllowed(ctx: Context): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Two topics can legitimately point at one directory — that is what /fork is — and
+// then `./outbox/` is no longer "this conversation's outbox" but a drop point two
+// conversations share. Whoever finishes a run first delivers whatever is in it, so
+// the fork's file lands in the parent's topic. Same for `./inbox/`: a file you sent
+// to one topic shows up as material in the other.
+//
+// So a topic that shares its directory gets its own subdirectory inside each, and is
+// told about it. A topic with the directory to itself keeps the plain paths — the
+// common case should not pay for the rare one.
+function topicsSharing(cwd: string, key: string): boolean {
+  const target = resolve(cwd)
+  for (const [k, e] of Object.entries(sessions)) {
+    if (k !== key && e?.cwd && resolve(e.cwd) === target) return true
+  }
+  return false
+}
+
+function boxDir(cwd: string, key: string, box: string): string {
+  return topicsSharing(cwd, key) ? join(cwd, box, topicTag(key)) : join(cwd, box)
+}
+
 // Files: receive (Telegram -> topic/inbox) and send (topic/outbox -> Telegram).
 // ---------------------------------------------------------------------------
 
@@ -1267,14 +1288,14 @@ function pickAttachment(msg: any): { fileId: string; name: string; size: number 
 }
 
 // Download a Telegram file into a topic's inbox. Returns the saved absolute path.
-async function receiveFile(ctx: Context, att: { fileId: string; name: string; size: number }, cwd: string): Promise<string> {
+async function receiveFile(ctx: Context, att: { fileId: string; name: string; size: number }, cwd: string, key: string): Promise<string> {
   if (att.size && att.size > TG_DOWNLOAD_LIMIT)
     throw new Error(
       `file is ${fmtBytes(att.size)}, over the ${fmtBytes(TG_DOWNLOAD_LIMIT)} the cloud Bot API lets bots fetch.\n` +
       `To lift this, run a local Bot API server and set TG_API_ROOT (see README) — or copy the file to ${cwd}/${INBOX_DIR}/ directly.`)
   const file = await ctx.api.getFile(att.fileId)
   if (!file.file_path) throw new Error('Telegram returned no file_path')
-  const dest = uniquePath(ensureDir(join(cwd, INBOX_DIR)), safeName(att.name, extname(file.file_path)))
+  const dest = uniquePath(ensureDir(boxDir(cwd, key, INBOX_DIR)), safeName(att.name, extname(file.file_path)))
   // A local server in --local mode has already written the file to its own disk
   // and hands back an absolute path; there is nothing to download.
   if (LOCAL_API && isAbsolute(file.file_path) && existsSync(file.file_path)) {
@@ -1313,8 +1334,16 @@ async function sendFile(ctx: Context, threadId: number | undefined, path: string
 
 // After a run, deliver anything Claude left in the topic's outbox, then archive
 // each sent file to outbox/.sent so it isn't delivered twice.
-async function flushOutbox(ctx: Context, threadId: number | undefined, cwd: string, replyTo?: number): Promise<void> {
-  const dir = join(cwd, OUTBOX_DIR)
+async function flushOutbox(ctx: Context, threadId: number | undefined, cwd: string, key: string, replyTo?: number): Promise<void> {
+  // This topic's own outbox first, then the shared root — which is drained too
+  // rather than left to strand files, since a model that ignored the note (or a
+  // delivery that failed earlier) would otherwise leave them there forever.
+  const own = boxDir(cwd, key, OUTBOX_DIR)
+  const root = join(cwd, OUTBOX_DIR)
+  for (const dir of own === root ? [root] : [own, root]) await drainOutbox(ctx, threadId, dir)
+}
+
+async function drainOutbox(ctx: Context, threadId: number | undefined, dir: string): Promise<void> {
   if (!existsSync(dir)) return
   let names: string[]
   try { names = readdirSync(dir) } catch { return }
@@ -1323,9 +1352,17 @@ async function flushOutbox(ctx: Context, threadId: number | undefined, cwd: stri
     if (n.startsWith('.')) continue
     const p = join(dir, n)
     let st; try { st = statSync(p) } catch { continue }
+    // Subdirectories are other topics' outboxes — never this one's to deliver.
     if (!st.isFile()) continue
-    if (await sendFile(ctx, threadId, p))
-      try { renameSync(p, uniquePath(ensureDir(sentDir), n)) } catch (e) { console.error(`[warn] archive outbox ${n}: ${e}`) }
+    // Claim it BEFORE sending: two topics sharing this directory can flush at the
+    // same moment, and a rename is the only step of the two that is atomic. The
+    // loser gets ENOENT and moves on rather than sending the same file twice.
+    const claimed = uniquePath(ensureDir(sentDir), n)
+    try { renameSync(p, claimed) } catch { continue }
+    if (!await sendFile(ctx, threadId, claimed)) {
+      // Put it back, or a failed send silently swallows the file.
+      try { renameSync(claimed, p) } catch (e) { console.error(`[warn] restore outbox ${n}: ${e}`) }
+    }
   }
 }
 
@@ -1816,7 +1853,14 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   const preamble = carried.length
     ? carried.map(t => `[xesious:${BRIDGE_NONCE}] a background task you started in this topic has finished. Its result:\n${t}`).join('\n\n') + '\n\n'
     : ''
-  const framed = preamble + frameUserMessage(prompt, {
+  // A shared directory changes where files go, and the model only knows what it is
+  // told: the standing profile says "./outbox/", which is a race when two topics
+  // drain one directory. Said every turn rather than once at fork time, because the
+  // sharing can start (or stop) long after this session began.
+  const shareNote = topicsSharing(cwd, key)
+    ? `[xesious:${BRIDGE_NONCE}] this directory is shared with another topic (a fork). Files sent to THIS conversation are in ./${INBOX_DIR}/${topicTag(key)}/, and anything you want delivered here goes in ./${OUTBOX_DIR}/${topicTag(key)}/ — not the shared ./${OUTBOX_DIR}/ itself.\n\n`
+    : ''
+  const framed = shareNote + preamble + frameUserMessage(prompt, {
     nonce: BRIDGE_NONCE,
     name: [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username,
     id: ctx.from?.id,
@@ -1919,7 +1963,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
       await send(ctx, threadId, `🌿 Background task finished.`, true, link)
     }
     await deliver(ctx, threadId, res.text, link)
-    await flushOutbox(ctx, threadId, cwd, link)
+    await flushOutbox(ctx, threadId, cwd, key, link)
     // Speak the answer too when this topic is in voice mode.
     const vm = voiceMode(key); if (vm !== 'off' && !res.isError) await speakAnswer(ctx, threadId, res.text, vm)
   } catch (e) {
@@ -1957,6 +2001,43 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 // Claude encodes a cwd by replacing every non-alphanumeric char with '-'.
 // encodeCwd and parseDirs live in ./lib.
 function projectDir(dir: string): string { return join(CLAUDE_PROJECTS, encodeCwd(dir)) }
+
+// Copy a session's transcript into a NEW session id, and hand back the id.
+//
+// This is what makes /fork honest. The alternative is to bind the new topic to the
+// PARENT's id and pass --fork-session on its first run, which the CLI supports —
+// but then two topics are bound to one id until that first message, and three
+// things go wrong with that: the fork branches from wherever the parent has got to
+// by then rather than from where you typed /fork; a message to each at the same
+// time has two processes resuming one transcript; and if the "fork me first" flag
+// is ever lost — a restart, or any path that runs the topic without it — the fork
+// silently APPENDS to the parent's session, so both topics share one conversation
+// and neither reports an error. Copying the file removes the window entirely:
+// there are two ids from the first second, and no flag to lose.
+//
+// Every line carries its own sessionId, so they are rewritten as we go — a
+// transcript whose contents disagree with its filename is asking for trouble later.
+function forkTranscript(cwd: string, sessionId: string): string | undefined {
+  const src = join(projectDir(cwd), `${sessionId}.jsonl`)
+  if (!existsSync(src)) return undefined
+  const newId = randomUUID()
+  const dst = join(projectDir(cwd), `${newId}.jsonl`)
+  try {
+    const out = readFileSync(src, 'utf8').split('\n').map(line => {
+      if (!line.trim()) return line
+      try {
+        const o = JSON.parse(line)
+        if (o && typeof o === 'object' && 'sessionId' in o) { o.sessionId = newId; return JSON.stringify(o) }
+        return line
+      } catch { return line }   // not JSON we understand: carry it over untouched
+    }).join('\n')
+    writeFileSync(dst, out)
+    return newId
+  } catch (e) {
+    console.error(`[fork] could not copy ${src}: ${e}`)
+    return undefined
+  }
+}
 
 function ago(ms: number): string {
   const s = Math.max(0, (Date.now() - ms) / 1000)
@@ -2065,7 +2146,7 @@ bot.on('message', async ctx => {
     enqueue(vKey, async () => {
       const cwd = resolveCwd(ctx, threadId)
       let saved: string
-      try { saved = await receiveFile(ctx, att, cwd) }
+      try { saved = await receiveFile(ctx, att, cwd, key) }
       catch (e) { await send(ctx, threadId, `⚠️ couldn't save the voice note: ${e}`); return }
       const heard = await transcribe(saved)
       if (!heard) { await send(ctx, threadId, '🎙 Sorry — I couldn’t make out that voice note. Try again, a bit closer to the mic.'); return }
@@ -2084,7 +2165,7 @@ bot.on('message', async ctx => {
     enqueue(aKey, async () => {
       const cwd = resolveCwd(ctx, threadId)
       let saved: string
-      try { saved = await receiveFile(ctx, attachment, cwd) }
+      try { saved = await receiveFile(ctx, attachment, cwd, key) }
       catch (e) { await send(ctx, threadId, `⚠️ couldn't save file: ${e}`); return }
       if (caption) {
         await handlePrompt(ctx, threadId, aKey, `[The user attached a file, saved at ${saved} (./${relative(cwd, saved)}).]\n\n${caption}`, undefined, ctx.message?.message_id)
@@ -2140,6 +2221,7 @@ bot.on('message', async ctx => {
       `Claude's own commands, forwarded as-is:\n${[...PASSTHROUGH].join(' · ')}\n\n` +
       `Bring existing Claude sessions in from the IDE/CLI:\n` +
       `/sessions <dir…> — list the sessions stored for one or more directories\n` +
+      `/fork [name] — continue this conversation in a second topic, from here (same directory)\n` +
       `/import <dir…> — make a topic for each session there (bound + backfilled)\n` +
       `/history [N] — re-post the last N turns of this topic's session`)
     return
@@ -2511,6 +2593,42 @@ bot.on('message', async ctx => {
       await send(ctx, threadId, `Sessions in ${dir} (${list.length}):\n\n${body}`)
     }
     await send(ctx, threadId, `Run /import <dir> [dir2 …] to make a topic per session.`, true)
+    return
+  }
+  if (cmd === '/fork') {
+    if (ctx.chat.type !== 'supergroup') { await send(ctx, threadId, 'Run /fork inside the forum group — a fork needs its own topic, and topics are a supergroup feature.'); return }
+    const e = sessions[key]
+    if (!e?.sessionId) { await send(ctx, threadId, 'Nothing to fork yet — this topic has no session. Message me once first.'); return }
+    const cwd = resolveCwd(ctx, threadId)
+    const newId = forkTranscript(cwd, e.sessionId)
+    if (!newId) { await send(ctx, threadId, `Could not fork: no transcript for session ${e.sessionId.slice(0, 8)} in ${projectDir(cwd)}.`); return }
+    const label = text.split(/\s+/).slice(1).join(' ').trim()
+    const name = (label || `${names[key] ?? 'topic'} · fork`).slice(0, 120)
+    let tid: number
+    try {
+      const topic = await ctx.api.createForumTopic(chatId, name, TOPIC_ICON ? { icon_custom_emoji_id: TOPIC_ICON } : {})
+      tid = topic.message_thread_id
+    } catch (err) { await send(ctx, threadId, `Could not create the topic: ${err}`); return }
+    const tkey = keyFor(chatId, tid)
+    // The same directory, deliberately: the conversation being forked is ABOUT the
+    // files in it, and its transcript is full of their absolute paths. A fork
+    // pointed somewhere else would remember files it cannot see.
+    sessions[tkey] = { cwd, sessionId: newId, updated: new Date().toISOString() }
+    names[tkey] = name
+    // Carry the topic's settings, or a fork silently drops to defaults and looks
+    // like the model got worse.
+    if (modes[key]) modes[tkey] = modes[key]
+    if (models[key]) models[tkey] = models[key]
+    if (efforts[key]) efforts[tkey] = efforts[key]
+    if (voice[key]) voice[tkey] = voice[key]
+    saveState()
+    const tag = topicTag(tkey)
+    await send(ctx, tid,
+      `🍴 Forked from "${names[key] ?? 'this topic'}" — everything said there up to now is context here, and the two carry on separately from this point.\n\n` +
+      `Same directory: ${cwd}\n` +
+      `Because it is shared, files for THIS topic go in ./${OUTBOX_DIR}/${tag}/ and what you send here lands in ./${INBOX_DIR}/${tag}/.`, true)
+    const link = topicLink(chatId, tid)
+    await send(ctx, threadId, `🍴 Forked into ${link ? `[${name}](${link})` : name}. This topic is unchanged.`, true, msg.message_id)
     return
   }
   if (cmd === '/import') {
@@ -2943,6 +3061,9 @@ export const _PID_FILE = PID_FILE
 export const _makeWorktree = makeWorktree
 export const _disposeFanoutTopics = disposeFanoutTopics
 export const _fanouts = fanouts
+export const _sessions = () => sessions
+export const _projectDir = projectDir
+export const _boxDir = boxDir
 export const _maybeSynthesise = maybeSynthesise
 
 export function _drainQueue(key: string): Promise<unknown> { return queues.get(key) ?? Promise.resolve() }

@@ -23,6 +23,15 @@ export function keyFor(chatId: number | string, threadId: number | undefined): s
   return `${chatId}:${threadId ?? 'main'}`
 }
 
+// A short, filesystem-safe tag for one topic, used to give it its own inbox and
+// outbox inside a directory it SHARES with another topic (a fork). Derived from the
+// topic key's last segment — the thread id, or `main` — because that is already the
+// thing that distinguishes two topics in one chat.
+export function topicTag(key: string): string {
+  const last = key.split(':').pop() || 'main'
+  return `t-${last.replace(/[^\w-]+/g, '')}`
+}
+
 export function sanitize(name: string): string {
   return name.normalize('NFKD').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'topic'
 }

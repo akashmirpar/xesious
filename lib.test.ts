@@ -15,7 +15,7 @@ import {
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
-  FANOUT_MARK, fanoutTopicName, topicLink,
+  FANOUT_MARK, fanoutTopicName, topicLink, topicTag,
   sanitizeProse, PROSE_RULES, isNonAnswer,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
@@ -1022,6 +1022,15 @@ describe('fan-out: telling the part topics apart in a busy group', () => {
     expect(n.length).toBeLessThanOrEqual(128)
     expect(n).toMatch(/…$/)                     // the title is what gets shortened
   })
+  test('a topic tag is derived from the thread, so two topics never share one', () => {
+    // Only used where a directory is shared — a fork points at the same cwd as the
+    // topic it came from, and "put it in ./outbox/" would otherwise be a race
+    // between two conversations.
+    expect(topicTag('-100777:1234')).toBe('t-1234')
+    expect(topicTag('-100777:main')).toBe('t-main')
+    expect(topicTag('-100777:1234')).not.toBe(topicTag('-100777:1235'))
+  })
+
   test('topic links point at the thread, with the -100 prefix stripped', () => {
     expect(topicLink(-1003744389982, 57)).toBe('https://t.me/c/3744389982/57')
   })
