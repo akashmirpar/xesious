@@ -630,7 +630,7 @@ async def feature_fork_carries_the_conversation(client, bot):
     intro = await _until(lambda: next((m for m in seen if m.id > mark and "Forked from" in (reply_text(m) or "")), None), 60)
     if not intro:
         return fail("the fork topic got no opening message")
-    fork_tid = _topic_of(intro)
+    fork_tid = note_topic(_topic_of(intro))
     print(f"    fork topic: {fork_tid}")
 
     problems = []
@@ -681,6 +681,40 @@ async def feature_fork_carries_the_conversation(client, bot):
             "; ".join(problems) if problems else
             "the fork knew the parent's codeword, both topics link to each other, "
             "and the fork's file was delivered to the fork")
+
+
+# Topics this run created, so the run can take them away again. Tracked explicitly
+# rather than matched by name at the end: a sweep that deletes "everything that
+# looks like a test topic" will one day be pointed at a group somebody is using,
+# and this is a real group with a real person in it.
+CREATED_TOPICS = set()
+
+
+def note_topic(tid):
+    """Remember a topic this run created, for teardown."""
+    if tid:
+        CREATED_TOPICS.add(int(tid))
+    return tid
+
+
+async def cleanup_topics(client):
+    """Delete the topics this run created. Never anything else."""
+    if not CREATED_TOPICS or not GROUP_ID:
+        return
+    from telethon.tl import functions
+    group = int(GROUP_ID)
+    peer = await client.get_input_entity(group)
+    gone, failed = 0, []
+    for tid in sorted(CREATED_TOPICS):
+        try:
+            await client(functions.messages.DeleteTopicHistoryRequest(peer=peer, top_msg_id=tid))
+            gone += 1
+        except Exception as e:                                  # noqa: BLE001
+            failed.append(f"{tid}: {e}")
+    # Said out loud, because a sweep that silently stops matching looks exactly like
+    # a run that had nothing to clean up.
+    print(f"[driver] cleaned up {gone}/{len(CREATED_TOPICS)} topic(s) this run created"
+          + (f"; could not remove {failed}" if failed else ""))
 
 
 def _topic_of(msg):
@@ -813,7 +847,7 @@ async def feature_fanout_steering(client, bot):
             t = reply_text(m) or ""
             if "Talk here to steer this part" in t and _topic_of(m):
                 n = t.split("Part ", 1)[1].split(" ", 1)[0] if "Part " in t else "?"
-                parts[n] = (_topic_of(m), t)
+                parts[n] = (note_topic(_topic_of(m)), t)
         return len(parts) >= 2 or None
 
     if not await _until(scan_parts, 120):
@@ -965,7 +999,7 @@ async def feature_fanout_end_to_end(client, bot):
         for m in list(seen):
             tid = _topic_of(m)
             if "Talk here to steer this part" in (reply_text(m) or "") and tid:
-                part_topics.add(tid)
+                part_topics.add(note_topic(tid))
         return len(part_topics) >= 2 or None
 
     await _until(scan, 180)
@@ -1167,13 +1201,18 @@ async def main():
             if not selected:
                 sys.exit(f"[driver] STAGING_ONLY={ONLY!r} matched no test; available: "
                          + ", ".join(t.__name__ for t in FEATURE_TESTS))
-        for t in selected:
-            total += 1
-            name, ok, detail = await t(client, bot)
-            print(f"[{'PASS' if ok else 'FAIL'}] {name}")
-            print(f"    {detail}")
-            if not ok:
-                failures += 1
+        try:
+            for t in selected:
+                total += 1
+                name, ok, detail = await t(client, bot)
+                print(f"[{'PASS' if ok else 'FAIL'}] {name}")
+                print(f"    {detail}")
+                if not ok:
+                    failures += 1
+        finally:
+            # In a finally, and once for the whole run rather than per case: a case
+            # that dies mid-way is exactly the one that leaves the most behind.
+            await cleanup_topics(client)
     else:
         cases = [c for c in CASES if not ONLY or ONLY in c[0].lower()]
         if ONLY and len(cases) != len(CASES):

@@ -15,7 +15,7 @@ import {
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
-  FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink,
+  FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName,
   sanitizeProse, PROSE_RULES, isNonAnswer,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
@@ -1022,6 +1022,17 @@ describe('fan-out: telling the part topics apart in a busy group', () => {
     expect(n.length).toBeLessThanOrEqual(128)
     expect(n).toMatch(/…$/)                     // the title is what gets shortened
   })
+  test('a fork is named after what it came from, never the word "topic"', () => {
+    expect(forkTopicName({ label: 'the other approach' })).toBe('the other approach')
+    expect(forkTopicName({ parentName: 'polymarket bot' })).toBe('polymarket bot · fork')
+    // The bridge only learns a topic's name from the service message sent when it is
+    // created, so a topic that predates the bot has none. The directory is what the
+    // conversation is about, and beats a generic word.
+    expect(forkTopicName({ cwd: '/home/george/scratchpad' })).toBe('scratchpad · fork')
+    expect(forkTopicName({ cwd: '/home/george/scratchpad/' })).toBe('scratchpad · fork')
+    expect(forkTopicName({})).toBe('topic · fork')
+  })
+
   test('a message link lands in the right thread, not the bottom of the group', () => {
     expect(messageLink(-1003744389982, 57, 91)).toBe('https://t.me/c/3744389982/57/91')
     // General has no topic id of its own.

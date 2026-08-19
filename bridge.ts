@@ -34,7 +34,7 @@ import {
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
-  FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink,
+  FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName,
   type FanoutPlanItem,
   frameUserMessage, attributionProfileLines,
   needsRich, hasRtl, sanitizeProse,
@@ -2132,6 +2132,14 @@ bot.on('message', async ctx => {
   const edited = (msg as any).forum_topic_edited
   if (created?.name && threadId !== undefined) { names[keyFor(chatId, threadId)] = created.name; saveState(); return }
   if (edited?.name && threadId !== undefined) { names[keyFor(chatId, threadId)] = edited.name; saveState(); return }
+  // A topic created before the bot joined, or while it was down, never produced
+  // that service message and so has no name here at all. Messages in a topic carry
+  // its creation as their reply_to, so learn it from there when we don't know it —
+  // incidental, so no early return.
+  const viaReply = (msg as any).reply_to_message?.forum_topic_created?.name
+  if (viaReply && threadId !== undefined && !names[keyFor(chatId, threadId)]) {
+    names[keyFor(chatId, threadId)] = viaReply; saveState()
+  }
 
   // File uploads: save into this topic's inbox. A caption (if any) runs as a prompt.
   // Voice note (or round video) → transcribe → run as a prompt, when the topic is
@@ -2602,8 +2610,7 @@ bot.on('message', async ctx => {
     const cwd = resolveCwd(ctx, threadId)
     const newId = forkTranscript(cwd, e.sessionId)
     if (!newId) { await send(ctx, threadId, `Could not fork: no transcript for session ${e.sessionId.slice(0, 8)} in ${projectDir(cwd)}.`); return }
-    const label = text.split(/\s+/).slice(1).join(' ').trim()
-    const name = (label || `${names[key] ?? 'topic'} · fork`).slice(0, 120)
+    const name = forkTopicName({ label: text.split(/\s+/).slice(1).join(' '), parentName: names[key], cwd })
     let tid: number
     try {
       const topic = await ctx.api.createForumTopic(chatId, name, TOPIC_ICON ? { icon_custom_emoji_id: TOPIC_ICON } : {})

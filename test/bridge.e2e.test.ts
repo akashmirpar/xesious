@@ -1167,6 +1167,31 @@ describe('/fork — a second topic on the same conversation and the same directo
     expect(existsSync(join(cwd, 'outbox', 'shared.txt'))).toBe(false)
   }, 20000)
 
+  test('an unnamed topic forks to its directory name, never "topic · fork"', async () => {
+    // Reported from production: /fork in a topic the user had made themselves
+    // produced "topic · fork". The bridge only learns a topic's name from the
+    // service message Telegram sends at creation, so a topic that predates the bot
+    // has none — and the fallback was the literal word.
+    await group('hello there', 96010, 5252)
+    await bridge._drainQueue('-100777:5252')
+    const parent = bridge._sessions()['-100777:5252']
+    const pdir = bridge._projectDir(parent.cwd)
+    mkdirSync(pdir, { recursive: true })
+    writeFileSync(join(pdir, `${parent.sessionId}.jsonl`),
+      JSON.stringify({ type: 'mode', sessionId: parent.sessionId }) + '\n')
+
+    const before = calls.length
+    await group('/fork', 96011, 5252)
+    await new Promise(r => setTimeout(r, 500))
+    const created = calls.slice(before).find(c => c.method === 'createForumTopic')
+    expect(created).toBeDefined()
+    const name = String(created!.payload.name)
+    expect(name).not.toBe('topic · fork')
+    // topic-5252 is what resolveCwd derives for an unnamed topic, so that is what
+    // the fork is named after: the directory the conversation is about.
+    expect(name).toBe('topic-5252 · fork')
+  }, 20000)
+
   test('refuses in a DM, and refuses a topic with no session', async () => {
     expect(finalReply(await incoming(1195, '/fork'))).toMatch(/forum group/i)
     const before = calls.length

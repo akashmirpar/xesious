@@ -880,6 +880,23 @@ export function topicLink(chatId: number | string, threadId?: number): string | 
   return `https://t.me/c/${internal}/${threadId}`
 }
 
+// What to call a fork's topic.
+//
+// The parent's name is the obvious choice and is often unavailable: the bridge only
+// learns a topic's name from the service message Telegram sends when it is created,
+// so a topic that existed before the bot joined — or was created while it was down —
+// has no recorded name at all. Falling back to the literal word "topic" produced
+// "topic · fork", which says nothing about what it came from. The directory is the
+// next best thing, because it is what the conversation is actually about.
+export function forkTopicName(opts: { label?: string; parentName?: string; cwd?: string }): string {
+  const label = opts.label?.trim()
+  if (label) return label.slice(0, 120)
+  const base = opts.parentName?.trim()
+    || (opts.cwd ? opts.cwd.replace(/\/+$/, '').split('/').filter(Boolean).pop() : undefined)
+    || 'topic'
+  return `${base} · fork`.slice(0, 120)
+}
+
 // A tappable link to one MESSAGE. Topic messages carry the topic id as well, so a
 // tap lands in the right thread rather than at the bottom of the group.
 export function messageLink(chatId: number | string, threadId: number | undefined, msgId: number): string | undefined {
