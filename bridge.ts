@@ -34,7 +34,7 @@ import {
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
-  FANOUT_MARK, fanoutTopicName, topicLink, topicTag,
+  FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink,
   type FanoutPlanItem,
   frameUserMessage, attributionProfileLines,
   needsRich, hasRtl, sanitizeProse,
@@ -2623,12 +2623,32 @@ bot.on('message', async ctx => {
     if (voice[key]) voice[tkey] = voice[key]
     saveState()
     const tag = topicTag(tkey)
-    await send(ctx, tid,
-      `🍴 Forked from "${names[key] ?? 'this topic'}" — everything said there up to now is context here, and the two carry on separately from this point.\n\n` +
-      `Same directory: ${cwd}\n` +
-      `Because it is shared, files for THIS topic go in ./${OUTBOX_DIR}/${tag}/ and what you send here lands in ./${INBOX_DIR}/${tag}/.`, true)
-    const link = topicLink(chatId, tid)
-    await send(ctx, threadId, `🍴 Forked into ${link ? `[${name}](${link})` : name}. This topic is unchanged.`, true, msg.message_id)
+    // Both directions get a link, and the order is what makes that possible: the
+    // parent's note has to exist before the fork can point at it, and the fork's
+    // first message has to exist before the parent can point at that. So: post the
+    // parent's note, post the fork's with a link back to it, then edit the parent's
+    // to carry the link forward. A fork you cannot get back from — or that you
+    // cannot tell where it came from — is a topic you will find later with no idea
+    // what it is.
+    const md = (text: string) => telegramify(sanitizeProse(text, 'markdownv2'), 'escape')
+    const topic = topicLink(chatId, tid)
+    const parentNote = await ctx.api.sendMessage(chatId, md(`🍴 Forked into ${topic ? `[${name}](${topic})` : name}. This topic is unchanged.`),
+      { ...destOpts({ threadId, replyTo: msg.message_id }), parse_mode: 'MarkdownV2', disable_notification: true }).catch(() => null)
+
+    const back = parentNote ? messageLink(chatId, threadId, parentNote.message_id) : undefined
+    const from = names[key] ?? 'the topic it came from'
+    const forkNote = await ctx.api.sendMessage(chatId, md(
+      `🍴 Forked from ${back ? `[${from}](${back})` : from} — everything said there up to now is context here, and the two carry on separately from this point.\n\n` +
+      `Same directory: \`${cwd}\`\n` +
+      `Because it is shared, files for THIS topic go in \`./${OUTBOX_DIR}/${tag}/\` and what you send here lands in \`./${INBOX_DIR}/${tag}/\`.`),
+      { ...destOpts({ threadId: tid }), parse_mode: 'MarkdownV2', disable_notification: true }).catch(() => null)
+
+    const into = forkNote ? messageLink(chatId, tid, forkNote.message_id) : topic
+    if (parentNote && into) {
+      await ctx.api.editMessageText(chatId, parentNote.message_id,
+        md(`🍴 Forked into [${name}](${into}). This topic is unchanged.`),
+        { parse_mode: 'MarkdownV2' }).catch(() => {})
+    }
     return
   }
   if (cmd === '/import') {

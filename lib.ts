@@ -880,6 +880,16 @@ export function topicLink(chatId: number | string, threadId?: number): string | 
   return `https://t.me/c/${internal}/${threadId}`
 }
 
+// A tappable link to one MESSAGE. Topic messages carry the topic id as well, so a
+// tap lands in the right thread rather than at the bottom of the group.
+export function messageLink(chatId: number | string, threadId: number | undefined, msgId: number): string | undefined {
+  const internal = String(chatId).replace(/^-100/, '')
+  if (!/^\d+$/.test(internal)) return undefined
+  return threadId === undefined
+    ? `https://t.me/c/${internal}/${msgId}`
+    : `https://t.me/c/${internal}/${threadId}/${msgId}`
+}
+
 // The instruction handed to the planning turn. Kept next to the parser so the two
 // cannot drift — a format the model was never told about is the usual reason this
 // kind of thing returns nothing.

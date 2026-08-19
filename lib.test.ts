@@ -15,7 +15,7 @@ import {
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
-  FANOUT_MARK, fanoutTopicName, topicLink, topicTag,
+  FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink,
   sanitizeProse, PROSE_RULES, isNonAnswer,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
@@ -1022,6 +1022,13 @@ describe('fan-out: telling the part topics apart in a busy group', () => {
     expect(n.length).toBeLessThanOrEqual(128)
     expect(n).toMatch(/…$/)                     // the title is what gets shortened
   })
+  test('a message link lands in the right thread, not the bottom of the group', () => {
+    expect(messageLink(-1003744389982, 57, 91)).toBe('https://t.me/c/3744389982/57/91')
+    // General has no topic id of its own.
+    expect(messageLink(-1003744389982, undefined, 91)).toBe('https://t.me/c/3744389982/91')
+    expect(messageLink('@public', 1, 2)).toBeUndefined()
+  })
+
   test('a topic tag is derived from the thread, so two topics never share one', () => {
     // Only used where a directory is shared — a fork points at the same cwd as the
     // topic it came from, and "put it in ./outbox/" would otherwise be a race

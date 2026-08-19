@@ -1100,6 +1100,20 @@ describe('/fork — a second topic on the same conversation and the same directo
     expect(created).toBeDefined()
     expect(String(created!.payload.name)).toBe('the other approach')
 
+    // Both directions carry a link. A fork you cannot get back from, or that does
+    // not say where it came from, is a topic you find later with no idea what it is.
+    const after = calls.slice(before)
+    const forkNote = after.find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Forked from'))
+    const parentNote = after.find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Forked into'))
+    expect(forkNote).toBeDefined()
+    expect(parentNote).toBeDefined()
+    expect(String(forkNote!.payload.text)).toMatch(/\/c\/777\//)            // → the parent's note
+    // The parent's note is edited once the fork's first message exists, so it can
+    // point at that rather than merely at the topic.
+    const edit = after.find(c => c.method === 'editMessageText' && String(c.payload.text ?? '').includes('Forked into'))
+    expect(edit).toBeDefined()
+    expect(String(edit!.payload.text)).toMatch(/\/c\/777\/\d+\/\d+/)
+
     const tid = 1000 + calls.slice(before).findIndex(c => c.method === 'createForumTopic')
     const child = Object.entries(bridge._sessions())
       .find(([k, v]: any) => k.startsWith('-100777:') && k !== '-100777:4242' && v.cwd === parent.cwd

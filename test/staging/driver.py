@@ -586,6 +586,103 @@ async def feature_fanout_guard(client, bot):
             "; ".join(problems) if problems else "refused with the reason and the alternative")
 
 
+async def feature_fork_carries_the_conversation(client, bot):
+    """/fork: a second topic that continues this one, on the same directory.
+
+    The half that only a real run can prove is that the COPIED transcript actually
+    resumes: Tier 2 can check the file exists, not that `claude --resume` reads it.
+    So the parent is told a codeword, the topic is forked, and the fork is asked for
+    the codeword — it can only answer from context it inherited.
+
+    It also checks the two links (each topic pointing at the other) and that a file
+    the fork produces is delivered to the FORK, not to the topic it came from —
+    they share one directory, and getting that wrong is silent.
+    """
+    if not GROUP_ID:
+        return ("a fork carries the conversation and keeps its files separate", False,
+                "STAGING_GROUP_ID is not set, so /fork was never exercised")
+    group = int(GROUP_ID)
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    def fail(why):
+        client.remove_event_handler(handler)
+        return ("a fork carries the conversation and keeps its files separate", False, why)
+
+    await client.send_message(group, "/new")
+    await asyncio.sleep(3)
+
+    print("  → establishing a codeword in the parent topic")
+    await client.send_message(group, "Remember this codeword for later: ZEBRA42. Reply with just OK.")
+    if not await _until(lambda: next((m for m in seen if "OK" in (reply_text(m) or "") and not m.out), None), 120):
+        return fail("the parent never acknowledged the codeword")
+
+    mark = seen[-1].id
+    print("  → /fork")
+    await client.send_message(group, "/fork staging fork test")
+
+    note = await _until(lambda: next((m for m in seen if m.id > mark and "Forked into" in (reply_text(m) or "")), None), 90)
+    if not note:
+        return fail(f"no fork confirmation; last saw {[(reply_text(m) or '')[:50] for m in seen[-4:]]}")
+    intro = await _until(lambda: next((m for m in seen if m.id > mark and "Forked from" in (reply_text(m) or "")), None), 60)
+    if not intro:
+        return fail("the fork topic got no opening message")
+    fork_tid = _topic_of(intro)
+    print(f"    fork topic: {fork_tid}")
+
+    problems = []
+    # Both directions, checked on the entities Telegram parsed rather than on the
+    # characters — a link that is not a link reads identically in the text.
+    def links(m):
+        return [e.url for e in (m.entities or []) if getattr(e, "url", None)] + \
+               ([u for u in [getattr(m, "web_preview_url", None)] if u])
+    if not any("/c/" in u for u in links(intro)):
+        problems.append("the fork's first message does not link back to the parent")
+    # The parent's note is edited to point at the fork's first message once it exists,
+    # so re-read it rather than trusting the copy captured at send time.
+    fresh = await client.get_messages(group, ids=note.id)
+    if not any("/c/" in u for u in links(fresh)):
+        problems.append("the parent's note does not link to the fork")
+    print(f"    links — fork→parent: {links(intro)}; parent→fork: {links(fresh)}")
+
+    # THE assertion: context the fork could only have inherited.
+    print("  → asking the fork for the codeword")
+    mark2 = seen[-1].id
+    await client.send_message(group, "What was the codeword I gave you? Reply with just the word.", reply_to=fork_tid)
+    answer = await _until(lambda: next((m for m in seen if m.id > mark2 and not m.out
+                                        and _topic_of(m) == fork_tid
+                                        and not is_status(reply_text(m) or "")
+                                        and "ZEBRA" in (reply_text(m) or "").upper()), None), 180)
+    if not answer:
+        problems.append("the fork did not know the codeword — the copied transcript did not resume")
+    else:
+        print(f"    fork answered: {(reply_text(answer) or '')[:60]!r}")
+
+    # Shared directory, separate delivery: the file must arrive in the FORK.
+    print("  → asking the fork to deliver a file")
+    mark3 = seen[-1].id
+    await client.send_message(group,
+        "Write a file named forkfile.txt containing exactly FORKFILE into the outbox directory "
+        "this bridge told you to use for this topic. Then reply DONE.", reply_to=fork_tid)
+    doc = await _until(lambda: next((m for m in seen if m.id > mark3 and m.document), None), 240)
+    if not doc:
+        problems.append("no file was delivered from the fork's outbox")
+    elif _topic_of(doc) != fork_tid:
+        problems.append(f"the file was delivered to topic {_topic_of(doc)}, not to the fork ({fork_tid}) — "
+                        "a shared directory misrouted it")
+    else:
+        print(f"    file arrived in the fork topic ({fork_tid})")
+
+    client.remove_event_handler(handler)
+    return ("a fork carries the conversation and keeps its files separate", not problems,
+            "; ".join(problems) if problems else
+            "the fork knew the parent's codeword, both topics link to each other, "
+            "and the fork's file was delivered to the fork")
+
+
 def _topic_of(msg):
     """Which forum topic a message landed in (None for the group's General)."""
     r = getattr(msg, "reply_to", None)
@@ -1041,6 +1138,7 @@ async def feature_fanout_worktrees(client, bot):
 FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
                  feature_midturn_text, feature_attribution, feature_reply_threading,
                  feature_interrupt_kills_the_tree, feature_run_alongside,
+                 feature_fork_carries_the_conversation,
                  feature_fanout_guard,
                  # Last, and in this order: they drive a group, spawn several sessions and
                  # keep talking for a while after they return. Ahead of the DM cases they
