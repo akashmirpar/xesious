@@ -586,6 +586,83 @@ async def feature_fanout_guard(client, bot):
             "; ".join(problems) if problems else "refused with the reason and the alternative")
 
 
+async def feature_files_in_and_out(client, bot):
+    """A NORMAL topic — not a fork, not a fan-out parent: files in, files out.
+
+    This is the path that broke in production and that nothing tested: an upload is
+    saved into the topic's inbox and handed to the model, and a file the model
+    leaves in the outbox is delivered back. Both halves run over real Telegram
+    because both involve Telegram's file API, which no in-process fake covers.
+    """
+    if not GROUP_ID:
+        return ("files go in and come back out of an ordinary topic", False,
+                "STAGING_GROUP_ID is not set, so the file paths were never exercised")
+    from telethon.tl import functions
+    group = int(GROUP_ID)
+    peer = await client.get_input_entity(group)
+    title = "files check"
+
+    res = await client(functions.messages.CreateForumTopicRequest(peer=peer, title=title))
+    tid = next((u.message.id for u in res.updates
+                if getattr(getattr(u, "message", None), "id", None) and getattr(u.message, "action", None)), None)
+    if not tid:
+        return ("files go in and come back out of an ordinary topic", False, "could not create a plain topic to test in")
+    note_topic(tid)
+    print(f"    plain topic: {tid}")
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    problems = []
+    # --- in: an upload must land in this topic's inbox and reach the model --------
+    base_dir = os.environ.get("TG_SESSIONS_BASE") or "/tmp"
+    os.makedirs(base_dir, exist_ok=True)
+    up = os.path.join(base_dir, "upload-probe.txt")
+    with open(up, "w") as fh:
+        fh.write("PINEAPPLE77\n")
+    print("  → sending a file with a caption")
+    await client.send_file(group, up, caption="Read the file I just sent and reply with its exact contents.", reply_to=tid)
+
+    answer = await _until(lambda: next((m for m in seen if not m.out and _topic_of(m) == tid
+                                        and "PINEAPPLE77" in (reply_text(m) or "")), None), 180)
+    if not answer:
+        problems.append("the model never saw the uploaded file (or could not read it)")
+    else:
+        print(f"    model read it: {(reply_text(answer) or '')[:60]!r}")
+
+    # …and on disk, in THIS topic's directory. The bridge derives it from the topic
+    # name when it knows it, and falls back to topic-<id>, so accept either.
+    base = os.environ.get("TG_SESSIONS_BASE", "")
+    candidates = [os.path.join(base, title.replace(" ", "-")), os.path.join(base, f"topic-{tid}")]
+    landed = [c for c in candidates if os.path.isdir(os.path.join(c, "inbox"))
+              and any("upload-probe" in f for f in os.listdir(os.path.join(c, "inbox")))]
+    print(f"    inbox on disk: {landed or 'nowhere in ' + str(candidates)}")
+    if not landed:
+        problems.append("the upload was not saved into the topic's inbox")
+
+    # --- out: a file the model leaves in the outbox must come back ---------------
+    print("  → asking for a file back")
+    mark = seen[-1].id if seen else 0
+    await client.send_message(group,
+        "Write a file named pong.txt containing exactly PONG into your outbox directory. Then reply DONE.",
+        reply_to=tid)
+    doc = await _until(lambda: next((m for m in seen if m.id > mark and m.document
+                                     and _topic_of(m) == tid), None), 240)
+    if not doc:
+        problems.append("nothing was delivered from the topic's outbox")
+    else:
+        print(f"    got back: {getattr(doc.document, 'id', '?')} in topic {_topic_of(doc)}")
+
+    client.remove_event_handler(handler)
+    try: os.remove(up)
+    except OSError: pass
+    return ("files go in and come back out of an ordinary topic", not problems,
+            "; ".join(problems) if problems else
+            "the upload reached the model and its inbox, and a file left in the outbox came back to the same topic")
+
+
 async def feature_fork_carries_the_conversation(client, bot):
     """/fork: a second topic that continues this one, on the same directory.
 
@@ -660,6 +737,34 @@ async def feature_fork_carries_the_conversation(client, bot):
         problems.append("the fork did not know the codeword — the copied transcript did not resume")
     else:
         print(f"    fork answered: {(reply_text(answer) or '')[:60]!r}")
+
+    # Shared directory, separate INBOX: a file sent to the fork must not land where
+    # the parent's model will read it as its own material.
+    print("  → sending a file to the fork")
+    up_base = os.environ.get("TG_SESSIONS_BASE") or "/tmp"
+    os.makedirs(up_base, exist_ok=True)
+    up = os.path.join(up_base, "fork-upload.txt")
+    with open(up, "w") as fh:
+        fh.write("FORKINBOX\n")
+    mark_up = seen[-1].id
+    await client.send_file(group, up, caption="Reply with the exact contents of the file I just sent.", reply_to=fork_tid)
+    read_back = await _until(lambda: next((m for m in seen if m.id > mark_up and not m.out
+                                           and _topic_of(m) == fork_tid
+                                           and "FORKINBOX" in (reply_text(m) or "")), None), 180)
+    if not read_back:
+        problems.append("the fork never read the file sent to it")
+    cwd = os.path.join(os.environ.get("TG_SESSIONS_BASE", ""), f"{GROUP_ID}-general")
+    own = os.path.join(cwd, "inbox", f"t-{fork_tid}")
+    shared = os.path.join(cwd, "inbox")
+    here = [f for f in (os.listdir(own) if os.path.isdir(own) else []) if "fork-upload" in f]
+    there = [f for f in (os.listdir(shared) if os.path.isdir(shared) else []) if "fork-upload" in f]
+    print(f"    fork inbox {own}: {here}; shared inbox: {there}")
+    if not here:
+        problems.append("the fork's upload did not land in its own inbox")
+    if there:
+        problems.append("the fork's upload landed in the SHARED inbox, where the parent reads it as its own")
+    try: os.remove(up)
+    except OSError: pass
 
     # Shared directory, separate delivery: the file must arrive in the FORK.
     print("  → asking the fork to deliver a file")
@@ -1172,7 +1277,7 @@ async def feature_fanout_worktrees(client, bot):
 FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
                  feature_midturn_text, feature_attribution, feature_reply_threading,
                  feature_interrupt_kills_the_tree, feature_run_alongside,
-                 feature_fork_carries_the_conversation,
+                 feature_files_in_and_out, feature_fork_carries_the_conversation,
                  feature_fanout_guard,
                  # Last, and in this order: they drive a group, spawn several sessions and
                  # keep talking for a while after they return. Ahead of the DM cases they

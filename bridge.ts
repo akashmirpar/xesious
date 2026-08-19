@@ -2154,7 +2154,7 @@ bot.on('message', async ctx => {
     enqueue(vKey, async () => {
       const cwd = resolveCwd(ctx, threadId)
       let saved: string
-      try { saved = await receiveFile(ctx, att, cwd, key) }
+      try { saved = await receiveFile(ctx, att, cwd, vKey) }
       catch (e) { await send(ctx, threadId, `⚠️ couldn't save the voice note: ${e}`); return }
       const heard = await transcribe(saved)
       if (!heard) { await send(ctx, threadId, '🎙 Sorry — I couldn’t make out that voice note. Try again, a bit closer to the mic.'); return }
@@ -2173,7 +2173,7 @@ bot.on('message', async ctx => {
     enqueue(aKey, async () => {
       const cwd = resolveCwd(ctx, threadId)
       let saved: string
-      try { saved = await receiveFile(ctx, attachment, cwd, key) }
+      try { saved = await receiveFile(ctx, attachment, cwd, aKey) }
       catch (e) { await send(ctx, threadId, `⚠️ couldn't save file: ${e}`); return }
       if (caption) {
         await handlePrompt(ctx, threadId, aKey, `[The user attached a file, saved at ${saved} (./${relative(cwd, saved)}).]\n\n${caption}`, undefined, ctx.message?.message_id)
