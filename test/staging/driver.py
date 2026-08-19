@@ -766,6 +766,32 @@ async def feature_fork_carries_the_conversation(client, bot):
     try: os.remove(up)
     except OSError: pass
 
+    # …and the PARENT still works after being forked. Its directory is now shared
+    # too, so its uploads move into a subdirectory of their own — this is the topic
+    # the production failure was reported in, and testing only the fork would have
+    # left exactly that case unproven.
+    print("  → sending a file to the parent, after the fork exists")
+    pfile = os.path.join(up_base, "parent-upload.txt")
+    with open(pfile, "w") as fh:
+        fh.write("PARENTINBOX\n")
+    mark_p = seen[-1].id
+    await client.send_file(group, pfile, caption="Reply with the exact contents of the file I just sent.")
+    p_read = await _until(lambda: next((m for m in seen if m.id > mark_p and not m.out
+                                        and _topic_of(m) != fork_tid
+                                        and "PARENTINBOX" in (reply_text(m) or "")), None), 180)
+    if not p_read:
+        problems.append("the parent could not read a file sent to it after the fork — uploads are broken there")
+    p_own = os.path.join(cwd, "inbox", "t-main")     # General's key is <chat>:main
+    p_here = [f for f in (os.listdir(p_own) if os.path.isdir(p_own) else []) if "parent-upload" in f]
+    p_wrong = [f for f in (os.listdir(own) if os.path.isdir(own) else []) if "parent-upload" in f]
+    print(f"    parent inbox {p_own}: {p_here}; in the fork's inbox: {p_wrong}")
+    if not p_here:
+        problems.append("the parent's upload did not land in its own inbox")
+    if p_wrong:
+        problems.append("the parent's upload landed in the FORK's inbox")
+    try: os.remove(pfile)
+    except OSError: pass
+
     # Shared directory, separate delivery: the file must arrive in the FORK.
     print("  → asking the fork to deliver a file")
     mark3 = seen[-1].id
