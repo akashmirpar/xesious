@@ -867,7 +867,13 @@ async def cleanup_topics(client):
             await client(functions.messages.DeleteTopicHistoryRequest(peer=peer, top_msg_id=tid))
             gone += 1
         except Exception as e:                                  # noqa: BLE001
-            failed.append(f"{tid}: {e}")
+            # TOPIC_ID_INVALID means it is not there — the steering case deletes its
+            # part topics through the bot's own button, so teardown finding them
+            # gone is the feature working, not a failure to clean up.
+            if "TOPIC_ID_INVALID" in str(e):
+                gone += 1
+            else:
+                failed.append(f"{tid}: {e}")
     # Said out loud, because a sweep that silently stops matching looks exactly like
     # a run that had nothing to clean up.
     print(f"[driver] cleaned up {gone}/{len(CREATED_TOPICS)} topic(s) this run created"
