@@ -23,6 +23,15 @@ export function keyFor(chatId: number | string, threadId: number | undefined): s
   return `${chatId}:${threadId ?? 'main'}`
 }
 
+// A short, filesystem-safe tag for one topic, used to give it its own inbox and
+// outbox inside a directory it SHARES with another topic (a fork). Derived from the
+// topic key's last segment — the thread id, or `main` — because that is already the
+// thing that distinguishes two topics in one chat.
+export function topicTag(key: string): string {
+  const last = key.split(':').pop() || 'main'
+  return `t-${last.replace(/[^\w-]+/g, '')}`
+}
+
 export function sanitize(name: string): string {
   return name.normalize('NFKD').replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'topic'
 }
@@ -869,6 +878,47 @@ export function topicLink(chatId: number | string, threadId?: number): string | 
   const internal = String(chatId).replace(/^-100/, '')
   if (!/^\d+$/.test(internal)) return undefined
   return `https://t.me/c/${internal}/${threadId}`
+}
+
+// What to call a fork's topic.
+//
+// The parent's name is the obvious choice and is often unavailable: the bridge only
+// learns a topic's name from the service message Telegram sends when it is created,
+// so a topic that existed before the bot joined — or was created while it was down —
+// has no recorded name at all. Falling back to the literal word "topic" produced
+// "topic · fork", which says nothing about what it came from. The directory is the
+// next best thing, because it is what the conversation is actually about.
+export function forkTopicName(opts: { label?: string; parentName?: string; cwd?: string }): string {
+  const label = opts.label?.trim()
+  if (label) return label.slice(0, 120)
+  const base = opts.parentName?.trim()
+    || (opts.cwd ? opts.cwd.replace(/\/+$/, '').split('/').filter(Boolean).pop() : undefined)
+    || 'topic'
+  return `${base} · fork`.slice(0, 120)
+}
+
+// What the next turn is told about files that arrived without a caption.
+//
+// A file uploaded with no caption starts no turn, so nothing tells the model it
+// exists — which is why the receipt used to end "mention it in your next message".
+// That is bookkeeping the bridge is already doing: it knows exactly what arrived
+// and where. So the next turn carries it, as bridge-authored context rather than
+// as something the user said.
+export function filesPreamble(nonce: string, files: { abs: string; rel: string }[]): string {
+  if (!files.length) return ''
+  const list = files.map(f => `- ${f.rel}  (${f.abs})`).join('\n')
+  return `[xesious:${nonce}] the user sent ${files.length === 1 ? 'this file' : 'these files'} since your last turn, already saved:\n${list}\n` +
+    `They may or may not be what this message is about — read ${files.length === 1 ? 'it' : 'them'} if it is.\n\n`
+}
+
+// A tappable link to one MESSAGE. Topic messages carry the topic id as well, so a
+// tap lands in the right thread rather than at the bottom of the group.
+export function messageLink(chatId: number | string, threadId: number | undefined, msgId: number): string | undefined {
+  const internal = String(chatId).replace(/^-100/, '')
+  if (!/^\d+$/.test(internal)) return undefined
+  return threadId === undefined
+    ? `https://t.me/c/${internal}/${msgId}`
+    : `https://t.me/c/${internal}/${threadId}/${msgId}`
 }
 
 // The instruction handed to the planning turn. Kept next to the parser so the two

@@ -15,7 +15,7 @@ import {
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
-  FANOUT_MARK, fanoutTopicName, topicLink,
+  FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
   sanitizeProse, PROSE_RULES, isNonAnswer,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
@@ -1022,6 +1022,47 @@ describe('fan-out: telling the part topics apart in a busy group', () => {
     expect(n.length).toBeLessThanOrEqual(128)
     expect(n).toMatch(/…$/)                     // the title is what gets shortened
   })
+  test('files that arrived without a caption are handed to the next turn', () => {
+    expect(filesPreamble('abc', [])).toBe('')
+    const out = filesPreamble('abc', [{ abs: '/w/inbox/a.pdf', rel: './inbox/a.pdf' }])
+    // Marked as bridge-authored, like a background result — it is the bridge
+    // speaking, not the user, and the attribution frame is what tells them apart.
+    expect(out).toContain('[xesious:abc]')
+    expect(out).toContain('./inbox/a.pdf')
+    expect(out).toContain('/w/inbox/a.pdf')
+    // Hedged on purpose: an upload is not necessarily what the next message is
+    // about, and a model told otherwise will drag the file into an unrelated answer.
+    expect(out).toMatch(/may or may not/)
+    expect(filesPreamble('abc', [{ abs: '/w/a', rel: './a' }, { abs: '/w/b', rel: './b' }])).toContain('these files')
+  })
+
+  test('a fork is named after what it came from, never the word "topic"', () => {
+    expect(forkTopicName({ label: 'the other approach' })).toBe('the other approach')
+    expect(forkTopicName({ parentName: 'polymarket bot' })).toBe('polymarket bot · fork')
+    // The bridge only learns a topic's name from the service message sent when it is
+    // created, so a topic that predates the bot has none. The directory is what the
+    // conversation is about, and beats a generic word.
+    expect(forkTopicName({ cwd: '/home/george/scratchpad' })).toBe('scratchpad · fork')
+    expect(forkTopicName({ cwd: '/home/george/scratchpad/' })).toBe('scratchpad · fork')
+    expect(forkTopicName({})).toBe('topic · fork')
+  })
+
+  test('a message link lands in the right thread, not the bottom of the group', () => {
+    expect(messageLink(-1003744389982, 57, 91)).toBe('https://t.me/c/3744389982/57/91')
+    // General has no topic id of its own.
+    expect(messageLink(-1003744389982, undefined, 91)).toBe('https://t.me/c/3744389982/91')
+    expect(messageLink('@public', 1, 2)).toBeUndefined()
+  })
+
+  test('a topic tag is derived from the thread, so two topics never share one', () => {
+    // Only used where a directory is shared — a fork points at the same cwd as the
+    // topic it came from, and "put it in ./outbox/" would otherwise be a race
+    // between two conversations.
+    expect(topicTag('-100777:1234')).toBe('t-1234')
+    expect(topicTag('-100777:main')).toBe('t-main')
+    expect(topicTag('-100777:1234')).not.toBe(topicTag('-100777:1235'))
+  })
+
   test('topic links point at the thread, with the -100 prefix stripped', () => {
     expect(topicLink(-1003744389982, 57)).toBe('https://t.me/c/3744389982/57')
   })

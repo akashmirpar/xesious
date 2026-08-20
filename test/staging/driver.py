@@ -586,6 +586,294 @@ async def feature_fanout_guard(client, bot):
             "; ".join(problems) if problems else "refused with the reason and the alternative")
 
 
+async def feature_files_in_and_out(client, bot):
+    """A NORMAL topic — not a fork, not a fan-out parent: files in, files out.
+
+    This is the path that broke in production and that nothing tested: an upload is
+    saved into the topic's inbox and handed to the model, and a file the model
+    leaves in the outbox is delivered back. Both halves run over real Telegram
+    because both involve Telegram's file API, which no in-process fake covers.
+    """
+    if not GROUP_ID:
+        return ("files go in and come back out of an ordinary topic", False,
+                "STAGING_GROUP_ID is not set, so the file paths were never exercised")
+    from telethon.tl import functions
+    group = int(GROUP_ID)
+    peer = await client.get_input_entity(group)
+    title = "files check"
+
+    res = await client(functions.messages.CreateForumTopicRequest(peer=peer, title=title))
+    tid = next((u.message.id for u in res.updates
+                if getattr(getattr(u, "message", None), "id", None) and getattr(u.message, "action", None)), None)
+    if not tid:
+        return ("files go in and come back out of an ordinary topic", False, "could not create a plain topic to test in")
+    note_topic(tid)
+    print(f"    plain topic: {tid}")
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    problems = []
+    # --- in: an upload must land in this topic's inbox and reach the model --------
+    base_dir = os.environ.get("TG_SESSIONS_BASE") or "/tmp"
+    os.makedirs(base_dir, exist_ok=True)
+    up = os.path.join(base_dir, "upload-probe.txt")
+    with open(up, "w") as fh:
+        fh.write("PINEAPPLE77\n")
+    print("  → sending a file with a caption")
+    await client.send_file(group, up, caption="Read the file I just sent and reply with its exact contents.", reply_to=tid)
+
+    answer = await _until(lambda: next((m for m in seen if not m.out and _topic_of(m) == tid
+                                        and "PINEAPPLE77" in (reply_text(m) or "")), None), 180)
+    if not answer:
+        problems.append("the model never saw the uploaded file (or could not read it)")
+    else:
+        print(f"    model read it: {(reply_text(answer) or '')[:60]!r}")
+
+    # …and on disk, in THIS topic's directory. The bridge derives it from the topic
+    # name when it knows it, and falls back to topic-<id>, so accept either.
+    base = os.environ.get("TG_SESSIONS_BASE", "")
+    candidates = [os.path.join(base, title.replace(" ", "-")), os.path.join(base, f"topic-{tid}")]
+    landed = [c for c in candidates if os.path.isdir(os.path.join(c, "inbox"))
+              and any("upload-probe" in f for f in os.listdir(os.path.join(c, "inbox")))]
+    print(f"    inbox on disk: {landed or 'nowhere in ' + str(candidates)}")
+    if not landed:
+        problems.append("the upload was not saved into the topic's inbox")
+
+    # --- in, with NO caption: the next turn must know about it unprompted --------
+    # A captionless upload starts no turn, so nothing tells the model it exists. The
+    # bridge used to push that onto the user ("mention it in your next message");
+    # now it carries the file into the next turn itself. The test therefore asks a
+    # question that never names the file — if the carrying breaks, the model has no
+    # way to answer and the case fails.
+    print("  → sending a file with NO caption, then asking about it without naming it")
+    quiet = os.path.join(base_dir, "silent-probe.txt")
+    with open(quiet, "w") as fh:
+        fh.write("MANGO51\n")
+    mark_q = seen[-1].id if seen else 0
+    await client.send_file(group, quiet, reply_to=tid)
+    await _until(lambda: next((m for m in seen if m.id > mark_q and not m.out
+                               and "Saved" in (reply_text(m) or "")), None), 90)
+    mark_ask = seen[-1].id
+    await client.send_message(group, "What is written in the file I just sent you? Reply with the word only.", reply_to=tid)
+    knew = await _until(lambda: next((m for m in seen if m.id > mark_ask and not m.out
+                                      and _topic_of(m) == tid
+                                      and "MANGO51" in (reply_text(m) or "")), None), 180)
+    if not knew:
+        problems.append("the model did not know about a file uploaded without a caption")
+    else:
+        print(f"    answered without being told the path: {(reply_text(knew) or '')[:50]!r}")
+    try: os.remove(quiet)
+    except OSError: pass
+
+    # --- out: a file the model leaves in the outbox must come back ---------------
+    print("  → asking for a file back")
+    mark = seen[-1].id if seen else 0
+    await client.send_message(group,
+        "Write a file named pong.txt containing exactly PONG into your outbox directory. Then reply DONE.",
+        reply_to=tid)
+    doc = await _until(lambda: next((m for m in seen if m.id > mark and m.document
+                                     and _topic_of(m) == tid), None), 240)
+    if not doc:
+        problems.append("nothing was delivered from the topic's outbox")
+    else:
+        print(f"    got back: {getattr(doc.document, 'id', '?')} in topic {_topic_of(doc)}")
+
+    client.remove_event_handler(handler)
+    try: os.remove(up)
+    except OSError: pass
+    return ("files go in and come back out of an ordinary topic", not problems,
+            "; ".join(problems) if problems else
+            "the upload reached the model and its inbox, and a file left in the outbox came back to the same topic")
+
+
+async def feature_fork_carries_the_conversation(client, bot):
+    """/fork: a second topic that continues this one, on the same directory.
+
+    The half that only a real run can prove is that the COPIED transcript actually
+    resumes: Tier 2 can check the file exists, not that `claude --resume` reads it.
+    So the parent is told a codeword, the topic is forked, and the fork is asked for
+    the codeword — it can only answer from context it inherited.
+
+    It also checks the two links (each topic pointing at the other) and that a file
+    the fork produces is delivered to the FORK, not to the topic it came from —
+    they share one directory, and getting that wrong is silent.
+    """
+    if not GROUP_ID:
+        return ("a fork carries the conversation and keeps its files separate", False,
+                "STAGING_GROUP_ID is not set, so /fork was never exercised")
+    group = int(GROUP_ID)
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    def fail(why):
+        client.remove_event_handler(handler)
+        return ("a fork carries the conversation and keeps its files separate", False, why)
+
+    await client.send_message(group, "/new")
+    await asyncio.sleep(3)
+
+    print("  → establishing a codeword in the parent topic")
+    await client.send_message(group, "Remember this codeword for later: ZEBRA42. Reply with just OK.")
+    if not await _until(lambda: next((m for m in seen if "OK" in (reply_text(m) or "") and not m.out), None), 120):
+        return fail("the parent never acknowledged the codeword")
+
+    mark = seen[-1].id
+    print("  → /fork")
+    await client.send_message(group, "/fork staging fork test")
+
+    note = await _until(lambda: next((m for m in seen if m.id > mark and "Forked into" in (reply_text(m) or "")), None), 90)
+    if not note:
+        return fail(f"no fork confirmation; last saw {[(reply_text(m) or '')[:50] for m in seen[-4:]]}")
+    intro = await _until(lambda: next((m for m in seen if m.id > mark and "Forked from" in (reply_text(m) or "")), None), 60)
+    if not intro:
+        return fail("the fork topic got no opening message")
+    fork_tid = note_topic(_topic_of(intro))
+    print(f"    fork topic: {fork_tid}")
+
+    problems = []
+    # Both directions, checked on the entities Telegram parsed rather than on the
+    # characters — a link that is not a link reads identically in the text.
+    def links(m):
+        return [e.url for e in (m.entities or []) if getattr(e, "url", None)] + \
+               ([u for u in [getattr(m, "web_preview_url", None)] if u])
+    if not any("/c/" in u for u in links(intro)):
+        problems.append("the fork's first message does not link back to the parent")
+    # The parent's note is edited to point at the fork's first message once it exists,
+    # so re-read it rather than trusting the copy captured at send time.
+    fresh = await client.get_messages(group, ids=note.id)
+    if not any("/c/" in u for u in links(fresh)):
+        problems.append("the parent's note does not link to the fork")
+    print(f"    links — fork→parent: {links(intro)}; parent→fork: {links(fresh)}")
+
+    # THE assertion: context the fork could only have inherited.
+    print("  → asking the fork for the codeword")
+    mark2 = seen[-1].id
+    await client.send_message(group, "What was the codeword I gave you? Reply with just the word.", reply_to=fork_tid)
+    answer = await _until(lambda: next((m for m in seen if m.id > mark2 and not m.out
+                                        and _topic_of(m) == fork_tid
+                                        and not is_status(reply_text(m) or "")
+                                        and "ZEBRA" in (reply_text(m) or "").upper()), None), 180)
+    if not answer:
+        problems.append("the fork did not know the codeword — the copied transcript did not resume")
+    else:
+        print(f"    fork answered: {(reply_text(answer) or '')[:60]!r}")
+
+    # Shared directory, separate INBOX: a file sent to the fork must not land where
+    # the parent's model will read it as its own material.
+    print("  → sending a file to the fork")
+    up_base = os.environ.get("TG_SESSIONS_BASE") or "/tmp"
+    os.makedirs(up_base, exist_ok=True)
+    up = os.path.join(up_base, "fork-upload.txt")
+    with open(up, "w") as fh:
+        fh.write("FORKINBOX\n")
+    mark_up = seen[-1].id
+    await client.send_file(group, up, caption="Reply with the exact contents of the file I just sent.", reply_to=fork_tid)
+    read_back = await _until(lambda: next((m for m in seen if m.id > mark_up and not m.out
+                                           and _topic_of(m) == fork_tid
+                                           and "FORKINBOX" in (reply_text(m) or "")), None), 180)
+    if not read_back:
+        problems.append("the fork never read the file sent to it")
+    cwd = os.path.join(os.environ.get("TG_SESSIONS_BASE", ""), f"{GROUP_ID}-general")
+    own = os.path.join(cwd, "inbox", f"t-{fork_tid}")
+    shared = os.path.join(cwd, "inbox")
+    here = [f for f in (os.listdir(own) if os.path.isdir(own) else []) if "fork-upload" in f]
+    there = [f for f in (os.listdir(shared) if os.path.isdir(shared) else []) if "fork-upload" in f]
+    print(f"    fork inbox {own}: {here}; shared inbox: {there}")
+    if not here:
+        problems.append("the fork's upload did not land in its own inbox")
+    if there:
+        problems.append("the fork's upload landed in the SHARED inbox, where the parent reads it as its own")
+    try: os.remove(up)
+    except OSError: pass
+
+    # …and the PARENT still works after being forked. Its directory is now shared
+    # too, so its uploads move into a subdirectory of their own — this is the topic
+    # the production failure was reported in, and testing only the fork would have
+    # left exactly that case unproven.
+    print("  → sending a file to the parent, after the fork exists")
+    pfile = os.path.join(up_base, "parent-upload.txt")
+    with open(pfile, "w") as fh:
+        fh.write("PARENTINBOX\n")
+    mark_p = seen[-1].id
+    await client.send_file(group, pfile, caption="Reply with the exact contents of the file I just sent.")
+    p_read = await _until(lambda: next((m for m in seen if m.id > mark_p and not m.out
+                                        and _topic_of(m) != fork_tid
+                                        and "PARENTINBOX" in (reply_text(m) or "")), None), 180)
+    if not p_read:
+        problems.append("the parent could not read a file sent to it after the fork — uploads are broken there")
+    p_own = os.path.join(cwd, "inbox", "t-main")     # General's key is <chat>:main
+    p_here = [f for f in (os.listdir(p_own) if os.path.isdir(p_own) else []) if "parent-upload" in f]
+    p_wrong = [f for f in (os.listdir(own) if os.path.isdir(own) else []) if "parent-upload" in f]
+    print(f"    parent inbox {p_own}: {p_here}; in the fork's inbox: {p_wrong}")
+    if not p_here:
+        problems.append("the parent's upload did not land in its own inbox")
+    if p_wrong:
+        problems.append("the parent's upload landed in the FORK's inbox")
+    try: os.remove(pfile)
+    except OSError: pass
+
+    # Shared directory, separate delivery: the file must arrive in the FORK.
+    print("  → asking the fork to deliver a file")
+    mark3 = seen[-1].id
+    await client.send_message(group,
+        "Write a file named forkfile.txt containing exactly FORKFILE into the outbox directory "
+        "this bridge told you to use for this topic. Then reply DONE.", reply_to=fork_tid)
+    doc = await _until(lambda: next((m for m in seen if m.id > mark3 and m.document), None), 240)
+    if not doc:
+        problems.append("no file was delivered from the fork's outbox")
+    elif _topic_of(doc) != fork_tid:
+        problems.append(f"the file was delivered to topic {_topic_of(doc)}, not to the fork ({fork_tid}) — "
+                        "a shared directory misrouted it")
+    else:
+        print(f"    file arrived in the fork topic ({fork_tid})")
+
+    client.remove_event_handler(handler)
+    return ("a fork carries the conversation and keeps its files separate", not problems,
+            "; ".join(problems) if problems else
+            "the fork knew the parent's codeword, both topics link to each other, "
+            "and the fork's file was delivered to the fork")
+
+
+# Topics this run created, so the run can take them away again. Tracked explicitly
+# rather than matched by name at the end: a sweep that deletes "everything that
+# looks like a test topic" will one day be pointed at a group somebody is using,
+# and this is a real group with a real person in it.
+CREATED_TOPICS = set()
+
+
+def note_topic(tid):
+    """Remember a topic this run created, for teardown."""
+    if tid:
+        CREATED_TOPICS.add(int(tid))
+    return tid
+
+
+async def cleanup_topics(client):
+    """Delete the topics this run created. Never anything else."""
+    if not CREATED_TOPICS or not GROUP_ID:
+        return
+    from telethon.tl import functions
+    group = int(GROUP_ID)
+    peer = await client.get_input_entity(group)
+    gone, failed = 0, []
+    for tid in sorted(CREATED_TOPICS):
+        try:
+            await client(functions.messages.DeleteTopicHistoryRequest(peer=peer, top_msg_id=tid))
+            gone += 1
+        except Exception as e:                                  # noqa: BLE001
+            failed.append(f"{tid}: {e}")
+    # Said out loud, because a sweep that silently stops matching looks exactly like
+    # a run that had nothing to clean up.
+    print(f"[driver] cleaned up {gone}/{len(CREATED_TOPICS)} topic(s) this run created"
+          + (f"; could not remove {failed}" if failed else ""))
+
+
 def _topic_of(msg):
     """Which forum topic a message landed in (None for the group's General)."""
     r = getattr(msg, "reply_to", None)
@@ -716,7 +1004,7 @@ async def feature_fanout_steering(client, bot):
             t = reply_text(m) or ""
             if "Talk here to steer this part" in t and _topic_of(m):
                 n = t.split("Part ", 1)[1].split(" ", 1)[0] if "Part " in t else "?"
-                parts[n] = (_topic_of(m), t)
+                parts[n] = (note_topic(_topic_of(m)), t)
         return len(parts) >= 2 or None
 
     if not await _until(scan_parts, 120):
@@ -868,7 +1156,7 @@ async def feature_fanout_end_to_end(client, bot):
         for m in list(seen):
             tid = _topic_of(m)
             if "Talk here to steer this part" in (reply_text(m) or "") and tid:
-                part_topics.add(tid)
+                part_topics.add(note_topic(tid))
         return len(part_topics) >= 2 or None
 
     await _until(scan, 180)
@@ -1041,6 +1329,7 @@ async def feature_fanout_worktrees(client, bot):
 FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
                  feature_midturn_text, feature_attribution, feature_reply_threading,
                  feature_interrupt_kills_the_tree, feature_run_alongside,
+                 feature_files_in_and_out, feature_fork_carries_the_conversation,
                  feature_fanout_guard,
                  # Last, and in this order: they drive a group, spawn several sessions and
                  # keep talking for a while after they return. Ahead of the DM cases they
@@ -1069,13 +1358,18 @@ async def main():
             if not selected:
                 sys.exit(f"[driver] STAGING_ONLY={ONLY!r} matched no test; available: "
                          + ", ".join(t.__name__ for t in FEATURE_TESTS))
-        for t in selected:
-            total += 1
-            name, ok, detail = await t(client, bot)
-            print(f"[{'PASS' if ok else 'FAIL'}] {name}")
-            print(f"    {detail}")
-            if not ok:
-                failures += 1
+        try:
+            for t in selected:
+                total += 1
+                name, ok, detail = await t(client, bot)
+                print(f"[{'PASS' if ok else 'FAIL'}] {name}")
+                print(f"    {detail}")
+                if not ok:
+                    failures += 1
+        finally:
+            # In a finally, and once for the whole run rather than per case: a case
+            # that dies mid-way is exactly the one that leaves the most behind.
+            await cleanup_topics(client)
     else:
         cases = [c for c in CASES if not ONLY or ONLY in c[0].lower()]
         if ONLY and len(cases) != len(CASES):

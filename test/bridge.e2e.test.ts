@@ -35,6 +35,10 @@ process.env.TG_QUIET_NOTE_MS = '500'
 // the bypass safety-gate test green for the wrong reason.
 process.env.TG_PROGRESS_DETAIL = '0'      // labels only in status edits
 process.env.TG_ALLOW_BYPASS = '0'         // bypass must be refused
+// Session transcripts live under CLAUDE_CONFIG_DIR. /fork copies one, so this must
+// point into the sandbox — a test has no business reading or writing the real
+// ~/.claude, and would be testing against whatever happens to be in it.
+process.env.CLAUDE_CONFIG_DIR = join(TMP, 'claude')
 
 // Dynamic import so the assignments above land first.
 const bridge: any = await import('../bridge')
@@ -1061,6 +1065,144 @@ describe('fan-out: worktree isolation for write-parts', () => {
   })
 })
 
+describe('/fork — a second topic on the same conversation and the same directory', () => {
+  const btns = (c: any) => c.payload?.reply_markup?.inline_keyboard?.[0] ?? []
+  const group = (text: string, id: number, threadId?: number) => bridge.bot.handleUpdate({
+    update_id: 96700 + id,
+    message: {
+      message_id: id, date: 0, message_thread_id: threadId,
+      chat: { id: -100777, type: 'supergroup', title: 'G', is_forum: true },
+      from: { id: 1, is_bot: false, first_name: 'T' }, text,
+    },
+  })
+
+  test('forks into a new topic with a NEW session id, sharing the parent directory', async () => {
+    // Establish a session in the parent topic first — there is nothing to fork
+    // without one, and that refusal is the next test.
+    await group('hello there', 96001, 4242)
+    await bridge._drainQueue('-100777:4242')
+    await new Promise(r => setTimeout(r, 500))
+    const parent = bridge._sessions()['-100777:4242']
+    expect(parent?.sessionId).toBeDefined()
+    // The stub CLI does not write transcripts, so stand one in for it — /fork copies
+    // the file the real CLI would have left, and refuses when there is none.
+    const pdir = bridge._projectDir(parent.cwd)
+    mkdirSync(pdir, { recursive: true })
+    writeFileSync(join(pdir, `${parent.sessionId}.jsonl`),
+      [JSON.stringify({ type: 'mode', mode: 'normal', sessionId: parent.sessionId }),
+       JSON.stringify({ type: 'user', sessionId: parent.sessionId, message: { role: 'user', content: 'hello there' } }),
+       ''].join('\n'))
+
+    const before = calls.length
+    await group('/fork the other approach', 96002, 4242)
+    await new Promise(r => setTimeout(r, 500))
+    const created = calls.slice(before).find(c => c.method === 'createForumTopic')
+    expect(created).toBeDefined()
+    expect(String(created!.payload.name)).toBe('the other approach')
+
+    // Both directions carry a link. A fork you cannot get back from, or that does
+    // not say where it came from, is a topic you find later with no idea what it is.
+    const after = calls.slice(before)
+    const forkNote = after.find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Forked from'))
+    const parentNote = after.find(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('Forked into'))
+    expect(forkNote).toBeDefined()
+    expect(parentNote).toBeDefined()
+    expect(String(forkNote!.payload.text)).toMatch(/\/c\/777\//)            // → the parent's note
+    // The parent's note is edited once the fork's first message exists, so it can
+    // point at that rather than merely at the topic.
+    const edit = after.find(c => c.method === 'editMessageText' && String(c.payload.text ?? '').includes('Forked into'))
+    expect(edit).toBeDefined()
+    expect(String(edit!.payload.text)).toMatch(/\/c\/777\/\d+\/\d+/)
+
+    const tid = 1000 + calls.slice(before).findIndex(c => c.method === 'createForumTopic')
+    const child = Object.entries(bridge._sessions())
+      .find(([k, v]: any) => k.startsWith('-100777:') && k !== '-100777:4242' && v.cwd === parent.cwd
+        && v.sessionId !== parent.sessionId)
+    expect(child).toBeDefined()
+    const [, ce]: any = child!
+    // The two properties that make a fork a fork: same directory, different session.
+    expect(ce.cwd).toBe(parent.cwd)
+    expect(ce.sessionId).not.toBe(parent.sessionId)
+    // …and the fork's transcript exists, so its first turn resumes a real session
+    // rather than starting empty. This is the half that binding-by-flag gets wrong.
+    expect(existsSync(join(bridge._projectDir(parent.cwd), `${ce.sessionId}.jsonl`))).toBe(true)
+    // The parent is untouched — forking must never move the topic you forked from.
+    expect(bridge._sessions()['-100777:4242'].sessionId).toBe(parent.sessionId)
+  }, 20000)
+
+  test('the copied transcript claims the new id, not the one it came from', async () => {
+    // A transcript whose contents disagree with its filename is a trap for anything
+    // that later reads either.
+    const all: any = bridge._sessions()
+    const parent = all['-100777:4242']
+    const [, ce]: any = Object.entries(all).find(([k, v]: any) =>
+      k.startsWith('-100777:') && k !== '-100777:4242' && v.sessionId !== parent.sessionId)!
+    const text = readFileSync(join(bridge._projectDir(parent.cwd), `${ce.sessionId}.jsonl`), 'utf8')
+    const ids = new Set(text.split('\n').filter(Boolean).map(l => {
+      try { return JSON.parse(l).sessionId } catch { return undefined }
+    }).filter(Boolean))
+    expect([...ids]).toEqual([ce.sessionId])
+  })
+
+  test('a topic sharing its directory gets its own inbox and outbox, and is told', async () => {
+    // "Put it in ./outbox/" is a race once two topics drain one directory: whoever
+    // finishes a run first delivers the other's file into the wrong conversation.
+    const all: any = bridge._sessions()
+    const parentKey = '-100777:4242'
+    const [childKey]: any = Object.entries(all).find(([k, v]: any) =>
+      k.startsWith('-100777:') && k !== parentKey && v.cwd === all[parentKey].cwd)!
+    expect(bridge._boxDir(all[parentKey].cwd, parentKey, 'outbox'))
+      .not.toBe(bridge._boxDir(all[parentKey].cwd, childKey, 'outbox'))
+
+    // And the model is told, every turn, because the sharing can begin long after
+    // the session did.
+    const cwd = all[parentKey].cwd
+    mkdirSync(join(cwd, 'outbox'), { recursive: true })
+    writeFileSync(join(cwd, 'outbox', 'shared.txt'), 'x')
+    const before = calls.length
+    await group('anything', 96003, 4242)
+    await bridge._drainQueue(parentKey)
+    // The file in the SHARED root is still delivered rather than stranded there…
+    expect(calls.slice(before).some(c => c.method === 'sendDocument')).toBe(true)
+    expect(existsSync(join(cwd, 'outbox', 'shared.txt'))).toBe(false)
+  }, 20000)
+
+  test('an unnamed topic forks to its directory name, never "topic · fork"', async () => {
+    // Reported from production: /fork in a topic the user had made themselves
+    // produced "topic · fork". The bridge only learns a topic's name from the
+    // service message Telegram sends at creation, so a topic that predates the bot
+    // has none — and the fallback was the literal word.
+    await group('hello there', 96010, 5252)
+    await bridge._drainQueue('-100777:5252')
+    const parent = bridge._sessions()['-100777:5252']
+    const pdir = bridge._projectDir(parent.cwd)
+    mkdirSync(pdir, { recursive: true })
+    writeFileSync(join(pdir, `${parent.sessionId}.jsonl`),
+      JSON.stringify({ type: 'mode', sessionId: parent.sessionId }) + '\n')
+
+    const before = calls.length
+    await group('/fork', 96011, 5252)
+    await new Promise(r => setTimeout(r, 500))
+    const created = calls.slice(before).find(c => c.method === 'createForumTopic')
+    expect(created).toBeDefined()
+    const name = String(created!.payload.name)
+    expect(name).not.toBe('topic · fork')
+    // topic-5252 is what resolveCwd derives for an unnamed topic, so that is what
+    // the fork is named after: the directory the conversation is about.
+    expect(name).toBe('topic-5252 · fork')
+  }, 20000)
+
+  test('refuses in a DM, and refuses a topic with no session', async () => {
+    expect(finalReply(await incoming(1195, '/fork'))).toMatch(/forum group/i)
+    const before = calls.length
+    await group('/fork', 96004, 4343)      // a topic that has never run anything
+    await new Promise(r => setTimeout(r, 300))
+    const said = calls.slice(before).filter(c => c.method === 'sendMessage').map(c => String(c.payload.text ?? '')).join('\n')
+    expect(said).toMatch(/no session/i)
+    expect(calls.slice(before).some(c => c.method === 'createForumTopic')).toBe(false)
+  }, 15000)
+})
+
 describe('fan-out: steering a part changes the combined answer', () => {
   const btns = (c: any) => c.payload?.reply_markup?.inline_keyboard?.[0] ?? []
   const group = (text: string, id: number, threadId?: number) => bridge.bot.handleUpdate({
@@ -1085,7 +1227,9 @@ describe('fan-out: steering a part changes the combined answer', () => {
         data: run.callback_data, message: { message_id: 99202, date: 0, chat: { id: -100777, type: 'supergroup' } } },
     })
     await new Promise(r => setTimeout(r, 3000))
-    const created = calls.filter(c => c.method === 'createForumTopic')
+    // Scoped to THIS fan-out's calls: other suites (/fork) create topics too, and a
+    // global filter turns their names into this test's business.
+    const created = calls.slice(before).filter(c => c.method === 'createForumTopic')
     expect(created.length).toBeGreaterThanOrEqual(2)
     // The identity is carried by a custom emoji from Telegram's approved set, which
     // always renders — an emoji in the NAME is drawn by the client's own font, and

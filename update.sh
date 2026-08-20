@@ -62,8 +62,19 @@ fi
 #    costs nothing; caught after the restart it costs an outage.
 say "installing deps…"; bun install >/dev/null 2>&1 || { fail "bun install"; exit 1; }
 say "typechecking…"
+# Two steps, because they catch different things and the first was doing duty for
+# both under a misleading name: `bun build` is a BUNDLER — it resolves imports and
+# never checks a type. tsc is the actual typecheck. (Neither catches a reference to
+# a `const` declared later in the same scope from inside an async callback; that is
+# a runtime TDZ error, and only a test that exercises the path will find it.)
 bun build bridge.ts --target=node >/dev/null 2>/tmp/update-build.err || {
   fail "bridge.ts does not compile — NOT restarting. Nothing changed."; cat /tmp/update-build.err >&2; exit 1; }
+if [ -x node_modules/.bin/tsc ]; then
+  node_modules/.bin/tsc --noEmit >/tmp/update-tsc.err 2>&1 || {
+    fail "typecheck failed — NOT restarting. Nothing changed."; head -30 /tmp/update-tsc.err >&2; exit 1; }
+else
+  say "  (no local tsc — skipping the type pass; bun add -d typescript to enable)"
+fi
 
 # 4. Run the test suite BEFORE touching the running bot. This is the regression
 #    gate: a change that breaks any tested feature stops the deploy here, with the
