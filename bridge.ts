@@ -2178,7 +2178,11 @@ bot.on('message', async ctx => {
       if (caption) {
         await handlePrompt(ctx, threadId, aKey, `[The user attached a file, saved at ${saved} (./${relative(cwd, saved)}).]\n\n${caption}`, undefined, ctx.message?.message_id)
       } else {
-        await send(ctx, threadId, `📎 Saved → ${saved}\n(in ./${relative(cwd, saved)} — reference it in your next message)`, true)
+        // One line, one path: the relative one, because that is what you would type
+        // to the model. It used to print the absolute path and then the relative one
+        // underneath, which said the same thing twice and got longer still once a
+        // shared directory added a per-topic subdirectory.
+        await send(ctx, threadId, `📎 Saved → ./${relative(cwd, saved)} — mention it in your next message`, true)
       }
     }).catch(e => console.error(`[error] file task ${aKey}: ${e}`))
     return
