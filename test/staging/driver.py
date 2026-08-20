@@ -642,6 +642,32 @@ async def feature_files_in_and_out(client, bot):
     if not landed:
         problems.append("the upload was not saved into the topic's inbox")
 
+    # --- in, with NO caption: the next turn must know about it unprompted --------
+    # A captionless upload starts no turn, so nothing tells the model it exists. The
+    # bridge used to push that onto the user ("mention it in your next message");
+    # now it carries the file into the next turn itself. The test therefore asks a
+    # question that never names the file — if the carrying breaks, the model has no
+    # way to answer and the case fails.
+    print("  → sending a file with NO caption, then asking about it without naming it")
+    quiet = os.path.join(base_dir, "silent-probe.txt")
+    with open(quiet, "w") as fh:
+        fh.write("MANGO51\n")
+    mark_q = seen[-1].id if seen else 0
+    await client.send_file(group, quiet, reply_to=tid)
+    await _until(lambda: next((m for m in seen if m.id > mark_q and not m.out
+                               and "Saved" in (reply_text(m) or "")), None), 90)
+    mark_ask = seen[-1].id
+    await client.send_message(group, "What is written in the file I just sent you? Reply with the word only.", reply_to=tid)
+    knew = await _until(lambda: next((m for m in seen if m.id > mark_ask and not m.out
+                                      and _topic_of(m) == tid
+                                      and "MANGO51" in (reply_text(m) or "")), None), 180)
+    if not knew:
+        problems.append("the model did not know about a file uploaded without a caption")
+    else:
+        print(f"    answered without being told the path: {(reply_text(knew) or '')[:50]!r}")
+    try: os.remove(quiet)
+    except OSError: pass
+
     # --- out: a file the model leaves in the outbox must come back ---------------
     print("  → asking for a file back")
     mark = seen[-1].id if seen else 0

@@ -897,6 +897,20 @@ export function forkTopicName(opts: { label?: string; parentName?: string; cwd?:
   return `${base} · fork`.slice(0, 120)
 }
 
+// What the next turn is told about files that arrived without a caption.
+//
+// A file uploaded with no caption starts no turn, so nothing tells the model it
+// exists — which is why the receipt used to end "mention it in your next message".
+// That is bookkeeping the bridge is already doing: it knows exactly what arrived
+// and where. So the next turn carries it, as bridge-authored context rather than
+// as something the user said.
+export function filesPreamble(nonce: string, files: { abs: string; rel: string }[]): string {
+  if (!files.length) return ''
+  const list = files.map(f => `- ${f.rel}  (${f.abs})`).join('\n')
+  return `[xesious:${nonce}] the user sent ${files.length === 1 ? 'this file' : 'these files'} since your last turn, already saved:\n${list}\n` +
+    `They may or may not be what this message is about — read ${files.length === 1 ? 'it' : 'them'} if it is.\n\n`
+}
+
 // A tappable link to one MESSAGE. Topic messages carry the topic id as well, so a
 // tap lands in the right thread rather than at the bottom of the group.
 export function messageLink(chatId: number | string, threadId: number | undefined, msgId: number): string | undefined {

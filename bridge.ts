@@ -34,7 +34,7 @@ import {
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   fanoutPlanPrompt, parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble,
-  FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName,
+  FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
   type FanoutPlanItem,
   frameUserMessage, attributionProfileLines,
   needsRich, hasRtl, sanitizeProse,
@@ -651,6 +651,10 @@ const skipQueued = new Set<number>()
 // conversation never learns the job happened. Without this the user gets an answer
 // in Telegram while the next turn in that topic has no idea it exists.
 const bgNotes: Record<string, string[]> = {}
+// Files uploaded with no caption, waiting to be mentioned to the model. A caption
+// starts a turn and tells it there and then; without one nothing runs, so the file
+// would otherwise sit on disk unmentioned until the user typed its path themselves.
+const pendingFiles: Record<string, { abs: string; rel: string }[]> = {}
 const noteBgResult = (key: string, text: string) => {
   (bgNotes[key] ??= []).push(text.length > 600 ? `${text.slice(0, 600)}…` : text)
   if (bgNotes[key].length > 3) bgNotes[key].shift()
@@ -1853,6 +1857,10 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   const preamble = carried.length
     ? carried.map(t => `[xesious:${BRIDGE_NONCE}] a background task you started in this topic has finished. Its result:\n${t}`).join('\n\n') + '\n\n'
     : ''
+  // Same idea for files that arrived without a caption. Foreground turns only: a
+  // background job was asked for something specific and should not inherit an
+  // upload that happened while it ran.
+  const arrived = !background && pendingFiles[key]?.length ? pendingFiles[key].splice(0) : []
   // A shared directory changes where files go, and the model only knows what it is
   // told: the standing profile says "./outbox/", which is a race when two topics
   // drain one directory. Said every turn rather than once at fork time, because the
@@ -1860,7 +1868,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   const shareNote = topicsSharing(cwd, key)
     ? `[xesious:${BRIDGE_NONCE}] this directory is shared with another topic (a fork). Files sent to THIS conversation are in ./${INBOX_DIR}/${topicTag(key)}/, and anything you want delivered here goes in ./${OUTBOX_DIR}/${topicTag(key)}/ — not the shared ./${OUTBOX_DIR}/ itself.\n\n`
     : ''
-  const framed = shareNote + preamble + frameUserMessage(prompt, {
+  const framed = shareNote + filesPreamble(BRIDGE_NONCE, arrived) + preamble + frameUserMessage(prompt, {
     nonce: BRIDGE_NONCE,
     name: [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username,
     id: ctx.from?.id,
@@ -2178,11 +2186,12 @@ bot.on('message', async ctx => {
       if (caption) {
         await handlePrompt(ctx, threadId, aKey, `[The user attached a file, saved at ${saved} (./${relative(cwd, saved)}).]\n\n${caption}`, undefined, ctx.message?.message_id)
       } else {
-        // One line, one path: the relative one, because that is what you would type
-        // to the model. It used to print the absolute path and then the relative one
-        // underneath, which said the same thing twice and got longer still once a
-        // shared directory added a per-topic subdirectory.
-        await send(ctx, threadId, `📎 Saved → ./${relative(cwd, saved)} — mention it in your next message`, true)
+        // A receipt, not an instruction. The next turn is told about the file by
+        // the bridge, so there is nothing for the user to do — asking them to
+        // repeat a path back was bookkeeping the bridge was already doing.
+        const rel = `./${relative(cwd, saved)}`
+        ;(pendingFiles[aKey] ??= []).push({ abs: saved, rel })
+        await send(ctx, threadId, `📎 Saved → ${rel}`, true)
       }
     }).catch(e => console.error(`[error] file task ${aKey}: ${e}`))
     return

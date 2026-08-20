@@ -15,7 +15,7 @@ import {
   needsRich, hasRtl, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, lastEffortFrom, needsReplyLink,
   parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
-  FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName,
+  FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
   sanitizeProse, PROSE_RULES, isNonAnswer,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
@@ -1022,6 +1022,20 @@ describe('fan-out: telling the part topics apart in a busy group', () => {
     expect(n.length).toBeLessThanOrEqual(128)
     expect(n).toMatch(/…$/)                     // the title is what gets shortened
   })
+  test('files that arrived without a caption are handed to the next turn', () => {
+    expect(filesPreamble('abc', [])).toBe('')
+    const out = filesPreamble('abc', [{ abs: '/w/inbox/a.pdf', rel: './inbox/a.pdf' }])
+    // Marked as bridge-authored, like a background result — it is the bridge
+    // speaking, not the user, and the attribution frame is what tells them apart.
+    expect(out).toContain('[xesious:abc]')
+    expect(out).toContain('./inbox/a.pdf')
+    expect(out).toContain('/w/inbox/a.pdf')
+    // Hedged on purpose: an upload is not necessarily what the next message is
+    // about, and a model told otherwise will drag the file into an unrelated answer.
+    expect(out).toMatch(/may or may not/)
+    expect(filesPreamble('abc', [{ abs: '/w/a', rel: './a' }, { abs: '/w/b', rel: './b' }])).toContain('these files')
+  })
+
   test('a fork is named after what it came from, never the word "topic"', () => {
     expect(forkTopicName({ label: 'the other approach' })).toBe('the other approach')
     expect(forkTopicName({ parentName: 'polymarket bot' })).toBe('polymarket bot · fork')
