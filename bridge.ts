@@ -598,7 +598,10 @@ const newJobId = () => randomUUID().replace(/-/g, '').slice(0, 8)
 // shares the BRIDGE's process group, and a group signal would take the bridge down
 // with it — verified while designing this.
 function signalJob(job: Job, sig: NodeJS.Signals): boolean {
-  try { process.kill(-job.pgid, sig); return true } catch {}
+  // pgid<=0 means the child never got a pid (spawn failed) — process.kill(-0) would
+  // signal the bridge's OWN process group and take the bridge down. Signal the
+  // child directly instead (it likely never started, so this is usually a no-op).
+  if (job.pgid > 0) { try { process.kill(-job.pgid, sig); return true } catch {} }
   try { job.child.kill(sig); return true } catch {}
   return false
 }

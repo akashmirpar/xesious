@@ -187,7 +187,7 @@ export function toolStep(b: any): Step {
 }
 
 export const escapeHtml = (s: string) =>
-  s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
 
 // Rich markdown parses both markdown and arbitrary inline HTML, so raw tool output
 // has to be neutralised on both fronts before it can be quoted back: HTML entities

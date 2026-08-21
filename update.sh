@@ -133,7 +133,20 @@ restart() {
   tmux_kill_own "$DIR" || true
   : > bridge.log
   ./start.sh >/tmp/update-start.log 2>&1
-  sleep 10
+  sleep 3
+}
+
+# Poll the health check rather than trusting one shot after a fixed sleep: a
+# healthy bridge can take longer than 10s to reach 'polling Telegram' (getMe + a
+# getChat per allowed chat), and a transient startup 409 self-heals in ~40s — a
+# one-shot check rolled those good deploys back, defeating the recovered-409 fix.
+wait_healthy() {
+  local secs="${1:-60}" waited=0
+  while [ "$waited" -lt "$secs" ]; do
+    healthy >/dev/null 2>&1 && return 0
+    sleep 3; waited=$((waited + 3))
+  done
+  healthy   # final attempt — prints the reason on failure
 }
 
 # 6. Health check: does it actually SERVE, not merely run? Each of these has been
@@ -154,7 +167,7 @@ healthy() {
 }
 
 say "restarting…"; restart
-if healthy; then
+if wait_healthy 60; then
   say "OK — up and serving. $(git rev-parse --short HEAD 2>/dev/null)"
   rm -rf "$BAK"
   exit 0
@@ -171,5 +184,5 @@ if [ "$PULLED" = 1 ] && [ -n "$BEFORE" ]; then
   git reset --mixed "$BEFORE" >/dev/null 2>&1 || true
 fi
 restart
-if healthy; then say "rolled back and healthy again (kept $BAK)"; exit 1; fi
+if wait_healthy 45; then say "rolled back and healthy again (kept $BAK)"; exit 1; fi
 fail "STILL unhealthy after rollback — look at bridge.log:"; tail -20 bridge.log >&2; exit 2

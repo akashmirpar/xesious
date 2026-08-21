@@ -768,7 +768,7 @@ describe('markdownToHtml — the constructs an answer actually uses', () => {
   test('fenced code is verbatim and escaped, with its language recorded', () => {
     const out = markdownToHtml('```sh\ncd ~ && echo "<b>"\n```')
     expect(out).toContain('class="lang-sh"')
-    expect(out).toContain('cd ~ &amp;&amp; echo &quot;&lt;b&gt;&quot;'.replace(/&quot;/g, '"'))
+    expect(out).toContain('cd ~ &amp;&amp; echo &quot;&lt;b&gt;&quot;')  // escapeHtml now escapes " too (H1 XSS fix)
     expect(out).not.toContain('<b>')
   })
   test('markdown inside a code fence is NOT interpreted', () => {
