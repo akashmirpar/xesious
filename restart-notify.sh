@@ -5,12 +5,27 @@
 # Run detached (it must outlive the claude process the bridge spawned, because
 # restarting the bridge kills that process):
 #   setsid nohup bash restart-notify.sh >/tmp/restart-notify.log 2>&1 </dev/null &
+#
+# Where the notification goes — override per deployment, since the defaults are
+# one specific chat and are wrong for anyone else's:
+#   TG_RESTART_CHAT_ID, TG_RESTART_THREAD_ID
+#   TG_RESTART_TEXT     what to say on success (default: a plain confirmation)
 set -uo pipefail
 
-DIR=$(pwd)
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG="$DIR/bridge.log"
-CHAT_ID="-1003777585204"
-THREAD_ID="44"
+# shellcheck source=lib.sh
+. "$DIR/lib.sh"
+
+# Was hardcoded to one chat/thread. Kept as defaults so this deployment behaves
+# exactly as before, but overridable so the script isn't married to one group.
+CHAT_ID="${TG_RESTART_CHAT_ID:--1003777585204}"
+THREAD_ID="${TG_RESTART_THREAD_ID:-44}"
+# Was hardcoded to `claude-tg`, ignoring the CLAUDE_TG_SESSION that start.sh,
+# update.sh and apply.sh all honour — so on any deployment that set it, this
+# script killed the wrong session (or none) and then waited three minutes to
+# conclude the bridge never came back.
+SESSION="${CLAUDE_TG_SESSION:-$(session_name_for "$DIR")}"
 
 log() { echo "[restart-notify $(date +%H:%M:%S)] $*"; }
 
@@ -27,7 +42,7 @@ log "restarting; log offset=$START"
 
 # start.sh no-ops if a session already exists, so kill it first (this also kills
 # the old bridge + any claude subprocess it spawned).
-tmux kill-session -t claude-tg 2>/dev/null || true
+tmux_kill_own "$DIR" || true   # by process proof, not by name
 sleep 1
 ( cd "$DIR" && ./start.sh ) >/dev/null 2>&1 || true
 
@@ -43,7 +58,10 @@ for i in $(seq 1 180); do
       sleep 4
       NEW=$(tail -c +"$((START + 1))" "$LOG" 2>/dev/null)
       AFTER=$(printf '%s\n' "$NEW" | awk '/polling Telegram/{seen=1; buf=""; next} seen{buf=buf $0 ORS} END{printf "%s", buf}')
-      if ! printf '%s' "$AFTER" | grep -q "409" && pgrep -f "bun run bridge.ts" >/dev/null; then
+      # The liveness half used `pgrep -f "bun run bridge.ts"` — no owner filter and
+      # no cwd filter — so ANOTHER user's bridge could satisfy "we came back up"
+      # and this script would report success while our own bot was down.
+      if ! printf '%s' "$AFTER" | grep -q "409" && [ -n "$(own_pids bun "$DIR")" ]; then
         UP=1; break
       fi
     fi
@@ -53,10 +71,14 @@ done
 
 if [ "$UP" = "1" ]; then
   log "bridge is up"
-  TEXT=$'✅ Bridge restarted and fully back online.\n\nNow live:\n• Files — send any file to drop it into this topic\'s inbox/ (a caption runs as a prompt). Ask me to put a file in outbox/, or use /get <path>, to receive one.\n• Clarifying questions — I\'ll now ask instead of guessing when a request is ambiguous; just reply in this topic to continue.'
+  # Was a hardcoded "Now live: …" release announcement for one specific deploy,
+  # re-sent verbatim on every restart long after those features shipped. Default
+  # to stating only what this script actually knows; set TG_RESTART_TEXT when a
+  # restart really does carry news.
+  TEXT="${TG_RESTART_TEXT:-✅ Bridge restarted and back online.}"
 else
   log "could not confirm bridge came up within timeout"
-  TEXT='⚠️ I tried to restart the bridge but could not confirm it came back within 3 minutes. Check: tmux attach -t claude-tg'
+  TEXT="⚠️ I tried to restart the bridge but could not confirm it came back within 3 minutes. Check: tmux attach -t $SESSION"
 fi
 
 curl -sS "https://api.telegram.org/bot${TOKEN}/sendMessage" \

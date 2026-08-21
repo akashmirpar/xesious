@@ -1,0 +1,21 @@
+{
+  // Typechecking only — bun runs the TypeScript directly, nothing is emitted.
+  // `bun build` (what update.sh called "typechecking") is a bundler: it resolves
+  // imports and never checks a type, so it happily shipped a reference to a
+  // variable that did not exist in scope. This is the check that catches that.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "types": ["bun"],
+    "allowJs": false,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "strict": false,
+    "noImplicitAny": false,
+    // The one that matters here: a name that is not in scope.
+    "noUnusedLocals": false,
+    "allowImportingTsExtensions": true
+  },
+  "include": ["*.ts", "test/*.ts"]
+}

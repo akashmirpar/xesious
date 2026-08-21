@@ -16,3 +16,18 @@ voice/kokoro/*.bin
 
 # live voice server log
 live/live.log
+
+# Tier 3 staging secrets: a second bot token + a test-account StringSession, which
+# is account-takeover-grade. Templates (*.example) stay tracked; real files never.
+.env.staging
+*.session
+test/staging/session.txt
+
+# python bytecode
+__pycache__/
+*.pyc
+
+# python venvs
+.venv/
+# isolated pip --target dir (alt to venv)
+test/staging/.deps/

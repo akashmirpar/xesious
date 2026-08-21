@@ -5,7 +5,10 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "bun run bridge.ts"
+    "start": "bun run bridge.ts",
+    "test": "bun test",
+    "test:shell": "bash test/shell/run.sh",
+    "test:all": "bun test && bash test/shell/run.sh"
   },
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",
@@ -13,5 +16,9 @@
     "@grammyjs/transformer-throttler": "^1.2.1",
     "grammy": "^1.21.0",
     "telegramify-markdown": "^1.3.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^7.0.2"
   }
 }
