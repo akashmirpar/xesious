@@ -10,9 +10,15 @@ outbox/
 # downloaded neural voice model (voice/setup.sh --piper)
 voice/piper/
 
-# Kokoro model files (voice/setup.sh --kokoro)
+# Kokoro model files (voice/setup.sh)
 voice/kokoro/*.onnx
 voice/kokoro/*.bin
+
+# Installed locally by voice/setup.sh when the system has neither: a private static
+# ffmpeg from pip, and a venv when the box has no usable --user pip.
+voice/bin/
+voice/.venv/
+voice/.python
 
 # live voice server log
 live/live.log

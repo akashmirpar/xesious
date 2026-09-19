@@ -20,22 +20,54 @@ elif [ -f "${TG_KOKORO_MODEL:-$DIR/kokoro/kokoro-v1.0.onnx}" ]; then ENGINE=koko
 else ENGINE=piper; fi
 
 PIPER="${TG_PIPER_BIN:-piper}"
+
+# The interpreter setup.sh installed into. Plain python3 unless it had to fall back
+# to a venv, in which case the packages are only importable from that one.
+PY="python3"
+[ -f "$DIR/.python" ] && [ -x "$(cat "$DIR/.python")" ] && PY="$(cat "$DIR/.python")"
+
+# ffmpeg, resolved rather than assumed: an override, then the private copy setup.sh
+# may have put in voice/bin (pip's static build — no root), then the system one.
+# Used ONLY for the transcode below; nothing on the inbound path needs it.
+FFMPEG="${TG_FFMPEG:-}"
+[ -n "$FFMPEG" ] && [ -x "$FFMPEG" ] || FFMPEG=""
+[ -z "$FFMPEG" ] && [ -x "$DIR/bin/ffmpeg" ] && FFMPEG="$DIR/bin/ffmpeg"
+[ -z "$FFMPEG" ] && FFMPEG="$(command -v ffmpeg 2>/dev/null || true)"
+if [ -z "$FFMPEG" ]; then
+  # Named precisely, because this used to surface to the user as silence: the bridge
+  # logs the exit code and sends text instead.
+  echo "tts.sh: no ffmpeg — cannot encode Opus. Run voice/setup.sh (it can install a private copy without root)." >&2
+  exit 4
+fi
+
 tmp="$(mktemp /tmp/tts-XXXX.wav)"
 trap 'rm -f "$tmp"' EXIT
 
 case "$ENGINE" in
   kokoro)
-    printf '%s' "$TEXT" | python3 "$DIR/kokoro_tts.py" "$tmp" ;;
+    # Delegated to speak.py, which is the ONE Kokoro implementation in the tree.
+    # There used to be a second one in kokoro_tts.py reading the same nine env vars;
+    # two ways to load the same model is two places for them to drift apart.
+    # speak.py encodes the Opus itself, so there is nothing left to do afterwards.
+    printf '%s' "$TEXT" | "$PY" -c '
+import json,sys
+sys.stdout.write(json.dumps({"units":[{"text":sys.stdin.read(),"gap":0.0}],"out":sys.argv[1]}))
+' "$OUT" | "$PY" "$DIR/speak.py" >/dev/null
+    exit $? ;;
   piper)
     if command -v "$PIPER" >/dev/null 2>&1 && [ -n "${TG_PIPER_VOICE:-}" ] && [ -f "${TG_PIPER_VOICE}" ]; then
       printf '%s' "$TEXT" | "$PIPER" --model "$TG_PIPER_VOICE" --output_file "$tmp" >/dev/null 2>&1
     else
+      command -v espeak-ng >/dev/null 2>&1 || {
+        echo "tts.sh: no TTS engine — piper is unconfigured and espeak-ng is not installed. Run voice/setup.sh." >&2; exit 5; }
       espeak-ng -v "${TG_ESPEAK_VOICE:-en}" -s "${TG_ESPEAK_WPM:-165}" "$TEXT" -w "$tmp" >/dev/null 2>&1
     fi ;;
   espeak)
+    command -v espeak-ng >/dev/null 2>&1 || {
+      echo "tts.sh: TG_TTS_ENGINE=espeak but espeak-ng is not installed. Run voice/setup.sh --espeak." >&2; exit 5; }
     espeak-ng -v "${TG_ESPEAK_VOICE:-en}" -s "${TG_ESPEAK_WPM:-165}" "$TEXT" -w "$tmp" >/dev/null 2>&1 ;;
   *)
     echo "tts.sh: unknown TG_TTS_ENGINE '$ENGINE'" >&2; exit 3 ;;
 esac
 
-ffmpeg -y -i "$tmp" -ac 1 -c:a libopus -b:a 32k "$OUT" >/dev/null 2>&1
+"$FFMPEG" -y -i "$tmp" -ac 1 -c:a libopus -b:a 32k "$OUT" >/dev/null 2>&1

@@ -76,20 +76,20 @@ off is now a **hard startup error**, not a warning.
 | *(any file)* | Upload it into this topic's `inbox/` (a caption runs as a prompt) |
 | `/whoami` | Show your user/chat/topic ids (for the allowlist) — works for anyone |
 | `/new` (or `/clear`) | Start a fresh session in this topic. The old session id is **kept** (nothing deleted) — `/resume` to undo. Like Claude's own `/clear`, this resets context without deleting the session. |
-| `/resume [id]` | Restore the previous session (undo `/new`), or bind this topic to a specific past session id |
+| `/resume [id]` | Restore the previous session (undo `/new`), or bind this topic to a specific past session — the 8-character prefix `/sessions` prints is enough, and an ambiguous one is refused rather than guessed |
 | `/compact [focus]` | Summarize this topic's session history to free up context (memory kept) |
 | `/stop` | Cancel the task currently running in this topic |
-| `/voice [on\|off]` | Voice mode: transcribe voice notes and speak answers back (eyes-free). Default from `TG_VOICE`. |
+| `/voice [on\|off\|parts on\|off]` | Voice mode: transcribe voice notes and speak answers back (eyes-free). Default from `TG_VOICE`. `parts` decides whether the progressive notes are sent or only the full file. |
 | `/interrupt [on\|off]` | Toggle interrupt mode: a new message cancels the running task and starts immediately (its reply comes as a new message) instead of queueing. Default from `TG_INTERRUPT`. |
 | `/mode [plan\|acceptEdits\|auto\|bypass]` | Show or set this topic's permission mode. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_PERMISSION_MODE`. |
 | `/plan <task>` | One read-only turn: Claude researches and proposes without editing. Doesn't change the topic's mode, so "go ahead" carries the plan out. |
 | `/model [opus\|sonnet\|haiku\|fable]` | Show or set this topic's model — an alias, a full id, or `default` to clear. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_MODEL`. |
-| `/usage` `/cost` `/context` | Claude's own commands, forwarded to the CLI as-is. They report rather than prompt the model, so they're free and take no turn. |
+| `/usage` `/cost` `/context` | Claude's own commands, forwarded to the CLI as-is. They report rather than prompt the model, so they're free and take no turn. Each answer carries a **🔄 Refresh** button that re-reads the numbers into the same message, so checking twice doesn't leave two. |
 | `/logo bot\|group` | Set the bot's avatar (`setMyProfilePhoto`) or this group's photo (`setChatPhoto`) from `assets/`. Startup only fills these in when they're missing; this replaces an existing one. |
 | `/get <path>` | Send a file from this topic's directory back to you |
 | `/cwd <abs-path>` | Set this topic's working directory (resets its session) |
 | `/status` | Show this topic's session id, cwd and permission mode |
-| `/sessions <dir…>` | List the Claude sessions stored for one or more directories (what the IDE/CLI picker shows) |
+| `/sessions <dir…>` | List the Claude sessions stored for one or more directories (what the IDE/CLI picker shows), as a **tappable picker** — tap one to bind this topic to it, page through with `‹ Prev` / `Next ›` |
 | `/import <dir…>` | Make a topic for each session in the given directories — bound + recent history backfilled |
 | `/history [N]` | Re-post the last N turns of this topic's bound session |
 | `/help` | Usage |
@@ -133,15 +133,57 @@ Send and receive files through the same topic.
 ## Voice (eyes-free, turn-based)
 
 Talk to a topic and hear the answer — no reading or typing. It runs **locally, no
-API key**: `faster-whisper` for speech→text, `piper`/`espeak-ng` for text→speech,
-and a fast model (Haiku) to summarize long answers into a few spoken sentences.
+API key**: `faster-whisper` for speech→text, **Kokoro** for text→speech, and a fast
+model (Haiku) to summarize long answers into a few spoken sentences.
 
-Setup once:
+Setup once — **no root required**:
 
 ```bash
-voice/setup.sh            # ffmpeg + faster-whisper + espeak-ng (robotic voice)
-voice/setup.sh --piper    # also a natural neural voice (recommended)
+voice/setup.sh            # faster-whisper + Kokoro (the good voice). ~340 MB of models.
+voice/setup.sh --check    # report what's installed, change nothing
+voice/setup.sh --espeak   # also the robotic espeak-ng fallback (this one needs apt)
+voice/setup.sh --piper    # also Piper + a neural voice
 ```
+
+Nothing in the voice path needs a system package. Python packages install with
+`python3 -m pip --user` (adding `--break-system-packages` only if the distro refuses,
+and never dropping `--user`), and the one native tool — `ffmpeg`, used solely to
+transcode the outgoing WAV to Opus — is taken from the system if present and
+otherwise installed privately into `voice/bin/` from pip. If a step fails the script
+**keeps going and tells you what works**: a missing `ffmpeg` costs you speaking, not
+listening, and neither costs you the install.
+
+No configuration follows: `voice/tts.sh` selects Kokoro whenever its model is on
+disk. `TG_TTS_ENGINE` (`kokoro|piper|espeak`) and `TG_KOKORO_VOICE` are overrides.
+
+A long answer is **spoken as it is made** rather than after it — but by default it is
+**sent quietly**: one status bubble while it speaks, then the finished audio.
+
+- **`🎙 Speaking… ~5m`** goes up the moment synthesis starts, carrying **🛑 Stop
+  speaking** from the first second rather than from whenever the first note appears.
+  `/stop` still works too.
+- **▶️ Send it in parts** on that bubble switches to progressive delivery, and it
+  **back-fills**: tap it a minute in and every chunk already made arrives at once,
+  then the rest follow live. `/voice parts on` makes that the topic's default
+  (`TG_VOICE_PARTS=1` for all topics).
+- The **full file** follows as one audio message, captioned with a timestamp per
+  section — tap one to jump there — and the status bubble is deleted. Synthesis is
+  chunked either way, so this arrives at exactly the same moment whichever you choose;
+  only the number of messages differs.
+- Any parts that were sent **stay**. **🧹 Remove the parts** on the full file clears
+  them if you want that; nothing deletes a voice note on its own, because the full file
+  lands while you are most likely still mid-chunk.
+- A **read-along page** comes with it: the answer, the audio, and each block
+  highlighted as it is spoken, with a **section list** in the player bar — tap a
+  heading to seek there and the page scrolls with it. Self-contained, so it works
+  offline. Only for answers long enough to arrive as `answer.md`/`answer.html`
+  (`TG_REPLY_FILE_CHARS`, default 6000) — it is a companion to those files, and a
+  reply short enough to sit inline in the chat gets a voice note and nothing to open.
+  `TG_VOICE_READALONG_MAX_MIN` caps how long an answer gets one;
+  `TG_VOICE_CHUNKED=0` turns the whole progressive path off.
+
+Synthesis runs off the topic's queue, so the next message you send is answered
+immediately.
 
 Then per topic send `/voice on` (or set `TG_VOICE=1` for all topics). With voice on:
 
@@ -245,6 +287,6 @@ holding a conversation.
   API) — only text is sent, so it's fast; the page shows your words live plus
   Claude's thinking, tool use, and answer. Default permission mode `plan` (read-only).
 
-Setup: `voice/setup.sh --kokoro`, set `LIVE_PASSCODE` in `.env`, `live/start-live.sh`,
+Setup: `voice/setup.sh`, set `LIVE_PASSCODE` in `.env`, `live/start-live.sh`,
 point the subdomain at `:3060`. Latency floor is Kokoro (~1x realtime on CPU); a GPU
 or a lighter voice makes it snappier.

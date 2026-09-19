@@ -58,6 +58,9 @@ STAGING_REAL_CLAUDE=1 test/staging/run-staging.sh   # against the real claude CL
 # real turns and real minutes, so re-running all of them per iteration is the main
 # thing that makes this tier feel slow. It prints what it skipped.
 STAGING_ONLY=interrupt STAGING_REAL_CLAUDE=1 test/staging/run-staging.sh
+# Comma-separated for a set — one fix often spans several cases, and running them
+# one invocation at a time reboots the bridge each round.
+STAGING_ONLY=rtl,usage,album STAGING_REAL_CLAUDE=1 test/staging/run-staging.sh
 ```
 
 `run-staging.sh` boots an isolated bridge (`state/staging/`, its own tmux session),
@@ -68,8 +71,24 @@ tears the bridge down. Exit code is non-zero if any case fails — so it can gat
 
 The default (stub) cases mirror `test/claude-stub.ts`: a normal reply (`okReply`), an
 empty result (`empty response`), and an error (`boom`) — round-tripped through real
-Telegram. Add cases in `driver.py`'s `CASES` list. The real-claude mode sends a single
-compliance prompt and checks for `PONG`.
+Telegram. Add cases in `driver.py`'s `CASES` list. Real-claude mode runs the async
+functions in `FEATURE_TESTS`, each driving a multi-step flow and asserting on replies,
+entities and/or the filesystem.
+
+### What only this tier can prove
+
+Several cases exist because tiers 1 and 2 fake Telegram and therefore *cannot* see the
+thing that broke:
+
+| Case | The fact only real Telegram settles |
+|---|---|
+| `unicode_topic_directories` | A **real** forum topic is what makes Telegram send the `forum_topic_created` service message the bridge derives a directory from — and the directory it then creates is on the real filesystem. Also checks the production symptom directly: a file made in one Persian topic comes back to *that* topic. |
+| `long_answer_is_one_album` | `grouped_id` is assigned by the **server**; whether a caption's markup became *entities* or stayed characters is a parsing result, not an API argument. |
+| `rtl_answer_stays_rich` | A rich message arrives with `.message` empty and its content in `.rich_message`. Nothing else distinguishes rich from MarkdownV2. |
+| `rtl_answer_file_reads_correctly` | Downloads the `.html` Telegram actually delivered and reads what is in it. |
+| `usage_refreshes_in_place` | "Same message id, changed text" is a server-side fact, and Telegram's `message is not modified` rejection is only reachable against the real API. |
+| `run_alongside` / `promoted_run_keeps_the_topics_session` | A real inline-keyboard **tap** is the only thing that produces the callback the promotion runs on — tier 2 hand-builds that update — and the real CLI is the only thing that mints a real forked session id, which tier 2 has to stub. The second case then asks the topic itself whether it remembers what was said inside the fork, which is the harm a state file cannot show. |
+| `sessions_picker` | A callback button is the only in-chat tap that carries a payload back to the bot, so the picker cannot be exercised any other way. |
 
 ## Notes / caveats
 

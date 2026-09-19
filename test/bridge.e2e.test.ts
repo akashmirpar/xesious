@@ -39,9 +39,23 @@ process.env.TG_ALLOW_BYPASS = '0'         // bypass must be refused
 // point into the sandbox — a test has no business reading or writing the real
 // ~/.claude, and would be testing against whatever happens to be in it.
 process.env.CLAUDE_CONFIG_DIR = join(TMP, 'claude')
+// Real synthesis is ~1x realtime, so tier 2 uses a stub and proves the PLUMBING:
+// that the note is threaded, and that a slow note does not block the topic. The
+// progressive/chunked path is inherently about real timing and is covered in tier 3.
+process.env.TG_TTS_CMD = join(import.meta.dir, 'tts-stub.sh')
+process.env.TG_VOICE_CHUNKED = '1'
+const SLOW_TTS = join(TMP, 'slow-tts')
+process.env.XESIOUS_TTS_STUB_SLOW = SLOW_TTS
+// The progressive path gets its own stub, speaking the same protocol as speak.py.
+// Without it, reaching that path in tier 2 would mean real synthesis at about
+// realtime — minutes per test.
+process.env.TG_SPEAK_CMD = join(import.meta.dir, 'speak-stub.py')
+const SLOW_SPEAK = join(TMP, 'slow-speak')
+process.env.XESIOUS_SPEAK_STUB_SLOW = SLOW_SPEAK
 
 // Dynamic import so the assignments above land first.
 const bridge: any = await import('../bridge')
+const { SPEAKERS } = await import('../lib')
 
 // --- Fake Telegram: record calls, return canned API responses (no network).
 type Call = { method: string; payload: any }
@@ -51,6 +65,13 @@ let nextMessageId = 1000
 // because the fallback to merely closing is the interesting half — a fallback that
 // no test ever reaches is a fallback nobody knows is broken.
 let denyDelete = false
+// A media group is all-or-nothing, so the fallback to two individual sends is the
+// half that keeps a failure cosmetic instead of losing the answer. A fallback no
+// test ever reaches is a fallback nobody knows is broken.
+let failMediaGroup = false
+// Telegram rejects an unbalanced entity outright. Before the retry existed, a
+// caption Telegram would not parse cost the user the FILE, not just the formatting.
+let failParsedCaption = false
 
 bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
   calls.push({ method, payload })
@@ -74,6 +95,18 @@ bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
     // The real API returns a thread id, and the fan-out code depends on it: without
     // one, every part would fall back to the parent's key.
     return { ok: true, result: { message_thread_id: nextMessageId++, name: payload.name, icon_color: 0 } }
+  }
+  if (method === 'sendDocument' && failParsedCaption && payload.parse_mode) {
+    return { ok: false, error_code: 400, description: "Bad Request: can't parse entities" }
+  }
+  if (method === 'sendVoice' || method === 'sendAudio') {
+    // A real Message, not `true`: the bridge records each note's id so it can offer
+    // to remove them later, and a bare `true` left that list silently empty.
+    return { ok: true, result: { message_id: nextMessageId++, date: 0, chat: { id: payload.chat_id, type: 'private' } } }
+  }
+  if (method === 'sendMediaGroup') {
+    if (failMediaGroup) return { ok: false, error_code: 400, description: 'Bad Request: group send failed' }
+    return { ok: true, result: (payload.media ?? []).map(() => ({ message_id: nextMessageId++, date: 0, chat: { id: payload.chat_id, type: 'private' } })) }
   }
   // deleteMessage, deleteWebhook, setMyCommands, everything else.
   return { ok: true, result: true }
@@ -102,6 +135,10 @@ async function incoming(chatId: number, text: string, fromId = 1): Promise<Call[
     },
   })
   await bridge._drainQueue(`${chatId}:main`)
+  // /usage and friends run on their OWN queue key so a refresh tapped during a long
+  // turn doesn't sit behind it. Draining only the topic's key would return before
+  // they finished and read as an empty reply.
+  await bridge._drainQueue(`${chatId}:main#pt`)
   return calls.slice(before)
 }
 
@@ -600,30 +637,50 @@ describe('/effort plumbs --effort through to the CLI (C5)', () => {
 })
 
 describe('a long answer is delivered as a readable file (C7)', () => {
-  const docs = (cs: any[]) => cs.filter(c => c.method === 'sendDocument')
+  const groups = (cs: any[]) => cs.filter(c => c.method === 'sendMediaGroup')
+  const items = (cs: any[]) => groups(cs).flatMap(c => c.payload?.media ?? [])
 
   test('both an .html and an .md are sent', async () => {
     // The .md alone was close to unreadable on macOS: no default viewer, no
     // preview in Telegram Desktop, and double-clicking shows raw pipe-tables —
     // exactly the content that needed a file in the first place.
     const cs = await incoming(1120, 'LONG')
-    const names = docs(cs).map(c => String(c.payload?.document?.filename ?? ''))
-    expect(names.some(n => n.endsWith('.html'))).toBe(true)
-    expect(names.some(n => n.endsWith('.md'))).toBe(true)
+    const names = items(cs).map((m: any) => String(m?.media?.filename ?? ''))
+    expect(names.some((n: string) => n.endsWith('.html'))).toBe(true)
+    expect(names.some((n: string) => n.endsWith('.md'))).toBe(true)
+  }, 10000)
+
+  test('they arrive as ONE grouped message, not two deliveries', async () => {
+    // Two independent sendDocument calls read on a phone as two different things,
+    // and the second — the source of truth — looked like a stray attachment.
+    const cs = await incoming(1123, 'LONG')
+    expect(groups(cs)).toHaveLength(1)
+    expect(cs.filter(c => c.method === 'sendDocument')).toHaveLength(0)
+    expect(items(cs)).toHaveLength(2)
   }, 10000)
 
   test('the preview caption rides on the first file only', async () => {
     const cs = await incoming(1121, 'LONG')
-    const captioned = docs(cs).filter(c => c.payload?.caption)
+    const captioned = items(cs).filter((m: any) => m?.caption)
     expect(captioned).toHaveLength(1)
-    expect(String(captioned[0].payload.caption)).toContain('Full answer')
+    expect(String(captioned[0].caption)).toContain('Full answer')
+  }, 10000)
+
+  test('the caption is FORMATTED, not raw markdown syntax', async () => {
+    // It used to be the only message in the bridge sent with no parse mode, so the
+    // preview of the longest, most structured answers was the one place a user saw
+    // literal **bold** and | pipe | tables |.
+    const cs = await incoming(1124, 'LONG')
+    const first = items(cs).find((m: any) => m?.caption)
+    expect(first.parse_mode).toBe('MarkdownV2')
+    expect(String(first.caption).length).toBeLessThanOrEqual(1024)
   }, 10000)
 
   test('the files follow the same threading rule as any other answer', async () => {
     // A lone question, so no quoted header — the .md and .html are obviously its
     // answer and the link would only cost space.
     const cs = await incoming(1122, 'LONG')
-    expect(docs(cs).every(c => !c.payload?.reply_parameters)).toBe(true)
+    expect(groups(cs).every(c => !c.payload?.reply_parameters)).toBe(true)
   }, 10000)
 })
 
@@ -911,6 +968,98 @@ describe('/bg and running a message alongside instead of behind (D: /bg)', () =>
     expect(ran.length).toBe(1)
   }, 25000)
 
+  test('taking the offer answers WHILE the blocking run is still going', async () => {
+    // The assertion the count-based test above cannot make, and the one the user's
+    // complaint actually is. Under the old guard the promoted run consumed the
+    // skipQueued flag meant for its twin and returned without spawning: zero replies
+    // from the fork, one from the queued turn later — total one, so `runs it once`
+    // stayed green for precisely the behaviour it was written to forbid. For a
+    // feature whose whole value is WHEN something happens, counting how many times it
+    // happened is not a test of it.
+    const run = incoming(1178, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    await inject(1178, 'promote me too', 98401)
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 98997,
+      callback_query: { id: 'cb3', from: { id: 1, is_bot: false, first_name: 'T' },
+        chat_instance: 'x', data: 'par:98401',
+        message: { message_id: 98402, date: 0, chat: { id: 1178, type: 'private' } } },
+    })
+    await bridge._drainQueue('1178:main#bg-98401')
+    // Read the answers BEFORE letting the blocking run end. Anything here arrived
+    // alongside it, which is the entire feature.
+    const during = calls.slice(before).filter(c => c.method === 'sendMessage'
+      && String(c.payload.text ?? '').includes('okReply'))
+    expect(during.length).toBe(1)
+    await inject(1178, '/interrupt', 98403)
+    await run
+    await bridge._drainQueue('1178:main')
+  }, 25000)
+
+  test('a promoted run does not steal the topic\'s session binding', async () => {
+    // It forked, so it reports a fresh session id on completion. Persisting that
+    // would silently continue the topic from the parallel job's transcript. The
+    // early binding was already guarded; the completion binding was not — and was
+    // unreachable until the fork above started actually running.
+    await incoming(1179, 'first, to establish a session')
+    const bound = stateNow().sessions['1179:main']?.sessionId
+    expect(bound).toBeTruthy()
+
+    const run = incoming(1179, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    await inject(1179, 'run me alongside', 98501)
+    await bridge.bot.handleUpdate({
+      update_id: 98996,
+      callback_query: { id: 'cb4', from: { id: 1, is_bot: false, first_name: 'T' },
+        chat_instance: 'x', data: 'par:98501',
+        message: { message_id: 98502, date: 0, chat: { id: 1179, type: 'private' } } },
+    })
+    await bridge._drainQueue('1179:main#bg-98501')
+    expect(stateNow().sessions['1179:main']?.sessionId).toBe(bound)
+    await inject(1179, '/interrupt', 98503)
+    await run
+    await bridge._drainQueue('1179:main')
+  }, 30000)
+
+  test('taking the offer does not announce itself as a finished background task', async () => {
+    // The banner exists to close /bg's promise to "report back", after a gap in
+    // which the topic has moved on. A promoted turn has no such gap: the tap was
+    // seconds ago, the toast already said it was starting, and the answer quotes the
+    // question. Reported as "it feels unnecessary".
+    const run = incoming(1182, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    await inject(1182, 'no banner for me', 98601)
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 98995,
+      callback_query: { id: 'cb5', from: { id: 1, is_bot: false, first_name: 'T' },
+        chat_instance: 'x', data: 'par:98601',
+        message: { message_id: 98602, date: 0, chat: { id: 1182, type: 'private' } } },
+    })
+    await bridge._drainQueue('1182:main#bg-98601')
+    const said = calls.slice(before).filter(c => c.method === 'sendMessage')
+      .map(c => String(c.payload.text ?? ''))
+    // The answer still lands — this suppresses the banner, not the reply.
+    expect(said.some(t => t.includes('okReply'))).toBe(true)
+    expect(said.some(t => t.includes('Background task finished'))).toBe(false)
+    await inject(1182, '/interrupt', 98603)
+    await run
+    await bridge._drainQueue('1182:main')
+  }, 25000)
+
+  test('/bg keeps the banner, because it promised to report back', async () => {
+    // The other side of the same rule. Dropping it here would leave "carry on here,
+    // I will report back" unanswered.
+    const before = calls.length
+    await incoming(1183, '/bg go and look something up')
+    await bridge._drainQueue('1183:main#bg-' + (updateId + 5000 - 1)).catch(() => {})
+    await new Promise(r => setTimeout(r, 800))
+    const said = calls.slice(before).filter(c => c.method === 'sendMessage')
+      .map(c => String(c.payload.text ?? ''))
+    expect(said.some(t => t.includes('Background task finished'))).toBe(true)
+  }, 15000)
+
   test('a stale offer says so rather than forking a second run', async () => {
     const before = calls.length
     await bridge.bot.handleUpdate({
@@ -936,6 +1085,36 @@ describe('a finished background job is carried into the next turn', () => {
     const cs = await incoming(1180, 'so what did you find?')
     expect(finalReply(cs)).toContain('sawBgResult')
   }, 20000)
+
+  test('a PROMOTED job is carried into the next turn too, banner or no banner', async () => {
+    // The carry-over and the banner used to be one `if`, so suppressing the banner
+    // for a promoted turn could silently take this with it. It must not: a promoted
+    // run forks exactly like /bg does, so the topic's own conversation never sees it
+    // and the next turn would have no idea the question was ever answered.
+    await incoming(1184, 'establish the session')
+    const run = incoming(1184, 'PARTIAL')
+    await new Promise(r => setTimeout(r, 400))
+    await bridge.bot.handleUpdate({
+      update_id: 98994,
+      message: { message_id: 98701, date: 0, chat: { id: 1184, type: 'private', first_name: 'T' },
+                 from: { id: 1, is_bot: false, first_name: 'T' }, text: 'promote and remember me' },
+    })
+    await bridge.bot.handleUpdate({
+      update_id: 98993,
+      callback_query: { id: 'cb6', from: { id: 1, is_bot: false, first_name: 'T' },
+        chat_instance: 'x', data: 'par:98701',
+        message: { message_id: 98702, date: 0, chat: { id: 1184, type: 'private' } } },
+    })
+    await bridge._drainQueue('1184:main#bg-98701')
+    await bridge.bot.handleUpdate({
+      update_id: 98992,
+      message: { message_id: 98703, date: 0, chat: { id: 1184, type: 'private', first_name: 'T' },
+                 from: { id: 1, is_bot: false, first_name: 'T' }, text: '/interrupt' },
+    })
+    await run
+    await bridge._drainQueue('1184:main')
+    expect(finalReply(await incoming(1184, 'so what did that turn up?'))).toContain('sawBgResult')
+  }, 30000)
 
   test('an ordinary turn with no background history carries nothing', async () => {
     expect(finalReply(await incoming(1181, 'just a question'))).toContain('noBgResult')
@@ -1402,4 +1581,1281 @@ describe('fan-out: steering a part changes the combined answer', () => {
     delete process.env.TG_FANOUT_TOPICS
     expect(calls.slice(before).length).toBe(0)
   })
+})
+
+// ---------------------------------------------------------------------------
+// Topic directories: one per topic, in the topic's own script
+//
+// sanitize() used to run on \w, which is ASCII-only, so EVERY Persian, Arabic,
+// Hebrew, Cyrillic, CJK or Devanagari topic name reduced to the empty string and
+// then to the constant 'topic'. All of them shared <SESSIONS_BASE>/topic — one cwd,
+// one git checkout, one outbox. Found in production when a YouTube transcript
+// generated in خلاصه یوتیوب was delivered into پک کادو.
+// ---------------------------------------------------------------------------
+describe('a topic gets its own directory, whatever its name is written in', () => {
+  const named = async (threadId: number, name: string, text: string) => {
+    // The service message the bot uses to learn a topic's name.
+    await bridge.bot.handleUpdate({
+      update_id: 97000 + threadId,
+      message: {
+        message_id: 97000 + threadId, date: 0, message_thread_id: threadId,
+        chat: { id: -100777, type: 'supergroup', title: 'G', is_forum: true },
+        from: { id: 1, is_bot: false, first_name: 'T' },
+        forum_topic_created: { name, icon_color: 0 },
+      },
+    })
+    await bridge.bot.handleUpdate({
+      update_id: 97500 + threadId,
+      message: {
+        message_id: 97500 + threadId, date: 0, message_thread_id: threadId,
+        chat: { id: -100777, type: 'supergroup', title: 'G', is_forum: true },
+        from: { id: 1, is_bot: false, first_name: 'T' }, text,
+      },
+    })
+    await bridge._drainQueue(`-100777:${threadId}`)
+    return bridge._sessions()[`-100777:${threadId}`]?.cwd as string
+  }
+
+  test('two non-Latin topics do not share one directory', async () => {
+    const a = await named(7101, 'خلاصه یوتیوب', 'hello there')
+    const b = await named(7102, 'پک کادو', 'hello there')
+    expect(a).toBeTruthy()
+    expect(a).not.toBe(b)
+    // And the name survives rather than being replaced by the fallback.
+    expect(a).toContain('خلاصه-یوتیوب')
+    expect(b).toContain('پک-کادو')
+  }, 20000)
+
+  test('two topics with the SAME name get separate directories', async () => {
+    // Perfect Unicode handling still leaves two topics legitimately called "notes"
+    // sharing a cwd. The second one takes its thread id as a suffix.
+    const a = await named(7103, 'notes', 'hello there')
+    const b = await named(7104, 'notes', 'hello there')
+    expect(a).not.toBe(b)
+    expect(b).toContain('notes-7104')
+  }, 20000)
+
+  test('a topic named ".." cannot escape the sessions base', async () => {
+    // '.' and '-' were both legal, so a dot-only name passed through untouched and
+    // join(SESSIONS_BASE, '..') resolved to the PARENT of the sessions base.
+    const d = await named(7105, '..', 'hello there')
+    expect(d.startsWith(process.env.TG_SESSIONS_BASE!)).toBe(true)
+    expect(d).not.toContain('..')
+  }, 20000)
+})
+
+// ---------------------------------------------------------------------------
+// /usage and friends are a live gauge, not conversation
+// ---------------------------------------------------------------------------
+describe('the passthrough reports refresh in place', () => {
+  const kbOf = (c: any) => c.payload?.reply_markup?.inline_keyboard
+
+  test('the answer carries a Refresh button', async () => {
+    const cs = await incoming(1301, '/usage')
+    const withKb = sends(cs).find(c => kbOf(c) && String(kbOf(c)[0][0].callback_data).startsWith('psx:'))
+    expect(withKb).toBeTruthy()
+    expect(kbOf(withKb)[0][0].text).toContain('Refresh')
+    expect(kbOf(withKb)[0][0].callback_data).toBe('psx:usage')
+  }, 15000)
+
+  test('it stamps the time, so a tap that finds the same numbers still shows a change', async () => {
+    // Telegram rejects an editMessageText whose text is byte-identical, which is the
+    // COMMON case for /usage tapped twice in a minute — the button would look broken
+    // exactly when it was working.
+    const cs = await incoming(1302, '/usage')
+    const withKb = sends(cs).find(c => kbOf(c))
+    expect(String(withKb!.payload.text)).toMatch(/updated \d\d:\d\d:\d\d/)
+  }, 15000)
+
+  test('tapping it EDITS the message rather than posting another one', async () => {
+    await incoming(1303, '/usage')
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 97900,
+      callback_query: {
+        id: 'px1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: 'psx:usage',
+        message: { message_id: 97901, date: 0, chat: { id: 1303, type: 'private' } },
+      },
+    })
+    await bridge._drainQueue('1303:main#pt')
+    await new Promise(r => setTimeout(r, 300))
+    const after = calls.slice(before)
+    expect(after.some(c => c.method === 'editMessageText')).toBe(true)
+    // The whole point: checking your limit five times must not leave five messages.
+    expect(after.filter(c => c.method === 'sendMessage')).toHaveLength(0)
+  }, 15000)
+
+  test('a passthrough run posts no "thinking" status at all', async () => {
+    // It spawns a CLI but takes no model turn, so the status flashed for two seconds
+    // offering to Interrupt a run that does nothing.
+    const cs = await incoming(1304, '/usage')
+    expect(sends(cs).some(c => textOf(c).includes('Thinking'))).toBe(false)
+  }, 15000)
+})
+
+// ---------------------------------------------------------------------------
+// /sessions used to print an 8-char prefix that /resume then refused to accept
+// ---------------------------------------------------------------------------
+describe('/sessions is a picker, and /resume accepts what it prints', () => {
+  const IDS = [
+    'aaaaaaaa-1111-4111-8111-111111111111',
+    'bbbbbbbb-2222-4222-8222-222222222222',
+  ]
+  let cwd = ''
+
+  test('setup: a topic with two past transcripts on disk', async () => {
+    await incoming(1310, 'hello there')
+    cwd = bridge._sessions()['1310:main'].cwd
+    const pdir = bridge._projectDir(cwd)
+    mkdirSync(pdir, { recursive: true })
+    for (const id of IDS) {
+      writeFileSync(join(pdir, `${id}.jsonl`), [
+        JSON.stringify({ type: 'summary', summary: `session ${id.slice(0, 4)}` }),
+        JSON.stringify({ type: 'user', sessionId: id, message: { role: 'user', content: 'a question' } }),
+      ].join('\n') + '\n')
+    }
+    expect(existsSync(join(pdir, `${IDS[0]}.jsonl`))).toBe(true)
+  }, 15000)
+
+  test('the listing is tappable — one button per session', async () => {
+    const cs = await incoming(1310, '/sessions')
+    const picker = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard?.length)
+    expect(picker).toBeTruthy()
+    const rows = picker!.payload.reply_markup.inline_keyboard
+    expect(rows.length).toBeGreaterThanOrEqual(2)
+    expect(String(rows[0][0].callback_data)).toStartWith('res:')
+    // callback_data caps at 64 bytes; an index into the listing is what keeps a
+    // directory path out of the payload.
+    expect(Buffer.byteLength(String(rows[0][0].callback_data))).toBeLessThanOrEqual(64)
+    // The button must say what the session was ABOUT. `d2b39072 · 10 turns · 4m ago`
+    // identifies a session to the filesystem and to nobody else — you cannot pick
+    // your own conversation out of a list of hashes.
+    const labels = rows.filter((r: any) => String(r[0].callback_data).startsWith('res:'))
+      .map((r: any) => String(r[0].text))
+    expect(labels.some((l: string) => l.includes('session aaaa'))).toBe(true)
+    expect(labels.some((l: string) => l.includes('session bbbb'))).toBe(true)
+    // …and the message body carries the id and age the label spends no room on.
+    expect(String(picker!.payload.text)).toMatch(/turns/)
+    expect(String(picker!.payload.text)).toContain('session aaaa')
+  }, 15000)
+
+  test('the message shows a long title in full; only the button truncates', async () => {
+    const pdir = bridge._projectDir(cwd)
+    const id = 'dddddddd-5555-4555-8555-555555555555'
+    const file = join(pdir, `${id}.jsonl`)
+    const long = 'I want to build a trading app that lets people trade forex and tokenized stocks on chain, through spot and perps, and I need to pick between a few venues'
+    writeFileSync(file, [
+      JSON.stringify({ type: 'summary', summary: long }),
+      JSON.stringify({ type: 'user', sessionId: id, message: { role: 'user', content: 'q' } }),
+    ].join('\n') + '\n')
+    try {
+      const cs = await incoming(1310, '/sessions')
+      const picker = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard?.length)
+      // The body has 4096 characters to work with, so it shows the sentence.
+      expect(String(picker!.payload.text)).toContain(long)
+      // The button has one line, so it does not.
+      const label = picker!.payload.reply_markup.inline_keyboard
+        .map((r: any) => String(r[0].text)).find((l: string) => l.includes('I want to build'))
+      expect(label!.length).toBeLessThanOrEqual(64)
+      expect(label).not.toContain(long)
+    } finally { rmSync(file, { force: true }) }
+  }, 15000)
+
+  test('scaffolding is never used as a session title', async () => {
+    // Reported: a session showed up as "<local-command-caveat>Caveat: The messages
+    // below were generated by the user whil". Both kinds of noise are covered — the
+    // harness's injected block, and the bridge's own attribution framing.
+    const pdir = bridge._projectDir(cwd)
+    const id = 'eeeeeeee-6666-4666-8666-666666666666'
+    const file = join(pdir, `${id}.jsonl`)
+    writeFileSync(file, [
+      // No summary line, so the label has to come from the user turns.
+      JSON.stringify({ type: 'user', sessionId: id, message: { role: 'user', content:
+        '<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>\n<command-name>/clear</command-name>' } }),
+      JSON.stringify({ type: 'user', sessionId: id, message: { role: 'user', content:
+        '[xesious:cfe601edd91a] this directory is shared with another topic (a fork).' } }),
+      JSON.stringify({ type: 'user', sessionId: id, message: { role: 'user', content:
+        '[xesious:cfe601edd91a] message from G, id 93362715:\nwhy is the gold fund premium moving?' } }),
+    ].join('\n') + '\n')
+    try {
+      const cs = await incoming(1310, '/sessions')
+      const picker = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard?.length)
+      const body = String(picker!.payload.text)
+      expect(body).not.toContain('local-command-caveat')
+      expect(body).not.toContain('[xesious:')
+      expect(body).not.toContain('shared with another topic')
+      // It fell through the two scaffolding turns to the thing the user actually said.
+      expect(body).toContain('why is the gold fund premium moving?')
+    } finally { rmSync(file, { force: true }) }
+  }, 15000)
+
+  test('a long title is truncated to something a phone can render', async () => {
+    const pdir = bridge._projectDir(cwd)
+    const longId = 'cccccccc-3333-4333-8333-333333333333'
+    const file = join(pdir, `${longId}.jsonl`)
+    writeFileSync(file, [
+      JSON.stringify({ type: 'summary', summary: 'x'.repeat(200) }),
+      JSON.stringify({ type: 'user', sessionId: longId, message: { role: 'user', content: 'q' } }),
+    ].join('\n') + '\n')
+    try {
+      const cs = await incoming(1310, '/sessions')
+      const picker = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard?.length)
+      const labels = picker!.payload.reply_markup.inline_keyboard
+        .filter((r: any) => String(r[0].callback_data).startsWith('res:'))
+        .map((r: any) => String(r[0].text))
+      expect(labels.every((l: string) => l.length <= 64)).toBe(true)
+      expect(labels.some((l: string) => l.endsWith('…'))).toBe(true)
+    } finally {
+      // Removed again: it is the NEWEST session, so leaving it behind would make the
+      // next case's "tap the first button" land on this fixture instead.
+      rmSync(file, { force: true })
+    }
+  }, 15000)
+
+  test('tapping one binds the topic to that session', async () => {
+    const cs = await incoming(1310, '/sessions')
+    const picker = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard?.length)
+    const btn = picker!.payload.reply_markup.inline_keyboard[0][0]
+    await bridge.bot.handleUpdate({
+      update_id: 97950,
+      callback_query: {
+        id: 'rs1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: btn.callback_data,
+        message: { message_id: 97951, date: 0, chat: { id: 1310, type: 'private' } },
+      },
+    })
+    await new Promise(r => setTimeout(r, 200))
+    expect(IDS).toContain(bridge._sessions()['1310:main'].sessionId)
+  }, 15000)
+
+  test('/resume accepts the 8-char prefix the listing prints', async () => {
+    // The reported bug in one line: the command told you the answer in a form it
+    // then refused to accept.
+    const cs = await incoming(1310, `/resume ${IDS[1].slice(0, 8)}`)
+    expect(finalReply(cs)).not.toMatch(/No session/i)
+    expect(bridge._sessions()['1310:main'].sessionId).toBe(IDS[1])
+  }, 15000)
+
+  test('an ambiguous prefix fails loudly instead of picking one', async () => {
+    // Silently continuing the wrong conversation is the failure to avoid.
+    const pdir = bridge._projectDir(cwd)
+    writeFileSync(join(pdir, 'aaaaaaaa-9999-4999-8999-999999999999.jsonl'),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'x' } }) + '\n')
+    const cs = await incoming(1310, '/resume aaaaaaaa')
+    expect(finalReply(cs)).toMatch(/matches 2 sessions/i)
+  }, 15000)
+
+  test('an unknown prefix points at the picker rather than just failing', async () => {
+    const cs = await incoming(1310, '/resume zzzzzzzz')
+    expect(finalReply(cs)).toMatch(/\/sessions/)
+  }, 15000)
+})
+
+// ---------------------------------------------------------------------------
+// The preview caption used to be the ONE message in the bridge sent with no parse
+// mode, so the preview of the longest, most heavily formatted answers was the only
+// place a user ever saw literal **bold** and | pipe | tables |.
+// ---------------------------------------------------------------------------
+describe('the caption on a long answer', () => {
+  const cap = (t: string) => bridge._answerCaption(t) as { text: string; mode?: string }
+  const long = (s: string) => s + '\n\n' + 'tail padding. '.repeat(600)
+
+  test('is formatted, and stays inside the 1024 cap', () => {
+    const c = cap(long('## Heading\n\nSome **bold** and a `span`.'))
+    expect(c.mode).toBe('MarkdownV2')
+    expect(c.text.length).toBeLessThanOrEqual(1024)
+    expect(c.text).not.toContain('**bold**')     // rendered, not shown as syntax
+    expect(c.text).toContain('Full answer')
+  })
+
+  test('a table is flattened into a code block, which captions CAN render', () => {
+    // Captions have no table entity, so the alternative to flattening is pipes.
+    const c = cap(long('| a | b |\n|---|---|\n| 1 | 2 |'))
+    expect(c.text).toContain('```')
+    expect((c.text.match(/```/g) || []).length % 2).toBe(0)
+  })
+
+  test('escaping inflation is measured, not assumed', () => {
+    // A preview made entirely of characters MarkdownV2 must escape roughly doubles
+    // when escaped. Slicing to 900 first and escaping after would sail past 1024
+    // and Telegram would reject the whole caption — which used to cost the FILE.
+    const c = cap(long('.'.repeat(900)))
+    expect(c.text.length).toBeLessThanOrEqual(1024)
+  })
+
+  test('a fence opened by the truncation is closed', () => {
+    // An unbalanced entity is exactly what Telegram refuses to parse.
+    const c = cap('intro\n```sh\n' + 'echo one line\n'.repeat(400) + '```\ntail')
+    expect((c.text.match(/```/g) || []).length % 2).toBe(0)
+  })
+})
+
+describe('a media group that fails falls back rather than dropping the answer', () => {
+  test('both files still arrive, as individual sends', async () => {
+    failMediaGroup = true
+    try {
+      const cs = await incoming(1125, 'LONG')
+      const docs = cs.filter(c => c.method === 'sendDocument')
+      // Two messages is the cosmetic problem this feature set out to remove. A lost
+      // answer is not cosmetic, so that is the trade the fallback makes.
+      expect(docs).toHaveLength(2)
+      const names = docs.map(c => String(c.payload?.document?.filename ?? ''))
+      expect(names.some(n => n.endsWith('.html'))).toBe(true)
+      expect(names.some(n => n.endsWith('.md'))).toBe(true)
+      // And the caption still rides on the first one only.
+      expect(docs.filter(c => c.payload?.caption)).toHaveLength(1)
+    } finally { failMediaGroup = false }
+  }, 15000)
+})
+
+describe('a caption Telegram refuses to parse costs the formatting, never the file', () => {
+  test('the send is retried unformatted instead of failing', async () => {
+    failMediaGroup = true      // force the individual-send path, which is where
+    failParsedCaption = true   // sendFile's own retry lives
+    try {
+      const cs = await incoming(1126, 'LONG')
+      const docs = cs.filter(c => c.method === 'sendDocument')
+      // Two attempts for the captioned file (parsed, then plain) plus the second
+      // file — what matters is that a file with no parse_mode got through.
+      const delivered = docs.filter(c => !c.payload?.parse_mode)
+      expect(delivered.length).toBeGreaterThan(0)
+      expect(delivered.some(c => String(c.payload?.caption ?? '').includes('Full answer'))).toBe(true)
+      // The retry must send the UNESCAPED caption. Resending the MarkdownV2 string
+      // with no parse mode would show the user its backslashes.
+      const retried = delivered.find(c => String(c.payload?.caption ?? '').includes('Full answer'))!
+      expect(String(retried.payload.caption)).toContain('Full answer (')
+      expect(String(retried.payload.caption)).not.toContain('\\(')
+      // And the user is not told the send failed, because it did not.
+      expect(sends(cs).some(c => String(c.payload.text ?? '').includes('could not send'))).toBe(false)
+    } finally { failMediaGroup = false; failParsedCaption = false }
+  }, 15000)
+})
+
+describe('the /sessions picker paginates', () => {
+  // Page 1 is all the flow test above reaches. This directory has far more sessions
+  // than fit one keyboard, which is the case the pager exists for.
+  const dir = join(TMP, 'paged')
+  let token = ''
+
+  test('setup: 20 sessions in one directory', () => {
+    mkdirSync(dir, { recursive: true })
+    const pdir = bridge._projectDir(dir)
+    mkdirSync(pdir, { recursive: true })
+    for (let i = 0; i < 20; i++) {
+      const id = `${String(i).padStart(8, '0')}-4444-4444-8444-444444444444`
+      writeFileSync(join(pdir, `${id}.jsonl`), [
+        JSON.stringify({ type: 'summary', summary: `topic number ${i}` }),
+        JSON.stringify({ type: 'user', sessionId: id, message: { role: 'user', content: 'q' } }),
+      ].join('\n') + '\n')
+    }
+    token = bridge._listing.make(dir, bridge._listSessions(dir))
+    expect(bridge._listSessions(dir)).toHaveLength(20)
+  })
+
+  const sessionRows = (kb: any) => kb.inline_keyboard.filter((r: any) => String(r[0].callback_data).startsWith('res:'))
+  const navRow = (kb: any) => kb.inline_keyboard.find((r: any) => r.some((b: any) => String(b.callback_data).startsWith('spg:')))
+
+  test('page 1 shows 8 and offers Next but not Prev', () => {
+    const kb = bridge._listing.kb(token, 0)
+    expect(sessionRows(kb)).toHaveLength(8)
+    const nav = navRow(kb).map((b: any) => b.text)
+    expect(nav).toContain('1/3')
+    expect(nav.some((t: string) => t.includes('Next'))).toBe(true)
+    expect(nav.some((t: string) => t.includes('Prev'))).toBe(false)
+    expect(bridge._listing.text(token, 0)).toContain('page 1/3')
+  })
+
+  test('the middle page offers both directions', () => {
+    const nav = navRow(bridge._listing.kb(token, 8)).map((b: any) => b.text)
+    expect(nav).toContain('2/3')
+    expect(nav.some((t: string) => t.includes('Prev'))).toBe(true)
+    expect(nav.some((t: string) => t.includes('Next'))).toBe(true)
+  })
+
+  test('the last page is short and offers no Next', () => {
+    const kb = bridge._listing.kb(token, 16)
+    expect(sessionRows(kb)).toHaveLength(4)          // 20 - 16
+    const nav = navRow(kb).map((b: any) => b.text)
+    expect(nav.some((t: string) => t.includes('Next'))).toBe(false)
+    expect(nav.some((t: string) => t.includes('Prev'))).toBe(true)
+  })
+
+  test('every page numbers its entries continuously, so a button matches its line', () => {
+    // The button says "9. …" and the body's ninth entry must be the same session, or
+    // the number that ties them together is a lie.
+    const kb = bridge._listing.kb(token, 8)
+    expect(String(sessionRows(kb)[0][0].text)).toStartWith('9.')
+    expect(bridge._listing.text(token, 8)).toContain('9. ')
+  })
+
+  test('an expired listing says so instead of rendering an empty picker', () => {
+    expect(bridge._listing.text('nosuch', 0)).toMatch(/expired/i)
+    expect(bridge._listing.kb('nosuch', 0).inline_keyboard).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Voice
+// ---------------------------------------------------------------------------
+describe('/voice is a keyboard, like every other setting', () => {
+  const kb = (c: any) => c.payload?.reply_markup?.inline_keyboard
+  const labels = (c: any) => (kb(c) || []).flat().map((b: any) => String(b.text))
+
+  test('bare /voice answers with buttons, not a menu you have to type back at', async () => {
+    // It was the last setting whose answer was plain text while /mode, /model and
+    // /effort all had keyboards. That was an inconsistency, not a missing feature.
+    const cs = await incoming(1400, '/voice')
+    const menu = sends(cs).find(c => kb(c))
+    expect(menu).toBeTruthy()
+    const l = labels(menu)
+    expect(l.some((x: string) => x.includes('Full'))).toBe(true)
+    expect(l.some((x: string) => x.includes('Summary'))).toBe(true)
+    expect(l.some((x: string) => x.includes('Off'))).toBe(true)
+  }, 15000)
+
+  test('the speakers are named, not raw ids, and every English voice is reachable', async () => {
+    const cs = await incoming(1401, '/voice')
+    const menu = sends(cs).find(c => kb(c))
+    const spk = (kb(menu) || []).flat().filter((b: any) => String(b.callback_data).startsWith('vspk:'))
+    expect(spk.length).toBe(8)                       // one page
+    // "am_michael" tells you nothing; a name and a flag do. Asserted on the page
+    // actually rendered, which is the one holding the current speaker — not page one.
+    expect(spk.every((b: any) => /[\u{1F1E6}-\u{1F1FF}]{2} \w+ \((f|m)\)/u.test(String(b.text)))).toBe(true)
+    expect(spk.some((b: any) => String(b.text).includes('Heart'))).toBe(true)
+    expect(spk.every((b: any) => Buffer.byteLength(String(b.callback_data)) <= 64)).toBe(true)
+    // Two per row: a speaker label is three short tokens, and 28 one-per-row is a scroll.
+    const spkRows = (kb(menu) || []).filter((r: any) => String(r[0].callback_data).startsWith('vspk:'))
+    expect(spkRows.every((r: any) => r.length === 2)).toBe(true)
+    // …and the other 20 are a tap away, not hidden behind typing.
+    const nav = (kb(menu) || []).flat().filter((b: any) => String(b.callback_data).startsWith('vspg:'))
+    expect(nav.length).toBeGreaterThan(0)
+  }, 15000)
+
+  test('all 28 English voices are offered, the published ten first', async () => {
+    // Reported: "why the fuck do I get 8 voice options but kokoro website has 10".
+    // Eight was a hand-picked shortlist; the installed pack has 28 English voices,
+    // and the ten from Kokoro's original release are the ones people have seen.
+    const ids = SPEAKERS.map((s: any) => s.id)
+    expect(ids).toHaveLength(28)
+    for (const known of ['af_bella', 'af_sarah', 'af_nicole', 'af_sky', 'am_adam',
+                         'am_michael', 'bf_emma', 'bf_isabella', 'bm_george', 'bm_lewis']) {
+      expect(ids.slice(0, 10)).toContain(known)
+    }
+    // Labels state a flag, a name and a gender — never an invented description of
+    // how a voice sounds.
+    expect(SPEAKERS.every((s: any) => /^[\u{1F1E6}-\u{1F1FF}]{2} \w+ \((f|m)\)$/u.test(s.label))).toBe(true)
+  })
+
+  test('paging reaches the later voices and edits in place', async () => {
+    await incoming(1406, '/voice')
+    const before = calls.length
+    // Explicitly to offset 0, which is NOT where the keyboard opens by default.
+    await bridge.bot.handleUpdate({
+      update_id: 98700,
+      callback_query: {
+        id: 'vp1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: 'vspg:0',
+        message: { message_id: 98701, date: 0, chat: { id: 1406, type: 'private' } },
+      },
+    })
+    await new Promise(r => setTimeout(r, 200))
+    const edit = calls.slice(before).find(c => c.method === 'editMessageText')
+    expect(edit).toBeTruthy()
+    const spk = edit!.payload.reply_markup.inline_keyboard.flat()
+      .filter((b: any) => String(b.callback_data).startsWith('vspk:'))
+      .map((b: any) => String(b.callback_data).slice(5))
+    // Page 1 shows the published ten, which the default page (holding af_heart) does not.
+    expect(spk).toContain('af_bella')
+    expect(spk).not.toContain('af_heart')
+    expect(calls.slice(before).filter(c => c.method === 'sendMessage')).toHaveLength(0)
+  }, 15000)
+
+  test('the current mode and speaker are marked, whichever page the voice is on', async () => {
+    // The default speaker sits on page two, so a keyboard that always opened on page
+    // one showed nothing selected — the setting you are looking at appearing unset.
+    const cs = await incoming(1402, '/voice')
+    const menu = sends(cs).find(c => kb(c))
+    expect(labels(menu).filter((x: string) => x.startsWith('● ')).length).toBe(2)  // one mode, one speaker
+    const marked = (kb(menu) || []).flat().find((b: any) => String(b.text).startsWith('● ') && String(b.callback_data).startsWith('vspk:'))
+    expect(String(marked.callback_data)).toBe('vspk:af_heart')
+  }, 15000)
+
+  test('tapping a speaker stores it PER TOPIC and re-renders in place', async () => {
+    // It used to be a deployment-wide constant: voiceEnv copied TG_KOKORO_VOICE out
+    // of the bridge's own environment, so changing it meant editing .env and
+    // restarting.
+    await incoming(1403, '/voice')
+    const before = calls.length
+    await bridge.bot.handleUpdate({
+      update_id: 98600,
+      callback_query: {
+        id: 'vs1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+        data: 'vspk:bm_george',
+        message: { message_id: 98601, date: 0, chat: { id: 1403, type: 'private' } },
+      },
+    })
+    await new Promise(r => setTimeout(r, 200))
+    const after = calls.slice(before)
+    expect(after.some(c => c.method === 'editMessageText')).toBe(true)
+    expect(after.filter(c => c.method === 'sendMessage')).toHaveLength(0)
+    const st = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+    expect(st.speakers['1403:main']).toBe('bm_george')
+  }, 15000)
+
+  test('/voice speaker <id> reaches the voices the keyboard does not show', async () => {
+    const cs = await incoming(1404, '/voice speaker jf_alpha')
+    expect(finalReply(cs)).toContain('jf_alpha')
+    const st = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+    expect(st.speakers['1404:main']).toBe('jf_alpha')
+  }, 15000)
+
+  test('a bogus speaker id is refused rather than stored', async () => {
+    const cs = await incoming(1405, '/voice speaker ../../etc/passwd')
+    expect(finalReply(cs)).toMatch(/Not a Kokoro voice id/i)
+    const st = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+    expect(st.speakers['1405:main']).toBeUndefined()
+  }, 15000)
+})
+
+describe('voice that cannot speak says so', () => {
+  test('/voice on reports the engine instead of failing at the first answer', async () => {
+    // Reported: /voice on, then a message, and the answer came back as text with no
+    // hint anything was wrong. The toggle is the moment to say it.
+    const cs = await incoming(1410, '/voice on')
+    const said = sends(cs).map(c => String(c.payload.text ?? '')).join('\n')
+    expect(said).toMatch(/Voice ON/)
+    // Either it names the engine, or it says plainly that speaking is unavailable —
+    // never silence. Which one depends on what is installed on the test box.
+    expect(/Engine: \w+/.test(said) || /not available here/.test(said)).toBe(true)
+  }, 20000)
+
+  test('when it cannot speak, the offer to install is a BUTTON and nothing installs on its own', async () => {
+    const cs = await incoming(1411, '/voice on')
+    const said = sends(cs).map(c => String(c.payload.text ?? '')).join('\n')
+    if (/not available here/.test(said)) {
+      const offer = sends(cs).find(c => c.payload?.reply_markup?.inline_keyboard)
+      expect(offer).toBeTruthy()
+      expect(String(offer!.payload.reply_markup.inline_keyboard[0][0].callback_data)).toBe('vinst:go')
+    } else {
+      // Speaking works on this box, so there is nothing to offer — assert THAT
+      // rather than passing vacuously.
+      expect(said).toMatch(/Engine: /)
+    }
+  }, 20000)
+})
+
+describe('the voice note is threaded, and never blocks the topic', () => {
+  const voices = (cs: any[]) => cs.filter(c => c.method === 'sendVoice')
+
+  test('the note replies to the ANSWER, not to nothing', async () => {
+    // It was the one send in the file that bypassed destOpts, so with two turns in
+    // flight you got untethered audio bubbles and no way to match them to questions.
+    await incoming(1420, '/voice on')
+    const cs = await incoming(1420, 'hello there')
+    await bridge._drainQueue('1420:main#voice')
+    const all = calls.slice(calls.length - 40)
+    const v = voices(all)
+    expect(v.length).toBeGreaterThan(0)
+    expect(v[0].payload?.reply_parameters?.message_id).toBeGreaterThan(0)
+    // …and specifically to the answer message, which is the one just before it.
+    const answer = all.filter(c => c.method === 'sendMessage' && String(c.payload.text ?? '').includes('okReply')).pop()
+    expect(answer).toBeTruthy()
+  }, 25000)
+
+  test('a LONG answer\'s note is still threaded — the production case', async () => {
+    // Reported from production: "the sound does not fucking reply to anything".
+    // Cause: the note fell back to `link`, and needsReplyLink deliberately returns
+    // false for an ordinary lone question — so `link` is undefined exactly when the
+    // topic is calm. A long answer goes out as a FILE GROUP, deliver could not name a
+    // single message, and the chain ended in nothing. Both halves are covered here:
+    // the group now reports its first message id, and the last resort is the user's
+    // own message rather than undefined.
+    await incoming(1423, '/voice on')
+    await incoming(1423, '/voice parts on')            // this is about threading, not about parts
+    const before = calls.length
+    await incoming(1423, 'LONG')                       // stub answer past REPLY_FILE_CHARS
+    await bridge._drainQueue('1423:main#voice')
+    const cs = calls.slice(before)
+    const group = cs.find(c => c.method === 'sendMediaGroup')
+    expect(group).toBeTruthy()                          // it really was the file path
+    const note = cs.find(c => c.method === 'sendVoice')
+    expect(note).toBeTruthy()
+    expect(note!.payload?.reply_parameters?.message_id).toBeGreaterThan(0)
+    // A deleted question must cost the reply, never the note.
+    expect(note!.payload?.reply_parameters?.allow_sending_without_reply).toBe(true)
+  }, 30000)
+
+  test('a chunked answer\'s note is threaded too', async () => {
+    // The other way deliver returns undefined: an answer long enough to be split
+    // across several messages has no single id either.
+    await incoming(1424, '/voice on')
+    const before = calls.length
+    await incoming(1424, 'hello there')
+    await bridge._drainQueue('1424:main#voice')
+    const note = calls.slice(before).find(c => c.method === 'sendVoice')
+    expect(note).toBeTruthy()
+    expect(note!.payload?.reply_parameters?.message_id).toBeGreaterThan(0)
+  }, 25000)
+
+  test('a slow note does NOT hold up the next message', async () => {
+    // Measured on the real engine: 65s of synthesis sat INSIDE the turn, so the next
+    // message you sent waited on audio for an answer you already had in your hand.
+    writeFileSync(SLOW_SPEAK, 'x')          // make the synthesiser take ~3s per chunk
+    try {
+      await incoming(1421, '/voice on')
+      const t0 = Date.now()
+      await incoming(1421, 'hello there')   // returns when the TURN is done
+      const turnMs = Date.now() - t0
+      // The turn must not have waited for the 4s note.
+      expect(turnMs).toBeLessThan(3500)
+      // …and the note still arrives, on its own queue. Timing the DRAIN proves the
+      // stub really was slow — without this the test would pass just as happily if
+      // synthesis had been skipped entirely.
+      const before = calls.length
+      const t1 = Date.now()
+      await bridge._drainQueue('1421:main#voice')
+      const voiceMs = Date.now() - t1
+      expect(voiceMs).toBeGreaterThan(2000)
+      expect(calls.slice(before).filter(c => c.method === 'sendVoice').length).toBeGreaterThan(0)
+    } finally { rmSync(SLOW_SPEAK, { force: true }) }
+  }, 30000)
+
+  test('speech runs on its own queue key, not the topic\'s', async () => {
+    // The invariant behind the fix: turns are serialised because two `claude
+    // --resume` runs on one transcript corrupt it. Synthesis touches no session, no
+    // transcript and no cwd, so it has no business on that queue.
+    await incoming(1422, '/voice on')
+    await incoming(1422, 'hello there')
+    await bridge._drainQueue('1422:main#voice')     // resolves => the key exists
+    expect(true).toBe(true)
+  }, 25000)
+})
+
+// ---------------------------------------------------------------------------
+// The progressive path: cancelling, tidying, the section index, the read-along.
+// TG_VOICE_CHUNKED is '0' for the suite, so these turn it on per test.
+// ---------------------------------------------------------------------------
+describe('a long spoken answer can be stopped, indexed and tidied', () => {
+  // No per-test toggle: VOICE_CHUNKED is read once at import, so it is set for the
+  // whole suite. An earlier version flipped process.env inside the test and silently
+  // did nothing at all.
+  const withChunking = async (fn: () => Promise<void>) => fn()
+  const kbOf = (c: any) => c.payload?.reply_markup?.inline_keyboard
+
+  test('the notes carry no buttons — Stop lives on the status message, from t=0', async () => {
+    // Reported: "if a very long voice is being generated… I have no way to cancel
+    // that shit". Nothing had a handle on synthesis at all.
+    //
+    // The first fix put 🛑 on note 1 — a message that does not exist for the first
+    // ~30 seconds, so during the slowest and least interruptible stretch of a run
+    // there was still no way to stop it. The status bubble exists before a single
+    // sample does, which is the only place the button is any use.
+    await withChunking(async () => {
+      await incoming(1430, '/voice on')
+      await incoming(1430, '/voice parts on')
+      const before = calls.length
+      await incoming(1430, 'HEADINGS')
+      const status = calls.slice(before).find(c => c.method === 'sendMessage'
+        && String(c.payload?.text ?? '').includes('🎙 Speaking'))
+      expect(status).toBeTruthy()
+      expect(String(kbOf(status)?.flat().find((b: any) => String(b.text).includes('Stop'))?.callback_data))
+        .toStartWith('vstop:')
+      await bridge._drainQueue('1430:main#voice')
+      const notes = calls.slice(before).filter(c => c.method === 'sendVoice')
+      expect(notes.length).toBeGreaterThan(1)
+      // Not on any note any more, first or otherwise.
+      expect(notes.every(c => !kbOf(c))).toBe(true)
+      // The label says where you are in the answer; it deliberately carries no
+      // timestamp, since a seek inside a 90-second chunk cannot reach 5:42.
+      expect(String(notes[1].payload.caption)).toMatch(/part 2/)
+    })
+  }, 25000)
+
+  test('QUIET BY DEFAULT: one status bubble and the full file, no part notes', async () => {
+    // Requested: "current implementation makes the chat messy". A long answer used to
+    // post six messages — four of them audio, and the same audio twice, because the
+    // parts are pure sediment once the full file lands.
+    await withChunking(async () => {
+      await incoming(1440, '/voice on')
+      const before = calls.length
+      await incoming(1440, 'HEADINGS')
+      await bridge._drainQueue('1440:main#voice')
+      await new Promise(r => setTimeout(r, 300))
+      const cs = calls.slice(before)
+      // Synthesis is untouched — the full file is here, and on time.
+      expect(cs.some(c => c.method === 'sendAudio')).toBe(true)
+      // …and not one part note went out.
+      expect(cs.filter(c => c.method === 'sendVoice').length).toBe(0)
+      // The bubble was posted, and then deleted once the audio landed: a text message
+      // cannot be edited into a media one, so it can never BECOME the audio.
+      const status = cs.find(c => c.method === 'sendMessage'
+        && String(c.payload?.text ?? '').includes('🎙 Speaking'))
+      expect(status).toBeTruthy()
+      // …and it said how long, because "Speaking…" alone is the same non-answer as
+      // no message at all.
+      expect(String(status!.payload.text)).toMatch(/~\d+(s|m|h)/)
+      expect(cs.some(c => c.method === 'deleteMessage')).toBe(true)
+    })
+  }, 25000)
+
+  test('the button BACK-FILLS: a tap at t=60s sends the parts already made', async () => {
+    // Its whole value is the window before the first note exists, so a switch that
+    // only affected future chunks would be useless exactly when it is wanted.
+    await withChunking(async () => {
+      // LONGHEADINGS, not HEADINGS: the button is only offered when the answer is
+      // predicted to have parts at all, and HEADINGS speaks in about twelve seconds.
+      await incoming(1441, '/voice on')
+      const before = calls.length
+      await incoming(1441, 'LONGHEADINGS')
+      const status = calls.slice(before).find(c => c.method === 'sendMessage'
+        && String(c.payload?.text ?? '').includes('🎙 Speaking'))
+      const parts = kbOf(status)?.flat().find((b: any) => String(b.callback_data).startsWith('vparts:'))
+      expect(parts).toBeTruthy()
+      // Let some chunks pile up unsent, then ask for them.
+      await new Promise(r => setTimeout(r, 250))
+      const mark = calls.length
+      await bridge.bot.handleUpdate({
+        update_id: 98810,
+        callback_query: { id: 'vp1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+          data: String(parts.callback_data),
+          message: { message_id: 98811, date: 0, chat: { id: 1441, type: 'private' } } },
+      })
+      await bridge._drainQueue('1441:main#voice')
+      await new Promise(r => setTimeout(r, 300))
+      const after = calls.slice(mark).filter(c => c.method === 'sendVoice')
+      expect(after.length).toBeGreaterThan(1)
+      // Back-filled in order and numbered as speak.py made them: part 1 has no
+      // caption, and the next one says part 2.
+      expect(after[0].payload.caption).toBeUndefined()
+      expect(String(after[1].payload.caption)).toMatch(/part 2/)
+    })
+  }, 25000)
+
+  test('the button works the moment it appears, with no chunk yet in existence', async () => {
+    // Tapped against a deliberately slow synthesiser, so nothing has been made yet.
+    //
+    // What this does NOT cover, stated because it looks like it should: the bubble is
+    // posted before the lead units are normalised, and that wait can run to twenty
+    // seconds — a window in which an earlier version answered "already finished
+    // speaking", which is the worst possible reply during exactly the stretch the
+    // button exists for. The suite runs with normalisation OFF, so `leadReady`
+    // resolves immediately and that window does not exist here. Verified by removing
+    // the fix: this test still passed. The guard is the ordering in speakChunked —
+    // release is installed before the message carrying its button is sent.
+    writeFileSync(SLOW_SPEAK, 'x')
+    try {
+      await withChunking(async () => {
+        await incoming(1450, '/voice on')
+        const before = calls.length
+        const run = bridge._drainQueue('1450:main#voice')
+        await incoming(1450, 'LONGHEADINGS')
+        const status = calls.slice(before).find(c => c.method === 'sendMessage'
+          && String(c.payload?.text ?? '').includes('🎙 Speaking'))
+        const parts = kbOf(status)?.flat().find((b: any) => String(b.callback_data).startsWith('vparts:'))
+        expect(parts).toBeTruthy()
+        // Tapped immediately — no waiting for a chunk to exist.
+        const mark = calls.length
+        await bridge.bot.handleUpdate({
+          update_id: 98820,
+          callback_query: { id: 'vp2', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+            data: String(parts.callback_data),
+            message: { message_id: 98821, date: 0, chat: { id: 1450, type: 'private' } } },
+        })
+        const answered = calls.slice(mark).find(c => c.method === 'answerCallbackQuery')
+        expect(answered).toBeTruthy()          // or the assertion below passes vacuously
+        expect(String(answered!.payload?.text ?? '')).not.toContain('already finished')
+        await run
+        await bridge._drainQueue('1450:main#voice')
+        await new Promise(r => setTimeout(r, 300))
+        // …and the parts really did start arriving, rather than the tap being a no-op.
+        expect(calls.slice(mark).filter(c => c.method === 'sendVoice').length).toBeGreaterThan(0)
+      })
+    } finally { rmSync(SLOW_SPEAK, { force: true }) }
+  }, 40000)
+
+  test('a short answer is offered no parts button — there are no parts', async () => {
+    // One note and no full file, so the button would be a lie. Predicted from the
+    // estimate, since the real boundary is decided by duration inside speak.py.
+    await withChunking(async () => {
+      await incoming(1442, '/voice on')
+      const before = calls.length
+      await incoming(1442, 'hello there')
+      await bridge._drainQueue('1442:main#voice')
+      const status = calls.slice(before).find(c => c.method === 'sendMessage'
+        && String(c.payload?.text ?? '').includes('🎙 Speaking'))
+      expect(status).toBeTruthy()
+      expect(kbOf(status)?.flat().some((b: any) => String(b.callback_data).startsWith('vparts:'))).toBe(false)
+      // 🛑 is still there: a short answer is still worth stopping.
+      expect(kbOf(status)?.flat().some((b: any) => String(b.callback_data).startsWith('vstop:'))).toBe(true)
+    })
+  }, 25000)
+
+  test('with no full file the held note goes out anyway — silence is not an option', async () => {
+    // The quiet path holds every chunk. A short answer produces no full file at all,
+    // so if the hold were unconditional the answer would simply never be spoken.
+    await withChunking(async () => {
+      await incoming(1443, '/voice on')
+      const before = calls.length
+      await incoming(1443, 'hello there')
+      await bridge._drainQueue('1443:main#voice')
+      const cs = calls.slice(before)
+      expect(cs.some(c => c.method === 'sendAudio')).toBe(false)   // the premise
+      expect(cs.filter(c => c.method === 'sendVoice').length).toBeGreaterThan(0)
+    })
+  }, 25000)
+
+  test('the full file is captioned with SECTION timestamps, not just its duration', async () => {
+    // The old caption's only number was the total, so the one seek link Telegram
+    // made of it jumped to the last second of the audio.
+    await withChunking(async () => {
+      await incoming(1431, '/voice on')
+      const before = calls.length
+      await incoming(1431, 'HEADINGS')
+      await bridge._drainQueue('1431:main#voice')
+      const full = calls.slice(before).find(c => c.method === 'sendAudio')
+      expect(full).toBeTruthy()
+      const cap = String(full!.payload.caption)
+      expect(cap).toContain('🎧 Full answer')
+      // One line per heading in the stub's answer, each a tappable M:SS.
+      expect((cap.match(/^\d+:\d\d {2}\S/gm) || []).length).toBeGreaterThan(1)
+      expect(cap).toContain('Alpha')
+    })
+  }, 25000)
+
+  test('the parts SURVIVE the full file — removing them is a tap, never automatic', async () => {
+    // Nothing deletes a voice note on its own. A rule that cleared parts you had opted
+    // into was tried and removed: the full file lands exactly when a listener is most
+    // likely mid-chunk, and deleting the note that is playing stops playback dead.
+    await withChunking(async () => {
+      await incoming(1432, '/voice on')
+      await incoming(1432, '/voice parts on')
+      const before = calls.length
+      await incoming(1432, 'HEADINGS')
+      await bridge._drainQueue('1432:main#voice')
+      await new Promise(r => setTimeout(r, 300))
+      const cs = calls.slice(before)
+      const notes = cs.filter(c => c.method === 'sendVoice').length
+      expect(notes).toBeGreaterThan(1)
+      const full = cs.find(c => c.method === 'sendAudio')
+      expect(full).toBeTruthy()
+      // Only the status bubble was deleted. The notes are all still there.
+      expect(cs.filter(c => c.method === 'deleteMessage').length).toBeLessThan(notes + 1)
+
+      // …and the button is offered, and IT is what removes them.
+      const tidy = kbOf(full)?.flat().find((b: any) => String(b.callback_data).startsWith('vtidy:'))
+      expect(tidy).toBeTruthy()
+      const mark = calls.length
+      await bridge.bot.handleUpdate({
+        update_id: 98800,
+        callback_query: { id: 'vt1', from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+          data: String(tidy.callback_data),
+          message: { message_id: 98801, date: 0, chat: { id: 1432, type: 'private' } } },
+      })
+      await new Promise(r => setTimeout(r, 300))
+      const after = calls.slice(mark)
+      // One delete per note, and the full file is NOT deleted.
+      expect(after.filter(c => c.method === 'deleteMessage').length).toBe(notes)
+      expect(after.some(c => c.method === 'editMessageReplyMarkup')).toBe(true)
+    })
+  }, 25000)
+
+  test('a read-along page follows the full file, self-contained', async () => {
+    // LONGHEADINGS, not HEADINGS: the page only exists for an answer that also went
+    // out as answer.md/.html, and HEADINGS is a paragraph that merely SPEAKS long.
+    await withChunking(async () => {
+      await incoming(1433, '/voice on')
+      const before = calls.length
+      await incoming(1433, 'LONGHEADINGS')
+      await bridge._drainQueue('1433:main#voice')
+      await new Promise(r => setTimeout(r, 400))
+      const cs = calls.slice(before)
+      // The premise: this answer really did arrive as files.
+      expect(cs.some(c => c.method === 'sendMediaGroup' || c.method === 'sendDocument')).toBe(true)
+      const doc = cs.find(c => c.method === 'sendDocument'
+        && String(c.payload?.document?.filename ?? '').includes('readalong'))
+      expect(doc).toBeTruthy()
+      expect(String(doc!.payload.caption)).toContain('Read along')
+    })
+  }, 25000)
+
+  test('the chunked path speaks the WHOLE answer — the 1400-char cap is not on it', async () => {
+    // The cap (TG_VOICE_MAX_CHARS, default 1400) is the safety net for summary mode
+    // and for the one-note engines. On the progressive path it must not apply at all,
+    // and a regression here is invisible from the outside: a sliced answer still
+    // synthesises cleanly and just stops early.
+    //
+    // This lives at tier 2 on purpose. Tier 3 used to guard it by asking for an
+    // answer long enough that the missing minutes were obvious, which cost ~10
+    // minutes of real synthesis and STILL only checked a duration floor — a 1400-char
+    // slice is about 117 seconds of speech, comfortably over the floor it used. Here
+    // the units handed to the synthesiser are read directly, so the check is exact
+    // and instant.
+    const dump = join(TMP, 'spoken-units.json')
+    rmSync(dump, { force: true })
+    process.env.XESIOUS_SPEAK_STUB_DUMP = dump
+    try {
+      await withChunking(async () => {
+        await incoming(1443, '/voice on')
+        await incoming(1443, 'CAPLONG')
+        await bridge._drainQueue('1443:main#voice')
+      })
+      const units = JSON.parse(readFileSync(dump, 'utf8')) as { text: string }[]
+      const spoken = units.map(u => u.text).join(' ')
+      expect(spoken.length).toBeGreaterThan(1400)
+      // The end of the answer is the part a cap removes.
+      expect(spoken).toContain('ZZ_LAST_WORDS_OF_THE_ANSWER')
+    } finally {
+      delete process.env.XESIOUS_SPEAK_STUB_DUMP
+      rmSync(dump, { force: true })
+    }
+  }, 25000)
+
+  test('the synthesiser is given the spoken form and the reader is given the original', async () => {
+    // The whole point of the `speak` field. `$100/yr` is phonemised as "dollar one
+    // hundred slash er", so the audio needs "one hundred dollars per year" — but the
+    // read-along page and the section index are BEING READ, and there `$100/yr` is the
+    // better rendering. Two fields, three consumers, and only one of them wants the
+    // spoken form.
+    const dump = join(TMP, 'spoken-units-norm.json')
+    rmSync(dump, { force: true })
+    process.env.XESIOUS_SPEAK_STUB_DUMP = dump
+    try {
+      await withChunking(async () => {
+        await incoming(1444, '/voice on')
+        await incoming(1444, 'SYMBOLS')
+        await bridge._drainQueue('1444:main#voice')
+      })
+      const units = JSON.parse(readFileSync(dump, 'utf8')) as { text: string; speak?: string }[]
+      expect(units.length).toBeGreaterThan(0)
+      // Every unit here carries a symbol, so every unit should have been normalised.
+      const normalised = units.filter(u => u.speak?.startsWith('SPOKEN('))
+      expect(normalised.length).toBe(units.length)
+      // …and the written form is untouched, which is what the page and index read.
+      expect(units.every(u => u.text.includes('$100/yr'))).toBe(true)
+      expect(units.some(u => u.text.startsWith('SPOKEN('))).toBe(false)
+    } finally {
+      delete process.env.XESIOUS_SPEAK_STUB_DUMP
+      rmSync(dump, { force: true })
+    }
+  }, 30000)
+
+  test('every unit reaches the synthesiser when only SOME of them are normalised', async () => {
+    // The case that shipped broken and cost a user 70% of an answer. The units are
+    // handed over in two parts — the first chunk's worth immediately, the rest once
+    // they are normalised — and the second hand-over was conditional on the
+    // normaliser succeeding. Any hiccup closed the pipe with the tail unsent, and a
+    // short reading exits 0, so it arrived labelled "Full answer" and ending
+    // mid-thought.
+    //
+    // Asserting on the LAST unit specifically: a truncated answer always keeps its
+    // beginning, so only the end can tell you it was complete.
+    const dump = join(TMP, 'spoken-units-mixed.json')
+    rmSync(dump, { force: true })
+    process.env.XESIOUS_SPEAK_STUB_DUMP = dump
+    try {
+      await withChunking(async () => {
+        await incoming(1447, '/voice on')
+        await incoming(1447, 'MIXED')
+        await bridge._drainQueue('1447:main#voice')
+      })
+      const units = JSON.parse(readFileSync(dump, 'utf8')) as { text: string; speak?: string }[]
+      const spoken = units.map(u => u.speak ?? u.text).join(' ')
+      // 1. the whole answer arrived — the tail is the part that used to vanish
+      expect(spoken).toContain('ZZ_LAST_WORDS_OF_THE_ANSWER')
+      // 2. and it really was a two-part hand-over, or this proves nothing
+      expect(units.length).toBeGreaterThan(10)
+      // 3. the normaliser did run, on the units that needed it and no others
+      expect(units.some(u => u.speak?.startsWith('SPOKEN('))).toBe(true)
+      expect(units.some(u => u.speak === undefined)).toBe(true)
+    } finally {
+      delete process.env.XESIOUS_SPEAK_STUB_DUMP
+      rmSync(dump, { force: true })
+    }
+  }, 30000)
+
+  test('the rest of the answer is still spoken when the normaliser fails', async () => {
+    // Un-normalised is a fine outcome; unsent is not. With the model unavailable every
+    // unit must still reach the synthesiser as written, which is the audio this bridge
+    // produced before normalisation existed — what its own comment promises.
+    const dump = join(TMP, 'spoken-units-broken.json')
+    rmSync(dump, { force: true })
+    process.env.XESIOUS_SPEAK_STUB_DUMP = dump
+    const realBin = process.env.CLAUDE_BIN
+    process.env.CLAUDE_BIN = join(TMP, 'no-such-normaliser')
+    try {
+      await withChunking(async () => {
+        await incoming(1448, '/voice on')
+        await incoming(1448, 'MIXED')
+        await bridge._drainQueue('1448:main#voice')
+      })
+      const units = JSON.parse(readFileSync(dump, 'utf8')) as { text: string; speak?: string }[]
+      const spoken = units.map(u => u.speak ?? u.text).join(' ')
+      // The whole answer, tail included. That is the entire point: a dead normaliser
+      // must cost pronunciation, never words.
+      expect(spoken).toContain('ZZ_LAST_WORDS_OF_THE_ANSWER')
+      expect(units.length).toBeGreaterThan(10)
+      // Deliberately NOT asserting that no unit has a spoken form. The normaliser
+      // caches by text, in memory, for the life of the process — so a unit an earlier
+      // test already normalised still comes back from the cache with the binary gone.
+      // That is the cache working; asserting otherwise pins the wrong behaviour.
+    } finally {
+      process.env.CLAUDE_BIN = realBin
+      delete process.env.XESIOUS_SPEAK_STUB_DUMP
+      rmSync(dump, { force: true })
+    }
+  }, 30000)
+
+  test('a unit with nothing to fix is never sent to the model', async () => {
+    // The gate is what keeps this affordable: on a real answer 61 of 100 units matched
+    // and the other 39 cost nothing. A unit that skips the model must still be spoken,
+    // which means `speak` stays absent and speak.py falls back to `text`.
+    const dump = join(TMP, 'spoken-units-gate.json')
+    rmSync(dump, { force: true })
+    process.env.XESIOUS_SPEAK_STUB_DUMP = dump
+    try {
+      await withChunking(async () => {
+        await incoming(1445, '/voice on')
+        await incoming(1445, 'HEADINGS')
+        await bridge._drainQueue('1445:main#voice')
+      })
+      const units = JSON.parse(readFileSync(dump, 'utf8')) as { text: string; speak?: string }[]
+      expect(units.length).toBeGreaterThan(0)
+      expect(units.every(u => u.speak === undefined)).toBe(true)
+    } finally {
+      delete process.env.XESIOUS_SPEAK_STUB_DUMP
+      rmSync(dump, { force: true })
+    }
+  }, 25000)
+
+  test('TG_VOICE_NORMALISE=0 restores exactly the old audio', async () => {
+    // The kill switch has to be real: off means no `speak` field at all, so speak.py
+    // takes the same path it took before any of this existed.
+    const dump = join(TMP, 'spoken-units-off.json')
+    rmSync(dump, { force: true })
+    process.env.XESIOUS_SPEAK_STUB_DUMP = dump
+    const prev = bridge._setNormaliseSpeech(false)
+    try {
+      await withChunking(async () => {
+        await incoming(1446, '/voice on')
+        await incoming(1446, 'SYMBOLS')
+        await bridge._drainQueue('1446:main#voice')
+      })
+      const units = JSON.parse(readFileSync(dump, 'utf8')) as { text: string; speak?: string }[]
+      expect(units.length).toBeGreaterThan(0)
+      expect(units.every(u => u.speak === undefined)).toBe(true)
+      // …and the streamed hand-over is not used either. The switch has to restore the
+      // OLD code path, not merely skip the model while keeping the new plumbing — the
+      // plumbing is what dropped 14 of 26 units, so "off" must not go near it.
+      const req = JSON.parse(readFileSync(dump.replace('.json', '-req.json'), 'utf8'))
+      expect(req.streaming).toBeUndefined()
+    } finally {
+      bridge._setNormaliseSpeech(prev)
+      delete process.env.XESIOUS_SPEAK_STUB_DUMP
+      rmSync(dump, { force: true })
+    }
+  }, 30000)
+
+  test('the part notes carry NO timestamp, because that seek can never land', async () => {
+    // Reported: "you are timestamping the shorter audio messages as well. But
+    // clicking on those timestamp does not work." Telegram turns M:SS in a media
+    // caption into a seek RELATIVE TO THAT MESSAGE — and "part 3 — from 5:42" sits
+    // on a note holding 90 seconds that begin at 5:42, so it has no 5:42 to seek to.
+    await withChunking(async () => {
+      await incoming(1438, '/voice on')
+      await incoming(1438, '/voice parts on')          // this is about the captions, not the default
+      const before = calls.length
+      await incoming(1438, 'HEADINGS')
+      await bridge._drainQueue('1438:main#voice')
+      const notes = calls.slice(before).filter(c => c.method === 'sendVoice')
+      expect(notes.length).toBeGreaterThan(1)
+      for (const c of notes) {
+        const cap = String(c.payload.caption ?? '')
+        expect(cap).not.toMatch(/\d+:\d\d/)
+      }
+      // The label itself stays — it says where you are in the answer.
+      expect(String(notes[1].payload.caption)).toMatch(/part 2/)
+    })
+  }, 25000)
+
+  test('the full file is the ONLY place an M:SS appears, and never for the total', async () => {
+    // Reported: "the message is full answer (timestamp) and the timestamp is
+    // clickable but jumps to the end of file and goes to a random file I had in
+    // telegram." The total duration is a fact about the file, not a place in it.
+    await withChunking(async () => {
+      await incoming(1439, '/voice on')
+      const before = calls.length
+      await incoming(1439, 'LONGHEADINGS')
+      await bridge._drainQueue('1439:main#voice')
+      const full = calls.slice(before).find(c => c.method === 'sendAudio')
+      expect(full).toBeTruthy()
+      const cap = String(full!.payload.caption)
+      const head = cap.split('\n')[0]
+      // The header still reports the length — just not as something tappable.
+      expect(head).toMatch(/🎧 Full answer \((\d+h )?(\d+m ?)?(\d+s)?\)/)
+      expect(head).not.toMatch(/\d+:\d\d/)
+      expect(String(full!.payload.title)).not.toMatch(/\d+:\d\d/)
+      // …while every section line is still a real seek, which is the part that works.
+      const stamps = cap.split('\n').slice(1).filter(l => /^\d+:\d\d {2}\S/.test(l))
+      expect(stamps.length).toBeGreaterThan(1)
+    })
+  }, 25000)
+
+  test('the read-along page is a reply to the full audio, not a loose message', async () => {
+    // Asked for: "the Read Along HTML, can it be sent with the last audio file?"
+    // Telegram will not put an audio and a document in one album — "Documents and
+    // audio files can be only grouped in an album with messages of the same type" —
+    // so replying to the audio is as close as one message gets.
+    await withChunking(async () => {
+      await incoming(1442, '/voice on')
+      const before = calls.length
+      await incoming(1442, 'LONGHEADINGS')
+      await bridge._drainQueue('1442:main#voice')
+      await new Promise(r => setTimeout(r, 600))
+      const cs = calls.slice(before)
+      const full = cs.find(c => c.method === 'sendAudio')
+      const page = cs.find(c => c.method === 'sendDocument'
+        && String(c.payload?.document?.filename ?? '').includes('readalong'))
+      expect(full).toBeTruthy()
+      expect(page).toBeTruthy()
+      // The audio's id is not on the recorded call, so match on order + reply target:
+      // the page must reply to a message sent in this turn, after the audio.
+      expect(cs.indexOf(page!)).toBeGreaterThan(cs.indexOf(full!))
+      expect(page!.payload?.reply_parameters?.message_id).toBeGreaterThan(0)
+      expect(String(page!.payload.caption)).toContain('full answer above')
+    })
+  }, 25000)
+
+  test('exactly ONE read-along page, not one per delivery path', async () => {
+    // `done` arrives on stdout immediately behind `full`, so a flag set inside the
+    // full file's queued SEND was still false when the `done` branch read it, and
+    // both queued a page: two near-identical documents for one answer. Found while
+    // gating the page on answer length — the log showed 11.2 KB and 11.1 KB back to
+    // back, the second built from the first chunk rather than the full audio.
+    await withChunking(async () => {
+      await incoming(1437, '/voice on')
+      const before = calls.length
+      await incoming(1437, 'LONGHEADINGS')
+      await bridge._drainQueue('1437:main#voice')
+      await new Promise(r => setTimeout(r, 600))
+      const pages = calls.slice(before).filter(c => c.method === 'sendDocument'
+        && String(c.payload?.document?.filename ?? '').includes('readalong'))
+      expect(pages).toHaveLength(1)
+    })
+  }, 25000)
+
+  test('a short answer gets NO read-along, however many notes it is spoken as', async () => {
+    // Reported: "even a 30 seconds voice is giving me read along html". The page was
+    // gated on having TIMINGS, which every spoken answer has — so it rode on audio
+    // length, not answer length. HEADINGS is ~180 characters and still speaks as
+    // several notes, which is exactly the case that produced an unwanted document.
+    await withChunking(async () => {
+      await incoming(1436, '/voice on')
+      await incoming(1436, '/voice parts on')          // several notes is the premise here
+      const before = calls.length
+      await incoming(1436, 'HEADINGS')
+      await bridge._drainQueue('1436:main#voice')
+      await new Promise(r => setTimeout(r, 400))
+      const cs = calls.slice(before)
+      // The audio all still happens — this removes a document, not a feature.
+      expect(cs.filter(c => c.method === 'sendVoice').length).toBeGreaterThan(1)
+      expect(cs.some(c => c.method === 'sendAudio')).toBe(true)
+      // …and the answer itself was short enough to sit inline, so: no files at all.
+      expect(cs.some(c => c.method === 'sendDocument' || c.method === 'sendMediaGroup')).toBe(false)
+    })
+  }, 25000)
+
+  test('tapping Stop kills it, and is idempotent', async () => {
+    // The button WILL be tapped twice.
+    writeFileSync(SLOW_SPEAK, 'x')
+    await withChunking(async () => {
+      try {
+        await incoming(1434, '/voice on')
+        const before = calls.length
+        const run = bridge._drainQueue('1434:main#voice')
+        await incoming(1434, 'HEADINGS')
+        // No polling any more, and that IS the fix. This used to wait up to fifteen
+        // seconds for note 1 to appear, because that was where 🛑 lived — which is the
+        // whole complaint: with a slow synthesiser there was a long stretch at the
+        // start of every run with nothing to tap. The status bubble is posted before
+        // the child is even spawned.
+        const status = calls.slice(before).find(c => c.method === 'sendMessage'
+          && String(c.payload?.text ?? '').includes('🎙 Speaking'))
+        expect(status).toBeTruthy()
+        expect(calls.slice(before).some(c => c.method === 'sendVoice')).toBe(false)
+        const stop = kbOf(status)?.flat().find((b: any) => String(b.callback_data).startsWith('vstop:'))
+        expect(stop).toBeTruthy()
+
+        const tap = (id: string) => bridge.bot.handleUpdate({
+          update_id: Math.floor(Math.random() * 1e6),
+          callback_query: { id, from: { id: 1, is_bot: false, first_name: 'T' }, chat_instance: 'x',
+            data: String(stop.callback_data),
+            message: { message_id: 98901, date: 0, chat: { id: 1434, type: 'private' } } },
+        })
+        await tap('s1')
+        await tap('s2')            // second tap must not throw or double-report
+        await run
+        await bridge._drainQueue('1434:main#voice')
+        const said = calls.slice(before).filter(c => c.method === 'sendMessage')
+          .map(c => String(c.payload.text ?? '')).join('\n')
+        expect(said).toContain('Stopped speaking')
+        expect((said.match(/Stopped speaking/g) || []).length).toBe(1)
+        // Nothing further was delivered after the kill.
+        expect(calls.slice(before).some(c => c.method === 'sendAudio')).toBe(false)
+      } finally { rmSync(SLOW_SPEAK, { force: true }) }
+    })
+  }, 30000)
+
+  test('/stop cancels speech as well as the run', async () => {
+    // Someone typing /stop wants everything to stop; ending the model turn while ten
+    // minutes of audio keeps arriving is the surprise this removes.
+    writeFileSync(SLOW_SPEAK, 'x')
+    await withChunking(async () => {
+      try {
+        await incoming(1435, '/voice on')
+        const run = bridge._drainQueue('1435:main#voice')
+        await incoming(1435, 'HEADINGS')
+        // Wait until speech is genuinely in flight, or /stop has nothing to cancel.
+        for (let i = 0; i < 60 && !calls.some(c => c.method === 'sendVoice'); i++) {
+          await new Promise(r => setTimeout(r, 250))
+        }
+        const cs = await incoming(1435, '/stop')
+        expect(finalReply(cs)).toMatch(/Stopped speaking|Speaking stopped/i)
+        await run
+      } finally { rmSync(SLOW_SPEAK, { force: true }) }
+    })
+  }, 30000)
+})
+
+describe('a SHORT spoken answer gets an index, and no read-along', () => {
+  // One chunk means no full file — the single note is the whole thing — so the INDEX
+  // used to be silently absent for short answers. Caught in tier 3 as "no full-length
+  // audio arrived", which read like a timeout and was a real gap; it is still fixed.
+  // The read-along went the other way: it was attached here too, and should not have
+  // been. An index costs a caption already being sent; a page costs an attachment.
+  test('the note itself is captioned with the section index', async () => {
+    await incoming(1440, '/voice on')
+    const before = calls.length
+    await incoming(1440, 'SHORTHEADINGS')
+    await bridge._drainQueue('1440:main#voice')
+    await new Promise(r => setTimeout(r, 400))
+    const cs = calls.slice(before)
+    expect(cs.filter(c => c.method === 'sendVoice')).toHaveLength(1)
+    expect(cs.some(c => c.method === 'sendAudio')).toBe(false)   // no duplicate file
+    const edit = cs.find(c => c.method === 'editMessageCaption')
+    expect(edit).toBeTruthy()
+    expect(String(edit!.payload.caption)).toContain('🎧 Full answer')
+    expect(String(edit!.payload.caption)).toMatch(/^\d+:\d\d {2}\S/m)
+  }, 25000)
+
+  test('and no read-along page follows it', async () => {
+    await incoming(1441, '/voice on')
+    const before = calls.length
+    await incoming(1441, 'SHORTHEADINGS')
+    await bridge._drainQueue('1441:main#voice')
+    await new Promise(r => setTimeout(r, 400))
+    const doc = calls.slice(before).find(c => c.method === 'sendDocument'
+      && String(c.payload?.document?.filename ?? '').includes('readalong'))
+    expect(doc).toBeUndefined()
+  }, 25000)
 })

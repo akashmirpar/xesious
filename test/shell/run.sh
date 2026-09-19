@@ -358,5 +358,85 @@ if command -v tmux >/dev/null 2>&1; then
 fi
 
 echo
+echo "== voice/setup.sh installs without root, and never aborts on an optional step =="
+# The reported bug: the script opened by apt-installing ffmpeg under `set -e`, so a
+# box with no sudo died on line one and installed NOTHING — not faster-whisper, not
+# Kokoro, neither of which needs a system package. "Switch to root" was the only way
+# through, and on a VPS that is a different account with a different pip prefix.
+VS="$ROOT/voice/setup.sh"
+
+# A PATH with no ffmpeg, no sudo, and an apt-get that fails the way an unprivileged
+# box fails: this is the exact shape that used to abort at step 1.
+VBIN="$TMP/vbin"; mkdir -p "$VBIN"
+for b in bash sh env cat echo mktemp rm mv ln mkdir dirname pwd id curl printf grep sed head tail cut python3 timeout; do
+  p="$(command -v "$b" 2>/dev/null)" && ln -sf "$p" "$VBIN/$b"
+done
+printf '#!/bin/sh\necho "E: Could not open lock file (13: Permission denied)" >&2\nexit 100\n' > "$VBIN/apt-get"
+chmod +x "$VBIN/apt-get"
+
+bash -n "$VS" && ok "setup.sh parses" || no "setup.sh has a syntax error"
+bash -n "$ROOT/voice/tts.sh" && ok "tts.sh parses" || no "tts.sh has a syntax error"
+
+# `set -e` must NOT be in force: one optional failure aborting the required steps is
+# the entire bug. Asserted on the source, because the behaviour it causes is exactly
+# what this box can no longer reproduce now that ffmpeg is installed.
+if grep -qE '^set -[a-z]*e' "$VS"; then
+  no "setup.sh still uses 'set -e' — one optional failure will abort the whole install"
+else
+  ok "setup.sh does not abort on the first failing step"
+fi
+
+# The pip entry point. `pip3` is a PATH-resolved console script that may belong to a
+# different interpreter, and it commonly lives in ~/.local/bin, which sudo drops —
+# so "switch to root" is what REMOVES pip. `python3 -m pip` is the same interpreter
+# by construction.
+if grep -qE '(^|[^-])\bpip3 install' "$VS"; then
+  no "setup.sh still installs via the pip3 console script"
+else
+  ok "setup.sh installs with python3 -m pip, not the pip3 script"
+fi
+
+# --break-system-packages must never be used WITHOUT --user: that aims the retry at
+# system site-packages, which as root damages the distro's Python.
+if grep -q 'break-system-packages' "$VS" && ! grep -q 'PIP_ARGS\[@\]}" --break-system-packages' "$VS"; then
+  no "--break-system-packages is used without preserving --user"
+else
+  ok "--break-system-packages keeps --user, so nothing is written system-wide"
+fi
+
+# --check must report honestly and change nothing.
+# grep, not has(): has() requires the needle to be space-delimited and these are
+# line-initial labels.
+CHECK_OUT="$(cd "$ROOT" && env PATH="$VBIN" HOME="$HOME" bash "$VS" --check 2>&1)"
+echo "$CHECK_OUT" | grep -qE '^ffmpeg +: MISSING' \
+  && ok "--check reports the ffmpeg it cannot find" \
+  || no "--check did not report the missing ffmpeg — got: $CHECK_OUT"
+# The two halves fail independently — a missing ffmpeg breaks only OUTBOUND voice —
+# so a check that collapsed them into one verdict would send you hunting the wrong one.
+echo "$CHECK_OUT" | grep -q 'faster-whisper (STT)' \
+  && echo "$CHECK_OUT" | grep -q 'kokoro-onnx    (TTS)' \
+  && ok "--check reports listening and speaking separately" \
+  || no "--check does not separate STT from TTS — got: $CHECK_OUT"
+# It must change nothing.
+echo "$CHECK_OUT" | grep -q 'installing' \
+  && no "--check installed something instead of only reporting" \
+  || ok "--check changes nothing"
+
+# An unknown flag warns instead of aborting — the old script silently ignored a
+# second flag and `set -e` made any surprise fatal.
+BOGUS="$(cd "$ROOT" && bash "$VS" --bogus --check 2>&1)"
+has "an unknown flag warns rather than aborting" "$BOGUS" "unknown option --bogus"
+
+# tts.sh must RESOLVE ffmpeg rather than assume it, and say so when it cannot —
+# a bare 127 reached the user as silence.
+if grep -q 'TG_FFMPEG' "$ROOT/voice/tts.sh"; then
+  ok "tts.sh resolves ffmpeg through an override and a private copy"
+else
+  no "tts.sh still calls ffmpeg unconditionally"
+fi
+NOFF="$(cd "$ROOT" && echo hi | env PATH="$VBIN" HOME="$HOME" bash "$ROOT/voice/tts.sh" "$TMP/x.ogg" 2>&1; true)"
+has "tts.sh names the missing ffmpeg instead of failing blank" "$NOFF" "no ffmpeg"
+
+echo
 echo "-- $PASS passed, $FAIL failed --"
 [ "$FAIL" -eq 0 ]

@@ -86,7 +86,11 @@ done
 grep -q 'polling Telegram' "$LOG" || { echo "[staging] bridge never reached 'polling Telegram':" >&2; tail -20 "$LOG" >&2; exit 1; }
 
 echo "[staging] bridge up — running driver…"
-python3 test/staging/driver.py
+# -u: unbuffered. Python block-buffers stdout when it is a pipe or a file, so a run
+# redirected to a log went dark for its whole length and every case result arrived at
+# once at the end — which is indistinguishable from a hung run in a tier where a
+# single case legitimately takes minutes.
+python3 -u test/staging/driver.py
 RC=$?
 echo "[staging] driver exit=$RC"
 exit $RC
