@@ -1756,6 +1756,14 @@ function synthesize(text: string, ogg: string, key?: string): Promise<string | n
 // A stateless fast-model pass that turns a full answer into a couple of spoken
 // sentences. It never --resumes the topic session, so it can't pollute or rebind
 // it, and runs read-only (plan) so it can't touch anything.
+// These stateless passes only rewrite text — they need NO tools. Disallowing them
+// closes an exfiltration path: the answer text is untrusted (it can quote web/file/
+// tool output carrying a prompt injection), and without this the pass — spawned in
+// HERE, next to .env — could be steered to Read ./.env and speak/return its contents.
+// disallowedTools overrides any operator allowlist; kept separate from plan mode,
+// which George dropped for producing meta-commentary.
+const STATELESS_NOTOOLS = ['--disallowedTools', 'Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'Task', 'NotebookEdit']
+
 function summarizeForSpeech(answer: string): Promise<string> {
   const prompt =
     'Rewrite the following assistant reply as a SHORT spoken summary for text-to-speech: ' +
@@ -1766,7 +1774,7 @@ function summarizeForSpeech(answer: string): Promise<string> {
     // No plan mode here either: the same shape as normaliseUnit, and the same reason —
     // there is nothing to plan about rewriting one reply into three sentences, and plan
     // mode is what produces a preamble about whether planning is needed.
-    const args = ['-p', prompt, '--output-format', 'json', '--model', VOICE_SUMMARY_MODEL]
+    const args = ['-p', prompt, '--output-format', 'json', '--model', VOICE_SUMMARY_MODEL, ...STATELESS_NOTOOLS]
     const child = spawn(CLAUDE_BIN, args, { cwd: HERE, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
     let out = ''
     child.stdout.on('data', d => (out += d))
@@ -1886,7 +1894,7 @@ function normaliseUnit(text: string): Promise<string> {
     // and it was worst on faithfulness (4/108 against 1/108). Dropping plan mode also
     // takes ~2s off the median call.
     const args = ['-p', `${NORMALISE_PROMPT}\n\n<line>\n${text}\n</line>`, '--output-format', 'json',
-                  '--model', NORMALISE_MODEL]
+                  '--model', NORMALISE_MODEL, ...STATELESS_NOTOOLS]
     // cwd: HERE and no --resume, for the reason summarizeForSpeech gives: a stateless
     // pass must not be able to touch or rebind the topic's session.
     const child = spawn(CLAUDE_BIN, args, { cwd: HERE, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })

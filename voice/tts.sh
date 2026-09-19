@@ -40,7 +40,7 @@ if [ -z "$FFMPEG" ]; then
   exit 4
 fi
 
-tmp="$(mktemp /tmp/tts-XXXX.wav)"
+tmp="$(mktemp /tmp/tts-XXXXXXXXXX.wav)"
 trap 'rm -f "$tmp"' EXIT
 
 case "$ENGINE" in
@@ -60,12 +60,12 @@ sys.stdout.write(json.dumps({"units":[{"text":sys.stdin.read(),"gap":0.0}],"out"
     else
       command -v espeak-ng >/dev/null 2>&1 || {
         echo "tts.sh: no TTS engine — piper is unconfigured and espeak-ng is not installed. Run voice/setup.sh." >&2; exit 5; }
-      espeak-ng -v "${TG_ESPEAK_VOICE:-en}" -s "${TG_ESPEAK_WPM:-165}" "$TEXT" -w "$tmp" >/dev/null 2>&1
+      espeak-ng -v "${TG_ESPEAK_VOICE:-en}" -s "${TG_ESPEAK_WPM:-165}" -w "$tmp" -- "$TEXT" >/dev/null 2>&1
     fi ;;
   espeak)
     command -v espeak-ng >/dev/null 2>&1 || {
       echo "tts.sh: TG_TTS_ENGINE=espeak but espeak-ng is not installed. Run voice/setup.sh --espeak." >&2; exit 5; }
-    espeak-ng -v "${TG_ESPEAK_VOICE:-en}" -s "${TG_ESPEAK_WPM:-165}" "$TEXT" -w "$tmp" >/dev/null 2>&1 ;;
+    espeak-ng -v "${TG_ESPEAK_VOICE:-en}" -s "${TG_ESPEAK_WPM:-165}" -w "$tmp" -- "$TEXT" >/dev/null 2>&1 ;;
   *)
     echo "tts.sh: unknown TG_TTS_ENGINE '$ENGINE'" >&2; exit 3 ;;
 esac
