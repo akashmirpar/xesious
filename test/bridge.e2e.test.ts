@@ -13,7 +13,7 @@ import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 
 // --- Env must be set BEFORE bridge.ts is imported (it reads config at module load).
 const TMP = mkdtempSync(join(tmpdir(), 'xesious-e2e-'))
@@ -1323,25 +1323,31 @@ describe('/fork — a second topic on the same conversation and the same directo
     expect([...ids]).toEqual([ce.sessionId])
   })
 
-  test('a topic sharing its directory gets its own inbox and outbox, and is told', async () => {
-    // "Put it in ./outbox/" is a race once two topics drain one directory: whoever
-    // finishes a run first delivers the other's file into the wrong conversation.
+  test('a topic sharing its directory gets its own inbox and outbox, told via the SYSTEM PROMPT', async () => {
     const all: any = bridge._sessions()
     const parentKey = '-100777:4242'
     const [childKey]: any = Object.entries(all).find(([k, v]: any) =>
       k.startsWith('-100777:') && k !== parentKey && v.cwd === all[parentKey].cwd)!
-    expect(bridge._boxDir(all[parentKey].cwd, parentKey, 'outbox'))
-      .not.toBe(bridge._boxDir(all[parentKey].cwd, childKey, 'outbox'))
-
-    // And the model is told, every turn, because the sharing can begin long after
-    // the session did.
     const cwd = all[parentKey].cwd
+    // Each sharing topic gets its own tagged outbox…
+    expect(bridge._boxDir(cwd, parentKey, 'outbox'))
+      .not.toBe(bridge._boxDir(cwd, childKey, 'outbox'))
+
+    // THE FIX: the SYSTEM PROMPT itself now names that tagged dir, not the generic
+    // ./outbox/. Before, the system prompt said ./outbox/ and outranked the per-turn
+    // "use ./outbox/t-NN/" note, so the model wrote to the shared root and files
+    // cross-delivered. Naming the tagged dir in the prompt removes the contradiction.
+    const tag = relative(cwd, bridge._boxDir(cwd, parentKey, 'outbox'))   // e.g. outbox/t-4242
+    const prof = bridge._profileFor(cwd, parentKey)
+    expect(prof).toContain(`./${tag}/`)
+    expect(prof).not.toMatch(/put it in \.\/outbox\/ and/)
+
+    // A file still in the shared root is delivered rather than stranded (unchanged).
     mkdirSync(join(cwd, 'outbox'), { recursive: true })
     writeFileSync(join(cwd, 'outbox', 'shared.txt'), 'x')
     const before = calls.length
     await group('anything', 96003, 4242)
     await bridge._drainQueue(parentKey)
-    // The file in the SHARED root is still delivered rather than stranded there…
     expect(calls.slice(before).some(c => c.method === 'sendDocument')).toBe(true)
     expect(existsSync(join(cwd, 'outbox', 'shared.txt'))).toBe(false)
   }, 20000)
