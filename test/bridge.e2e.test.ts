@@ -4224,29 +4224,45 @@ describe('/private <question> — an answer only the asker sees, where they aske
     expect(handed()).not.toContain('when is the launch now?')
   }, 20000)
 
-  test('Continue in DM carries on from the answer\'s own copy, with the question on the banner', async () => {
+  test('Continue in DM opens the DM through a start link, which links it to the answer\'s own copy', async () => {
     const before = calls.length
     await bridge.bot.handleUpdate({ update_id: updateId++, callback_query: { id: 'pva1', from: ADA, chat_instance: 'x', data: `pva:${token}`,
       message: { message_id: 0, date: 0, chat: { id: C, type: 'supergroup' } } } })
-    const cs = calls.slice(before)
+    const tap = calls.slice(before)
+    // A tap may open only a start link: this one carries the answer on.
+    expect(tap.find(c => c.method === 'answerCallbackQuery')?.payload.url).toBe(`https://t.me/testbot?start=pva_${token}`)
+    // The button becomes a plain link to the DM at once, so a later tap only moves them.
+    const relink = tap.find(c => c.method === 'editEphemeralMessageReplyMarkup')!
+    expect(relink.payload).toMatchObject({ chat_id: C, receiver_user_id: 1 })
+    expect(relink.payload.reply_markup).toEqual({ inline_keyboard: [[{ text: '🔒 Continue in DM', url: 'https://t.me/testbot' }]] })
+    expect(sends(tap)).toEqual([])
+    // Telegram opens the DM and sends the start from them.
+    const startId = mid++
+    const before2 = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: startId, date: nowS(), text: `/start pva_${token}`,
+      chat: { id: 1, type: 'private', first_name: 'Ada' }, from: ADA } })
+    await bridge._drainQueue('1:main')
+    const cs = calls.slice(before2)
     const banner = sends(cs).find(c => c.payload.chat_id === 1)!
     expect(textOf(banner)).toContain('<blockquote>when is the launch now?</blockquote>')
     expect(bridge._privateLinks()['1:main']).toMatchObject({ chat: C, thread: T })
     expect(bridge._sessions()['1:main'].sessionId).toBe(bridge._privateAsks.get(token).sessionId)
-    // The tap takes them to the DM…
-    expect(cs.find(c => c.method === 'answerCallbackQuery')?.payload.url).toBe('https://t.me/testbot')
-    // …and the button becomes a plain link to it, so a later tap only moves them.
-    const relink = cs.find(c => c.method === 'editEphemeralMessageReplyMarkup')!
-    expect(relink.payload).toMatchObject({ chat_id: C, receiver_user_id: 1 })
-    expect(relink.payload.reply_markup).toEqual({ inline_keyboard: [[{ text: '🔒 Continue in DM', url: 'https://t.me/testbot' }]] })
-    // Not answered again: it was answered in the topic.
+    // Their /start is taken away again, and the question is not answered a second time.
+    expect(cs.some(c => c.method === 'deleteMessage' && c.payload.chat_id === 1 && c.payload.message_id === startId)).toBe(true)
     expect(sends(cs).some(c => textOf(c).includes('okReply'))).toBe(false)
-    const before2 = calls.length
+    // The same start again only goes away: already there.
+    const before3 = calls.length
+    const againId = mid++
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: againId, date: nowS(), text: `/start pva_${token}`,
+      chat: { id: 1, type: 'private', first_name: 'Ada' }, from: ADA } })
+    await bridge._drainQueue('1:main')
+    const again = calls.slice(before3)
+    expect(sends(again)).toEqual([])
+    expect(again.some(c => c.method === 'deleteMessage' && c.payload.message_id === againId)).toBe(true)
     await bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: mid++, date: nowS(), text: '/private off',
       chat: { id: 1, type: 'private', first_name: 'Ada' }, from: ADA } })
     await bridge._drainQueue('1:main')
     expect(bridge._privateLinks()['1:main']).toBeUndefined()
-    expect(calls.slice(before2).length).toBeGreaterThan(0)
   }, 20000)
 
   test('the button is the asker\'s alone', async () => {
@@ -4258,29 +4274,13 @@ describe('/private <question> — an answer only the asker sees, where they aske
     expect(bridge._privateLinks()['3:main']).toBeUndefined()
   })
 
-  test('someone who never started the bot is taken there by a start link, and the button becomes a link once linked', async () => {
-    cannotWriteFirst.add(1)
+  test('someone else opening that start link gets nothing', async () => {
     const before = calls.length
-    try {
-      await bridge.bot.handleUpdate({ update_id: updateId++, callback_query: { id: 'pva3', from: ADA, chat_instance: 'x', data: `pva:${token}`,
-        message: { message_id: 0, date: 0, chat: { id: C, type: 'supergroup' } } } })
-    } finally { cannotWriteFirst.delete(1) }
-    const url = String(calls.slice(before).find(c => c.method === 'answerCallbackQuery')?.payload.url)
-    const inv = /start=pv_(\w+)/.exec(url)![1]
-    expect(bridge._privateLinks()['1:main']).toBeUndefined()
-    const before2 = calls.length
-    await bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: mid++, date: nowS(), text: `/start pv_${inv}`,
-      chat: { id: 1, type: 'private', first_name: 'Ada' }, from: ADA } })
-    await bridge._drainQueue('1:main')
-    const cs = calls.slice(before2)
-    expect(bridge._privateLinks()['1:main']).toMatchObject({ chat: C, thread: T })
-    expect(bridge._sessions()['1:main'].sessionId).toBe(bridge._privateAsks.get(token).sessionId)
-    expect(cs.find(c => c.method === 'editEphemeralMessageReplyMarkup')?.payload.reply_markup.inline_keyboard[0][0].url).toBe('https://t.me/testbot')
-    // Not answered again in the DM: it was answered in the topic.
-    expect(sends(cs).some(c => textOf(c).includes('okReply'))).toBe(false)
-    await bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: mid++, date: nowS(), text: '/private off',
-      chat: { id: 1, type: 'private', first_name: 'Ada' }, from: ADA } })
-    await bridge._drainQueue('1:main')
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: mid++, date: nowS(), text: `/start pva_${token}`,
+      chat: { id: 3, type: 'private', first_name: 'Bea' }, from: BEA } })
+    await bridge._drainQueue('3:main')
+    expect(sends(calls.slice(before)).map(textOf).join('\n')).toMatch(/expired or is not yours/)
+    expect(bridge._privateLinks()['3:main']).toBeUndefined()
   }, 20000)
 
   test('an answer that cannot be shown in the topic goes to the DM', async () => {

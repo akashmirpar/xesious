@@ -1801,6 +1801,12 @@ describe('ephemeral commands delivered again', () => {
 
 describe('/private — continuing a group topic in a DM', () => {
   const L = require('./lib') as typeof import('./lib')
+  test('a private answer\'s start link is read only in its own shape', () => {
+    expect(L.privateAskStartToken('/start pva_abc123def4')).toBe('abc123def4')
+    expect(L.privateAskStartToken('/start pv_abc123def4')).toBeUndefined()
+    expect(L.privateStartToken('/start pva_abc123def4')).toBeUndefined()
+    expect(L.privateAskStartToken('/start pva_ab')).toBeUndefined()
+  })
   test('a start link is read only in its own shape', () => {
     expect(L.privateStartToken('/start pv_abc123def4')).toBe('abc123def4')
     expect(L.privateStartToken('/start@testbot pv_abc123def4')).toBe('abc123def4')

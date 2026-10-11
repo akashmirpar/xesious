@@ -45,7 +45,7 @@ import {
   effectiveAnswers, effectiveRecords, foldRecords, contextParts, sinceMark, replyWindow, convLine, fitNewest,
   conversationPreamble, conversationFile, type ConvRecord, type Answers, type SettingValue, type SettingSource, type EditorPolicy, type EditorMode,
   EphemeralCommands, EPHEMERAL_REPLY_WINDOW_S,
-  PRIVATE_START_PREFIX, PRIVATE_EXIT_START, privateStartToken, PrivateInvites, isGroupMember, privatePreamble, privateFooter, privateExitKeyboard, isPrivateExitButton, richMessageText,
+  PRIVATE_START_PREFIX, PRIVATE_EXIT_START, privateStartToken, PRIVATE_ASK_START_PREFIX, privateAskStartToken, PrivateInvites, isGroupMember, privatePreamble, privateFooter, privateExitKeyboard, isPrivateExitButton, richMessageText,
   readsAlong, AUTO_PACE, asEagerness, triageDelay, triageSystemPrompt, triageCompactPrompt, triageUserPrompt, parseTriage, joinProbability, triageNeed,
   isSilentReply, SILENT_REPLY, type TriageMsg, type Eagerness,
   needsRich, sanitizeProse,
@@ -5978,9 +5978,10 @@ async function privateAnswerToDm(user: NonNullable<Context['from']>, src: Privat
 }
 
 // The private answer's button: carry the conversation on in the DM, from the copy the
-// answer came from — it already holds the question and the answer. The first tap
-// links the DM and takes them there; then the button becomes a plain link to the DM,
-// so a later tap only moves them, sending nothing.
+// answer came from — it already holds the question and the answer. A tap can open
+// only a start link (a plain link to the chat is refused, URL_INVALID), so the first
+// tap opens "/start pva_<token>" in the DM, which links it; that /start is deleted.
+// The button then becomes a plain link to the DM, so a later tap only moves them.
 const dmUrl = (): string | undefined => { const me = botUsername || bot.botInfo?.username; return me ? `https://t.me/${me}` : undefined }
 async function askButtonToLink(token: string): Promise<void> {
   const ask = privateAsks.get(token)
@@ -5996,25 +5997,35 @@ async function continueAskInDm(ctx: Context, token: string): Promise<void> {
     await ctx.answerCallbackQuery({ text: ask ? 'That answer is someone else\'s.' : 'That has expired. Send /private in the topic again.', show_alert: true }).catch(() => {})
     return
   }
-  const carry = { sessionId: ask.sessionId, mark: ask.mark }
+  const me = botUsername || bot.botInfo?.username
+  await ctx.answerCallbackQuery({ url: `https://t.me/${me}?start=${PRIVATE_ASK_START_PREFIX}${token}` })
+    .catch(e => console.error(`[private] could not open the DM from the tap: ${e}`))
+  await askButtonToLink(token)
+}
+
+// "/start pva_<token>" in the DM, from a private answer's button: link the DM to that
+// answer's copy, unless it already is, and take the /start away again.
+async function privateFromAskLink(ctx: Context, token: string): Promise<void> {
+  const user = ctx.from!
+  const startId = ctx.message?.message_id
+  const drop = () => startId ? bot.api.deleteMessage(user.id, startId).catch(e => console.error(`[private] could not delete the /start: ${e}`)) : undefined
+  const ask = privateAsks.get(token)
+  if (!ask || ask.userId !== user.id) { await drop(); await send(ctx, undefined, 'That has expired or is not yours. Send /private in the topic again.'); return }
+  // Allowed when asked, and still now: listed, or (trusted members) still in the group.
+  const ok = ALLOWED_USERS.has(String(user.id)) ||
+    (TRUST_CHAT_MEMBERS && ALLOWED_CHATS.has(String(ask.src.chat)) && await stillInGroup(ask.src.chat, user.id))
+  if (!ok) { await drop(); await send(ctx, undefined, 'Not authorized. Send /whoami to get the id to allowlist.'); return }
+  const dmKey = keyFor(user.id, undefined)
+  const linked = privateLinks[dmKey]
+  if (linked && linked.chat === ask.src.chat && linked.thread === ask.src.thread && sessions[dmKey]?.sessionId === ask.sessionId) { await drop(); return }
   const banner = privateBanner(ask.src, ask.question)
   const bannerAt = Date.now()
   const intro = await bot.api.sendMessage(user.id, banner.text, { reply_markup: banner.kb, parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
-    .catch(e => { console.log(`[private] cannot write to ${user.id} first (${e}); opening the DM with a start link`); return null })
-  if (!intro) {
-    const inv = randomUUID().replace(/-/g, '').slice(0, 16)
-    privateInvites.add(inv, { userId: user.id, ...ask.src, question: ask.question, ...carry, askToken: token, created: Date.now() })
-    const me = botUsername || bot.botInfo?.username
-    await ctx.answerCallbackQuery({ url: `https://t.me/${me}?start=${PRIVATE_START_PREFIX}${inv}` }).catch(e => console.error(`[private] start link: ${e}`))
-    return
-  }
-  const why = await openPrivate(user.id, ask.src, intro.message_id, bannerAt, carry)
-  if (why) { await bannerFailed(user.id, intro.message_id, ask.src, why); await ctx.answerCallbackQuery({ text: `Could not: ${why}`, show_alert: true }).catch(() => {}); return }
-  // Take them there. Telegram documents this for start links; a plain link to the
-  // chat is tried, and a short note is the fallback — the button is a link from now on.
-  const url = dmUrl()
-  const moved = url ? await ctx.answerCallbackQuery({ url }).then(() => true, e => { console.log(`[private] could not open the DM from the tap (${e})`); return false }) : false
-  if (!moved) await ctx.answerCallbackQuery({ text: 'Carried on in your DM.' }).catch(() => {})
+    .catch(e => { console.error(`[private] banner: ${e}`); return null })
+  await drop()
+  if (!intro) return
+  const why = await openPrivate(user.id, ask.src, intro.message_id, bannerAt, { sessionId: ask.sessionId, mark: ask.mark })
+  if (why) { await bannerFailed(user.id, intro.message_id, ask.src, why); return }
   await askButtonToLink(token)
 }
 
@@ -6161,6 +6172,8 @@ bot.on('message', async ctx => {
   // person may not be allowed in a DM until it links them.
   const pvToken = ctx.chat.type === 'private' && cmd === '/start' ? privateStartToken(text) : undefined
   if (pvToken) { await privateFromInvite(ctx, pvToken); return }
+  const pvaToken = ctx.chat.type === 'private' && cmd === '/start' ? privateAskStartToken(text) : undefined
+  if (pvaToken) { await privateFromAskLink(ctx, pvaToken); return }
   // The "click to exit" link under a private answer. Ungated: leaving is always allowed.
   if (ctx.chat.type === 'private' && cmd === '/start' && text.split(/\s+/)[1] === PRIVATE_EXIT_START) { await privateInDm(ctx, 'off'); return }
   // The exit button under the typing box: a message from the person, never a turn.

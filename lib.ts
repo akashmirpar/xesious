@@ -2375,6 +2375,14 @@ export const PRIVATE_INVITE_TTL_MS = 30 * 60_000
 // DM, Telegram sends "/start pvoff" from the person, which leaves like /private off.
 export const PRIVATE_EXIT_START = 'pvoff'
 
+// The start parameter that carries a private answer on into the DM: Telegram lets a
+// button's tap open only a start link, so the tap opens "/start pva_<token>".
+export const PRIVATE_ASK_START_PREFIX = 'pva_'
+export function privateAskStartToken(text: string): string | undefined {
+  const m = /^\/start(?:@\S+)?\s+pva_([A-Za-z0-9]{6,40})\s*$/.exec(text.trim())
+  return m?.[1]
+}
+
 // The token in "/start pv_<token>", if that is what the message is.
 export function privateStartToken(text: string): string | undefined {
   const m = /^\/start(?:@\S+)?\s+pv_([A-Za-z0-9]{6,40})\s*$/.exec(text.trim())
