@@ -5219,7 +5219,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
       await send(ctx, threadId, `🌿 Background task finished.`, true, link)
     }
     // A private continuation says so under every answer, with a way out.
-    const footer = plink ? privateFooter({ topic: plink.topic, group: plink.group, exitUrl: privateExitUrl() }) : ''
+    const footer = plink ? privateFooter({ topic: plink.topic, group: plink.group, origin: plink.origin, exitUrl: privateExitUrl() }) : ''
     const answerId = await deliver(ctx, threadId, res.text, link, footer)
     await flushOutbox(ctx, threadId, cwd, key, link)
     // For Auto mode's judge, which otherwise sees only what people said.
@@ -5646,19 +5646,21 @@ const privateExitUrl = (): string | undefined => {
 }
 const PRIVATE_LEAVE = 'pvoff'
 
-// The banner a private continuation opens with, pinned for as long as it lasts: its
-// first line is what the pin bar shows. A link back to where it started, and a way out.
-function privateBanner(src: PrivateSource, keptOwn: boolean): { text: string; kb: any } {
+// The one message a private continuation opens with, pinned for as long as it lasts:
+// its first line is what the pin bar shows, its topic name links back to where it
+// started, and it carries the exit button under the typing box. A message holds
+// either buttons of its own or that keyboard, never both — the keyboard won, so the
+// way out is always in reach and nothing else needs sending. HTML.
+function privateBanner(src: PrivateSource, keptOwn: boolean, question?: string): { text: string; kb: any } {
+  const where = `"${escapeHtml(src.topic)}" (${escapeHtml(src.group)})`
   return {
-    text: `🔒 Private: "${src.topic}" (${src.group})\n\n` +
+    text: `🔒 Private: ${src.origin ? `<a href="${escapeHtml(src.origin)}">${where}</a>` : where}\n\n` +
       `This chat carries that topic on, just for you. Everything said there up to now is context here, and what people say there next reaches me as background. ` +
       `Nobody in the group sees what you say here.\n\n` +
-      `To leave: the button below, /private off or /new. ` +
-      (keptOwn ? `Your own conversation with me comes back.` : `This chat then starts fresh.`),
-    kb: { inline_keyboard: [
-      ...(src.origin ? [[{ text: '↗ Open the topic', url: src.origin }]] : []),
-      [{ text: '🔓 Leave — back to my own chat', callback_data: PRIVATE_LEAVE }],
-    ] },
+      `To leave: the 🔓 button under the typing box, /private off or /new. ` +
+      (keptOwn ? `Your own conversation with me comes back.` : `This chat then starts fresh.`) +
+      (question ? `\n\nYou asked: ${escapeHtml(question)}` : ''),
+    kb: privateExitKeyboard(src.topic, src.group),
   }
 }
 async function pinBanner(dmKey: string, msgId: number): Promise<void> {
@@ -5680,19 +5682,18 @@ async function leavePrivate(dmKey: string): Promise<PrivateLink | undefined> {
   if (was) await retireBanner(Number(chatOfKey(dmKey)), was, `🔓 Left "${was.topic}" (${was.group}).`)
   return was
 }
-// The keyboard goes up with one message when a continuation starts — the question,
-// when there is one, so it costs no message of its own — and comes down with the
-// message that says it has ended. A message carries inline buttons or this keyboard,
-// never both, which is why the banner cannot carry it.
-async function sendExitKeyboard(userId: number, src: PrivateSource, text: string): Promise<void> {
-  await bot.api.sendMessage(userId, text, { reply_markup: privateExitKeyboard(src.topic, src.group), disable_notification: true })
-    .catch(e => console.error(`[private] exit keyboard: ${e}`))
-}
+// The exit keyboard goes up with the banner and comes down with the message that
+// says the continuation has ended.
 async function sayRemovingKeyboard(chatId: number, text: string): Promise<void> {
   await bot.api.sendMessage(chatId, text, { reply_markup: { remove_keyboard: true } })
     .catch(e => console.error(`[private] ${e}`))
 }
-const EXIT_KEYBOARD_NOTE = '🔓 The button under the typing box takes you back to your own chat.'
+// The banner went out but the link could not be made: it comes back down, and so
+// does the exit button it brought.
+async function bannerFailed(userId: number, bannerId: number, src: PrivateSource, why: string): Promise<void> {
+  await bot.api.deleteMessage(userId, bannerId).catch(() => {})
+  await sayRemovingKeyboard(userId, `⚠️ Could not carry "${src.topic}" over: ${why}.`)
+}
 const leftText = (was: PrivateLink) => was.before?.sessionId
   ? `🔓 Left "${was.topic}". Back to your own conversation — message to continue it.`
   : `🔓 Left "${was.topic}". This chat starts fresh.`
@@ -5745,8 +5746,8 @@ async function privateFromGroup(ctx: Context, threadId: number | undefined, ques
   const me = botUsername || bot.botInfo?.username
   // A bot may not write first to someone who never started it. Then the private
   // reply carries a link that starts it, and the DM takes the request from there.
-  const banner = privateBanner(src, keptOwnFor(dmKey))
-  const intro = await ctx.api.sendMessage(user.id, banner.text, { reply_markup: banner.kb }).catch(e => {
+  const banner = privateBanner(src, keptOwnFor(dmKey), question || undefined)
+  const intro = await ctx.api.sendMessage(user.id, banner.text, { reply_markup: banner.kb, parse_mode: 'HTML', link_preview_options: { is_disabled: true } }).catch(e => {
     console.log(`[private] cannot write to ${user.id} first (${e}); offering a start link`)
     return null
   })
@@ -5760,14 +5761,12 @@ async function privateFromGroup(ctx: Context, threadId: number | undefined, ques
   }
   const why = await openPrivate(user.id, src, intro.message_id)
   if (why) {
-    await ctx.api.editMessageText(user.id, intro.message_id, `⚠️ Could not carry "${src.topic}" over: ${why}.`).catch(() => {})
+    await bannerFailed(user.id, intro.message_id, src, why)
     await replyOnlyTo(ctx, threadId, `⚠️ Could not continue privately: ${why}.`, undefined, replyTo, replyToEphemeral)
     return
   }
   await replyOnlyTo(ctx, threadId, `🔒 Continued in our DM — only you see it.`,
     me ? { inline_keyboard: [[{ text: '🔒 Open DM', url: `https://t.me/${me}` }]] } : undefined, replyTo, replyToEphemeral)
-  // Nobody saw a question asked, the asker included: the command was hidden.
-  await sendExitKeyboard(user.id, src, question ? `You asked: ${question}` : EXIT_KEYBOARD_NOTE)
   if (question) {
     const dctx = dmContext(user)
     enqueue(dmKey, () => handlePrompt(dctx, undefined, dmKey, question)).catch(e => console.error(`[error] private ${dmKey}: ${e}`))
@@ -5784,12 +5783,12 @@ async function privateFromInvite(ctx: Context, token: string): Promise<void> {
   if (!ok) { await send(ctx, undefined, 'Not authorized. Send /whoami to get the id to allowlist.'); return }
   const src: PrivateSource = { chat: inv.chat, thread: inv.thread, cwd: inv.cwd, topic: inv.topic, group: inv.group, origin: inv.origin }
   const dmKey = keyFor(user.id, undefined)
-  const banner = privateBanner(src, keptOwnFor(dmKey))
-  const intro = await ctx.api.sendMessage(user.id, banner.text, { reply_markup: banner.kb }).catch(e => { console.error(`[private] banner: ${e}`); return null })
+  const banner = privateBanner(src, keptOwnFor(dmKey), inv.question)
+  const intro = await ctx.api.sendMessage(user.id, banner.text, { reply_markup: banner.kb, parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
+    .catch(e => { console.error(`[private] banner: ${e}`); return null })
   if (!intro) return
   const why = await openPrivate(user.id, src, intro.message_id)
-  if (why) { await ctx.api.editMessageText(user.id, intro.message_id, `⚠️ Could not carry "${src.topic}" over: ${why}.`).catch(() => {}); return }
-  await sendExitKeyboard(user.id, src, inv.question ? `You asked: ${inv.question}` : EXIT_KEYBOARD_NOTE)
+  if (why) { await bannerFailed(user.id, intro.message_id, src, why); return }
   if (inv.question) {
     enqueue(dmKey, () => handlePrompt(ctx, undefined, dmKey, inv.question!)).catch(e => console.error(`[error] private ${dmKey}: ${e}`))
   }
@@ -6621,7 +6620,7 @@ bot.on('my_chat_member', async ctx => {
 // so callback_data only has to carry the mode (it's capped at 64 bytes).
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
-  // The banner's Leave button. Ungated, like the exit link: it only ever ends the
+  // The Leave button on banners sent before the exit keyboard replaced it. Ungated, like the exit link: it only ever ends the
   // tapper's own continuation, in their own DM.
   if (data === PRIVATE_LEAVE && ctx.chat?.type === 'private' && ctx.from?.id === ctx.chat.id) {
     const was = await leavePrivate(keyFor(ctx.chat.id, undefined))

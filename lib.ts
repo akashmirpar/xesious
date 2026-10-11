@@ -2419,12 +2419,13 @@ export function privatePreamble(nonce: string, o: { topic: string; group: string
 }
 
 // The lines under every answer in a private continuation, so it can never be mistaken
-// for the person's own chat with the bot: which topic it continues, and — on a line
-// of its own, the only link, so it cannot read as part of the topic's name — a way
-// out. The way back to the topic is on the pinned banner.
-export function privateFooter(o: { topic: string; group: string; exitUrl?: string }): string {
+// for the person's own chat with the bot: which topic it continues, linked back to
+// it, and on a line of its own a way out. Two links side by side read as one, so
+// they never share a line.
+export function privateFooter(o: { topic: string; group: string; origin?: string; exitUrl?: string }): string {
   const clean = (t: string) => t.replace(/[\[\]()]/g, ' ').replace(/\s+/g, ' ').trim()
-  return `\n\n🔒 Private · ${clean(o.topic)} (${clean(o.group)})\n` +
+  const where = `${clean(o.topic)} (${clean(o.group)})`
+  return `\n\n🔒 Private · ${o.origin ? `[${where}](${o.origin})` : where}\n` +
     (o.exitUrl ? `[🔓 Exit to your own chat](${o.exitUrl})` : '🔓 /private off to exit to your own chat')
 }
 

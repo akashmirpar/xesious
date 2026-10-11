@@ -3911,24 +3911,22 @@ describe('/private — carry a group topic on in your own DM', () => {
     writeFileSync(join(pdir, `${parent.sessionId}.jsonl`), JSON.stringify({ type: 'user', sessionId: parent.sessionId, message: { role: 'user', content: 'x' } }) + '\n')
 
     const cs = await privately('/private', ADA)
-    const intro = toDm(cs, 1).filter(c => c.payload.reply_markup?.inline_keyboard)
+    // One message to the DM: the banner, which carries everything.
+    const intro = toDm(cs, 1)
     expect(intro.length).toBe(1)
-    // The banner: its first line is what the pin bar shows.
-    expect(String(intro[0].payload.text).split('\n')[0]).toBe('🔒 Private: "topic 851" (Team)')
-    expect(String(intro[0].payload.text)).toContain('/private off or /new')
-    const rows = intro[0].payload.reply_markup.inline_keyboard
-    // A link back to where it was started: the latest message in the topic.
-    expect(rows[0][0].url).toMatch(/^https:\/\/t\.me\/c\/888\/851\/\d+$/)
-    expect(rows[1][0].callback_data).toBe('pvoff')
+    const banner = String(intro[0].payload.text)
+    expect(intro[0].payload.parse_mode).toBe('HTML')
+    // Its first line is what the pin bar shows; the topic's name links back to where
+    // it was started, the latest message in the topic.
+    expect(banner.split('\n')[0]).toMatch(/^🔒 Private: <a href="https:\/\/t\.me\/c\/888\/851\/\d+">.*topic 851.*\(Team\)<\/a>$/)
+    expect(banner).toContain('/private off or /new')
+    // The exit button under the typing box rides on it.
+    expect(intro[0].payload.reply_markup).toEqual({ keyboard: [[{ text: '🔓 Exit private: topic 851' }]], is_persistent: true, resize_keyboard: true,
+      input_field_placeholder: 'Private: topic 851 (Team)' })
     // …and it is pinned, quietly.
     const pin = cs.find(c => c.method === 'pinChatMessage')
     expect(pin?.payload).toMatchObject({ chat_id: 1, disable_notification: true })
     expect(bridge._privateLinks()['1:main'].pinned).toBe(pin!.payload.message_id)
-    // …and the exit button goes under the typing box, on a message of its own.
-    const kb = toDm(cs, 1).length ? cs.find(c => c.method === 'sendMessage' && c.payload.reply_markup?.keyboard) : undefined
-    expect(kb?.payload.chat_id).toBe(1)
-    expect(kb!.payload.reply_markup).toMatchObject({ keyboard: [[{ text: '🔓 Exit private: topic 851' }]], is_persistent: true, resize_keyboard: true,
-      input_field_placeholder: 'Private: topic 851 (Team)' })
     // The group gets one message, and only Ada sees it.
     const g = inGroup(cs)
     expect(g.length).toBe(1)
@@ -3951,7 +3949,8 @@ describe('/private — carry a group topic on in your own DM', () => {
     expect(textOf(answer!)).toContain('🔒 Private')
     // The exit is the only link, on a line of its own; the topic's name is plain.
     expect(textOf(answer!)).toMatch(/\n\[🔓 Exit to your own chat\]\(https:\/\/t\.me\/testbot\?start=pvoff\)\n?$/)
-    expect(textOf(answer!)).not.toContain('t.me/c/888')
+    // …and the topic's name on the line above links back to where it started.
+    expect(textOf(answer!)).toMatch(/🔒 Private · \[topic 851 \\\(Team\\\)\]\(https:\/\/t\.me\/c\/888\/851\/\d+\)\n/)
     const p = handed()
     expect(p).toContain('this is a private conversation with Ada')
     expect(p).toContain('continued from the topic "topic 851" in the group "Team"')
@@ -4066,9 +4065,11 @@ describe('/private — carry a group topic on in your own DM', () => {
     expect(sends(await dm(`/start pv_${token}`, ADA)).map(textOf).join('\n')).toMatch(/expired or is not yours/)
     expect(bridge._privateLinks()['1:main']).toBeUndefined()
     const opened = await dm(`/start pv_${token}`, BEA)
-    // The question carries the exit button: no message of its own for it.
-    const asked = sends(opened).find(c => textOf(c) === 'You asked: what changed since Monday?')
-    expect(asked?.payload.reply_markup?.keyboard).toBeDefined()
+    // The question is in the banner: still one message, with the exit button.
+    const dmSends = toDm(opened, 3).filter(c => !textOf(c).includes('okReply') && !textOf(c).includes('Thinking'))
+    expect(dmSends.length).toBe(1)
+    expect(textOf(dmSends[0])).toContain('You asked: what changed since Monday?')
+    expect(dmSends[0].payload.reply_markup?.keyboard).toBeDefined()
     expect(opened.some(c => c.method === 'pinChatMessage' && c.payload.chat_id === 3)).toBe(true)
     expect(sends(opened).some(c => textOf(c).includes('okReply'))).toBe(true)
     expect(handed()).toContain('what changed since Monday?')
