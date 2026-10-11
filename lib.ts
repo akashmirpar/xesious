@@ -2425,7 +2425,7 @@ export function privatePreamble(nonce: string, o: { topic: string; group: string
 export function privateFooter(o: { topic: string; group: string; origin?: string; exitUrl?: string }): string {
   const clean = (t: string) => t.replace(/[\[\]()]/g, ' ').replace(/\s+/g, ' ').trim()
   const where = `${clean(o.topic)} (${clean(o.group)})`
-  return `\n\n🔒 Private · ${o.origin ? `[${where}](${o.origin})` : where}\n` +
+  return `\n\n🔒 Private: ${o.origin ? `[${where}](${o.origin})` : where}\n` +
     (o.exitUrl ? `[🔓 Exit to your own chat](${o.exitUrl})` : '🔓 /private off to exit to your own chat')
 }
 
