@@ -2122,11 +2122,13 @@ export function fitNewest(lines: string[], maxChars: number): { kept: string[]; 
 // The bridge-authored block that goes in front of the user's message.
 export function conversationPreamble(nonce: string, o: {
   since: string[]; omitted: number; reply: string[]; file?: string; total?: number
+  // What the reply block says it is, when it is not a reply in the topic (/private).
+  replyLead?: string
 }): string {
   // With a window above it, the since-list leaves out what the window already shows.
   const parts: string[] = []
   if (o.reply.length) {
-    parts.push(`[xesious:${nonce}] the message below is a reply to an earlier message in this topic. Here it is, with a few around it:\n` +
+    parts.push(`[xesious:${nonce}] ${o.replyLead ?? 'the message below is a reply to an earlier message in this topic'}. Here it is, with a few around it:\n` +
       o.reply.join('\n'))
   }
   if (o.since.length) {
@@ -2379,7 +2381,7 @@ export function privateStartToken(text: string): string | undefined {
   return m?.[1]
 }
 
-export type PrivateInvite = { userId: number; chat: number; thread?: number; cwd: string; topic: string; group: string; origin?: string; question?: string; created: number }
+export type PrivateInvite = { userId: number; chat: number; thread?: number; cwd: string; topic: string; group: string; origin?: string; reply?: ConvRecord; question?: string; created: number }
 export class PrivateInvites {
   private byToken = new Map<string, PrivateInvite>()
   constructor(private ttlMs = PRIVATE_INVITE_TTL_MS, private max = 1000) {}

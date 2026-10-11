@@ -4056,6 +4056,25 @@ describe('/private — carry a group topic on in your own DM', () => {
     expect(bridge._sessions()['1:main'].sessionId).toBe(ownDmSession)
   }, 20000)
 
+  test('sent as a reply, it picks up from that message: linked, and handed to the first turn with the talk around it', async () => {
+    await say('the invoice total looks wrong to me')
+    const answer = { message_id: 885999, date: 1790885999, chat: { id: C, type: 'supergroup' },
+      from: { id: 42, is_bot: true, first_name: 'TestBot', username: 'testbot' }, text: 'The total should be 120, not 210.' }
+    const cs = await say('/private', ADA, { message_id: 0, ephemeral_message_id: mid, date: nowS(), reply_to_message: answer })
+    const banner = toDm(cs, 1)[0]
+    expect(textOf(banner)).toContain('Picking up from the message you replied to.')
+    expect(textOf(banner)).toMatch(/<a href="https:\/\/t\.me\/c\/888\/851\/885999">/)
+    await dm('so which one is right?', ADA)
+    const p = handed()
+    expect(p).toContain('this private conversation was started from a message in the topic, and carries on from it')
+    expect(p).toMatch(/TestBot \(@testbot\): The total should be 120, not 210\.  ← the message being replied to/)
+    expect(p).toContain('the invoice total looks wrong to me')
+    // Once: the next turn is not handed it again.
+    await dm('thanks', ADA)
+    expect(handed()).not.toContain('120, not 210')
+    await dm('/private off', ADA)
+  }, 20000)
+
   test('when the bot cannot write first, a start link carries the request — for that person only', async () => {
     cannotWriteFirst.add(3)
     const cs = await privately('/private what changed since Monday?', BEA)

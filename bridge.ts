@@ -42,7 +42,7 @@ import {
   frameUserMessage, attributionProfileLines,
   SETTINGS, settingDef, resolveSetting, choiceLabel, normalizeUsername, canEditSettings, pinPendingEditor,
   DEFAULT_EDITORS, escapeHtml, type SettingDef,
-  effectiveAnswers, effectiveRecords, foldRecords, contextParts, sinceMark, convLine, fitNewest,
+  effectiveAnswers, effectiveRecords, foldRecords, contextParts, sinceMark, replyWindow, convLine, fitNewest,
   conversationPreamble, conversationFile, type ConvRecord, type Answers, type SettingValue, type SettingSource, type EditorPolicy, type EditorMode,
   EphemeralCommands, EPHEMERAL_REPLY_WINDOW_S,
   PRIVATE_START_PREFIX, PRIVATE_EXIT_START, privateStartToken, PrivateInvites, isGroupMember, privatePreamble, privateFooter, privateExitKeyboard, isPrivateExitButton,
@@ -608,7 +608,9 @@ type PrivateLink = { chat: number; thread?: number; topic: string; group: string
   // Where it was started (a link into the topic), and the DM's pinned banner.
   origin?: string; pinned?: number
   // Whether the exit button under the typing box has gone out (with the first answer).
-  keyboard?: boolean }
+  keyboard?: boolean
+  // The message /private replied to, until the first turn has been handed it.
+  reply?: ConvRecord }
 let privateLinks: Record<string, PrivateLink> = {}
 
 function loadState(): void {
@@ -3066,11 +3068,23 @@ async function privateContext(ctx: Context, key: string, link: PrivateLink, text
   const gKey = keyFor(link.chat, link.thread)
   const recs = recordsFor(gKey) ? readTopicLog(link.chat, link.thread) : []
   const mark = contextMarks[key] ?? 0
-  const since = sinceMark(recs, mark, Number.MAX_SAFE_INTEGER)
+  // Sent as a reply: the first turn gets that message, with a few either side, the
+  // way a mention replying to something does. The bot's own answers are not recorded,
+  // so one of those goes in among the recorded messages around it.
+  const target = link.reply
+  let window: ConvRecord[] = []
+  if (target) {
+    window = recs.some(r => r.id === target.id) ? replyWindow(recs, target.id)
+      : [...recs.filter(r => r.id < target.id).slice(-10), target, ...recs.filter(r => r.id > target.id).slice(0, 10)]
+    delete link.reply
+    saveState()
+  }
+  const inWindow = new Set(window.map(r => r.id))
+  const since = sinceMark(recs, mark, Number.MAX_SAFE_INTEGER).filter(r => !inWindow.has(r.id))
   const last = recs.reduce((m, r) => Math.max(m, r.id), 0)
   if (last > mark) { contextMarks[key] = last; saveState() }
   const recalled = recallFor(gKey) ? await recallBlock(link.chat, gKey, text, {
-    exclude: new Set(since.map(r => r.id)), context: since.slice(-6).map(r => r.text).join('\n') || undefined,
+    exclude: new Set([...since, ...window].map(r => r.id)), context: [...window, ...since].slice(-6).map(r => r.text).join('\n') || undefined,
     asked: lastAskedFor(key), recentSince: mark, onSearch,
   }).catch(e => { console.error(`[ctx] recall: ${e}`); return '' }) : ''
   const { kept, omitted } = fitNewest(since.map(r => convLine(r, { nonce: BRIDGE_NONCE })), CONV_INLINE_CHARS)
@@ -3085,7 +3099,9 @@ async function privateContext(ctx: Context, key: string, link: PrivateLink, text
   if (kept.length) console.log(`[private] ${key}: ${kept.length} from ${gKey} since the last turn${omitted ? ` (+${omitted} in the file)` : ''}`)
   const person = [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username
   return privatePreamble(BRIDGE_NONCE, { topic: link.topic, group: link.group, person }) + recalled +
-    conversationPreamble(BRIDGE_NONCE, { since: kept, omitted, reply: [], file, total: recs.length })
+    conversationPreamble(BRIDGE_NONCE, { since: kept, omitted, file, total: recs.length,
+      reply: window.map(r => convLine(r, { nonce: BRIDGE_NONCE, targetId: target?.id })),
+      replyLead: 'this private conversation was started from a message in the topic, and carries on from it' })
 }
 
 // "Replying to the bot" means replying to a message the bot WROTE. In a forum every
@@ -5591,7 +5607,7 @@ const ephemeralCommands = new EphemeralCommands()
 // DM reaches the group, and the group's transcript stays what the group saw. The DM's
 // own conversation is put aside, and /private off puts it back.
 const privateInvites = new PrivateInvites()
-type PrivateSource = { chat: number; thread?: number; cwd: string; topic: string; group: string; origin?: string }
+type PrivateSource = { chat: number; thread?: number; cwd: string; topic: string; group: string; origin?: string; reply?: ConvRecord }
 type DmSettings = { mode?: string; model?: string; effort?: string }
 
 // Undefined when linked, else why not.
@@ -5614,7 +5630,7 @@ function linkPrivate(userId: number, src: PrivateSource): string | undefined {
     if (v) store[dmKey] = v; else delete store[dmKey]
   }
   privateLinks[dmKey] = { chat: src.chat, thread: src.thread, topic: src.topic, group: src.group, at: new Date().toISOString(),
-    ...(before ? { before } : {}), settings: kept, ...(src.origin ? { origin: src.origin } : {}) }
+    ...(before ? { before } : {}), settings: kept, ...(src.origin ? { origin: src.origin } : {}), ...(src.reply ? { reply: src.reply } : {}) }
   // From where the topic's session last looked, so what it has not seen comes next.
   contextMarks[dmKey] = contextMarks[gKey] ?? 0
   if (TRUST_CHAT_MEMBERS && !ALLOWED_USERS.has(String(userId))) { privateGuests.add(userId); guestChecked.set(userId, Date.now()) }
@@ -5640,10 +5656,25 @@ function unlinkPrivate(dmKey: string): PrivateLink | undefined {
   return link
 }
 
+// The message /private was sent as a reply to, as a record: a person's, or one of the
+// bot's own answers — which recordOf leaves out, since in a topic a reply to the bot
+// is just the conversation carrying on, but here it is the point to pick up from.
+function privateReplyRecord(reply: any): ConvRecord | undefined {
+  if (!reply || reply.forum_topic_created) return undefined
+  const r = recordOf(reply, false)
+  if (r) return r
+  const text = String(reply.text || reply.caption || '').trim()
+  if (!reply.from?.is_bot || !text) return undefined
+  return { id: reply.message_id, t: reply.date, from: reply.from.id, name: reply.from.first_name || 'the bot',
+    ...(reply.from.username ? { username: reply.from.username } : {}), text }
+}
+
 // Where a private continuation was started: the latest message the bridge knows of
 // in the topic, so the link lands on the conversation as it stood then; else the
 // topic itself (General has no link of its own).
-function privateOrigin(chat: number, thread: number | undefined, visibleMsg?: number): string | undefined {
+function privateOrigin(chat: number, thread: number | undefined, visibleMsg?: number, replyId?: number): string | undefined {
+  // Sent as a reply: it starts from that message.
+  if (replyId) return messageLink(chat, thread, replyId) ?? topicLink(chat, thread)
   const gKey = keyFor(chat, thread)
   const recs = recordsFor(gKey) ? readTopicLog(chat, thread) : []
   const last = Math.max(visibleMsg ?? 0, latestIncoming[gKey] ?? 0, recs.reduce((m, r) => Math.max(m, r.id), 0))
@@ -5664,6 +5695,7 @@ function privateBanner(src: PrivateSource, keptOwn: boolean, question?: string):
   const where = `"${escapeHtml(src.topic)}" (${escapeHtml(src.group)})`
   return {
     text: `🔒 Private: ${src.origin ? `<a href="${escapeHtml(src.origin)}">${where}</a>` : where}\n\n` +
+      (src.reply ? `Picking up from the message you replied to.\n` : '') +
       `Only you see this chat; what the topic says reaches me here.\n` +
       `Leave with the button, /private off or /new${keptOwn ? ' — your own chat with me comes back' : ''}.` +
       (question ? `\n\nYou asked: ${escapeHtml(question)}` : ''),
@@ -5744,11 +5776,15 @@ async function replyOnlyTo(ctx: Context, threadId: number | undefined, text: str
 
 const keptOwnFor = (dmKey: string) => !privateLinks[dmKey] ? !!sessions[dmKey]?.sessionId : !!privateLinks[dmKey].before?.sessionId
 
-async function privateFromGroup(ctx: Context, threadId: number | undefined, question: string, replyTo?: number, replyToEphemeral?: number): Promise<void> {
+async function privateFromGroup(ctx: Context, threadId: number | undefined, question: string, replyTo?: number, replyToEphemeral?: number, repliedTo?: any): Promise<void> {
   const user = ctx.from!
   const gKey = keyFor(ctx.chat!.id, threadId)
+  const reply = privateReplyRecord(repliedTo)
+  // Whether a hidden command keeps what it replied to is not documented; this says.
+  console.log(`[private] asked by ${user.id} in ${gKey}${replyToEphemeral ? ' (ephemeral)' : ''}: ` +
+    (reply ? `replying to #${reply.id}` : repliedTo && !repliedTo.forum_topic_created ? `replying to #${repliedTo.message_id} (no text to carry)` : 'not a reply'))
   const src: PrivateSource = { chat: ctx.chat!.id, thread: threadId, cwd: resolveCwd(ctx, threadId), topic: topicTitle(gKey),
-    group: (ctx.chat as any).title ?? 'the group', origin: privateOrigin(ctx.chat!.id, threadId, replyTo) }
+    group: (ctx.chat as any).title ?? 'the group', origin: privateOrigin(ctx.chat!.id, threadId, replyTo, reply?.id), ...(reply ? { reply } : {}) }
   const dmKey = keyFor(user.id, undefined)
   const me = botUsername || bot.botInfo?.username
   // A bot may not write first to someone who never started it. Then the private
@@ -5788,7 +5824,7 @@ async function privateFromInvite(ctx: Context, token: string): Promise<void> {
   const ok = ALLOWED_USERS.has(String(user.id)) ||
     (TRUST_CHAT_MEMBERS && ALLOWED_CHATS.has(String(inv.chat)) && await stillInGroup(inv.chat, user.id))
   if (!ok) { await send(ctx, undefined, 'Not authorized. Send /whoami to get the id to allowlist.'); return }
-  const src: PrivateSource = { chat: inv.chat, thread: inv.thread, cwd: inv.cwd, topic: inv.topic, group: inv.group, origin: inv.origin }
+  const src: PrivateSource = { chat: inv.chat, thread: inv.thread, cwd: inv.cwd, topic: inv.topic, group: inv.group, origin: inv.origin, ...(inv.reply ? { reply: inv.reply } : {}) }
   const dmKey = keyFor(user.id, undefined)
   const banner = privateBanner(src, keptOwnFor(dmKey), inv.question)
   const intro = await ctx.api.sendMessage(user.id, banner.text, { reply_markup: banner.kb, parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
@@ -6002,7 +6038,7 @@ bot.on('message', async ctx => {
   if (cmd === '/private') {
     const arg = text.slice(text.split(/\s+/)[0].length).trim()
     if (ctx.chat.type === 'private') await privateInDm(ctx, arg)
-    else await privateFromGroup(ctx, threadId, arg, msg.message_id || undefined, ephemeralId)
+    else await privateFromGroup(ctx, threadId, arg, msg.message_id || undefined, ephemeralId, msg.reply_to_message)
     return
   }
   // What every search engine finds for a question in this topic's history, side by
