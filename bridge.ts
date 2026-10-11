@@ -5703,13 +5703,35 @@ function privateBanner(src: PrivateSource, question?: string): { text: string; k
     kb: { inline_keyboard: [[{ text: privateExitKeyboard(src.topic, src.group).keyboard[0][0].text, callback_data: PRIVATE_LEAVE }]] },
   }
 }
-async function pinBanner(dmKey: string, msgId: number): Promise<void> {
+// `sentAt`: when the banner went out (ms), for the notice below.
+async function pinBanner(dmKey: string, msgId: number, sentAt: number): Promise<void> {
   const link = privateLinks[dmKey]
   if (!link) return
   link.pinned = msgId
   saveState()
-  await bot.api.pinChatMessage(Number(chatOfKey(dmKey)), msgId, { disable_notification: true })
-    .catch(e => console.error(`[private] could not pin the banner: ${e}`))
+  const userId = Number(chatOfKey(dmKey))
+  const ok = await bot.api.pinChatMessage(userId, msgId, { disable_notification: true })
+    .then(() => true, e => { console.error(`[private] could not pin the banner: ${e}`); return false })
+  if (!ok) return
+  // Telegram puts a "pinned a message" notice in the chat, and pinning cannot be
+  // told not to. It is the message right after the banner — nothing else is sent
+  // in between — unless the person wrote something meanwhile, and then it is left
+  // alone rather than risk deleting what they wrote. If Telegram hands the bot the
+  // notice itself, dropPinNotice takes it from there instead.
+  if ((lastDmIncoming.get(userId) ?? 0) >= sentAt) { console.log(`[private] pin notice in dm ${userId} left: they wrote since`); return }
+  await dropPinNotice(userId, msgId + 1, 'the message after the banner')
+}
+// When each person last wrote in their DM (ms).
+const lastDmIncoming = new Map<number, number>()
+const droppedNotices = new Set<string>()
+async function dropPinNotice(userId: number, noticeId: number, how: string): Promise<void> {
+  const k = `${userId}:${noticeId}`
+  if (droppedNotices.has(k)) return
+  droppedNotices.add(k)
+  if (droppedNotices.size > 1000) droppedNotices.delete(droppedNotices.values().next().value as string)
+  await bot.api.deleteMessage(userId, noticeId)
+    .then(() => console.log(`[private] removed the pin notice in dm ${userId} (#${noticeId}, ${how})`),
+      e => console.log(`[private] no pin notice removed in dm ${userId} at #${noticeId} (${how}): ${e}`))
 }
 // A banner whose continuation has ended loses its button and comes down. Its words
 // stay as they were — they are the record of where that conversation started; the
@@ -5742,13 +5764,13 @@ const leftText = (was: PrivateLink) => was.before?.sessionId
   : `🔓 Left "${was.topic}". This chat starts fresh.`
 
 // Link the DM, then put its banner up in place of any earlier one.
-async function openPrivate(userId: number, src: PrivateSource, bannerId: number): Promise<string | undefined> {
+async function openPrivate(userId: number, src: PrivateSource, bannerId: number, bannerAt: number): Promise<string | undefined> {
   const dmKey = keyFor(userId, undefined)
   const old = privateLinks[dmKey]
   const why = linkPrivate(userId, src)
   if (why) return why
   if (old?.pinned && old.pinned !== bannerId) await retireBanner(userId, old)
-  await pinBanner(dmKey, bannerId)
+  await pinBanner(dmKey, bannerId, bannerAt)
   return undefined
 }
 
@@ -5793,6 +5815,7 @@ async function privateFromGroup(ctx: Context, threadId: number | undefined, ques
   // A bot may not write first to someone who never started it. Then the private
   // reply carries a link that starts it, and the DM takes the request from there.
   const banner = privateBanner(src, question || undefined)
+  const bannerAt = Date.now()
   const intro = await ctx.api.sendMessage(user.id, banner.text, { reply_markup: banner.kb, parse_mode: 'HTML', link_preview_options: { is_disabled: true } }).catch(e => {
     console.log(`[private] cannot write to ${user.id} first (${e}); offering a start link`)
     return null
@@ -5805,7 +5828,7 @@ async function privateFromGroup(ctx: Context, threadId: number | undefined, ques
       replyTo, replyToEphemeral, true)
     return
   }
-  const why = await openPrivate(user.id, src, intro.message_id)
+  const why = await openPrivate(user.id, src, intro.message_id, bannerAt)
   if (why) {
     await bannerFailed(user.id, intro.message_id, src, why)
     await replyOnlyTo(ctx, threadId, `⚠️ Could not continue privately: ${why}.`, undefined, replyTo, replyToEphemeral)
@@ -5830,10 +5853,11 @@ async function privateFromInvite(ctx: Context, token: string): Promise<void> {
   const src: PrivateSource = { chat: inv.chat, thread: inv.thread, cwd: inv.cwd, topic: inv.topic, group: inv.group, origin: inv.origin, ...(inv.reply ? { reply: inv.reply } : {}) }
   const dmKey = keyFor(user.id, undefined)
   const banner = privateBanner(src, inv.question)
+  const bannerAt = Date.now()
   const intro = await ctx.api.sendMessage(user.id, banner.text, { reply_markup: banner.kb, parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
     .catch(e => { console.error(`[private] banner: ${e}`); return null })
   if (!intro) return
-  const why = await openPrivate(user.id, src, intro.message_id)
+  const why = await openPrivate(user.id, src, intro.message_id, bannerAt)
   if (why) { await bannerFailed(user.id, intro.message_id, src, why); return }
   if (inv.question) {
     enqueue(dmKey, () => handlePrompt(ctx, undefined, dmKey, inv.question!)).catch(e => console.error(`[error] private ${dmKey}: ${e}`))
@@ -5857,10 +5881,17 @@ async function privateInDm(ctx: Context, arg: string): Promise<void> {
 
 bot.on('message', async ctx => {
   const msg = ctx.message
+  // The notice Telegram adds when the bot pins a private continuation's banner, if it
+  // is handed to the bot: removed, like the guess in pinBanner.
+  const pinnedNow = (msg as any)?.pinned_message
+  if (pinnedNow && ctx.chat.type === 'private' && ctx.from?.is_bot && privateLinks[keyFor(ctx.chat.id, undefined)]?.pinned === pinnedNow.message_id) {
+    await dropPinNotice(ctx.chat.id, msg!.message_id, 'its own update')
+    return
+  }
   if (!msg || !ctx.from || ctx.from.is_bot) return
   const chatId = ctx.chat.id
   const threadId = msg.message_thread_id
-  if (ctx.chat.type === 'private') await refreshPrivateGuest(ctx.from.id)
+  if (ctx.chat.type === 'private') { lastDmIncoming.set(ctx.from.id, Date.now()); await refreshPrivateGuest(ctx.from.id) }
 
   // Capture forum-topic names from service messages so we can name directories.
   const created = (msg as any).forum_topic_created

@@ -3928,6 +3928,8 @@ describe('/private — carry a group topic on in your own DM', () => {
     const pin = cs.find(c => c.method === 'pinChatMessage')
     expect(pin?.payload).toMatchObject({ chat_id: 1, disable_notification: true })
     expect(bridge._privateLinks()['1:main'].pinned).toBe(pin!.payload.message_id)
+    // Telegram's "pinned a message" notice — the message right after the banner — goes.
+    expect(cs.some(c => c.method === 'deleteMessage' && c.payload.chat_id === 1 && c.payload.message_id === pin!.payload.message_id + 1)).toBe(true)
     // The group gets one message, and only Ada sees it.
     const g = inGroup(cs)
     expect(g.length).toBe(1)
@@ -3940,6 +3942,15 @@ describe('/private — carry a group topic on in your own DM', () => {
     expect(bridge._sessions()[gKey].sessionId).toBe(parent.sessionId)
     expect(bridge._privateLinks()['1:main']).toMatchObject({ chat: C, thread: T, group: 'Team' })
   }, 20000)
+
+  test('a pin notice Telegram hands the bot is removed', async () => {
+    const pinned = bridge._privateLinks()['1:main'].pinned
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: 777001, date: nowS(),
+      chat: { id: 1, type: 'private', first_name: 'Ada' }, from: { id: 42, is_bot: true, first_name: 'TestBot', username: 'testbot' },
+      pinned_message: { message_id: pinned, date: 0, chat: { id: 1, type: 'private' } } } })
+    expect(calls.slice(before).find(c => c.method === 'deleteMessage')?.payload).toEqual({ chat_id: 1, message_id: 777001 })
+  })
 
   test('a DM turn is told it is private and handed what the topic said since — once', async () => {
     await say('the vendor quote came in at 4k')
