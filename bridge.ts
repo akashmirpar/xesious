@@ -2516,8 +2516,12 @@ function pruneConversations(): void {
 // history unless context-engines.json links it to another (an archive or a group).
 //
 // Deleting state/context.db loses nothing: it is rebuilt from the logs at startup.
+//
+// OFF by default: nothing is indexed, recalled, or OCR'd until an operator opts in
+// with TG_CONTEXT=1 (or true/yes/on). A plain install then behaves exactly as it did
+// before the engine existed — no recording into the index, no recall, no hidden calls.
 
-const CONTEXT_ON = !/^(0|false|no|off)$/i.test(process.env.TG_CONTEXT || '1')
+const CONTEXT_ON = /^(1|true|yes|on)$/i.test(process.env.TG_CONTEXT || '0')
 const CONTEXT_DB = process.env.TG_CONTEXT_DB || join(dirname(STATE_FILE), 'context.db')
 // Meaning search without a context-engines.json: TG_CONTEXT_EMBED=1 is bge-m3 on the
 // local embeddings server context/setup.sh runs (or the one TG_CONTEXT_EMBED_URL names,

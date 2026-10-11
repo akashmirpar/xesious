@@ -41,6 +41,9 @@ process.env.XESIOUS_STUB_QUERY_LOG = QUERY_LOG
 const SLOW_QUERY = join(TMP, 'slow-query')
 process.env.XESIOUS_STUB_QUERY_SLOW = SLOW_QUERY
 process.env.TG_AUTO_QUIET_MS = '300'
+// The context engine ships OFF by default (TG_CONTEXT unset); these tests exercise it,
+// so they opt in explicitly, the way an operator who wants recall would.
+process.env.TG_CONTEXT = '1'
 // A stand-in for a local model server (llama.cpp's llama-server): OpenAI-style chat
 // completions with first-token logprobs, JOIN when the new messages say stubJOIN.
 const localJudgeCalls: any[] = []
