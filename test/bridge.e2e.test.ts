@@ -4194,7 +4194,7 @@ describe('/private <question> — an answer only the asker sees, where they aske
     const g = sends(cs).filter(c => c.payload.chat_id === C)
     expect(g.length).toBe(1)
     expect(g[0].payload.ephemeral_message_parameters).toEqual({ receiver_user_id: 1 })
-    expect(textOf(g[0])).toContain('Looking into it')
+    expect(textOf(g[0])).toBe('⏳ Looking into it…')
     await waitFor(() => calls.slice(before).some(c => c.method === 'editEphemeralMessageText'))
     const after = calls.slice(before)
     const edit = after.find(c => c.method === 'editEphemeralMessageText')!
@@ -4233,7 +4233,12 @@ describe('/private <question> — an answer only the asker sees, where they aske
     expect(textOf(banner)).toContain('<blockquote>when is the launch now?</blockquote>')
     expect(bridge._privateLinks()['1:main']).toMatchObject({ chat: C, thread: T })
     expect(bridge._sessions()['1:main'].sessionId).toBe(bridge._privateAsks.get(token).sessionId)
-    expect(cs.find(c => c.method === 'answerCallbackQuery')?.payload.text).toBe('Carried on in your DM.')
+    // The tap takes them to the DM…
+    expect(cs.find(c => c.method === 'answerCallbackQuery')?.payload.url).toBe('https://t.me/testbot')
+    // …and the button becomes a plain link to it, so a later tap only moves them.
+    const relink = cs.find(c => c.method === 'editEphemeralMessageReplyMarkup')!
+    expect(relink.payload).toMatchObject({ chat_id: C, receiver_user_id: 1 })
+    expect(relink.payload.reply_markup).toEqual({ inline_keyboard: [[{ text: '🔒 Continue in DM', url: 'https://t.me/testbot' }]] })
     // Not answered again: it was answered in the topic.
     expect(sends(cs).some(c => textOf(c).includes('okReply'))).toBe(false)
     const before2 = calls.length
@@ -4252,6 +4257,31 @@ describe('/private <question> — an answer only the asker sees, where they aske
     expect(cs.find(c => c.method === 'answerCallbackQuery')?.payload).toMatchObject({ show_alert: true })
     expect(bridge._privateLinks()['3:main']).toBeUndefined()
   })
+
+  test('someone who never started the bot is taken there by a start link, and the button becomes a link once linked', async () => {
+    cannotWriteFirst.add(1)
+    const before = calls.length
+    try {
+      await bridge.bot.handleUpdate({ update_id: updateId++, callback_query: { id: 'pva3', from: ADA, chat_instance: 'x', data: `pva:${token}`,
+        message: { message_id: 0, date: 0, chat: { id: C, type: 'supergroup' } } } })
+    } finally { cannotWriteFirst.delete(1) }
+    const url = String(calls.slice(before).find(c => c.method === 'answerCallbackQuery')?.payload.url)
+    const inv = /start=pv_(\w+)/.exec(url)![1]
+    expect(bridge._privateLinks()['1:main']).toBeUndefined()
+    const before2 = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: mid++, date: nowS(), text: `/start pv_${inv}`,
+      chat: { id: 1, type: 'private', first_name: 'Ada' }, from: ADA } })
+    await bridge._drainQueue('1:main')
+    const cs = calls.slice(before2)
+    expect(bridge._privateLinks()['1:main']).toMatchObject({ chat: C, thread: T })
+    expect(bridge._sessions()['1:main'].sessionId).toBe(bridge._privateAsks.get(token).sessionId)
+    expect(cs.find(c => c.method === 'editEphemeralMessageReplyMarkup')?.payload.reply_markup.inline_keyboard[0][0].url).toBe('https://t.me/testbot')
+    // Not answered again in the DM: it was answered in the topic.
+    expect(sends(cs).some(c => textOf(c).includes('okReply'))).toBe(false)
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: mid++, date: nowS(), text: '/private off',
+      chat: { id: 1, type: 'private', first_name: 'Ada' }, from: ADA } })
+    await bridge._drainQueue('1:main')
+  }, 20000)
 
   test('an answer that cannot be shown in the topic goes to the DM', async () => {
     failEphemeralEdit = true

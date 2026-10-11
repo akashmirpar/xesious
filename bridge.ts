@@ -5864,6 +5864,7 @@ async function privateFromInvite(ctx: Context, token: string): Promise<void> {
   const why = await openPrivate(user.id, src, intro.message_id, bannerAt,
     inv.sessionId !== undefined || inv.mark !== undefined ? { sessionId: inv.sessionId, mark: inv.mark } : undefined)
   if (why) { await bannerFailed(user.id, intro.message_id, src, why); return }
+  if (inv.askToken) await askButtonToLink(inv.askToken)
   if (inv.question && inv.sessionId === undefined && inv.mark === undefined) {
     enqueue(dmKey, () => handlePrompt(ctx, undefined, dmKey, inv.question!)).catch(e => console.error(`[error] private ${dmKey}: ${e}`))
   }
@@ -5881,13 +5882,16 @@ async function privateFromInvite(ctx: Context, token: string): Promise<void> {
 // note to the topic's next turn, files to the DM. Hidden messages are best-effort,
 // so when one cannot be shown the answer goes to the DM. Its button carries the
 // conversation on in the DM, from that copy.
-type PrivateAsk = { userId: number; src: PrivateSource; question: string; sessionId?: string; mark: number; created: number }
+type PrivateAsk = { userId: number; src: PrivateSource; question: string; sessionId?: string; mark: number; created: number
+  // The hidden message holding the answer, whose button becomes a link once used.
+  ackId: number }
 const privateAsks = new Map<string, PrivateAsk>()
 // A private answer's run key → the topic it belongs to, for the history tools.
 const askSource = new Map<string, string>()
 const PRIVATE_ASK_TTL_MS = 24 * 3600_000
 const PRIVATE_ASK_MAX = 300
-const PRIVATE_ASK_ACK = '🔒 Looking into it — only you will see the answer.'
+// Telegram marks a hidden message as one only you see; nothing here needs to say so.
+const PRIVATE_ASK_ACK = '⏳ Looking into it…'
 
 async function privateAsk(ctx: Context, threadId: number | undefined, question: string, replyTo?: number, replyToEphemeral?: number, repliedTo?: any): Promise<void> {
   const user = ctx.from!
@@ -5924,7 +5928,7 @@ async function runPrivateAsk(ctx: Context, threadId: number | undefined, token: 
     const now = Date.now()
     for (const [t, a] of privateAsks) if (now - a.created > PRIVATE_ASK_TTL_MS) privateAsks.delete(t)
     if (privateAsks.size >= PRIVATE_ASK_MAX) privateAsks.delete(privateAsks.keys().next().value as string)
-    privateAsks.set(token, { userId: user.id, src: { ...src, reply: undefined }, question, sessionId: res.sessionId, mark: contextMarks[askKey] ?? 0, created: now })
+    privateAsks.set(token, { userId: user.id, src: { ...src, reply: undefined }, question, sessionId: res.sessionId, mark: contextMarks[askKey] ?? 0, created: now, ackId })
     const kb = { inline_keyboard: [[{ text: '🔒 Continue in DM', callback_data: `pva:${token}` }]] }
     console.log(`[private] answer for ${user.id} in ${gKey} (${text.length} chars, session ${res.sessionId?.slice(0, 8) ?? 'none'})`)
     if (!await showPrivateAnswer(src.chat, threadId, user.id, ackId, text, kb)) await privateAnswerToDm(user, src, question, text)
@@ -5974,7 +5978,17 @@ async function privateAnswerToDm(user: NonNullable<Context['from']>, src: Privat
 }
 
 // The private answer's button: carry the conversation on in the DM, from the copy the
-// answer came from — it already holds the question and the answer.
+// answer came from — it already holds the question and the answer. The first tap
+// links the DM and takes them there; then the button becomes a plain link to the DM,
+// so a later tap only moves them, sending nothing.
+const dmUrl = (): string | undefined => { const me = botUsername || bot.botInfo?.username; return me ? `https://t.me/${me}` : undefined }
+async function askButtonToLink(token: string): Promise<void> {
+  const ask = privateAsks.get(token)
+  const url = dmUrl()
+  if (!ask || !url) return
+  await bot.api.editEphemeralMessageReplyMarkup(ask.src.chat, ask.userId, ask.ackId, { reply_markup: { inline_keyboard: [[{ text: '🔒 Continue in DM', url }]] } })
+    .catch(e => console.error(`[private] answer button to a link: ${e}`))
+}
 async function continueAskInDm(ctx: Context, token: string): Promise<void> {
   const ask = privateAsks.get(token)
   const user = ctx.from!
@@ -5989,14 +6003,19 @@ async function continueAskInDm(ctx: Context, token: string): Promise<void> {
     .catch(e => { console.log(`[private] cannot write to ${user.id} first (${e}); opening the DM with a start link`); return null })
   if (!intro) {
     const inv = randomUUID().replace(/-/g, '').slice(0, 16)
-    privateInvites.add(inv, { userId: user.id, ...ask.src, question: ask.question, ...carry, created: Date.now() })
+    privateInvites.add(inv, { userId: user.id, ...ask.src, question: ask.question, ...carry, askToken: token, created: Date.now() })
     const me = botUsername || bot.botInfo?.username
     await ctx.answerCallbackQuery({ url: `https://t.me/${me}?start=${PRIVATE_START_PREFIX}${inv}` }).catch(e => console.error(`[private] start link: ${e}`))
     return
   }
   const why = await openPrivate(user.id, ask.src, intro.message_id, bannerAt, carry)
   if (why) { await bannerFailed(user.id, intro.message_id, ask.src, why); await ctx.answerCallbackQuery({ text: `Could not: ${why}`, show_alert: true }).catch(() => {}); return }
-  await ctx.answerCallbackQuery({ text: 'Carried on in your DM.' }).catch(() => {})
+  // Take them there. Telegram documents this for start links; a plain link to the
+  // chat is tried, and a short note is the fallback — the button is a link from now on.
+  const url = dmUrl()
+  const moved = url ? await ctx.answerCallbackQuery({ url }).then(() => true, e => { console.log(`[private] could not open the DM from the tap (${e})`); return false }) : false
+  if (!moved) await ctx.answerCallbackQuery({ text: 'Carried on in your DM.' }).catch(() => {})
+  await askButtonToLink(token)
 }
 
 // /private inside the DM: what it continues, or `off` to go back.

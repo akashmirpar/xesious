@@ -2383,7 +2383,9 @@ export function privateStartToken(text: string): string | undefined {
 
 export type PrivateInvite = { userId: number; chat: number; thread?: number; cwd: string; topic: string; group: string; origin?: string; reply?: ConvRecord; question?: string; created: number
   // From a private answer in the topic: carry on from its session, not the topic's.
-  sessionId?: string; mark?: number }
+  sessionId?: string; mark?: number
+  // …and which private answer's button to turn into a plain link to the DM once linked.
+  askToken?: string }
 export class PrivateInvites {
   private byToken = new Map<string, PrivateInvite>()
   constructor(private ttlMs = PRIVATE_INVITE_TTL_MS, private max = 1000) {}
