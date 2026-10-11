@@ -3919,7 +3919,8 @@ describe('/private — carry a group topic on in your own DM', () => {
     // Its first line is what the pin bar shows; the topic's name links back to where
     // it was started, the latest message in the topic.
     expect(banner.split('\n')[0]).toMatch(/^🔒 Private: <a href="https:\/\/t\.me\/c\/888\/851\/\d+">.*topic 851.*\(Team\)<\/a>$/)
-    expect(banner).toContain('/private off or /new')
+    // Just that line: no explanation of what a private chat is.
+    expect(banner.split('\n').length).toBe(1)
     // Short, and its button leaves — worded like the one under the typing box.
     expect(banner.length).toBeLessThan(260)
     expect(intro[0].payload.reply_markup).toEqual({ inline_keyboard: [[{ text: '🔓 Exit private: topic 851', callback_data: 'pvoff' }]] })
@@ -3980,9 +3981,9 @@ describe('/private — carry a group topic on in your own DM', () => {
     const cs = await dm('/private off', ADA)
     expect(sends(cs).map(textOf).join('\n')).toContain('Back to your own conversation')
     // The banner says it is over, loses its buttons, and is unpinned.
-    const edit = cs.find(c => c.method === 'editMessageText' && c.payload.message_id === pinned)
-    expect(textOf(edit!)).toContain('🔓 Left "topic 851"')
-    expect(edit!.payload.reply_markup).toBeUndefined()
+    // The banner keeps its words — where it started — and only loses its button.
+    expect(cs.some(c => c.method === 'editMessageText' && c.payload.message_id === pinned)).toBe(false)
+    expect(cs.find(c => c.method === 'editMessageReplyMarkup' && c.payload.message_id === pinned)?.payload.reply_markup).toEqual({ inline_keyboard: [] })
     expect(cs.find(c => c.method === 'unpinChatMessage')?.payload).toMatchObject({ chat_id: 1, message_id: pinned })
     // The message saying so takes the exit button away.
     expect(sends(cs).find(c => textOf(c).includes('Back to your own conversation'))!.payload.reply_markup).toEqual({ remove_keyboard: true })
@@ -4040,7 +4041,7 @@ describe('/private — carry a group topic on in your own DM', () => {
     expect(bridge._sessions()['1:main'].sessionId).toBe(ownDmSession)
   }, 20000)
 
-  test('/private from a second topic moves the DM on: the old banner says so and comes down', async () => {
+  test('/private from a second topic moves the DM on: the old banner loses its button and comes down', async () => {
     await privately('/private', ADA)
     const first = bridge._privateLinks()['1:main'].pinned
     const before = calls.length
@@ -4049,7 +4050,8 @@ describe('/private — carry a group topic on in your own DM', () => {
       chat: { id: C, type: 'supergroup', title: 'Team', is_forum: true }, from: ADA } })
     const cs = calls.slice(before)
     expect(bridge._privateLinks()['1:main']).toMatchObject({ thread: 852 })
-    expect(textOf(cs.find(c => c.method === 'editMessageText' && c.payload.message_id === first)!)).toMatch(/Moved on from "topic 851"/)
+    expect(cs.some(c => c.method === 'editMessageText' && c.payload.message_id === first)).toBe(false)
+    expect(cs.find(c => c.method === 'editMessageReplyMarkup' && c.payload.message_id === first)?.payload.reply_markup).toEqual({ inline_keyboard: [] })
     expect(cs.find(c => c.method === 'unpinChatMessage')?.payload.message_id).toBe(first)
     await dm('/private off', ADA)
     // Still the DM's own conversation underneath, not the first topic's.
@@ -4062,7 +4064,7 @@ describe('/private — carry a group topic on in your own DM', () => {
       from: { id: 42, is_bot: true, first_name: 'TestBot', username: 'testbot' }, text: 'The total should be 120, not 210.' }
     const cs = await say('/private', ADA, { message_id: 0, ephemeral_message_id: mid, date: nowS(), reply_to_message: answer })
     const banner = toDm(cs, 1)[0]
-    expect(textOf(banner)).toContain('Picking up from the message you replied to.')
+    expect(textOf(banner)).not.toContain('Picking up')
     expect(textOf(banner)).toMatch(/<a href="https:\/\/t\.me\/c\/888\/851\/885999">/)
     await dm('so which one is right?', ADA)
     const p = handed()
@@ -4072,6 +4074,18 @@ describe('/private — carry a group topic on in your own DM', () => {
     // Once: the next turn is not handed it again.
     await dm('thanks', ADA)
     expect(handed()).not.toContain('120, not 210')
+    await dm('/private off', ADA)
+  }, 20000)
+
+  test('a reply to one of the bot\'s rich answers (a table, say) carries its words too', async () => {
+    // A rich message has blocks, not text: before, this reply carried nothing.
+    const rich = { message_id: 886500, date: 1790886500, chat: { id: C, type: 'supergroup' },
+      from: { id: 42, is_bot: true, first_name: 'TestBot', username: 'testbot' },
+      rich_message: { blocks: [{ type: 'paragraph', text: 'Costs by vendor:' },
+        { type: 'table', cells: [[{ text: 'Acme', align: 'left', valign: 'top' }, { text: '4k', align: 'left', valign: 'top' }]] }] } }
+    await say('/private', ADA, { message_id: 0, ephemeral_message_id: mid, date: nowS(), reply_to_message: rich })
+    await dm('which vendor was cheapest?', ADA)
+    expect(handed()).toMatch(/TestBot \(@testbot\): Costs by vendor:\nAcme \| 4k  ← the message being replied to/)
     await dm('/private off', ADA)
   }, 20000)
 
@@ -4092,7 +4106,9 @@ describe('/private — carry a group topic on in your own DM', () => {
     // The question is in the banner: still one message, with the exit button.
     const dmSends = toDm(opened, 3).filter(c => !textOf(c).includes('okReply') && !textOf(c).includes('Thinking'))
     expect(dmSends.length).toBe(1)
-    expect(textOf(dmSends[0])).toContain('You asked: what changed since Monday?')
+    // The question stands out: a quote under a bold label.
+    expect(textOf(dmSends[0])).toContain('<b>You asked:</b>\n<blockquote>what changed since Monday?</blockquote>')
+    expect(dmSends[0].payload.parse_mode).toBe('HTML')
     expect(dmSends[0].payload.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data).toBe('pvoff')
     // The question's answer brings the keyboard.
     expect(sends(opened).find(c => textOf(c).includes('okReply'))!.payload.reply_markup?.keyboard).toBeDefined()

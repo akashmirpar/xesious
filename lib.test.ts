@@ -1857,6 +1857,21 @@ describe('/private — continuing a group topic in a DM', () => {
     expect(L.isPrivateExitButton('how do I exit private mode?')).toBe(false)
     expect(L.isPrivateExitButton(undefined)).toBe(false)
   })
+  test('a rich message reads out as plain text: paragraphs, headings, lists, tables, details', () => {
+    const rm = { blocks: [
+      { type: 'heading', size: 2, text: 'Release plan' },
+      { type: 'paragraph', text: ['Ship on ', { type: 'bold', text: 'Friday' }, ' if ', { type: 'url', text: 'CI', url: 'https://x' }, ' is green.'] },
+      { type: 'list', items: [{ label: '1.', blocks: [{ type: 'paragraph', text: 'freeze' }] }, { label: '2.', blocks: [{ type: 'paragraph', text: 'tag' }] }] },
+      { type: 'table', cells: [[{ text: 'Step', is_header: true, align: 'left', valign: 'top' }, { text: 'Owner', align: 'left', valign: 'top' }],
+        [{ text: 'deploy', align: 'left', valign: 'top' }, { text: { type: 'italic', text: 'Ada' }, align: 'left', valign: 'top' }]] },
+      { type: 'details', summary: 'Why', blocks: [{ type: 'paragraph', text: 'the migration needs a quiet day' }] },
+      { type: 'divider' },
+      { type: 'paragraph', text: [{ type: 'mathematical_expression', expression: 'x^2' }, ' and ', { type: 'custom_emoji', custom_emoji_id: '1', alternative_text: '🚀' }] },
+    ] }
+    expect(L.richMessageText(rm)).toBe(['Release plan', 'Ship on Friday if CI is green.', '1. freeze', '2. tag',
+      'Step | Owner', 'deploy | Ada', 'Why', 'the migration needs a quiet day', 'x^2 and 🚀'].join('\n'))
+    expect(L.richMessageText(undefined)).toBe('')
+  })
   test('the turn note says where the conversation is and what not to do', () => {
     const p = L.privatePreamble('NONCE', { topic: 'Plans', group: 'Team', person: 'Ada' })
     expect(p).toMatch(/^\[xesious:NONCE\] this is a private conversation with Ada/)

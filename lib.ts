@@ -2447,3 +2447,35 @@ export function privateExitKeyboard(topic: string, group: string): {
   }
 }
 export const isPrivateExitButton = (text: string | undefined): boolean => !!text && text.trim().startsWith(PRIVATE_EXIT_BUTTON)
+
+// The plain text of a rich message (Bot API 10.1). It has blocks instead of `text`, so
+// a reply to one of the bot's rich answers — anything with a table, say — carried no
+// words at all until this read them out.
+function richInline(t: any): string {
+  if (t == null) return ''
+  if (typeof t === 'string') return t
+  if (Array.isArray(t)) return t.map(richInline).join('')
+  if (typeof t !== 'object') return ''
+  if (t.type === 'mathematical_expression') return String(t.expression ?? '')
+  if (t.type === 'custom_emoji') return String(t.alternative_text ?? '')
+  return richInline(t.text)
+}
+function richBlocks(b: any): string {
+  if (!b || typeof b !== 'object') return ''
+  if (Array.isArray(b)) return b.map(richBlocks).filter(Boolean).join('\n')
+  if (b.type === 'list') return (b.items ?? []).map((it: any) => `${it.label ?? '•'} ${richBlocks(it.blocks)}`.trim()).join('\n')
+  if (b.type === 'table') {
+    const rows = (b.cells ?? []).map((row: any[]) => (row ?? []).map(c => richInline(c?.text).trim()).join(' | '))
+    return [b.caption ? richInline(b.caption) : '', ...rows].filter(Boolean).join('\n')
+  }
+  return [
+    b.summary !== undefined ? richInline(b.summary) : '',
+    b.text !== undefined ? richInline(b.text) : '',
+    b.blocks ? richBlocks(b.blocks) : '',
+    b.caption ? richInline(b.caption.text ?? b.caption) : '',
+    b.credit ? `— ${richInline(b.credit)}` : '',
+  ].filter(Boolean).join('\n')
+}
+export function richMessageText(rm: { blocks?: unknown[] } | undefined): string {
+  return richBlocks(rm?.blocks ?? []).trim()
+}

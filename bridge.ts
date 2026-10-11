@@ -45,7 +45,7 @@ import {
   effectiveAnswers, effectiveRecords, foldRecords, contextParts, sinceMark, replyWindow, convLine, fitNewest,
   conversationPreamble, conversationFile, type ConvRecord, type Answers, type SettingValue, type SettingSource, type EditorPolicy, type EditorMode,
   EphemeralCommands, EPHEMERAL_REPLY_WINDOW_S,
-  PRIVATE_START_PREFIX, PRIVATE_EXIT_START, privateStartToken, PrivateInvites, isGroupMember, privatePreamble, privateFooter, privateExitKeyboard, isPrivateExitButton,
+  PRIVATE_START_PREFIX, PRIVATE_EXIT_START, privateStartToken, PrivateInvites, isGroupMember, privatePreamble, privateFooter, privateExitKeyboard, isPrivateExitButton, richMessageText,
   readsAlong, AUTO_PACE, asEagerness, triageDelay, triageSystemPrompt, triageCompactPrompt, triageUserPrompt, parseTriage, joinProbability, triageNeed,
   isSilentReply, SILENT_REPLY, type TriageMsg, type Eagerness,
   needsRich, sanitizeProse,
@@ -5663,7 +5663,9 @@ function privateReplyRecord(reply: any): ConvRecord | undefined {
   if (!reply || reply.forum_topic_created) return undefined
   const r = recordOf(reply, false)
   if (r) return r
-  const text = String(reply.text || reply.caption || '').trim()
+  // An answer with a table or the like went out as a rich message, whose words are in
+  // blocks rather than `text`.
+  const text = String(reply.text || reply.caption || richMessageText(reply.rich_message)).trim()
   if (!reply.from?.is_bot || !text) return undefined
   return { id: reply.message_id, t: reply.date, from: reply.from.id, name: reply.from.first_name || 'the bot',
     ...(reply.from.username ? { username: reply.from.username } : {}), text }
@@ -5687,18 +5689,17 @@ const privateExitUrl = (): string | undefined => {
 const PRIVATE_LEAVE = 'pvoff'
 
 // The one message a private continuation opens with, pinned for as long as it lasts:
-// its first line is what the pin bar shows, its topic name links back to where it
-// started, and its button leaves. The same exit also goes under the typing box, but
-// a message holds its own buttons or that keyboard, never both — so the keyboard
-// rides on the first answer instead (see handlePrompt). HTML.
-function privateBanner(src: PrivateSource, keptOwn: boolean, question?: string): { text: string; kb: any } {
+// which topic (linked back to where it started), and a button that leaves. Nothing
+// more — the person asked for a private chat and knows what one is. The same exit
+// also goes under the typing box, but a message holds its own buttons or that
+// keyboard, never both, so the keyboard rides on the first answer (see handlePrompt).
+// HTML.
+function privateBanner(src: PrivateSource, question?: string): { text: string; kb: any } {
   const where = `"${escapeHtml(src.topic)}" (${escapeHtml(src.group)})`
   return {
-    text: `🔒 Private: ${src.origin ? `<a href="${escapeHtml(src.origin)}">${where}</a>` : where}\n\n` +
-      (src.reply ? `Picking up from the message you replied to.\n` : '') +
-      `Only you see this chat; what the topic says reaches me here.\n` +
-      `Leave with the button, /private off or /new${keptOwn ? ' — your own chat with me comes back' : ''}.` +
-      (question ? `\n\nYou asked: ${escapeHtml(question)}` : ''),
+    text: `🔒 Private: ${src.origin ? `<a href="${escapeHtml(src.origin)}">${where}</a>` : where}` +
+      // The question was asked with a hidden command, so this is where it shows.
+      (question ? `\n\n<b>You asked:</b>\n<blockquote>${escapeHtml(question)}</blockquote>` : ''),
     kb: { inline_keyboard: [[{ text: privateExitKeyboard(src.topic, src.group).keyboard[0][0].text, callback_data: PRIVATE_LEAVE }]] },
   }
 }
@@ -5710,15 +5711,18 @@ async function pinBanner(dmKey: string, msgId: number): Promise<void> {
   await bot.api.pinChatMessage(Number(chatOfKey(dmKey)), msgId, { disable_notification: true })
     .catch(e => console.error(`[private] could not pin the banner: ${e}`))
 }
-// A banner whose continuation has ended says so, loses its buttons, and comes down.
-async function retireBanner(userId: number, link: PrivateLink, text: string): Promise<void> {
+// A banner whose continuation has ended loses its button and comes down. Its words
+// stay as they were — they are the record of where that conversation started; the
+// message that says it ended is a new one.
+async function retireBanner(userId: number, link: PrivateLink): Promise<void> {
   if (!link.pinned) return
-  await bot.api.editMessageText(userId, link.pinned, text).catch(e => console.error(`[private] banner edit: ${e}`))
+  await bot.api.editMessageReplyMarkup(userId, link.pinned, { reply_markup: { inline_keyboard: [] } })
+    .catch(e => console.error(`[private] banner button: ${e}`))
   await bot.api.unpinChatMessage(userId, link.pinned).catch(e => console.error(`[private] unpin: ${e}`))
 }
 async function leavePrivate(dmKey: string): Promise<PrivateLink | undefined> {
   const was = unlinkPrivate(dmKey)
-  if (was) await retireBanner(Number(chatOfKey(dmKey)), was, `🔓 Left "${was.topic}" (${was.group}).`)
+  if (was) await retireBanner(Number(chatOfKey(dmKey)), was)
   return was
 }
 // The exit keyboard goes up with the banner and comes down with the message that
@@ -5743,7 +5747,7 @@ async function openPrivate(userId: number, src: PrivateSource, bannerId: number)
   const old = privateLinks[dmKey]
   const why = linkPrivate(userId, src)
   if (why) return why
-  if (old?.pinned && old.pinned !== bannerId) await retireBanner(userId, old, `↪️ Moved on from "${old.topic}" (${old.group}) to "${src.topic}".`)
+  if (old?.pinned && old.pinned !== bannerId) await retireBanner(userId, old)
   await pinBanner(dmKey, bannerId)
   return undefined
 }
@@ -5774,7 +5778,6 @@ async function replyOnlyTo(ctx: Context, threadId: number | undefined, text: str
   }
 }
 
-const keptOwnFor = (dmKey: string) => !privateLinks[dmKey] ? !!sessions[dmKey]?.sessionId : !!privateLinks[dmKey].before?.sessionId
 
 async function privateFromGroup(ctx: Context, threadId: number | undefined, question: string, replyTo?: number, replyToEphemeral?: number, repliedTo?: any): Promise<void> {
   const user = ctx.from!
@@ -5789,7 +5792,7 @@ async function privateFromGroup(ctx: Context, threadId: number | undefined, ques
   const me = botUsername || bot.botInfo?.username
   // A bot may not write first to someone who never started it. Then the private
   // reply carries a link that starts it, and the DM takes the request from there.
-  const banner = privateBanner(src, keptOwnFor(dmKey), question || undefined)
+  const banner = privateBanner(src, question || undefined)
   const intro = await ctx.api.sendMessage(user.id, banner.text, { reply_markup: banner.kb, parse_mode: 'HTML', link_preview_options: { is_disabled: true } }).catch(e => {
     console.log(`[private] cannot write to ${user.id} first (${e}); offering a start link`)
     return null
@@ -5826,7 +5829,7 @@ async function privateFromInvite(ctx: Context, token: string): Promise<void> {
   if (!ok) { await send(ctx, undefined, 'Not authorized. Send /whoami to get the id to allowlist.'); return }
   const src: PrivateSource = { chat: inv.chat, thread: inv.thread, cwd: inv.cwd, topic: inv.topic, group: inv.group, origin: inv.origin, ...(inv.reply ? { reply: inv.reply } : {}) }
   const dmKey = keyFor(user.id, undefined)
-  const banner = privateBanner(src, keptOwnFor(dmKey), inv.question)
+  const banner = privateBanner(src, inv.question)
   const intro = await ctx.api.sendMessage(user.id, banner.text, { reply_markup: banner.kb, parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
     .catch(e => { console.error(`[private] banner: ${e}`); return null })
   if (!intro) return
