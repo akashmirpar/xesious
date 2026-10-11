@@ -17,7 +17,7 @@
  *
  * Config comes from the environment (and a sibling .env). See .env.example.
  */
-import { Bot, InputFile, InputMediaBuilder, type Context } from 'grammy'
+import { Bot, Context, InputFile, InputMediaBuilder } from 'grammy'
 import { run, type RunnerHandle } from '@grammyjs/runner'
 import telegramify from 'telegramify-markdown'
 import { autoRetry } from '@grammyjs/auto-retry'
@@ -42,9 +42,10 @@ import {
   frameUserMessage, attributionProfileLines,
   SETTINGS, settingDef, resolveSetting, choiceLabel, normalizeUsername, canEditSettings, pinPendingEditor,
   DEFAULT_EDITORS, escapeHtml, type SettingDef,
-  effectiveAnswers, effectiveRecords, foldRecords, contextParts, convLine, fitNewest,
+  effectiveAnswers, effectiveRecords, foldRecords, contextParts, sinceMark, convLine, fitNewest,
   conversationPreamble, conversationFile, type ConvRecord, type Answers, type SettingValue, type SettingSource, type EditorPolicy, type EditorMode,
   EphemeralCommands, EPHEMERAL_REPLY_WINDOW_S,
+  PRIVATE_START_PREFIX, PRIVATE_EXIT_START, privateStartToken, PrivateInvites, isGroupMember, privatePreamble, privateFooter,
   readsAlong, AUTO_PACE, asEagerness, triageDelay, triageSystemPrompt, triageCompactPrompt, triageUserPrompt, parseTriage, joinProbability, triageNeed,
   isSilentReply, SILENT_REPLY, type TriageMsg, type Eagerness,
   needsRich, sanitizeProse,
@@ -168,7 +169,7 @@ const GHOST_CONFLICTS = 2
 const ALLOWED_USERS = parseIdList(process.env.TG_ALLOWED_USERS)
 // See isAllowed(): trust every member of an allowlisted group instead of listing
 // users. Off by default — it widens authorization to whoever is in that group.
-const TRUST_CHAT_MEMBERS = /^(1|true|yes)$/i.test(process.env.TG_TRUST_CHAT_MEMBERS || '')
+let TRUST_CHAT_MEMBERS = /^(1|true|yes)$/i.test(process.env.TG_TRUST_CHAT_MEMBERS || '')
 const ALLOWED_CHATS = parseIdList(process.env.TG_ALLOWED_CHATS)
 
 // File transfer between Telegram and a topic's directory (relative to its cwd).
@@ -601,6 +602,12 @@ function recordsFor(key: string): boolean {
 // a mention hands over only what was said since — each message reaches Claude once
 // and then lives in the session.
 let contextMarks: Record<string, number> = {}
+// /private: a DM (keyed like any chat) carrying on a group topic's conversation, and
+// what that DM held before, so /private off can put it back.
+type PrivateLink = { chat: number; thread?: number; topic: string; group: string; at: string; before?: Entry; settings?: { mode?: string; model?: string; effort?: string }
+  // Where it was started (a link into the topic), and the DM's pinned banner.
+  origin?: string; pinned?: number }
+let privateLinks: Record<string, PrivateLink> = {}
 
 function loadState(): void {
   try {
@@ -622,6 +629,7 @@ function loadState(): void {
       editorPolicies = o.editorPolicies ?? {}
       seenUsers = o.seenUsers ?? {}
       contextMarks = o.contextMarks ?? {}
+      privateLinks = o.privateLinks ?? {}
       // "Reply only when mentioned" became Topic mode: on → Conversation, off → Bot chat.
       for (const g of Object.values(groupSettings)) if ('mentionOnly' in g) { g.topicMode ??= g.mentionOnly ? 'conversation' : 'bot'; delete g.mentionOnly }
       const legacy = topicSettings.mentionOnly
@@ -644,7 +652,7 @@ function saveState(): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true })
     writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models, efforts, voice, speakers, voiceParts,
-      groupSettings, groupSettingMeta, topicSettings, editorPolicies, seenUsers, contextMarks,
+      groupSettings, groupSettingMeta, topicSettings, editorPolicies, seenUsers, contextMarks, privateLinks,
       // Only the ones still awaiting a decision. A fan-out that has started cannot be
       // resumed — its parts were child processes and died with the bridge — so
       // persisting it would offer a button that could not honour itself.
@@ -2816,6 +2824,9 @@ function cliComplete(model: string, system: string, user: string, timeoutMs = 12
 // only read what the group itself wrote.
 const HISTORY_TOOLS = ['mcp__history__search_history', 'mcp__history__read_messages', 'mcp__history__list_topics']
 function historyMcp(key: string): { args: string[]; tools: string[] } | undefined {
+  // A private continuation searches the group it continues.
+  const link = privateLinks[key]
+  if (link) key = keyFor(link.chat, link.thread)
   const chat = key.slice(0, key.indexOf(':'))
   if (!chat.startsWith('-') || !recallFor(key) || !contextIndex()) return undefined
   // Pinned to the history this topic searches (its group's, or a linked archive's),
@@ -3042,6 +3053,35 @@ async function conversationContext(ctx: Context, key: string, threadId: number |
   console.log(`[conv] ${key}: ${kept.length} since the last turn${omitted ? ` (+${omitted} in the file)` : ''}` +
     `${replyLines.length ? `, ${replyLines.length} around the replied-to message` : ''}, ${fetched} file(s) fetched`)
   return recalled + conversationPreamble(BRIDGE_NONCE, { since: kept, omitted, reply: replyLines, file, total: recs.length })
+}
+
+// What each turn of a private continuation is handed: where it is, what people said
+// in its topic since the DM last looked, and the group's recall for the question. The
+// DM keeps its own mark in the group's message ids, so each message reaches it once.
+async function privateContext(ctx: Context, key: string, link: PrivateLink, text: string, cwd: string, onSearch?: () => void): Promise<string> {
+  const gKey = keyFor(link.chat, link.thread)
+  const recs = recordsFor(gKey) ? readTopicLog(link.chat, link.thread) : []
+  const mark = contextMarks[key] ?? 0
+  const since = sinceMark(recs, mark, Number.MAX_SAFE_INTEGER)
+  const last = recs.reduce((m, r) => Math.max(m, r.id), 0)
+  if (last > mark) { contextMarks[key] = last; saveState() }
+  const recalled = recallFor(gKey) ? await recallBlock(link.chat, gKey, text, {
+    exclude: new Set(since.map(r => r.id)), context: since.slice(-6).map(r => r.text).join('\n') || undefined,
+    asked: lastAskedFor(key), recentSince: mark, onSearch,
+  }).catch(e => { console.error(`[ctx] recall: ${e}`); return '' }) : ''
+  const { kept, omitted } = fitNewest(since.map(r => convLine(r, { nonce: BRIDGE_NONCE })), CONV_INLINE_CHARS)
+  let file: string | undefined
+  if (recs.length) {
+    try {
+      const abs = join(ensureDir(boxDir(cwd, key, INBOX_DIR)), 'conversation.md')
+      writeFileSync(abs, conversationFile(recs, BRIDGE_NONCE, link.topic))
+      file = `./${relative(cwd, abs)}`
+    } catch (e) { console.error(`[private] could not write the conversation file: ${e}`) }
+  }
+  if (kept.length) console.log(`[private] ${key}: ${kept.length} from ${gKey} since the last turn${omitted ? ` (+${omitted} in the file)` : ''}`)
+  const person = [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username
+  return privatePreamble(BRIDGE_NONCE, { topic: link.topic, group: link.group, person }) + recalled +
+    conversationPreamble(BRIDGE_NONCE, { since: kept, omitted, reply: [], file, total: recs.length })
 }
 
 // "Replying to the bot" means replying to a message the bot WROTE. In a forum every
@@ -3298,6 +3338,26 @@ function autoFrame(reason: string): string {
     `If on reflection you do not, or someone has already covered it, reply with exactly ${SILENT_REPLY} and nothing else. That reply is never shown.`
 }
 
+// With TG_TRUST_CHAT_MEMBERS, the members of an allowlisted group may drive the bot
+// there without being listed — and so, through /private, in their DM, for as long as
+// they are still in the group the DM continues. Checked with Telegram before each
+// update from such a DM (refreshPrivateGuest), at most every few minutes.
+const privateGuests = new Set<number>()
+const guestChecked = new Map<number, number>()
+const GUEST_RECHECK_MS = 5 * 60_000
+async function stillInGroup(chat: number, userId: number): Promise<boolean> {
+  const m = await bot.api.getChatMember(chat, userId).catch(e => { console.error(`[private] membership of ${userId} in ${chat}: ${e}`); return undefined })
+  return isGroupMember(m as any)
+}
+async function refreshPrivateGuest(userId: number): Promise<void> {
+  if (!TRUST_CHAT_MEMBERS || ALLOWED_USERS.has(String(userId))) return
+  const link = privateLinks[keyFor(userId, undefined)]
+  if (!link || !ALLOWED_CHATS.has(String(link.chat))) { privateGuests.delete(userId); return }
+  if (Date.now() - (guestChecked.get(userId) ?? 0) < GUEST_RECHECK_MS) return
+  guestChecked.set(userId, Date.now())
+  if (await stillInGroup(link.chat, userId)) privateGuests.add(userId); else privateGuests.delete(userId)
+}
+
 // Gate on the SENDER's id, never the room.
 function isAllowed(ctx: Context): boolean {
   const chat = ctx.chat
@@ -3309,7 +3369,7 @@ function isAllowed(ctx: Context): boolean {
   // it is off by default. DMs are never covered: a private chat id is the sender's,
   // so it could only match by being listed in TG_ALLOWED_CHATS explicitly.
   if (TRUST_CHAT_MEMBERS && chat.type !== 'private') return ALLOWED_CHATS.has(String(chat.id))
-  if (!ALLOWED_USERS.has(userId)) return false
+  if (!ALLOWED_USERS.has(userId)) return chat.type === 'private' && privateGuests.has(Number(userId))
   if (chat.type === 'private') return true
   return ALLOWED_CHATS.has(String(chat.id))
 }
@@ -3573,8 +3633,8 @@ const CAPTION_PREVIEW = 900
 // Build the caption for a long answer: a preview that ends on a structure boundary,
 // formatted the way every other message in the topic is, plus the size note.
 // Falls back to plain text if the escaped form cannot be made to fit.
-function answerCaption(text: string): { text: string; mode?: string; plain: string } {
-  const note = `\n\n📄 Full answer (${text.length} chars) attached.`
+function answerCaption(text: string, footer = ''): { text: string; mode?: string; plain: string } {
+  const note = `\n\n📄 Full answer (${text.length} chars) attached.${footer}`
   const body = (cut: string) => `${cut}${cut.length < text.length ? ' …' : ''}${note}`
   for (let budget = CAPTION_PREVIEW; budget >= 200; budget = Math.floor(budget * 0.75)) {
     const raw = body(previewCut(text, budget))
@@ -3598,7 +3658,9 @@ function answerCaption(text: string): { text: string; mode?: string; plain: stri
 // Run one prompt against a topic's session, post the reply, deliver the outbox.
 // Deliver a Claude answer: inline (markdown) if short, else as an answer.md file
 // with a preview caption — so a huge reply isn't a dozen chunked messages.
-async function deliver(ctx: Context, threadId: number | undefined, text: string, replyTo?: number): Promise<number | undefined> {
+// `footer` is markdown that goes under the answer: at the end of the text, or of the
+// caption when the answer goes as a file.
+async function deliver(ctx: Context, threadId: number | undefined, text: string, replyTo?: number, footer = ''): Promise<number | undefined> {
   const format = setting('replyFileFormat', keyFor(ctx.chat!.id, threadId)) as string
   if (answerGoesToFile(text, keyFor(ctx.chat!.id, threadId))) {
     const dir = mkdtempSync(join(tmpdir(), 'tg-'))
@@ -3617,13 +3679,13 @@ async function deliver(ctx: Context, threadId: number | undefined, text: string,
         writeFileSync(m, text)
         files.push(m)
       }
-      const cap = answerCaption(text)
+      const cap = answerCaption(text, footer)
       // The group's first message IS a thing to point at, so a long answer's voice
       // note hangs off the files rather than falling all the way back.
       return await sendFileGroup(ctx, threadId, files, cap.text, replyTo, cap.mode, cap.plain)
     } finally { rmSync(dir, { recursive: true, force: true }) }
   }
-  return sendRich(ctx, threadId, text, replyTo)
+  return sendRich(ctx, threadId, text + footer, replyTo)
 }
 
 // ---------------------------------------------------------------------------
@@ -4996,13 +5058,17 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     ? `[xesious:${BRIDGE_NONCE}] this directory is shared with another topic (a fork). Files sent to THIS conversation are in ./${INBOX_DIR}/${topicTag(key)}/, and anything you want delivered here goes in ./${OUTBOX_DIR}/${topicTag(key)}/ — not the shared ./${OUTBOX_DIR}/ itself.\n\n`
     : ''
   const conv = !background && ctx.chat?.type !== 'private' ? kind.conv : undefined
+  const plink = !background && ctx.chat?.type === 'private' ? privateLinks[key] : undefined
   // The status goes up before the conversation is gathered, not when the run starts:
   // gathering it can take seconds (the recall has a model write its search words, then
   // embeds them), and a bot that shows nothing for that long looks slow. The turn is a
   // job from this moment, so Interrupt, /stop and /jobs reach it while it prepares.
   // An Auto turn has no status at all.
-  const early = conv && !kind.auto ? await postEarlyStatus(ctx, threadId, key, prompt, replyTo) : undefined
-  const convBlock = conv
+  const early = (conv || plink) && !kind.auto ? await postEarlyStatus(ctx, threadId, key, prompt, replyTo) : undefined
+  const convBlock = plink
+    ? await privateContext(ctx, key, plink, prompt, cwd, early && (() => { early.edit = showEarlyStep(ctx, early, '🔎 Searching the history…') }))
+      .catch(e => { console.error(`[private] ${key}: ${e}`); return '' })
+    : conv
     ? await conversationContext(ctx, key, threadId, conv.msgId, conv.reply, cwd, {
         through: !!kind.auto, text: kind.auto ? kind.auto.text ?? '' : prompt,
         onSearch: early && (() => { early.edit = showEarlyStep(ctx, early, '🔎 Searching the history…') }),
@@ -5152,7 +5218,9 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     if (background && !owner && !isSynthesis && !promotedTurn) {
       await send(ctx, threadId, `🌿 Background task finished.`, true, link)
     }
-    const answerId = await deliver(ctx, threadId, res.text, link)
+    // A private continuation says so under every answer, with a way out.
+    const footer = plink ? privateFooter({ topic: plink.topic, group: plink.group, origin: plink.origin, exitUrl: privateExitUrl() }) : ''
+    const answerId = await deliver(ctx, threadId, res.text, link, footer)
     await flushOutbox(ctx, threadId, cwd, key, link)
     // For Auto mode's judge, which otherwise sees only what people said.
     if (ctx.chat?.type !== 'private') lastSpoke[key] = { t: Math.floor(Date.now() / 1000), text: res.text.slice(0, 400) }
@@ -5504,11 +5572,236 @@ bot.use(async (ctx, next) => { noteUser(ctx); await next() })
 // Ephemeral commands already handled, so one delivered again is left alone.
 const ephemeralCommands = new EphemeralCommands()
 
+// ---------------------------------------------------------------------------
+// /private — carry a group topic on in your own DM
+// ---------------------------------------------------------------------------
+//
+// Asked in a topic, it forks the topic's session into the asker's DM (like /fork, in
+// the same directory) and links the DM to the topic: each turn there is handed what
+// the topic said since, and the group's recall and history tools. Nothing said in the
+// DM reaches the group, and the group's transcript stays what the group saw. The DM's
+// own conversation is put aside, and /private off puts it back.
+const privateInvites = new PrivateInvites()
+type PrivateSource = { chat: number; thread?: number; cwd: string; topic: string; group: string; origin?: string }
+type DmSettings = { mode?: string; model?: string; effort?: string }
+
+// Undefined when linked, else why not.
+function linkPrivate(userId: number, src: PrivateSource): string | undefined {
+  const gKey = keyFor(src.chat, src.thread)
+  const dmKey = keyFor(userId, undefined)
+  const from = sessions[gKey]?.sessionId
+  let sessionId: string | undefined
+  if (from) {
+    sessionId = forkTranscript(src.cwd, from)
+    if (!sessionId) return `no transcript for session ${from.slice(0, 8)} in ${projectDir(src.cwd)}`
+  }
+  const prev = privateLinks[dmKey]
+  // Only the DM's own conversation is kept aside; a continuation replaced by another is not.
+  const before = prev ? prev.before : sessions[dmKey]
+  const kept: DmSettings = prev ? prev.settings ?? {} : { mode: modes[dmKey], model: models[dmKey], effort: efforts[dmKey] }
+  sessions[dmKey] = { cwd: src.cwd, ...(sessionId ? { sessionId } : {}) }
+  // The topic's settings come along, or the private side silently drops to defaults.
+  for (const [store, v] of [[modes, modes[gKey]], [models, models[gKey]], [efforts, efforts[gKey]]] as [Record<string, string>, string | undefined][]) {
+    if (v) store[dmKey] = v; else delete store[dmKey]
+  }
+  privateLinks[dmKey] = { chat: src.chat, thread: src.thread, topic: src.topic, group: src.group, at: new Date().toISOString(),
+    ...(before ? { before } : {}), settings: kept, ...(src.origin ? { origin: src.origin } : {}) }
+  // From where the topic's session last looked, so what it has not seen comes next.
+  contextMarks[dmKey] = contextMarks[gKey] ?? 0
+  if (TRUST_CHAT_MEMBERS && !ALLOWED_USERS.has(String(userId))) { privateGuests.add(userId); guestChecked.set(userId, Date.now()) }
+  topicSessionChanged(dmKey)
+  console.log(`[private] ${gKey} → dm ${userId}${sessionId ? ` (session ${from!.slice(0, 8)} forked to ${sessionId.slice(0, 8)})` : ' (no session yet)'}`)
+  return undefined
+}
+
+function unlinkPrivate(dmKey: string): PrivateLink | undefined {
+  const link = privateLinks[dmKey]
+  if (!link) return undefined
+  const userId = Number(chatOfKey(dmKey))
+  sessions[dmKey] = link.before ?? { cwd: join(SESSIONS_BASE, `dm-${userId}`) }
+  const kept: DmSettings = link.settings ?? {}
+  for (const [store, v] of [[modes, kept.mode], [models, kept.model], [efforts, kept.effort]] as [Record<string, string>, string | undefined][]) {
+    if (v) store[dmKey] = v; else delete store[dmKey]
+  }
+  delete privateLinks[dmKey]
+  delete contextMarks[dmKey]
+  privateGuests.delete(userId)
+  topicSessionChanged(dmKey)
+  console.log(`[private] dm ${userId} unlinked from ${keyFor(link.chat, link.thread)}`)
+  return link
+}
+
+// Where a private continuation was started: the latest message the bridge knows of
+// in the topic, so the link lands on the conversation as it stood then; else the
+// topic itself (General has no link of its own).
+function privateOrigin(chat: number, thread: number | undefined, visibleMsg?: number): string | undefined {
+  const gKey = keyFor(chat, thread)
+  const recs = recordsFor(gKey) ? readTopicLog(chat, thread) : []
+  const last = Math.max(visibleMsg ?? 0, latestIncoming[gKey] ?? 0, recs.reduce((m, r) => Math.max(m, r.id), 0))
+  return last > 0 ? messageLink(chat, thread, last) : topicLink(chat, thread)
+}
+const privateExitUrl = (): string | undefined => {
+  const me = botUsername || bot.botInfo?.username
+  return me ? `https://t.me/${me}?start=${PRIVATE_EXIT_START}` : undefined
+}
+const PRIVATE_LEAVE = 'pvoff'
+
+// The banner a private continuation opens with, pinned for as long as it lasts: its
+// first line is what the pin bar shows. A link back to where it started, and a way out.
+function privateBanner(src: PrivateSource, keptOwn: boolean): { text: string; kb: any } {
+  return {
+    text: `🔒 Private: "${src.topic}" (${src.group})\n\n` +
+      `This chat carries that topic on, just for you. Everything said there up to now is context here, and what people say there next reaches me as background. ` +
+      `Nobody in the group sees what you say here.\n\n` +
+      `To leave: the button below, /private off or /new. ` +
+      (keptOwn ? `Your own conversation with me comes back.` : `This chat then starts fresh.`),
+    kb: { inline_keyboard: [
+      ...(src.origin ? [[{ text: '↗ Open the topic', url: src.origin }]] : []),
+      [{ text: '🔓 Leave — back to my own chat', callback_data: PRIVATE_LEAVE }],
+    ] },
+  }
+}
+async function pinBanner(dmKey: string, msgId: number): Promise<void> {
+  const link = privateLinks[dmKey]
+  if (!link) return
+  link.pinned = msgId
+  saveState()
+  await bot.api.pinChatMessage(Number(chatOfKey(dmKey)), msgId, { disable_notification: true })
+    .catch(e => console.error(`[private] could not pin the banner: ${e}`))
+}
+// A banner whose continuation has ended says so, loses its buttons, and comes down.
+async function retireBanner(userId: number, link: PrivateLink, text: string): Promise<void> {
+  if (!link.pinned) return
+  await bot.api.editMessageText(userId, link.pinned, text).catch(e => console.error(`[private] banner edit: ${e}`))
+  await bot.api.unpinChatMessage(userId, link.pinned).catch(e => console.error(`[private] unpin: ${e}`))
+}
+async function leavePrivate(dmKey: string): Promise<PrivateLink | undefined> {
+  const was = unlinkPrivate(dmKey)
+  if (was) await retireBanner(Number(chatOfKey(dmKey)), was, `🔓 Left "${was.topic}" (${was.group}).`)
+  return was
+}
+const leftText = (was: PrivateLink) => was.before?.sessionId
+  ? `🔓 Left "${was.topic}". Back to your own conversation — message to continue it.`
+  : `🔓 Left "${was.topic}". This chat starts fresh.`
+
+// Link the DM, then put its banner up in place of any earlier one.
+async function openPrivate(userId: number, src: PrivateSource, bannerId: number): Promise<string | undefined> {
+  const dmKey = keyFor(userId, undefined)
+  const old = privateLinks[dmKey]
+  const why = linkPrivate(userId, src)
+  if (why) return why
+  if (old?.pinned && old.pinned !== bannerId) await retireBanner(userId, old, `↪️ Moved on from "${old.topic}" (${old.group}) to "${src.topic}".`)
+  await pinBanner(dmKey, bannerId)
+  return undefined
+}
+
+// A context for the DM, for a question asked from inside the group.
+function dmContext(user: NonNullable<Context['from']>): Context {
+  const update = { update_id: 0, message: { message_id: 0, date: Math.floor(Date.now() / 1000), text: '',
+    chat: { id: user.id, type: 'private', first_name: user.first_name, ...(user.username ? { username: user.username } : {}) }, from: user } }
+  return new Context(update as any, bot.api, bot.botInfo)
+}
+
+// A reply only the asker sees, to the command that asked: ephemeral, retried once.
+// Falls back to an ordinary message only when `orVisible` — it must reach them.
+async function replyOnlyTo(ctx: Context, threadId: number | undefined, text: string, kb: any, replyTo?: number, replyToEphemeral?: number, orVisible = false): Promise<void> {
+  const reply = replyToEphemeral ? { ephemeral_message_id: replyToEphemeral } : replyTo ? { message_id: replyTo } : undefined
+  const sendPrivate = () => ctx.api.sendMessage(ctx.chat!.id, text, {
+    ...destOpts({ threadId }), reply_markup: kb, ephemeral_message_parameters: { receiver_user_id: ctx.from!.id },
+    ...(reply ? { reply_parameters: reply } : {}),
+  })
+  const sent = await sendPrivate().catch(async e => {
+    console.error(`[private] ephemeral reply refused, retrying once: ${e}`)
+    await sleep(1000)
+    return sendPrivate().catch(e2 => { console.error(`[private] ephemeral reply refused again: ${e2}`); return null })
+  })
+  if (!sent && orVisible) {
+    await ctx.api.sendMessage(ctx.chat!.id, text, { ...destOpts({ threadId, replyTo }), reply_markup: kb, disable_notification: true })
+      .catch(e => console.error(`[private] reply: ${e}`))
+  }
+}
+
+const keptOwnFor = (dmKey: string) => !privateLinks[dmKey] ? !!sessions[dmKey]?.sessionId : !!privateLinks[dmKey].before?.sessionId
+
+async function privateFromGroup(ctx: Context, threadId: number | undefined, question: string, replyTo?: number, replyToEphemeral?: number): Promise<void> {
+  const user = ctx.from!
+  const gKey = keyFor(ctx.chat!.id, threadId)
+  const src: PrivateSource = { chat: ctx.chat!.id, thread: threadId, cwd: resolveCwd(ctx, threadId), topic: topicTitle(gKey),
+    group: (ctx.chat as any).title ?? 'the group', origin: privateOrigin(ctx.chat!.id, threadId, replyTo) }
+  const dmKey = keyFor(user.id, undefined)
+  const me = botUsername || bot.botInfo?.username
+  // A bot may not write first to someone who never started it. Then the private
+  // reply carries a link that starts it, and the DM takes the request from there.
+  const banner = privateBanner(src, keptOwnFor(dmKey))
+  const intro = await ctx.api.sendMessage(user.id, banner.text, { reply_markup: banner.kb }).catch(e => {
+    console.log(`[private] cannot write to ${user.id} first (${e}); offering a start link`)
+    return null
+  })
+  if (!intro) {
+    const token = randomUUID().replace(/-/g, '').slice(0, 16)
+    privateInvites.add(token, { userId: user.id, ...src, ...(question ? { question } : {}), created: Date.now() })
+    await replyOnlyTo(ctx, threadId, `🔒 To carry this topic on privately, open a chat with me — tap below, then Start.`,
+      { inline_keyboard: [[{ text: '🔒 Continue in DM', url: `https://t.me/${me}?start=${PRIVATE_START_PREFIX}${token}` }]] },
+      replyTo, replyToEphemeral, true)
+    return
+  }
+  const why = await openPrivate(user.id, src, intro.message_id)
+  if (why) {
+    await ctx.api.editMessageText(user.id, intro.message_id, `⚠️ Could not carry "${src.topic}" over: ${why}.`).catch(() => {})
+    await replyOnlyTo(ctx, threadId, `⚠️ Could not continue privately: ${why}.`, undefined, replyTo, replyToEphemeral)
+    return
+  }
+  await replyOnlyTo(ctx, threadId, `🔒 Continued in our DM — only you see it.`,
+    me ? { inline_keyboard: [[{ text: '🔒 Open DM', url: `https://t.me/${me}` }]] } : undefined, replyTo, replyToEphemeral)
+  if (question) {
+    const dctx = dmContext(user)
+    // Nobody saw it asked, the asker included: the command was hidden.
+    await send(dctx, undefined, `You asked: ${question}`, true)
+    enqueue(dmKey, () => handlePrompt(dctx, undefined, dmKey, question)).catch(e => console.error(`[error] private ${dmKey}: ${e}`))
+  }
+}
+
+async function privateFromInvite(ctx: Context, token: string): Promise<void> {
+  const user = ctx.from!
+  const inv = privateInvites.take(token, user.id, Date.now())
+  if (!inv) { await send(ctx, undefined, 'That link has expired or is not yours. Send /private in the topic again.'); return }
+  // Allowed in the group then, and still now: listed, or (trusted members) still in it.
+  const ok = ALLOWED_USERS.has(String(user.id)) ||
+    (TRUST_CHAT_MEMBERS && ALLOWED_CHATS.has(String(inv.chat)) && await stillInGroup(inv.chat, user.id))
+  if (!ok) { await send(ctx, undefined, 'Not authorized. Send /whoami to get the id to allowlist.'); return }
+  const src: PrivateSource = { chat: inv.chat, thread: inv.thread, cwd: inv.cwd, topic: inv.topic, group: inv.group, origin: inv.origin }
+  const dmKey = keyFor(user.id, undefined)
+  const banner = privateBanner(src, keptOwnFor(dmKey))
+  const intro = await ctx.api.sendMessage(user.id, banner.text, { reply_markup: banner.kb }).catch(e => { console.error(`[private] banner: ${e}`); return null })
+  if (!intro) return
+  const why = await openPrivate(user.id, src, intro.message_id)
+  if (why) { await ctx.api.editMessageText(user.id, intro.message_id, `⚠️ Could not carry "${src.topic}" over: ${why}.`).catch(() => {}); return }
+  if (inv.question) {
+    await send(ctx, undefined, `You asked: ${inv.question}`, true)
+    enqueue(dmKey, () => handlePrompt(ctx, undefined, dmKey, inv.question!)).catch(e => console.error(`[error] private ${dmKey}: ${e}`))
+  }
+}
+
+// /private inside the DM: what it continues, or `off` to go back.
+async function privateInDm(ctx: Context, arg: string): Promise<void> {
+  const dmKey = keyFor(ctx.chat!.id, undefined)
+  const link = privateLinks[dmKey]
+  if (/^(off|end|stop|leave)$/i.test(arg)) {
+    const was = await leavePrivate(dmKey)
+    await send(ctx, undefined, was ? leftText(was) : 'This chat is not continuing a group topic.')
+    return
+  }
+  await send(ctx, undefined, link
+    ? `🔒 This chat continues "${link.topic}" (${link.group}) privately, since ${link.at.slice(0, 16).replace('T', ' ')} UTC.\n/private off — leave it and go back to your own conversation.`
+    : 'Send /private in a group topic to carry it on here, privately. Add a question to have it answered here: /private what did we decide?')
+}
+
 bot.on('message', async ctx => {
   const msg = ctx.message
   if (!msg || !ctx.from || ctx.from.is_bot) return
   const chatId = ctx.chat.id
   const threadId = msg.message_thread_id
+  if (ctx.chat.type === 'private') await refreshPrivateGuest(ctx.from.id)
 
   // Capture forum-topic names from service messages so we can name directories.
   const created = (msg as any).forum_topic_created
@@ -5620,6 +5913,13 @@ bot.on('message', async ctx => {
   // answer arriving after it is no longer adjacent to what it answers.
   if (cmd) latestIncoming[keyFor(ctx.chat!.id, threadId)] = msg.message_id
 
+  // A /private start link, opened: checked against the invite itself, since the
+  // person may not be allowed in a DM until it links them.
+  const pvToken = ctx.chat.type === 'private' && cmd === '/start' ? privateStartToken(text) : undefined
+  if (pvToken) { await privateFromInvite(ctx, pvToken); return }
+  // The "click to exit" link under a private answer. Ungated: leaving is always allowed.
+  if (ctx.chat.type === 'private' && cmd === '/start' && text.split(/\s+/)[1] === PRIVATE_EXIT_START) { await privateInDm(ctx, 'off'); return }
+
   // Ungated: only reveals the caller's own ids.
   if (cmd === '/whoami' || cmd === '/id') {
     await send(ctx, threadId,
@@ -5643,6 +5943,7 @@ bot.on('message', async ctx => {
       `/restart — restart the bridge; in-flight tasks finish first\n` +
       `/config — this group's settings (model, voice, mentions, instructions, who can edit; More settings for the rest)\n` +
       `/recall <question> — what each search engine finds for it in this group's history, side by side\n` +
+      `/private [question] — carry this topic on in your DM with me, where only you see it (/private off there to leave)\n` +
 
       `/voice [on|summary|off] — speak answers back; full or summarized (text is always complete)\n` +
       `/live — get a private link to a real-time voice call bound to this session\n` +
@@ -5674,6 +5975,12 @@ bot.on('message', async ctx => {
 
   if (cmd === '/config') {
     await openConfigMenu(ctx, threadId, msg.message_id || undefined, (msg as any).ephemeral_message_id)
+    return
+  }
+  if (cmd === '/private') {
+    const arg = text.slice(text.split(/\s+/)[0].length).trim()
+    if (ctx.chat.type === 'private') await privateInDm(ctx, arg)
+    else await privateFromGroup(ctx, threadId, arg, msg.message_id || undefined, ephemeralId)
     return
   }
   // What every search engine finds for a question in this topic's history, side by
@@ -5923,13 +6230,16 @@ bot.on('message', async ctx => {
     return
   }
   if (cmd === '/new' || cmd === '/reset' || cmd === '/clear') {
+    // In a private continuation, a fresh start is a fresh start of your OWN chat: it
+    // leaves the topic first, and the fresh session is in your own directory.
+    const left = ctx.chat.type === 'private' ? await leavePrivate(key) : undefined
     // A record even when there is none yet: its stamp is what outranks a live link.
     const e = sessions[key] ?? (sessions[key] = { cwd: resolveCwd(ctx, threadId) })
     if (e?.sessionId) { e.prevSessionId = e.sessionId; delete e.sessionId }
     topicSessionChanged(key)
-    await send(ctx, threadId, e?.prevSessionId
+    await send(ctx, threadId, (left ? `🔓 Left "${left.topic}". ` : '') + (e?.prevSessionId
       ? `🧹 Fresh session started. The old one is kept (${e.prevSessionId.slice(0, 8)}) — send /resume to restore it. Nothing was deleted.`
-      : '🧹 Fresh session for this topic.')
+      : '🧹 Fresh session for this topic.'))
     return
   }
   if (cmd === '/resume') {
@@ -6083,6 +6393,7 @@ bot.on('message', async ctx => {
   if (cmd === '/status') {
     const e = sessions[key]
     await send(ctx, threadId,
+      (privateLinks[key] ? `private continuation of: ${privateLinks[key].topic} (${privateLinks[key].group})\n` : '') +
       `directory: ${e?.cwd ?? resolveCwd(ctx, threadId)}\n` +
       `session: ${e?.sessionId ?? '(none yet)'}\n` +
       `mode: ${modeFor(key)}${bypassDowngraded(key) ? ' (stored: bypass — disabled on this deployment)' : ''}\n` +
@@ -6293,6 +6604,15 @@ bot.on('my_chat_member', async ctx => {
 // so callback_data only has to carry the mode (it's capped at 64 bytes).
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
+  // The banner's Leave button. Ungated, like the exit link: it only ever ends the
+  // tapper's own continuation, in their own DM.
+  if (data === PRIVATE_LEAVE && ctx.chat?.type === 'private' && ctx.from?.id === ctx.chat.id) {
+    const was = await leavePrivate(keyFor(ctx.chat.id, undefined))
+    await ctx.answerCallbackQuery(was ? { text: `Left "${was.topic}".` } : { text: 'Already left.' }).catch(() => {})
+    if (was) await send(ctx, undefined, leftText(was))
+    return
+  }
+  if (ctx.chat?.type === 'private' && ctx.from) await refreshPrivateGuest(ctx.from.id)
   if (!isAllowed(ctx)) { await ctx.answerCallbackQuery({ text: 'Not authorized.', show_alert: true }).catch(() => {}); return }
   // Logged like every other tap: a /config tap that never reaches the bot and one
   // whose menu edit never reaches the person look the same from the chat.
@@ -6630,6 +6950,7 @@ async function ensureGroupLogos(): Promise<void> {
 // review, see FEEDBACK.md) are left out; everything still works when typed.
 const BOT_COMMANDS: { command: string; description: string; is_ephemeral?: boolean }[] = [
   { command: 'config', description: "This group's settings (only you see the menu)", is_ephemeral: true },
+  { command: 'private', description: 'Carry this topic on in your DM, where only you see it', is_ephemeral: true },
   { command: 'recall', description: "What each search engine finds in this group's history" },
   { command: 'new', description: 'Fresh session in this topic (/resume undoes it)' },
   { command: 'stop', description: 'Cancel the running task' },
@@ -6853,6 +7174,10 @@ export const _awaitingInput = awaitingInput
 export const _clearAdminCache = () => adminCache.clear()
 export const _ensureCommands = ensureCommands
 export const _projectDir = projectDir
+export const _privateLinks = () => privateLinks
+// Trusted members and their DMs, from a test: the env is read once at import.
+export function _setTrustChatMembers(on: boolean): void { TRUST_CHAT_MEMBERS = on; guestChecked.clear(); privateGuests.clear() }
+export const _forgetGuestChecks = () => guestChecked.clear()
 export const _profileFor = profileFor
 export const _boxDir = boxDir
 export const _answerCaption = answerCaption

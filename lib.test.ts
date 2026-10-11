@@ -1798,3 +1798,58 @@ describe('ephemeral commands delivered again', () => {
     expect(e.check(-100123, 7, 4, now, now)).toBe('again')
   })
 })
+
+describe('/private — continuing a group topic in a DM', () => {
+  const L = require('./lib') as typeof import('./lib')
+  test('a start link is read only in its own shape', () => {
+    expect(L.privateStartToken('/start pv_abc123def4')).toBe('abc123def4')
+    expect(L.privateStartToken('/start@testbot pv_abc123def4')).toBe('abc123def4')
+    expect(L.privateStartToken('/start')).toBeUndefined()
+    expect(L.privateStartToken('/start pv_ab')).toBeUndefined()
+    expect(L.privateStartToken('/start other_abc123def4')).toBeUndefined()
+    expect(L.privateStartToken('/start pv_abc123def4 extra')).toBeUndefined()
+  })
+  const inv = (userId: number, created: number) => ({ userId, chat: -100777, thread: 5, cwd: '/w', topic: 'Plans', group: 'Team', created })
+  test('an invite is for one person, once', () => {
+    const v = new L.PrivateInvites()
+    v.add('tok1', inv(7, 1000))
+    expect(v.take('tok1', 8, 2000)).toBeUndefined()
+    expect(v.take('tok1', 7, 2000)?.topic).toBe('Plans')
+    expect(v.take('tok1', 7, 2000)).toBeUndefined()
+  })
+  test('an invite expires', () => {
+    const v = new L.PrivateInvites(60_000)
+    v.add('tok2', inv(7, 1000))
+    expect(v.take('tok2', 7, 1000 + 60_001)).toBeUndefined()
+  })
+  test('what it remembers is bounded, oldest out first', () => {
+    const v = new L.PrivateInvites(60_000, 2)
+    for (const t of ['a', 'b', 'c']) v.add(t, inv(7, 1000))
+    expect(v.take('a', 7, 1000)).toBeUndefined()
+    expect(v.take('c', 7, 1000)).toBeDefined()
+  })
+  test('still in the group, by getChatMember', () => {
+    for (const status of ['creator', 'administrator', 'member']) expect(L.isGroupMember({ status })).toBe(true)
+    expect(L.isGroupMember({ status: 'restricted', is_member: true })).toBe(true)
+    expect(L.isGroupMember({ status: 'restricted', is_member: false })).toBe(false)
+    expect(L.isGroupMember({ status: 'left' })).toBe(false)
+    expect(L.isGroupMember({ status: 'kicked' })).toBe(false)
+    expect(L.isGroupMember(undefined)).toBe(false)
+  })
+  test('a DM shares a directory under a tag of its own, never General\'s', () => {
+    expect(L.topicTag('5551234:main')).toBe('t-dm-5551234')
+    expect(L.topicTag('-100777:main')).toBe('t-main')
+    expect(L.topicTag('-100777:42')).toBe('t-42')
+  })
+  test('the label under a private answer links back to the topic and out', () => {
+    const f = L.privateFooter({ topic: 'Plans [v2]', group: 'Team (core)', origin: 'https://t.me/c/777/5/90', exitUrl: 'https://t.me/bot?start=pvoff' })
+    expect(f).toBe('\n\n🔒 Private · [Plans v2 (Team core)](https://t.me/c/777/5/90) · [click to exit](https://t.me/bot?start=pvoff)')
+    expect(L.privateFooter({ topic: 'General', group: 'Team' })).toBe('\n\n🔒 Private · General (Team) · /private off to exit')
+  })
+  test('the turn note says where the conversation is and what not to do', () => {
+    const p = L.privatePreamble('NONCE', { topic: 'Plans', group: 'Team', person: 'Ada' })
+    expect(p).toMatch(/^\[xesious:NONCE\] this is a private conversation with Ada/)
+    expect(p).toContain('"Plans" in the group "Team"')
+    expect(p).toContain('never post, forward or copy anything into the group')
+  })
+})

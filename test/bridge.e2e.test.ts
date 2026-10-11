@@ -119,6 +119,10 @@ let nextEphemeralId = 1
 // getChatMemberCount, per chat. Unset means the call fails, and a group whose size
 // cannot be read is not given a Topic mode from it.
 const memberCount: Record<number, number> = {}
+// People who never started the bot: it may not write to them first.
+const cannotWriteFirst = new Set<number>()
+// People getChatMember reports as having left.
+const leftIds = new Set<number>()
 
 // Told of each call the moment it goes out, for a test about the ORDER of two things:
 // what had already happened when this call was made.
@@ -141,6 +145,7 @@ bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
   }
   if (method === 'getFile') return { ok: false, error_code: 400, description: 'Bad Request: no downloads in tier 2' }
   if (method === 'getChatMember') {
+    if (leftIds.has(payload.user_id)) return { ok: true, result: { status: 'left', user: { id: payload.user_id, is_bot: false, first_name: 'U' } } }
     return { ok: true, result: { status: adminIds.has(payload.user_id) ? 'administrator' : 'member', user: { id: payload.user_id, is_bot: false, first_name: 'U' } } }
   }
   if (method === 'sendMessage' && payload.ephemeral_message_parameters) {
@@ -149,6 +154,9 @@ bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
     return { ok: true, result: { message_id: 0, ephemeral_message_id: nextEphemeralId++, date: 0,
       chat: { id: payload.chat_id, type: 'supergroup' }, text: payload.text,
       receiver_user: { id: payload.ephemeral_message_parameters.receiver_user_id, is_bot: false, first_name: 'U' } } }
+  }
+  if (method === 'sendMessage' && cannotWriteFirst.has(payload.chat_id)) {
+    return { ok: false, error_code: 403, description: "Forbidden: bot can't initiate conversation with a user" }
   }
   if (method === 'sendMessage' || method === 'editMessageText') {
     // editMessageText's real result can be a Message or true; bridge ignores it.
@@ -3130,7 +3138,7 @@ describe('/config — group settings from Telegram', () => {
     await bridge._ensureCommands()
     const set = calls.slice(before).find(c => c.method === 'setMyCommands')!
     const eph = set.payload.commands.filter((c: any) => c.is_ephemeral).map((c: any) => c.command)
-    expect(eph).toEqual(['config'])
+    expect(eph).toEqual(['config', 'private'])
     expect(set.payload.commands.map((c: any) => c.command)).not.toContain('config_advanced')
     expect(set.payload.commands.map((c: any) => c.command)).toContain('help')
   })
@@ -3855,4 +3863,212 @@ describe('auto mode with the context engine', () => {
     expect(p).toContain('earlier conversations in this group')
     expect(p).toContain('Maryam: proposal: the quarterly roadmap review moves')
   })
+})
+
+describe('/private — carry a group topic on in your own DM', () => {
+  const C = -100888, T = 851
+  let mid = 885000
+  const person = (id: number, first: string, username?: string) => ({ id, is_bot: false, first_name: first, ...(username ? { username } : {}) })
+  const SARA = person(71, 'Sara', 'sara_k'), ADA = person(1, 'Ada'), BEA = person(3, 'Bea'), GUEST = person(77, 'Gus')
+  const nowS = () => Math.floor(Date.now() / 1000)
+  async function say(text: string, from: any = SARA, extra: any = {}): Promise<Call[]> {
+    const before = calls.length
+    const id = mid++
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: {
+      message_id: id, date: 1790000000 + id, text, message_thread_id: T, is_topic_message: true,
+      chat: { id: C, type: 'supergroup', title: 'Team', is_forum: true }, from, ...extra } })
+    await bridge._drainQueue(`${C}:${T}`)
+    return calls.slice(before)
+  }
+  // Picked from the command menu: nobody else saw it, so it has no message id.
+  const privately = (text: string, from: any) => say(text, from, { message_id: 0, ephemeral_message_id: mid, date: nowS() })
+  async function dm(text: string, from: any): Promise<Call[]> {
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: {
+      message_id: mid++, date: nowS(), text, chat: { id: from.id, type: 'private', first_name: from.first_name }, from } })
+    await bridge._drainQueue(`${from.id}:main`)
+    return calls.slice(before)
+  }
+  const handed = () => readFileSync(LAST_PROMPT, 'utf8')
+  const inGroup = (cs: Call[]) => sends(cs).filter(c => c.payload.chat_id === C)
+  const toDm = (cs: Call[], id: number) => sends(cs).filter(c => c.payload.chat_id === id)
+  const gKey = `${C}:${T}`
+  let ownDmSession: string | undefined
+
+  test('/private forks the topic into the asker\'s DM; the group sees nothing of it', async () => {
+    // Ada has her own DM conversation, which must survive this.
+    await dm('a note to self', ADA)
+    ownDmSession = bridge._sessions()['1:main'].sessionId
+    expect(ownDmSession).toBeDefined()
+    bridge._topicStore('topicMode')[gKey] = 'conversation'
+    await say('the budget review is on Thursday')
+    await say('@testbot can you draft the agenda?', ADA)
+    const parent = bridge._sessions()[gKey]
+    expect(parent?.sessionId).toBeDefined()
+    // The stub CLI writes no transcript; stand one in, as /fork's tests do.
+    const pdir = bridge._projectDir(parent.cwd)
+    mkdirSync(pdir, { recursive: true })
+    writeFileSync(join(pdir, `${parent.sessionId}.jsonl`), JSON.stringify({ type: 'user', sessionId: parent.sessionId, message: { role: 'user', content: 'x' } }) + '\n')
+
+    const cs = await privately('/private', ADA)
+    const intro = toDm(cs, 1)
+    expect(intro.length).toBe(1)
+    // The banner: its first line is what the pin bar shows.
+    expect(String(intro[0].payload.text).split('\n')[0]).toBe('🔒 Private: "topic 851" (Team)')
+    expect(String(intro[0].payload.text)).toContain('/private off or /new')
+    const rows = intro[0].payload.reply_markup.inline_keyboard
+    // A link back to where it was started: the latest message in the topic.
+    expect(rows[0][0].url).toMatch(/^https:\/\/t\.me\/c\/888\/851\/\d+$/)
+    expect(rows[1][0].callback_data).toBe('pvoff')
+    // …and it is pinned, quietly.
+    const pin = cs.find(c => c.method === 'pinChatMessage')
+    expect(pin?.payload).toMatchObject({ chat_id: 1, disable_notification: true })
+    expect(bridge._privateLinks()['1:main'].pinned).toBe(pin!.payload.message_id)
+    // The group gets one message, and only Ada sees it.
+    const g = inGroup(cs)
+    expect(g.length).toBe(1)
+    expect(g[0].payload.ephemeral_message_parameters).toEqual({ receiver_user_id: 1 })
+    expect(g[0].payload.reply_parameters?.ephemeral_message_id).toBeDefined()
+    const dmE = bridge._sessions()['1:main']
+    expect(dmE.cwd).toBe(parent.cwd)
+    expect(dmE.sessionId).not.toBe(parent.sessionId)
+    expect(existsSync(join(pdir, `${dmE.sessionId}.jsonl`))).toBe(true)
+    expect(bridge._sessions()[gKey].sessionId).toBe(parent.sessionId)
+    expect(bridge._privateLinks()['1:main']).toMatchObject({ chat: C, thread: T, group: 'Team' })
+  }, 20000)
+
+  test('a DM turn is told it is private and handed what the topic said since — once', async () => {
+    await say('the vendor quote came in at 4k')
+    const cs = await dm('what did the vendor quote?', ADA)
+    const answer = sends(cs).find(c => textOf(c).includes('okReply'))
+    expect(answer).toBeDefined()
+    // Every answer says where it is, with a way back to the topic and a way out.
+    expect(textOf(answer!)).toContain('🔒 Private')
+    expect(textOf(answer!)).toMatch(/click to exit\]\(https:\/\/t\.me\/testbot\?start=pvoff\)/)
+    expect(textOf(answer!)).toMatch(/\(https:\/\/t\.me\/c\/888\/851\/\d+\)/)
+    const p = handed()
+    expect(p).toContain('this is a private conversation with Ada')
+    expect(p).toContain('continued from the topic "topic 851" in the group "Team"')
+    expect(p).toContain('never post, forward or copy anything into the group')
+    expect(p).toMatch(/Sara \(@sara_k\): the vendor quote came in at 4k/)
+    // What the topic's session already saw is not handed over again.
+    expect(p).not.toContain('the budget review is on Thursday')
+    // Nothing of the DM turn reached the group.
+    expect(inGroup(cs)).toEqual([])
+    await dm('and anything else?', ADA)
+    expect(handed()).not.toContain('vendor quote came in')
+  }, 20000)
+
+  test('its files go to an outbox of its own, not the General topic\'s', async () => {
+    const lib = await import('../lib')
+    expect(lib.topicTag('1:main')).toBe('t-dm-1')
+    expect(lib.topicTag(`${C}:main`)).toBe('t-main')
+  })
+
+  test('/private off gives the DM back its own conversation, and takes the banner down', async () => {
+    const pinned = bridge._privateLinks()['1:main'].pinned
+    const cs = await dm('/private off', ADA)
+    expect(sends(cs).map(textOf).join('\n')).toContain('Back to your own conversation')
+    // The banner says it is over, loses its buttons, and is unpinned.
+    const edit = cs.find(c => c.method === 'editMessageText' && c.payload.message_id === pinned)
+    expect(textOf(edit!)).toContain('🔓 Left "topic 851"')
+    expect(edit!.payload.reply_markup).toBeUndefined()
+    expect(cs.find(c => c.method === 'unpinChatMessage')?.payload).toMatchObject({ chat_id: 1, message_id: pinned })
+    expect(bridge._sessions()['1:main'].sessionId).toBe(ownDmSession)
+    expect(bridge._privateLinks()['1:main']).toBeUndefined()
+    expect(sends(await dm('/private', ADA)).map(textOf).join('\n')).toContain('Send /private in a group topic')
+  }, 20000)
+
+  test('the banner\'s Leave button leaves', async () => {
+    await privately('/private', ADA)
+    expect(bridge._privateLinks()['1:main']).toBeDefined()
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, callback_query: { id: 'pv1', from: ADA, chat_instance: 'x', data: 'pvoff',
+      message: { message_id: bridge._privateLinks()['1:main'].pinned, date: 0, chat: { id: 1, type: 'private' } } } })
+    const cs = calls.slice(before)
+    expect(bridge._privateLinks()['1:main']).toBeUndefined()
+    expect(bridge._sessions()['1:main'].sessionId).toBe(ownDmSession)
+    expect(cs.some(c => c.method === 'unpinChatMessage')).toBe(true)
+    expect(sends(cs).map(textOf).join('\n')).toContain('Back to your own conversation')
+  }, 20000)
+
+  test('the "click to exit" link leaves', async () => {
+    await privately('/private', ADA)
+    await dm('/start pvoff', ADA)
+    expect(bridge._privateLinks()['1:main']).toBeUndefined()
+    expect(bridge._sessions()['1:main'].sessionId).toBe(ownDmSession)
+  }, 20000)
+
+  test('/new leaves the topic and starts the DM\'s own chat fresh', async () => {
+    await privately('/private', ADA)
+    const forked = bridge._sessions()['1:main'].sessionId
+    const cs = await dm('/new', ADA)
+    expect(bridge._privateLinks()['1:main']).toBeUndefined()
+    const e = bridge._sessions()['1:main']
+    expect(e.sessionId).toBeUndefined()
+    // What /resume brings back is the DM's own conversation, not the topic's fork.
+    expect(e.prevSessionId).toBe(ownDmSession)
+    expect(e.prevSessionId).not.toBe(forked)
+    expect(e.cwd).not.toBe(bridge._sessions()[gKey].cwd)
+    expect(sends(cs).map(textOf).join('\n')).toContain('🔓 Left "topic 851"')
+    await dm('/resume', ADA)
+    expect(bridge._sessions()['1:main'].sessionId).toBe(ownDmSession)
+  }, 20000)
+
+  test('/private from a second topic moves the DM on: the old banner says so and comes down', async () => {
+    await privately('/private', ADA)
+    const first = bridge._privateLinks()['1:main'].pinned
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: {
+      message_id: 0, ephemeral_message_id: mid++, date: nowS(), text: '/private', message_thread_id: 852, is_topic_message: true,
+      chat: { id: C, type: 'supergroup', title: 'Team', is_forum: true }, from: ADA } })
+    const cs = calls.slice(before)
+    expect(bridge._privateLinks()['1:main']).toMatchObject({ thread: 852 })
+    expect(textOf(cs.find(c => c.method === 'editMessageText' && c.payload.message_id === first)!)).toMatch(/Moved on from "topic 851"/)
+    expect(cs.find(c => c.method === 'unpinChatMessage')?.payload.message_id).toBe(first)
+    await dm('/private off', ADA)
+    // Still the DM's own conversation underneath, not the first topic's.
+    expect(bridge._sessions()['1:main'].sessionId).toBe(ownDmSession)
+  }, 20000)
+
+  test('when the bot cannot write first, a start link carries the request — for that person only', async () => {
+    cannotWriteFirst.add(3)
+    const cs = await privately('/private what changed since Monday?', BEA)
+    cannotWriteFirst.delete(3)
+    const g = inGroup(cs)
+    expect(g.length).toBe(1)
+    expect(g[0].payload.ephemeral_message_parameters).toEqual({ receiver_user_id: 3 })
+    const url = String(g[0].payload.reply_markup.inline_keyboard[0][0].url)
+    const token = /start=pv_(\w+)/.exec(url)![1]
+    expect(bridge._privateLinks()['3:main']).toBeUndefined()
+    // Someone else holding the link gets nothing.
+    expect(sends(await dm(`/start pv_${token}`, ADA)).map(textOf).join('\n')).toMatch(/expired or is not yours/)
+    expect(bridge._privateLinks()['1:main']).toBeUndefined()
+    const opened = await dm(`/start pv_${token}`, BEA)
+    expect(sends(opened).map(textOf).join('\n')).toContain('You asked: what changed since Monday?')
+    expect(opened.some(c => c.method === 'pinChatMessage' && c.payload.chat_id === 3)).toBe(true)
+    expect(sends(opened).some(c => textOf(c).includes('okReply'))).toBe(true)
+    expect(handed()).toContain('what changed since Monday?')
+    expect(bridge._privateLinks()['3:main']).toMatchObject({ chat: C, thread: T })
+    // Spent: a second tap does nothing.
+    expect(sends(await dm(`/start pv_${token}`, BEA)).map(textOf).join('\n')).toMatch(/expired or is not yours/)
+    await dm('/private off', BEA)
+  }, 20000)
+
+  test('a trusted member who is not listed may use their linked DM while still in the group', async () => {
+    bridge._setTrustChatMembers(true)
+    try {
+      await privately('/private', GUEST)
+      expect(bridge._privateLinks()['77:main']).toBeDefined()
+      expect(sends(await dm('hello from my DM', GUEST)).some(c => textOf(c).includes('okReply'))).toBe(true)
+      // Gone from the group: the DM stops answering.
+      leftIds.add(77); bridge._forgetGuestChecks()
+      expect(sends(await dm('still there?', GUEST)).some(c => textOf(c).includes('okReply'))).toBe(false)
+    } finally {
+      leftIds.delete(77)
+      bridge._setTrustChatMembers(false)
+    }
+    // Without trust, an unlisted person's DM is not served, link or no link.
+    expect(sends(await dm('and now?', GUEST)).some(c => textOf(c).includes('okReply'))).toBe(false)
+  }, 20000)
 })

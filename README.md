@@ -102,6 +102,7 @@ off is now a **hard startup error**, not a warning.
 | `/import <dir…>` | Make a topic for each session in the given directories — bound + recent history backfilled |
 | `/history [N]` | Re-post the last N turns of this topic's bound session |
 | `/recall <question>` | What each context engine finds in this group's history for a question, side by side (no answer from Claude) |
+| `/private [question]` | Carry this topic on in your DM with the bot, where only you see it. The topic's session is forked into your DM (same directory, same mode, model and effort); each DM turn is told what the topic said since, and searches the group's history. Nothing said there reaches the group. In a group only you see the command and the reply; if you have never started the bot, the reply carries a **Continue in DM** button instead. A question after it is answered in the DM. The DM shows a pinned banner (which topic, a link back to it, a **Leave** button), and every answer there ends with a 🔒 line linking to the topic and a *click to exit* link. Leaving — the button, the link, `/private off` or `/new` — brings back your own conversation there (`/new` then starts it fresh, `/resume` undoes that). With `TG_TRUST_CHAT_MEMBERS`, a member who is not listed may use their DM this way for as long as they are still in the group. |
 | `/help` | Usage |
 
 ## Import existing sessions

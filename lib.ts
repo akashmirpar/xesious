@@ -28,7 +28,10 @@ export function keyFor(chatId: number | string, threadId: number | undefined): s
 // topic key's last segment — the thread id, or `main` — because that is already the
 // thing that distinguishes two topics in one chat.
 export function topicTag(key: string): string {
-  const last = key.split(':').pop() || 'main'
+  const [chat, last = 'main'] = key.split(':')
+  // A DM's key ends in `main` too, like a group's General. A private continuation
+  // (/private) shares its topic's directory, so a DM gets a tag of its own.
+  if (chat && !chat.startsWith('-')) return `t-dm-${chat.replace(/[^\w-]+/g, '')}`
   return `t-${last.replace(/[^\w-]+/g, '')}`
 }
 
@@ -2353,4 +2356,74 @@ export class EphemeralCommands {
     if (this.seen.size > this.max) this.seen.delete(this.seen.keys().next().value as string)
     return date > 0 && now - date > EPHEMERAL_REPLY_WINDOW_S ? 'late' : undefined
   }
+}
+
+// ---------------------------------------------------------------------------
+// /private — continue a group topic in your own DM with the bot
+// ---------------------------------------------------------------------------
+//
+// A person asks /private in a topic; the topic's session is forked into their DM,
+// where they carry on with the topic's context and nobody in the group sees it.
+// A bot cannot write to someone who never started it, so then the private reply in
+// the group carries a t.me/<bot>?start=pv_<token> button instead, and the DM picks
+// the request up from the token. A token is good for one person, once, for a while.
+export const PRIVATE_START_PREFIX = 'pv_'
+export const PRIVATE_INVITE_TTL_MS = 30 * 60_000
+// The start parameter of the "click to exit" link on a private answer: tapped in the
+// DM, Telegram sends "/start pvoff" from the person, which leaves like /private off.
+export const PRIVATE_EXIT_START = 'pvoff'
+
+// The token in "/start pv_<token>", if that is what the message is.
+export function privateStartToken(text: string): string | undefined {
+  const m = /^\/start(?:@\S+)?\s+pv_([A-Za-z0-9]{6,40})\s*$/.exec(text.trim())
+  return m?.[1]
+}
+
+export type PrivateInvite = { userId: number; chat: number; thread?: number; cwd: string; topic: string; group: string; origin?: string; question?: string; created: number }
+export class PrivateInvites {
+  private byToken = new Map<string, PrivateInvite>()
+  constructor(private ttlMs = PRIVATE_INVITE_TTL_MS, private max = 1000) {}
+  add(token: string, inv: PrivateInvite): void {
+    this.prune(inv.created)
+    this.byToken.set(token, inv)
+    if (this.byToken.size > this.max) this.byToken.delete(this.byToken.keys().next().value as string)
+  }
+  // The invite, spent, when it is this person's and still fresh.
+  take(token: string, userId: number, now: number): PrivateInvite | undefined {
+    this.prune(now)
+    const inv = this.byToken.get(token)
+    if (!inv || inv.userId !== userId) return undefined
+    this.byToken.delete(token)
+    return inv
+  }
+  private prune(now: number): void {
+    for (const [t, inv] of this.byToken) if (now - inv.created > this.ttlMs) this.byToken.delete(t)
+  }
+}
+
+// Still in the group, by getChatMember's answer. A restricted member is in it only
+// while is_member says so.
+export function isGroupMember(m: { status?: string; is_member?: boolean } | undefined): boolean {
+  if (!m) return false
+  if (m.status === 'creator' || m.status === 'administrator' || m.status === 'member') return true
+  return m.status === 'restricted' && m.is_member === true
+}
+
+// Said in front of every turn of a private continuation, so the model knows where
+// it is: not in the group, and with no business posting there.
+export function privatePreamble(nonce: string, o: { topic: string; group: string; person?: string }): string {
+  return `[xesious:${nonce}] this is a private conversation${o.person ? ` with ${o.person}` : ''} in their direct messages with you, ` +
+    `continued from the topic "${o.topic}" in the group "${o.group}". Nobody else in the group sees it, and nothing said here reaches the group. ` +
+    `Answer here only — never post, forward or copy anything into the group from this conversation. ` +
+    `What people say in that topic reaches you here as background, and the group's history tools search that group.\n\n`
+}
+
+// The line under every answer in a private continuation, so it can never be mistaken
+// for the person's own chat with the bot: which topic it continues (a link back to
+// it) and a link that leaves. Markdown; brackets in names would break the links.
+export function privateFooter(o: { topic: string; group: string; origin?: string; exitUrl?: string }): string {
+  const clean = (t: string) => t.replace(/[\[\]()]/g, ' ').replace(/\s+/g, ' ').trim()
+  const where = `${clean(o.topic)} (${clean(o.group)})`
+  return `\n\n🔒 Private · ${o.origin ? `[${where}](${o.origin})` : where}` +
+    (o.exitUrl ? ` · [click to exit](${o.exitUrl})` : ' · /private off to exit')
 }
