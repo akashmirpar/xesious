@@ -23,12 +23,12 @@ import telegramify from 'telegramify-markdown'
 import { autoRetry } from '@grammyjs/auto-retry'
 import { apiThrottler } from '@grammyjs/transformer-throttler'
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync, copyFileSync, readlinkSync, openSync, readSync, closeSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync, copyFileSync, readlinkSync, openSync, readSync, closeSync } from 'node:fs'
 import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 'node:path'
 import { homedir, tmpdir, freemem as osFreemem } from 'node:os'
 import { randomUUID, createHash } from 'node:crypto'
 import {
-  parseIdList, keyFor, sanitize, encodeCwd, parseDirs,
+  parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
   EFFORT_LEVELS, EFFORT_DEFAULT, normalizeEffort,
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
@@ -40,12 +40,25 @@ import {
   FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
   type FanoutPlanItem,
   frameUserMessage, attributionProfileLines,
+  SETTINGS, settingDef, resolveSetting, choiceLabel, normalizeUsername, canEditSettings, pinPendingEditor,
+  DEFAULT_EDITORS, escapeHtml, type SettingDef,
+  effectiveAnswers, effectiveRecords, foldRecords, contextParts, convLine, fitNewest,
+  conversationPreamble, conversationFile, type ConvRecord, type Answers, type SettingValue, type SettingSource, type EditorPolicy, type EditorMode,
+  EphemeralCommands, EPHEMERAL_REPLY_WINDOW_S,
+  readsAlong, AUTO_PACE, asEagerness, triageDelay, triageSystemPrompt, triageCompactPrompt, triageUserPrompt, parseTriage, joinProbability, triageNeed,
+  isSilentReply, SILENT_REPLY, type TriageMsg, type Eagerness,
   needsRich, sanitizeProse,
   normalizeMode as libNormalizeMode,
   permissionArgs as libPermissionArgs,
   renderSteps as libRenderSteps,
   renderStepsHtml as libRenderStepsHtml,
 } from './lib'
+import { ContextIndex, recallPick, refersBack, type CtxMessage, type Hit, type SearchOptions } from './context/engine'
+import { QUERY_SYSTEM, languageNote, parseQuery, queryUser } from './context/query'
+import { DIGEST_BATCH_SYSTEM, digestBatchUser, splitDigests } from './context/digest'
+import { buildEngines, defaultEngineId, envEmbedding, historyChat, loadEnginesConfig, type Engine, type EnginesConfig } from './context/engines'
+import { readPhotos } from './context/ocr'
+import { recallBody, recallIntro, RECALL_CAVEAT, RECALL_CHARS, RECALL_MAX } from './context/recall'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -117,6 +130,8 @@ const QUIET_NOTE_MS = Number(process.env.TG_QUIET_NOTE_MS || 90 * 1000)
 // its first second — a button that materialises later is a control you have to
 // notice arriving, exactly when you are already waiting on something.
 const INTERRUPT_LABEL = '— Interrupt —'
+// What a run stopped by Interrupt delivers when it had produced nothing yet.
+const INTERRUPTED_EMPTY = '⏹ Interrupted before it produced anything.'
 // Every message that will WAIT gets the offer — there is no delay threshold.
 //
 // There used to be one, to keep a burst of messages from sprouting a button each.
@@ -171,10 +186,10 @@ const BRIDGE_NONCE = randomUUID().replace(/-/g, '').slice(0, 12)
 // directory (a fork). Before, this line always said the generic ./outbox/, and being
 // the system prompt it outranked the per-turn "use ./outbox/t-NN/" note — so the model
 // wrote to the shared root, where flushOutbox cross-delivered the file to whichever
-// sharing topic flushed first. TG_PROFILE overrides the whole thing (then per-topic
-// routing is the operator's to include); empty disables.
+// sharing topic flushed first. TG_PROFILE overrides this built-in text (then per-topic
+// routing is the operator's to include); empty disables it.
 const PROFILE_OVERRIDE = process.env.TG_PROFILE
-function profileFor(cwd: string, key: string): string {
+function baseProfile(cwd: string, key: string): string {
   if (PROFILE_OVERRIDE !== undefined) return PROFILE_OVERRIDE
   const inb = relative(cwd, boxDir(cwd, key, INBOX_DIR)) || INBOX_DIR
   const out = relative(cwd, boxDir(cwd, key, OUTBOX_DIR)) || OUTBOX_DIR
@@ -189,6 +204,22 @@ function profileFor(cwd: string, key: string): string {
     `- Files the user sends are saved in ./${inb}/. To send a file back, put it in ./${out}/ and it is delivered then cleared.`,
     ...attributionProfileLines(BRIDGE_NONCE),
   ].join('\n')
+}
+// A group's own instructions (/config) go after the built-in ones, never in place
+// of them: the built-in text carries the speaker-attribution scheme, and a group
+// replacing it would silently turn that off. A topic's own go after the group's —
+// added, not substituted, so a rule the whole group set still holds in every topic.
+// They are added after a TG_PROFILE override too: that replaces the built-in text,
+// not what a group set for itself.
+function profileFor(cwd: string, key: string): string {
+  const base = baseProfile(cwd, key)
+  const group = String(groupSettings[chatOfKey(key)]?.instructions ?? '').trim()
+  const topic = String(topicStore('instructions')[key] ?? '').trim()
+  if (!group && !topic) return base
+  return [base,
+    group ? `Instructions this group set for you in its settings. Follow them on every turn here:\n${group}` : '',
+    topic ? `Instructions for this topic in particular, on top of the group's. Follow them on every turn in this topic:\n${topic}` : '',
+  ].filter(s => s.trim()).join('\n\n')
 }
 // A local Bot API server (tdlib/telegram-bot-api or the tdlight fork) lifts the
 // cloud's file caps: 2000 MB up, no download cap, and getFile returns an absolute
@@ -230,12 +261,46 @@ const PROGRESS_DETAIL = /^(1|true|yes)$/i.test(process.env.TG_PROGRESS_DETAIL ||
 // map is shared on disk with the live server (live/server.ts).
 const LIVE_URL = (process.env.LIVE_URL || 'https://app.besporesh.ir').replace(/\/+$/, '')
 const LINKS_FILE = process.env.LIVE_LINKS_FILE || join(HERE, 'state', 'live-links.json')
-type LiveLink = { key: string; cwd: string; model?: string; sessionId?: string; created: string }
+// `updated` is when the link's session last changed: a turn on the call, or the
+// topic's session changing in Telegram. It decides which side is current.
+type LiveLink = { key: string; cwd: string; model?: string; sessionId?: string; created: string; updated?: string }
 function loadLinks(): Record<string, LiveLink> {
   try { return JSON.parse(readFileSync(LINKS_FILE, 'utf8')) } catch { return {} }
 }
 function saveLinks(l: Record<string, LiveLink>): void {
   try { mkdirSync(dirname(LINKS_FILE), { recursive: true }); writeFileSync(LINKS_FILE, JSON.stringify(l, null, 2)) } catch (e) { console.error(`[live-links] ${e}`) }
+}
+// Which session a topic's next turn resumes. The topic's own record wins, unless its
+// live link moved more recently — i.e. the web call ran a turn after the topic last
+// changed. It used to be "the link always wins", which made the link the source of
+// truth for every topic that ever had /live: /new, /resume and /cwd changed only the
+// topic's record, so the next message silently resumed whatever the link still
+// held. Found in production on a link left over from July, in General. A link with
+// no timestamp predates this rule and loses to the topic.
+function resumeIdFor(key: string): string | undefined {
+  const own = sessions[key]
+  const link = linkForKey(key)?.link
+  if (link?.sessionId && link.updated && (!own?.updated || link.updated > own.updated)) return link.sessionId
+  return own?.sessionId
+}
+// Every change to a topic's session that is not a turn goes through here: it stamps
+// the topic's record so it outranks an older link, and carries the change to the
+// link, so the call follows a /new in Telegram too.
+function topicSessionChanged(key: string): void {
+  lastAsked.delete(key)
+  const at = new Date().toISOString()
+  const e = sessions[key]
+  if (e) e.updated = at
+  saveState()
+  const linked = linkForKey(key)
+  if (!linked) return
+  const l = loadLinks()
+  const link = l[linked.uuid]
+  if (!link) return
+  if (e?.sessionId) link.sessionId = e.sessionId; else delete link.sessionId
+  if (e?.cwd) link.cwd = e.cwd
+  link.updated = at
+  saveLinks(l)
 }
 // The (single) live link bound to a topic, if any.
 function linkForKey(key: string): { uuid: string; link: LiveLink } | null {
@@ -315,8 +380,9 @@ const REPLY_FILE_CHARS = Math.max(0, Number(process.env.TG_REPLY_FILE_CHARS || 6
 // The read-along is a companion to those files — it is the same answer, laid out to
 // be read while it is spoken — so an answer short enough to sit inline in the chat
 // gets a voice note and nothing else. A 30-second reply does not need a document.
-function answerGoesToFile(text: string): boolean {
-  return !!REPLY_FILE_CHARS && text.length > REPLY_FILE_CHARS
+function answerGoesToFile(text: string, key: string): boolean {
+  const max = setting('replyFileChars', key) as number
+  return !!max && text.length > max
 }
 // Which file(s) a long reply is delivered as: md | html | both (default).
 // Both, rather than swapping one for the other: the .md is the source of truth —
@@ -347,12 +413,12 @@ let pending: { chat: number; id: number }[] = []
 // Per-topic "interrupt mode": a new message cancels the running run and starts
 // the new one immediately, instead of queueing behind it. Defaults to TG_INTERRUPT.
 let interruptMode: Record<string, boolean> = {}
-const isInterrupt = (key: string) => interruptMode[key] ?? INTERRUPT_DEFAULT
+const isInterrupt = (key: string) => setting('interrupt', key) as boolean
 // Per-topic permission mode, switchable from Telegram with /mode. Defaults to
 // TG_PERMISSION_MODE.
 let modes: Record<string, string> = {}
 const modeFor = (key: string) => {
-  const m = modes[key] ?? PERMISSION_MODE
+  const m = setting('mode', key) as string
   // A bypass persisted before the opt-in existed (or set via TG_PERMISSION_MODE)
   // must not silently keep taking effect once TG_ALLOW_BYPASS is off.
   return m === 'bypass' && !ALLOW_BYPASS ? 'auto' : m
@@ -365,12 +431,12 @@ const bypassDowngraded = (key: string) => modes[key] === 'bypass' && !ALLOW_BYPA
 // Per-topic model override, switchable with /model. Empty string ⇒ fall back to
 // TG_MODEL, and empty TG_MODEL ⇒ the account default (no --model flag at all).
 let models: Record<string, string> = {}
-const modelFor = (key: string) => models[key] ?? MODEL
+const modelFor = (key: string) => setting('model', key) as string
 
 // Per-topic reasoning effort, sticky like /mode and /model. Absent falls back to
 // TG_EFFORT; empty means pass no --effort and let the CLI decide.
 let efforts: Record<string, string> = {}
-const effortFor = (key: string) => efforts[key] ?? EFFORT_TIER
+const effortFor = (key: string) => setting('effort', key) as string
 // What effort this topic is actually on. An override answers directly; otherwise
 // report what the LAST RUN used, read from the session transcript — "default" on
 // its own tells the user nothing, and the CLI does not report effort in the stream
@@ -430,15 +496,111 @@ let speakers: Record<string, string> = {}
 // whichever direction this is not.
 let voiceParts: Record<string, boolean> = {}
 function voiceMode(key: string): 'off' | 'full' | 'summary' {
-  const v = voice[key]
-  if (v === 'full' || v === 'summary') return v
-  if (v === undefined) return VOICE_DEFAULT ? 'full' : 'off'
-  return 'off'
+  const v = setting('voice', key)
+  return v === 'full' || v === 'summary' ? v : 'off'
 }
 function partsMode(key: string): boolean {
-  const v = voiceParts[key]
-  return v === undefined ? VOICE_PARTS_DEFAULT : v
+  return setting('voiceParts', key) as boolean
 }
+// "off" in one topic has to be stored when its group speaks, or the group's
+// setting would win and the topic could never be silenced on its own. When the
+// group is silent anyway, clearing the override keeps the topic following it.
+function setTopicVoice(key: string, v: 'off' | 'full' | 'summary'): void {
+  const inherited = groupSettings[chatOfKey(key)]?.voice ?? serverDefault('voice')
+  if (v === 'off' && inherited === 'off') delete voice[key]
+  else voice[key] = v
+}
+
+// ---------------------------------------------------------------------------
+// Group settings. Every value resolves topic → group → server (.env), so a group
+// can set its own defaults from Telegram and a topic can still differ. Changes
+// apply on the next read — nothing here needs a restart.
+// ---------------------------------------------------------------------------
+
+// groupSettings[chatId][settingId]. A DM is its own "group" of one.
+let groupSettings: Record<string, Record<string, SettingValue>> = {}
+// Who changed each group setting and when, for the menu and for the record.
+let groupSettingMeta: Record<string, Record<string, { by: string; at: string }>> = {}
+// Topic overrides for the settings that had no per-topic store before /config.
+// The older ones (mode, model, effort, voice, interrupt, voice parts) keep their
+// own maps so existing state files load unchanged; topicStore() hides the split.
+let topicSettings: Record<string, Record<string, SettingValue>> = {}
+let editorPolicies: Record<string, EditorPolicy> = {}
+// People the bridge has seen post in each group, so an admin can pick an editor
+// from a list. Capped per group; a username can also be typed for someone who has
+// never posted.
+let seenUsers: Record<string, Record<string, { name: string; username?: string; at: number }>> = {}
+const SEEN_USERS_MAX = 200
+
+const chatOfKey = (key: string) => key.slice(0, key.indexOf(':'))
+
+function topicStore(id: string): Record<string, any> {
+  switch (id) {
+    case 'model': return models
+    case 'effort': return efforts
+    case 'voice': return voice
+    case 'mode': return modes
+    case 'interrupt': return interruptMode
+    case 'voiceParts': return voiceParts
+    default: return (topicSettings[id] ??= {})
+  }
+}
+
+// The value in effect when nothing below the server sets one.
+function serverDefault(id: string): SettingValue {
+  switch (id) {
+    case 'model': return MODEL
+    case 'effort': return EFFORT_TIER
+    case 'voice': return VOICE_DEFAULT ? 'full' : 'off'
+    // TG_REQUIRE_MENTION was the one switch before Topic mode existed; it still
+    // decides the server default.
+    case 'topicMode': return REQUIRE_MENTION ? 'conversation' : 'bot'
+    case 'answers': return 'mode'
+    case 'records': return 'mode'
+    case 'autoEagerness': return asEagerness(process.env.TG_AUTO_EAGERNESS)
+    case 'autoJudge': return /^(haiku|sonnet|local)$/.test(process.env.TG_AUTO_JUDGE || '') ? process.env.TG_AUTO_JUDGE! : 'haiku'
+    case 'retention': return 0
+    case 'recall': return CONTEXT_ON
+    case 'contextEngine': return ''
+    case 'recallQuery': { const q = (process.env.TG_CONTEXT_QUERY || '').trim().toLowerCase(); return q === 'typed' ? 'typed' : q === 'haiku' ? 'claude' : 'sonnet' }
+    case 'summaries': return !!summaryModel()
+    case 'instructions': return ''
+    case 'mode': return PERMISSION_MODE
+    case 'interrupt': return INTERRUPT_DEFAULT
+    case 'voiceParts': return VOICE_PARTS_DEFAULT
+    case 'progressDetail': return PROGRESS_DETAIL
+    case 'progressKeep': return PROGRESS_KEEP
+    case 'replyFileChars': return REPLY_FILE_CHARS
+    case 'replyFileFormat': return REPLY_FILE_FORMAT
+    case 'fanoutMax': return FANOUT_MAX
+    case 'fanoutConcurrency': return FANOUT_CONCURRENCY
+    case 'fanoutTopics': return FANOUT_TOPICS
+  }
+  throw new Error(`no server default for setting ${id}`)
+}
+
+function settingWithSource(id: string, key: string): { value: SettingValue; from: SettingSource } {
+  const def = settingDef(id)
+  const topic = def?.topic ? topicStore(id)[key] : undefined
+  return resolveSetting<SettingValue>(topic, groupSettings[chatOfKey(key)]?.[id], serverDefault(id))
+}
+function setting(id: string, key: string): SettingValue {
+  return settingWithSource(id, key).value
+}
+// What a topic does with a message, after its Topic mode and any override of the
+// two settings the mode presets. A DM is always a conversation with the bot.
+function answersFor(key: string): Answers {
+  if (!chatOfKey(key).startsWith('-')) return 'all'
+  return effectiveAnswers(String(setting('answers', key)), String(setting('topicMode', key)))
+}
+function recordsFor(key: string): boolean {
+  if (!chatOfKey(key).startsWith('-')) return false
+  return effectiveRecords(String(setting('records', key)), String(setting('topicMode', key)))
+}
+// Per topic: the id of the last message a turn there has already accounted for, so
+// a mention hands over only what was said since — each message reaches Claude once
+// and then lives in the session.
+let contextMarks: Record<string, number> = {}
 
 function loadState(): void {
   try {
@@ -454,13 +616,27 @@ function loadState(): void {
       voice = o.voice ?? {}
       speakers = o.speakers ?? {}
       voiceParts = o.voiceParts ?? {}
+      groupSettings = o.groupSettings ?? {}
+      groupSettingMeta = o.groupSettingMeta ?? {}
+      topicSettings = o.topicSettings ?? {}
+      editorPolicies = o.editorPolicies ?? {}
+      seenUsers = o.seenUsers ?? {}
+      contextMarks = o.contextMarks ?? {}
+      // "Reply only when mentioned" became Topic mode: on → Conversation, off → Bot chat.
+      for (const g of Object.values(groupSettings)) if ('mentionOnly' in g) { g.topicMode ??= g.mentionOnly ? 'conversation' : 'bot'; delete g.mentionOnly }
+      const legacy = topicSettings.mentionOnly
+      if (legacy) {
+        const tm = (topicSettings.topicMode ??= {})
+        for (const [k, v] of Object.entries(legacy)) tm[k] ??= v ? 'conversation' : 'bot'
+        delete topicSettings.mentionOnly
+      }
       // Plans proposed but not yet confirmed. A plan is just text until you tap
       // "run", and losing it to a restart made the button answer "that plan is no
       // longer available" for something the person had only just been offered.
       // Restored as pending: nothing was ever started, so there is nothing to adopt.
       for (const f of (o.fanoutPlans ?? []) as Fanout[]) fanouts.set(f.id, f)
       // migrate old boolean state: true → 'full', false/other → off
-      for (const k of Object.keys(voice)) { const v: any = voice[k]; if (v === true) voice[k] = 'full'; else if (v !== 'full' && v !== 'summary') delete voice[k] }
+      for (const k of Object.keys(voice)) { const v: any = voice[k]; if (v === true) voice[k] = 'full'; else if (v !== 'full' && v !== 'summary' && v !== 'off') delete voice[k] }
     }
   } catch (e) { console.error(`[warn] could not read state (${e}); starting empty`) }
 }
@@ -468,6 +644,7 @@ function saveState(): void {
   try {
     mkdirSync(dirname(STATE_FILE), { recursive: true })
     writeFileSync(STATE_FILE, JSON.stringify({ sessions, names, pending, interruptMode, modes, models, efforts, voice, speakers, voiceParts,
+      groupSettings, groupSettingMeta, topicSettings, editorPolicies, seenUsers, contextMarks,
       // Only the ones still awaiting a decision. A fan-out that has started cannot be
       // resumed — its parts were child processes and died with the bridge — so
       // persisting it would offer a button that could not honour itself.
@@ -499,7 +676,10 @@ function resolveCwd(ctx: Context, threadId: number | undefined): string {
     dir = join(SESSIONS_BASE, `${chat.id}-general`)
   } else {
     const name = names[key]
-    dir = name ? uniqueTopicDir(sanitize(name), key, threadId) : join(SESSIONS_BASE, `topic-${threadId}`)
+    // An unnamed topic's directory used to be `topic-<thread id>` with no check at
+    // all — and thread ids are only unique within one chat, so topic 12 in one group
+    // and topic 12 in another shared a directory, a git checkout and an outbox.
+    dir = name ? uniqueTopicDir(sanitize(name), key, threadId) : uniqueTopicDir(`topic-${threadId}`, key, threadId, chat.id)
   }
   ensureDir(dir)
   sessions[key] = { ...(sessions[key] ?? {}), cwd: dir }
@@ -519,12 +699,21 @@ function resolveCwd(ctx: Context, threadId: number | undefined): string {
 // The check-then-claim looks racy and is not: resolveCwd is fully synchronous and
 // writes sessions[key] before it returns, so no other topic can be resolved in
 // between on a single-threaded runtime.
-function uniqueTopicDir(base: string, key: string, threadId: number): string {
+function uniqueTopicDir(base: string, key: string, threadId: number, chatId?: number): string {
   const claimed = new Set<string>()
   for (const [k, e] of Object.entries(sessions)) if (k !== key && e?.cwd) claimed.add(resolve(e.cwd))
-  const free = (d: string) => !claimed.has(resolve(d))
+  // A directory already on disk that no topic claims is still someone's: a topic
+  // whose state was lost, or one from another deployment on the same base. Handing
+  // it to a new topic would give that topic the old one's files, so it is taken too.
+  const free = (d: string) => !claimed.has(resolve(d)) && !existsSync(d)
   const first = join(SESSIONS_BASE, base)
   if (free(first)) return first
+  // An unnamed topic's base already carries its thread id, so appending it again
+  // says nothing; the chat is what tells two groups' topic 12 apart.
+  if (chatId !== undefined) {
+    const withChat = join(SESSIONS_BASE, `${base}-g${String(Math.abs(chatId)).slice(-6)}`)
+    if (free(withChat)) return withChat
+  }
   // Thread ids are unique within a chat but not across chats, so the id alone can
   // still land on a taken directory; the counter is the last resort, not the norm.
   const withId = join(SESSIONS_BASE, `${base}-${threadId}`)
@@ -700,7 +889,10 @@ type Job = {
   // this job — the interrupt acknowledgement, the cancellation notice, its files —
   // quotes it, because by then those messages are far from what caused them.
   askedBy?: number
-  child: ChildProcess
+  // Unset while the turn is still preparing: a turn whose status went up before its
+  // run started (the recall first — see handlePrompt) is a job from that moment, so
+  // Interrupt, /stop and /jobs reach it; the run gives it its process.
+  child?: ChildProcess
   pgid: number
   startedAt: number
   outcome?: RunOutcome     // set when a human ends it early
@@ -711,6 +903,11 @@ const jobs = new Map<string, Job>()
 const jobsFor = (key: string) => [...jobs.values()].filter(j => j.key === key)
 // Short, because callback_data caps at 64 bytes and the id has to fit in a button.
 const newJobId = () => randomUUID().replace(/-/g, '').slice(0, 8)
+// Keyed by JOB id, never by topic (see the note in runStreaming's editStatus).
+const interruptKeyboard = (jobId: string) => ({ inline_keyboard: [[{ text: INTERRUPT_LABEL, callback_data: `int:${jobId}` }]] })
+// A turn whose status went up before its run started (see handlePrompt): its job is
+// registered from that moment, without a process until the run takes it over.
+type EarlyTurn = { job: Job; statusId: number; edit?: Promise<void> }
 
 // Signal a run's whole process group, falling back to the bare child if the group
 // is gone. NEVER call this on a child spawned without `detached`: such a child
@@ -721,6 +918,8 @@ function signalJob(job: Job, sig: NodeJS.Signals): boolean {
   // signal the bridge's OWN process group and take the bridge down. Signal the
   // child directly instead (it likely never started, so this is usually a no-op).
   if (job.pgid > 0) { try { process.kill(-job.pgid, sig); return true } catch {} }
+  // No child: a turn still preparing, which checks its outcome before it starts one.
+  if (!job.child) return false
   try { job.child.kill(sig); return true } catch {}
   return false
 }
@@ -728,6 +927,9 @@ function signalJob(job: Job, sig: NodeJS.Signals): boolean {
 // Members of a run's process group that are still alive. After the run ends these
 // are, by construction, processes it left behind — no command-line guessing.
 function groupSurvivors(pgid: number): number[] {
+  // 0 is no group at all (a job with no process yet, or a spawn that failed), and the
+  // kernel's own threads sit in process group 0: they are nobody's leftovers.
+  if (pgid <= 0) return []
   const out: number[] = []
   try {
     for (const name of readdirSync('/proc')) {
@@ -801,6 +1003,10 @@ const FANOUT_MAX = Number(process.env.TG_FANOUT_MAX || 6)
 // by a model, and eight live children is roughly 2.4 GB on a box with 7.9 GB and no
 // swap. Batching is stated in the proposal rather than applied silently.
 const FANOUT_CONCURRENCY = Number(process.env.TG_FANOUT_CONCURRENCY || 3)
+const FANOUT_TOPICS = (() => {
+  const v = (process.env.TG_FANOUT_TOPICS || 'ask').toLowerCase()
+  return v === 'delete' || v === 'close' || v === 'keep' ? v : 'ask'
+})()
 // 🧪, from Telegram's approved topic-icon set. Only ids from that set are accepted,
 // which is also why there is no leaf here: the set has no plant of any kind.
 const FANOUT_TOPIC_ICON = process.env.TG_FANOUT_TOPIC_ICON || '5411138633765757782'
@@ -890,7 +1096,8 @@ const MODES: readonly string[] = allowedModes(ALLOW_BYPASS)
 // Thin wrappers over ./lib that bind this process's config. MODE_HELP, MODEL_ALIASES,
 // MODEL_DEFAULT and normalizeModel are imported directly (no config dependency).
 const normalizeMode = (m: string) => libNormalizeMode(m, { allowBypass: ALLOW_BYPASS })
-const permissionArgs = (mode: string) => libPermissionArgs(mode, { allowBypass: ALLOW_BYPASS, allowedTools: ALLOWED_TOOLS })
+const permissionArgs = (mode: string, extraTools: string[] = []) =>
+  libPermissionArgs(mode, { allowBypass: ALLOW_BYPASS, allowedTools: [ALLOWED_TOOLS, ...extraTools].filter(Boolean).join(',') })
 
 // Env for the claude subprocess: strip TELEGRAM_*/TG_* so the Claude Code
 // process (and any installed telegram channel plugin) can't grab our bot token
@@ -924,10 +1131,27 @@ function voiceEnv(key?: string): NodeJS.ProcessEnv {
 }
 
 // toolStep, the Step type and both status renderers live in ./lib. renderSteps and
-// renderStepsHtml there take progressDetail as a parameter; bind this process's
-// PROGRESS_DETAIL here.
-const renderSteps = (steps: Step[], total: number, headline?: string, note?: string) => libRenderSteps(steps, total, { progressDetail: PROGRESS_DETAIL, headline, note })
-const renderStepsHtml = (steps: Step[]) => libRenderStepsHtml(steps, { progressDetail: PROGRESS_DETAIL })
+// renderStepsHtml there take progressDetail as a parameter; it is a group setting,
+// so each run passes the value in effect for its own topic.
+const renderSteps = (steps: Step[], total: number, detail: boolean, headline?: string, note?: string) => libRenderSteps(steps, total, { progressDetail: detail, headline, note })
+const renderStepsHtml = (steps: Step[], detail: boolean) => libRenderStepsHtml(steps, { progressDetail: detail })
+// One edit of a status message: `body` (the rich rendering of `shown`), else the HTML
+// one, else plain labels. Same posture as sendRich: formatting is best-effort, the
+// update is not. reply_markup has to ride on EVERY edit: an edit without it drops the
+// keyboard. Verified against the API that a rich message keeps its keyboard across
+// editMessageText.
+async function editStatusMessage(ctx: Context, msgId: number, body: string, shown: Step[], detail: boolean, markup?: any): Promise<void> {
+  try {
+    await ctx.api.raw.editMessageText({ chat_id: ctx.chat!.id, message_id: msgId, rich_message: { markdown: body }, ...(markup ? { reply_markup: markup } : {}) })
+  } catch {
+    try {
+      await ctx.api.editMessageText(ctx.chat!.id, msgId, renderStepsHtml(shown, detail), { parse_mode: 'HTML', reply_markup: markup })
+    } catch {
+      const plain = [THINKING, ...shown.map(s => s.label)].join('\n').slice(0, 3500)
+      await ctx.api.editMessageText(ctx.chat!.id, msgId, plain).catch(() => {})
+    }
+  }
+}
 
 // Run a prompt with streaming output, editing a single "status" message in the
 // topic to show live tool-step progress, then return the final result.
@@ -951,12 +1175,21 @@ type RunOpts = {
   // a "turn": /usage and friends take no model time, so the status flashed for two
   // seconds offering an Interrupt button for a run that does nothing.
   silent?: boolean
+  // A status message and job the caller already put up, because the turn had work to
+  // do before its run could start (see handlePrompt). The run takes both over
+  // instead of posting its own.
+  early?: EarlyTurn
 }
 async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL, ro: RunOpts = {}): Promise<ClaudeResult> {
-  const { onInit, effort = EFFORT_TIER, askedBy, fork, silent } = ro
-  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs(mode)]
+  const { onInit, effort = EFFORT_TIER, askedBy, fork, silent, early } = ro
+  const history = historyMcp(key)
+  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs(mode, history?.tools), ...(history?.args ?? [])]
   const profile = profileFor(cwd, key)
   if (profile.trim()) args.push('--append-system-prompt', profile)
+  // Read once per run: a setting changed mid-run applies from the next one, so a
+  // single status message never mixes the two renderings.
+  const detail = setting('progressDetail', key) as boolean
+  const progressKeep = setting('progressKeep', key) as string
   if (resumeId) args.push('--resume', resumeId)
   if (model) args.push('--model', model)
   if (effort) args.push('--effort', effort)
@@ -965,16 +1198,20 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   const opts: any = threadId ? { message_thread_id: threadId } : {}
   // Minted before the status message so its keyboard can name this run from the
   // start. If the spawn below fails the id never registers, and a tap on it is told
-  // the task has already finished — which is true.
-  const jobId = newJobId()
-  const interruptKb = { inline_keyboard: [[{ text: INTERRUPT_LABEL, callback_data: `int:${jobId}` }]] }
+  // the task has already finished — which is true. An early turn has both already.
+  const jobId = early?.job.id ?? newJobId()
+  const interruptKb = interruptKeyboard(jobId)
   // Status is machine chatter, not an answer — post and edit it silently so only
   // the real reply buzzes the user's phone.
-  const status = silent ? null : await ctx.api.sendMessage(ctx.chat!.id, THINKING,
+  const status = silent ? null : early ? { message_id: early.statusId } : await ctx.api.sendMessage(ctx.chat!.id, THINKING,
     { ...opts, disable_notification: true, reply_markup: interruptKb }).catch(() => null)
-  if (status) { pending.push({ chat: ctx.chat!.id, id: status.message_id }); saveState() }
+  if (status && !early) { pending.push({ chat: ctx.chat!.id, id: status.message_id }); saveState() }
   const steps: Step[] = []
-  let lastEdit = 0, dirty = false
+  // What the automatic recall did just before this turn, as its first step.
+  const recalled = recallSteps.get(key)
+  recallSteps.delete(key)
+  if (recalled && Date.now() - recalled.at < 120_000) steps.push(recalled.step)
+  let lastEdit = 0, dirty = steps.length > 0
   // Reset by every stream event; drives both the staleness note and the watchdog.
   let lastEventAt = Date.now()
   // Set once the child is spawned; the status renderer uses it to offer Interrupt.
@@ -993,28 +1230,18 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     // every step, so trimming never misreports how much work was done.
     let shown = steps.slice(-12)
     const note = stalenessNote(Date.now() - lastEventAt, { quietMs: QUIET_NOTE_MS })
-    let body = renderSteps(shown, steps.length, undefined, note)
+    let body = renderSteps(shown, steps.length, detail, undefined, note)
     // Keyed by JOB id, never by topic. The status message is KEPT after a run that
     // produced mid-turn text, so a topic-scoped button would sit on an old record
     // and end whatever is running today. A tap on a finished job is told so.
     const markup = interruptKb
-    while (body.length > 15000 && shown.length > 1) { shown = shown.slice(1); body = renderSteps(shown, steps.length, undefined, note) }
-    try {
-      // reply_markup has to ride on EVERY edit: an edit without it drops the
-      // keyboard. Verified against the API that a rich message keeps its keyboard
-      // across editMessageText.
-      await ctx.api.raw.editMessageText({ chat_id: ctx.chat!.id, message_id: status.message_id, rich_message: { markdown: body }, ...(markup ? { reply_markup: markup } : {}) })
-    } catch {
-      // Same posture as sendRich: formatting is best-effort, the update is not.
-      try {
-        await ctx.api.editMessageText(ctx.chat!.id, status.message_id, renderStepsHtml(shown), { parse_mode: 'HTML', reply_markup: markup })
-      } catch {
-        const plain = [THINKING, ...shown.map(s => s.label)].join('\n').slice(0, 3500)
-        await ctx.api.editMessageText(ctx.chat!.id, status.message_id, plain).catch(() => {})
-      }
-    }
+    while (body.length > 15000 && shown.length > 1) { shown = shown.slice(1); body = renderSteps(shown, steps.length, detail, undefined, note) }
+    await editStatusMessage(ctx, status.message_id, body, shown, detail, markup)
   }
   const ticker = setInterval(() => void editStatus(), 4000)
+  // What the recall found, as soon as there is a run to show it on, not at the CLI's
+  // first event seconds later. With nothing to show this edits nothing.
+  void editStatus()
 
   return await new Promise<ClaudeResult>(resolve => {
     let buf = '', err = '', finalText = '', sessionId: string | undefined, isError = false, got = false
@@ -1028,12 +1255,17 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     // group — where a group signal would kill the bridge — and killing the child
     // alone orphans every grandchild it spawned.
     const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'], detached: true })
-    const job: Job = {
-      id: jobId, key, threadId, prompt, child, pgid: child.pid ?? 0, askedBy,
-      startedAt: Date.now(), statusMsgId: status?.message_id, steps: () => steps.length,
-    }
+    // An early turn's job has been registered since its status went up, with the
+    // prompt as it was asked (for /jobs); the run gives it its process.
+    const job: Job = early?.job ?? { id: jobId, key, threadId, prompt, pgid: 0, askedBy, startedAt: Date.now(), statusMsgId: status?.message_id, steps: () => 0 }
+    job.child = child
+    job.pgid = child.pid ?? 0
+    job.steps = () => steps.length
     jobs.set(job.id, job)
     runningJob = job
+    // Ended before the run took it over: handlePrompt checks first, so this only
+    // matters if an await ever lands between that check and this spawn.
+    if (job.outcome) void endJob(job, job.outcome)
     const timer = setTimeout(() => child.kill('SIGKILL'), CLAUDE_TIMEOUT_MS)
     // Keyed on stream events, not wall-clock: a long turn emits them steadily even
     // when each step takes minutes, while a hung child emits nothing at all.
@@ -1057,7 +1289,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
       while ((nl = buf.indexOf('\n')) !== -1) {
         const line = buf.slice(0, nl); buf = buf.slice(nl + 1)
         // Classification lives in ./lib (parseStreamLine); the side effects stay here.
-        for (const ev of parseStreamLine(line, { progressDetail: PROGRESS_DETAIL })) {
+        for (const ev of parseStreamLine(line, { progressDetail: detail })) {
           lastEventAt = Date.now()
           if (ev.kind === 'step') { steps.push(ev.step); dirty = true }
           else if (ev.kind === 'text') {
@@ -1099,14 +1331,14 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
         // is why the reasoning was unavailable BOTH during and after a run — on a
         // phone the user is usually not watching in real time.
         const carriesMore = textBlocks.length > 1 || (textBlocks.length === 1 && !res.text.includes(textBlocks[0]))
-        const keep = PROGRESS_KEEP === 'keep' || (PROGRESS_KEEP !== 'off' && carriesMore)
+        const keep = progressKeep === 'keep' || (progressKeep !== 'off' && carriesMore)
         // Whatever happens next, the run is over: the Interrupt button must go, or
         // a retained record keeps a dead control on it.
         await ctx.api.editMessageReplyMarkup(ctx.chat!.id, status.message_id).catch(() => {})
         if (keep && steps.length) {
-          const body = renderSteps(steps.slice(-12), steps.length, RUN_RECORD)
+          const body = renderSteps(steps.slice(-12), steps.length, detail, RUN_RECORD)
           await ctx.api.raw.editMessageText({ chat_id: ctx.chat!.id, message_id: status.message_id, rich_message: { markdown: body } })
-            .catch(async () => { await ctx.api.editMessageText(ctx.chat!.id, status.message_id, renderStepsHtml(steps.slice(-12)), { parse_mode: 'HTML' }).catch(() => {}) })
+            .catch(async () => { await ctx.api.editMessageText(ctx.chat!.id, status.message_id, renderStepsHtml(steps.slice(-12), detail), { parse_mode: 'HTML' }).catch(() => {}) })
         } else {
           await ctx.api.deleteMessage(ctx.chat!.id, status.message_id).catch(() => {})
         }
@@ -1127,7 +1359,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
         // an error, and what they asked for is whatever it had.
         const partial = textBlocks.join('\n\n').trim()
         void finish({
-          text: partial || (got && !isError ? finalText : '') || '⏹ Interrupted before it produced anything.',
+          text: partial || (got && !isError ? finalText : '') || INTERRUPTED_EMPTY,
           sessionId, isError: false, blocks: textBlocks,
         })
         return
@@ -1399,7 +1631,10 @@ function modeKeyboard(key: string) {
 
 // Human label for the model currently in effect for a topic.
 function modelLabel(key: string): string {
-  const m = modelFor(key)
+  const { value, from } = settingWithSource('model', key)
+  const m = value as string
+  if (from === 'topic') return m || 'CLI default (set for this topic)'
+  if (from === 'group') return `${MODEL_DEFAULT} → this group's setting (${m || 'CLI default'})`
   if (m) return m
   return MODEL ? `${MODEL_DEFAULT} → TG_MODEL (${MODEL})` : `${MODEL_DEFAULT} → system default`
 }
@@ -1430,6 +1665,1637 @@ function modelKeyboard(key: string) {
   const rows = MODEL_ALIASES.map(m => [{ text: `${m === cur ? '● ' : ''}${m}`, callback_data: `model:${m}` }])
   rows.push([{ text: `${cur === '' ? '● ' : ''}${MODEL_DEFAULT}`, callback_data: `model:${MODEL_DEFAULT}` }])
   return { inline_keyboard: rows }
+}
+
+// ---------------------------------------------------------------------------
+// /config — a group's settings as one button menu
+// ---------------------------------------------------------------------------
+//
+// One menu for every setting in SETTINGS, instead of one hand-written command and
+// keyboard per setting. In a group the menu is an ephemeral message — only the
+// person who asked sees it — and each change is announced in the room with one
+// line, so the room learns what changed without watching someone click through.
+// Ephemeral delivery is best-effort by Telegram's own account, so a refused send
+// falls back to an ordinary message rather than leaving the command unanswered.
+
+type MenuRef = { messageId?: number; ephemeralId?: number }
+type ConfigMenu = {
+  chatId: number
+  threadId?: number
+  userId: number
+  userName: string
+  isPrivate: boolean
+  title: string
+  created: number
+  ref?: MenuRef
+  // What the last screen listed, so a tap can name an entry by index. Callback
+  // data is capped at 64 bytes, far too small for a topic key or a person's name.
+  diff: string[]
+  seen: number[]
+  editors: { id?: number; username?: string }[]
+  // Does Telegram deliver this group's messages to the bot at all? Privacy mode off,
+  // or the bot is an admin here — admins get everything whatever privacy mode says.
+  botReadsAll?: boolean
+}
+const configMenus = new Map<string, ConfigMenu>()
+const CONFIG_MENU_TTL_MS = 60 * 60 * 1000
+const CONFIG_MENU_MAX = 200
+
+// Replies the bridge is waiting for: an @username for the editor list, or the text
+// of the group instructions. Keyed `${chatId}:${promptMessageId}`.
+type AwaitedInput = { kind: 'editor' | 'instructions' | 'topicInstructions'; chatId: number; threadId?: number; userId: number; tok: string; at: number }
+const awaitingInput = new Map<string, AwaitedInput>()
+const INPUT_TTL_MS = 10 * 60 * 1000
+const INSTRUCTIONS_MAX = 2000
+
+const userName = (u: { first_name: string; last_name?: string }) => [u.first_name, u.last_name].filter(Boolean).join(' ')
+
+// Telegram's own admin list is the default authority, so it is asked rather than
+// mirrored. Cached briefly: every tap in the menu checks it. A failed lookup is
+// not cached and counts as "not an admin" — fail closed.
+const adminCache = new Map<string, { admin: boolean; at: number }>()
+const ADMIN_CACHE_MS = 5 * 60 * 1000
+async function isChatAdmin(chatId: number, userId: number): Promise<boolean> {
+  const k = `${chatId}:${userId}`
+  const hit = adminCache.get(k)
+  if (hit && Date.now() - hit.at < ADMIN_CACHE_MS) return hit.admin
+  try {
+    const m = await bot.api.getChatMember(chatId, userId)
+    const admin = m.status === 'creator' || m.status === 'administrator'
+    adminCache.set(k, { admin, at: Date.now() })
+    return admin
+  } catch (e) {
+    console.error(`[config] could not check admin status of ${userId} in ${chatId}: ${e}`)
+    return false
+  }
+}
+
+const editorPolicy = (chatId: number): EditorPolicy => editorPolicies[String(chatId)] ?? DEFAULT_EDITORS
+const editablePolicy = (chatId: number): EditorPolicy =>
+  (editorPolicies[String(chatId)] ??= { mode: 'admins', ids: [], names: {}, pending: [] })
+
+type ConfigAccess = { canEdit: boolean; isAdmin: boolean }
+async function configAccess(chatId: number, isPrivate: boolean, user: { id: number; username?: string }): Promise<ConfigAccess> {
+  const isAdmin = isPrivate || await isChatAdmin(chatId, user.id)
+  return { isAdmin, canEdit: canEditSettings({ isPrivate, isAdmin, userId: user.id, username: user.username, policy: editorPolicy(chatId) }) }
+}
+
+// Every update passes through here. Two jobs: pin a pending @username to the id
+// behind it the first time that person is seen anywhere, and remember who posts in
+// each allowed group so an admin can pick an editor from a list.
+function noteUser(ctx: Context): void {
+  const u = ctx.from
+  if (!u || u.is_bot) return
+  const name = userName(u)
+  let dirty = false
+  for (const p of Object.values(editorPolicies)) if (pinPendingEditor(p, { id: u.id, username: u.username, name })) dirty = true
+  const chat = ctx.chat
+  if (chat && chat.type !== 'private' && ctx.message && ALLOWED_CHATS.has(String(chat.id))) {
+    const room = (seenUsers[String(chat.id)] ??= {})
+    const prev = room[String(u.id)]
+    if (!prev || prev.name !== name || prev.username !== u.username) dirty = true
+    room[String(u.id)] = { name, username: u.username, at: Date.now() }
+    const ids = Object.keys(room)
+    if (ids.length > SEEN_USERS_MAX) {
+      ids.sort((a, b) => room[a].at - room[b].at)
+      for (const id of ids.slice(0, ids.length - SEEN_USERS_MAX)) delete room[id]
+      dirty = true
+    }
+  }
+  if (dirty) saveState()
+}
+
+// Every topic in a chat that has an override for anything.
+function topicKeysOf(chatId: number): string[] {
+  const pre = `${chatId}:`
+  const keys = new Set<string>()
+  for (const d of SETTINGS) if (d.topic) for (const k of Object.keys(topicStore(d.id))) if (k.startsWith(pre)) keys.add(k)
+  return [...keys].filter(k => overridesOf(k).length)
+}
+// "from topic mode" on a topic is how a topic follows its OWN mode; it is not a
+// difference worth listing.
+const isOverride = (id: string, v: unknown) => v !== undefined && !((id === 'answers' || id === 'records') && v === 'mode')
+const overridesOf = (key: string): SettingDef[] => SETTINGS.filter(d => d.topic && isOverride(d.id, topicStore(d.id)[key]))
+const overrideCount = (chatId: number, id: string): number => {
+  const pre = `${chatId}:`
+  return Object.keys(topicStore(id)).filter(k => k.startsWith(pre) && isOverride(id, topicStore(id)[k])).length
+}
+function topicTitle(key: string): string {
+  const t = key.slice(key.indexOf(':') + 1)
+  return names[key] ?? (t === 'main' ? 'General' : `topic ${t}`)
+}
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
+
+function editorsSummary(chatId: number): string {
+  const p = editorPolicy(chatId)
+  if (p.mode === 'everyone') return 'everyone'
+  if (p.mode === 'list') return `admins + ${plural(p.ids.length + p.pending.length, 'person', 'people')}`
+  return 'Telegram admins'
+}
+
+// What "from topic mode" currently comes to, in the setting's own words.
+function modeDerivedLabel(id: string, key: string): string {
+  if (id === 'answers') return choiceLabel(settingDef('answers')!, answersFor(key))
+  if (id === 'records') return recordsFor(key) ? 'on' : 'off'
+  return ''
+}
+
+function valueText(def: SettingDef, key: string): string {
+  if (def.kind === 'editors') return editorsSummary(Number(chatOfKey(key)))
+  if (def.kind === 'text') {
+    const group = String(groupSettings[chatOfKey(key)]?.[def.id] ?? '').trim()
+    const topic = String(topicStore(def.id)[key] ?? '').trim()
+    if (topic) return group ? 'set · this topic adds its own' : 'this topic only'
+    return group ? 'set' : 'none'
+  }
+  const { value, from } = settingWithSource(def.id, key)
+  const label = value === 'mode' ? `from topic mode (${modeDerivedLabel(def.id, key)})` : choiceLabel(def, value)
+  return label + (from === 'server' ? ' · default' : from === 'topic' ? ' · this topic' : '')
+}
+
+type Screen = { text: string; kb: { inline_keyboard: { text: string; callback_data: string }[][] } }
+const cb = (tok: string, act: string) => `cf:${tok}:${act}`
+
+function homeScreen(tok: string, m: ConfigMenu, access: ConfigAccess, level: 'basic' | 'advanced' | 'context'): Screen {
+  const key = keyFor(m.chatId, m.threadId)
+  const where = m.isPrivate ? '' : `\nOpened in: ${topicTitle(key)}`
+  const rows: Screen['kb']['inline_keyboard'] = SETTINGS
+    .filter(d => d.level === level && !(m.isPrivate && d.kind === 'editors'))
+    .map(d => [{ text: `${d.emoji} ${d.label}: ${valueText(d, key)}`, callback_data: cb(tok, `s${SETTINGS.indexOf(d)}`) }])
+  // The context engine has its own page, in groups (a DM has no history to search).
+  if (level === 'advanced' && !m.isPrivate) rows.unshift([{ text: '🔎 Context engine ›', callback_data: cb(tok, 'C') }])
+  const differ = m.isPrivate || level !== 'advanced' ? 0 : topicKeysOf(m.chatId).length
+  if (differ) rows.push([{ text: `🗂 Topics that differ (${differ})`, callback_data: cb(tok, 'd') }])
+  rows.push(level === 'basic'
+    ? [{ text: '⚙️ More settings ›', callback_data: cb(tok, 'H') }]
+    : level === 'context' ? [{ text: '‹ More settings', callback_data: cb(tok, 'H') }] : [{ text: '‹ Basic settings', callback_data: cb(tok, 'h') }])
+  rows.push([{ text: '✖ Close', callback_data: cb(tok, 'x') }])
+  const title = level === 'advanced' ? '⚙️ Advanced settings' : level === 'context' ? '🔎 Context engine' : '⚙️ Settings'
+  const text = `${title} — ${m.title}${where}\n\n` + (level === 'context' ? contextSummary(key) + '\n\n' : '') +
+    `Changes apply straight away. "default" is the server's setting; "this topic" means this topic has its own.` +
+    (access.canEdit ? '' : `\n\n👀 You can look around, but only ${editorsSummary(m.chatId)} can change these.`)
+  return { text, kb: { inline_keyboard: rows } }
+}
+
+// The top of the context engine page: what this topic searches, and with what.
+function contextSummary(key: string): string {
+  const hchat = historyOf(key)
+  const store = storeFor(hchat)
+  const st = store ? store.stats(hchat) : undefined
+  const whose = historyTitle(hchat) ? `${historyTitle(hchat)} — linked to this topic on the server` : "this group's recorded messages"
+  const engine = engineFor(key)
+  const model = summaryModel()
+  return `Searches: ${whose}${st ? ` (${st.messages.toLocaleString('en-US')} messages, ${st.episodes.toLocaleString('en-US')} stretches of conversation)` : ''}.\n` +
+    `Engine in use here: ${engine.label}. ${ctxEngines.size} on this server; /recall <question> compares them.\n` +
+    `Summaries: ${model ? `written by ${model}` : 'no model set on the server (context-engines.json "summaries")'}.`
+}
+
+function settingScreen(tok: string, m: ConfigMenu, access: ConfigAccess, i: number): Screen {
+  const d = SETTINGS[i]
+  const key = keyFor(m.chatId, m.threadId)
+  const back = [{ text: '‹ Back', callback_data: cb(tok, d.level === 'basic' ? 'h' : d.level === 'context' ? 'C' : 'H') }]
+  if (d.kind === 'text') {
+    const clip = (v: string) => v.length > 1200 ? `${v.slice(0, 1200)}…` : v
+    const group = String(groupSettings[String(m.chatId)]?.[d.id] ?? '').trim()
+    const topic = m.isPrivate ? '' : String(topicStore(d.id)[key] ?? '').trim()
+    const here = topicTitle(key)
+    const rows: Screen['kb']['inline_keyboard'] = []
+    if (access.canEdit) {
+      rows.push([{ text: group ? `✏️ Replace the ${m.isPrivate ? '' : "group's "}instructions` : `✏️ Write ${m.isPrivate ? '' : 'group '}instructions`, callback_data: cb(tok, 'it') }])
+      if (group) rows.push([{ text: `🗑 Remove the ${m.isPrivate ? '' : "group's "}instructions`, callback_data: cb(tok, 'ic') }])
+      if (!m.isPrivate) {
+        rows.push([{ text: topic ? `✏️ Replace ${here}'s own` : `➕ Add instructions for ${here} only`, callback_data: cb(tok, 'tt') }])
+        if (topic) rows.push([{ text: `🗑 Remove ${here}'s own`, callback_data: cb(tok, 'tc') }])
+      }
+    }
+    rows.push(back)
+    const lines = [`${d.emoji} ${d.label}`, '', d.help, '',
+      m.isPrivate ? (group ? `Now:\n${clip(group)}` : 'None set.') : (group ? `Whole group:\n${clip(group)}` : 'Whole group: none.')]
+    if (!m.isPrivate) lines.push('', topic ? `${here} adds:\n${clip(topic)}` : `${here} adds nothing of its own.`)
+    return { text: lines.join('\n'), kb: { inline_keyboard: rows } }
+  }
+  const group = groupSettings[String(m.chatId)]?.[d.id]
+  const effectiveGroup = group ?? serverDefault(d.id)
+  const n = m.isPrivate ? 0 : overrideCount(m.chatId, d.id)
+  const lines = [`${d.emoji} ${d.label}`, '', d.help, '',
+    m.isPrivate
+      ? `Now: ${choiceLabel(d, effectiveGroup)}${group === undefined ? ' (server default)' : ''}`
+      : `Group: ${choiceLabel(d, effectiveGroup)}${group === undefined ? ' (server default)' : ''}`]
+  if (!m.isPrivate) {
+    const { value, from } = settingWithSource(d.id, key)
+    if (from === 'topic') lines.push(`This topic: ${choiceLabel(d, value)} (its own)`)
+    if (n) lines.push(`${plural(n, 'topic')} ${n === 1 ? 'has' : 'have'} their own value.`)
+  }
+  const meta = groupSettingMeta[String(m.chatId)]?.[d.id]
+  if (meta && group !== undefined) lines.push(`Last changed by ${meta.by}, ${meta.at.slice(0, 10)}.`)
+  // Conversation mode reads along only if Telegram delivers the messages at all.
+  if ((d.id === 'topicMode' || d.id === 'records') && m.botReadsAll === false) {
+    lines.push('', '⚠️ Telegram privacy mode is on for this bot and it is not an admin here, so it only receives messages ' +
+      'that mention it — Conversation mode cannot read along. Make the bot an admin, or turn privacy mode off in ' +
+      '@BotFather: /setprivacy → Disable.')
+  }
+  const rows: Screen['kb']['inline_keyboard'] = []
+  if (access.canEdit) {
+    d.choices!.forEach((c, ci) => rows.push([{ text: `${c.value === effectiveGroup ? '● ' : ''}${c.label}`, callback_data: cb(tok, `c${i}.${ci}`) }]))
+    if (group !== undefined || n) rows.push([{ text: `↺ Server default (${choiceLabel(d, serverDefault(d.id))})`, callback_data: cb(tok, `c${i}.r`) }])
+  } else {
+    lines.push('', `Only ${editorsSummary(m.chatId)} can change this.`)
+  }
+  rows.push(back)
+  return { text: lines.join('\n'), kb: { inline_keyboard: rows } }
+}
+
+// Where a change should land. Asked every time rather than defaulted, because the
+// two group-level answers differ exactly when it matters: when some topics have
+// their own value, "the whole group" leaves them alone and "everywhere" does not.
+function scopeScreen(tok: string, m: ConfigMenu, i: number, ci: string): Screen {
+  const d = SETTINGS[i]
+  const n = overrideCount(m.chatId, d.id)
+  const reset = ci === 'r'
+  const what = reset ? `back to the server default (${choiceLabel(d, serverDefault(d.id))})` : `→ ${d.choices![Number(ci)].label}`
+  const topic = topicTitle(keyFor(m.chatId, m.threadId))
+  const rows: Screen['kb']['inline_keyboard'] = [
+    [{ text: `👥 The whole group${n ? ` (${plural(n, 'topic')} keep their own)` : ''}`, callback_data: cb(tok, `a${i}.${ci}.g`) }],
+  ]
+  if (n) rows.push([{ text: `🌐 Everywhere — also reset ${plural(n, 'topic')}`, callback_data: cb(tok, `a${i}.${ci}.e`) }])
+  rows.push([{ text: reset ? `📍 Only ${topic}: follow the group` : `📍 Only ${topic}`, callback_data: cb(tok, `a${i}.${ci}.t`) }])
+  rows.push([{ text: '‹ Back', callback_data: cb(tok, `s${i}`) }])
+  return { text: `${d.emoji} ${d.label} ${what}\n\nWhere should this apply?`, kb: { inline_keyboard: rows } }
+}
+
+function diffScreen(tok: string, m: ConfigMenu, access: ConfigAccess): Screen {
+  m.diff = topicKeysOf(m.chatId)
+  const lines = m.diff.map(k => `• ${topicTitle(k)}: ` +
+    overridesOf(k).map(d => d.kind === 'text' ? `its own ${d.label.toLowerCase()}` : `${d.label} ${choiceLabel(d, topicStore(d.id)[k])}`).join(', '))
+  let body = lines.join('\n')
+  if (body.length > 3500) body = `${body.slice(0, 3500)}…`
+  const rows: Screen['kb']['inline_keyboard'] = []
+  if (access.canEdit) m.diff.forEach((k, n) => rows.push([{ text: `↺ Reset ${topicTitle(k)}`, callback_data: cb(tok, `dr${n}`) }]))
+  rows.push([{ text: '‹ Back', callback_data: cb(tok, 'H') }])
+  return {
+    text: `🗂 Topics that differ from the group\n\n${body || 'Every topic follows the group.'}` +
+      (m.diff.length && access.canEdit ? '\n\nReset a topic to make it follow the group again.' : ''),
+    kb: { inline_keyboard: rows },
+  }
+}
+
+function editorsScreen(tok: string, m: ConfigMenu, access: ConfigAccess): Screen {
+  const p = editorPolicy(m.chatId)
+  m.editors = [...p.ids.map(id => ({ id })), ...p.pending.map(username => ({ username }))]
+  const who = m.editors.map(e => e.id !== undefined
+    ? `• ${p.names[String(e.id)] ?? `user ${e.id}`}`
+    : `• @${e.username} (not seen yet — counts once they are)`)
+  const desc: Record<EditorMode, string> = {
+    admins: 'Only Telegram admins.',
+    list: 'Telegram admins, and these people:',
+    everyone: 'Everyone who can use the bot here.',
+  }
+  const lines = ['👥 Who can change settings', '', 'Telegram admins always can.', '', desc[p.mode]]
+  if (p.mode === 'list') lines.push(who.length ? who.join('\n') : '(nobody added yet)')
+  const rows: Screen['kb']['inline_keyboard'] = []
+  if (access.isAdmin) {
+    const modes: [EditorMode, string, string][] = [['admins', 'a', 'Admins only'], ['list', 'l', 'Admins + people I pick'], ['everyone', 'w', 'Everyone']]
+    for (const [mode, c, label] of modes) rows.push([{ text: `${p.mode === mode ? '● ' : ''}${label}`, callback_data: cb(tok, `em${c}`) }])
+    if (p.mode === 'list') {
+      rows.push([{ text: '➕ Add by @username', callback_data: cb(tok, 'eu') }])
+      rows.push([{ text: '👀 Pick someone who has posted here', callback_data: cb(tok, 'es') }])
+      m.editors.forEach((e, n) => rows.push([{
+        text: `✖ Remove ${e.id !== undefined ? (p.names[String(e.id)] ?? `user ${e.id}`) : `@${e.username}`}`,
+        callback_data: cb(tok, `ex${n}`),
+      }]))
+    }
+  } else {
+    lines.push('', 'Only Telegram admins can change who else can.')
+  }
+  rows.push([{ text: '‹ Back', callback_data: cb(tok, 'h') }])
+  return { text: lines.join('\n'), kb: { inline_keyboard: rows } }
+}
+
+function seenScreen(tok: string, m: ConfigMenu): Screen {
+  const p = editorPolicy(m.chatId)
+  const room = seenUsers[String(m.chatId)] ?? {}
+  m.seen = Object.keys(room).map(Number)
+    .filter(id => !p.ids.includes(id))
+    .sort((a, b) => room[String(b)].at - room[String(a)].at)
+    .slice(0, 20)
+  const rows: Screen['kb']['inline_keyboard'] = m.seen.map((id, n) => {
+    const u = room[String(id)]
+    return [{ text: `${u.name}${u.username ? ` @${u.username}` : ''}`, callback_data: cb(tok, `ep${n}`) }]
+  })
+  rows.push([{ text: '‹ Back', callback_data: cb(tok, 'e') }])
+  return {
+    text: m.seen.length
+      ? '👀 People who have posted here recently. Tap one to let them change settings.'
+      : '👀 Nobody new has posted here since the bot started keeping track. Add someone by @username instead — they do not need to have posted.',
+    kb: { inline_keyboard: rows },
+  }
+}
+
+async function showMenu(m: ConfigMenu, s: Screen): Promise<void> {
+  const r = m.ref
+  const ignore = (e: unknown) => { if (!String(e).includes('not modified')) console.error(`[config] menu edit: ${e}`) }
+  if (r?.ephemeralId) await bot.api.editEphemeralMessageText(m.chatId, m.userId, r.ephemeralId, s.text, { reply_markup: s.kb }).catch(ignore)
+  else if (r?.messageId) await bot.api.editMessageText(m.chatId, r.messageId, s.text, { reply_markup: s.kb }).catch(ignore)
+}
+
+async function closeMenu(m: ConfigMenu): Promise<void> {
+  const r = m.ref
+  if (r?.ephemeralId) await bot.api.deleteEphemeralMessage(m.chatId, m.userId, r.ephemeralId).catch(() => {})
+  else if (r?.messageId) await bot.api.deleteMessage(m.chatId, r.messageId).catch(() => {})
+}
+
+async function openConfigMenu(ctx: Context, threadId: number | undefined, replyTo?: number, replyToEphemeral?: number): Promise<void> {
+  const chat = ctx.chat!
+  const from = ctx.from!
+  const now = Date.now()
+  for (const [t, m] of configMenus) if (now - m.created > CONFIG_MENU_TTL_MS) configMenus.delete(t)
+  if (configMenus.size >= CONFIG_MENU_MAX) configMenus.delete(configMenus.keys().next().value as string)
+  const tok = randomUUID().replace(/-/g, '').slice(0, 10)
+  const isPrivate = chat.type === 'private'
+  const m: ConfigMenu = {
+    chatId: chat.id, threadId, userId: from.id, userName: userName(from), isPrivate,
+    title: isPrivate ? 'this chat' : ((chat as any).title ?? 'this group'),
+    created: now, diff: [], seen: [], editors: [],
+  }
+  configMenus.set(tok, m)
+  if (!isPrivate) m.botReadsAll = (bot.botInfo as any)?.can_read_all_group_messages !== false || await isChatAdmin(chat.id, bot.botInfo.id)
+  const s = homeScreen(tok, m, await configAccess(chat.id, isPrivate, from), 'basic')
+  let sent: any = null
+  if (!isPrivate) {
+    // Sent as a reply to the /config that asked for it. In a topic the menu is placed
+    // by the topic anyway, but in General an ephemeral message with nothing to hang
+    // off has no position at all: Telegram accepts it, delivers it (verified over
+    // MTProto: top_msg_id unset) and the app simply never shows it — /config in
+    // General looked like it did nothing. Replying anchors it (top_msg_id 1).
+    // No allow_sending_without_reply: Telegram documents it as always false for
+    // ephemeral sends.
+    //
+    // /config itself is registered as an ephemeral command, so from an app that
+    // supports it it arrives with message_id 0 and an ephemeral id instead — nobody
+    // else saw it. A reply to it goes through that id, must itself be ephemeral, and
+    // must be sent within 15 seconds, all of which the menu already is.
+    const reply = replyToEphemeral ? { ephemeral_message_id: replyToEphemeral } : replyTo ? { message_id: replyTo } : undefined
+    const sendPrivate = () => ctx.api.sendMessage(chat.id, s.text, {
+      ...destOpts({ threadId }), reply_markup: s.kb, ephemeral_message_parameters: { receiver_user_id: from.id },
+      ...(reply ? { reply_parameters: reply } : {}),
+    })
+    // Once more after a second before giving up on privacy. Telegram has refused a
+    // reply to a /config that had only just arrived (REPLY_MESSAGE_ID_INVALID) and
+    // accepted the identical request moments later — and the fallback is a menu the
+    // whole room can see. An ephemeral reply must go within 15 seconds, so one short
+    // retry stays well inside the window.
+    sent = await sendPrivate().catch(async e => {
+      console.error(`[config] ephemeral menu refused, retrying once: ${e}`)
+      await sleep(1000)
+      return sendPrivate().catch(e2 => { console.error(`[config] ephemeral menu refused again, sending a normal one: ${e2}`); return null })
+    })
+  }
+  if (!sent) {
+    sent = await ctx.api.sendMessage(chat.id, s.text, { ...destOpts({ threadId, replyTo }), reply_markup: s.kb, disable_notification: true })
+      .catch(e => { console.error(`[config] menu: ${e}`); return null })
+  }
+  m.ref = { messageId: sent?.message_id || undefined, ephemeralId: sent?.ephemeral_message_id }
+  // How the menu went out, and whether the /config that asked for it was itself
+  // ephemeral — the one thing that is not visible from the chat.
+  console.log(`[config] menu to ${from.id} in ${chat.id}/${threadId ?? 'general'}: ` +
+    (m.ref.ephemeralId ? `ephemeral ${m.ref.ephemeralId}` : m.ref.messageId ? `ordinary ${m.ref.messageId}` : 'NOT SENT') +
+    (replyToEphemeral ? `, replying to ephemeral command ${replyToEphemeral}` : replyTo ? `, replying to ${replyTo}` : ', no reply'))
+}
+
+// Instructions ride on --append-system-prompt, and the CLI fixes that when a session
+// is CREATED: a resumed session keeps the text it started with and ignores the flag
+// (verified on CLI 2.1.282). So a change reaches a topic only when it next starts a
+// new session, and anyone reading the announcement has to be told, or the group
+// concludes the setting is broken. See the FEEDBACK.md item on per-turn delivery.
+// Said when a topic's mode changes, because three of the four change what the bot
+// does with people's messages.
+function topicModeNote(mode: SettingValue): string | undefined {
+  if (mode === 'conversation') return "The bot now reads this topic's messages, so a mention can include what was said. It answers only when mentioned or replied to."
+  if (mode === 'auto') return "The bot now reads this topic's messages and may join in on its own when it has something useful to add. A mention still always gets an answer."
+  if (mode === 'off') return 'The bot ignores messages here and stores nothing. Commands still work.'
+  return undefined
+}
+const INSTRUCTIONS_NOTE = 'Only new sessions pick this up. Send /new in a topic to apply it there.'
+
+// The one line the room sees. The menu itself is private; a change to the room's
+// settings is not.
+// A note, when given, is set apart under a bold "Note:" so a caveat is not lost at
+// the end of a sentence. HTML, so everything else is escaped: the text carries
+// people's names and topic titles.
+async function announceConfig(m: ConfigMenu, text: string, note?: string): Promise<void> {
+  console.log(`[config] chat=${m.chatId} by=${m.userId} ${text}${note ? ` (note: ${note})` : ''}`)
+  if (m.isPrivate) return
+  const html = `⚙️ ${escapeHtml(text)}` + (note ? `\n\n<b>Note:</b> ${escapeHtml(note)}` : '')
+  await bot.api.sendMessage(m.chatId, html, { ...destOpts({ threadId: m.threadId }), parse_mode: 'HTML', disable_notification: true })
+    .catch(e => console.error(`[config] announce: ${e}`))
+}
+
+function noteGroupChange(m: ConfigMenu, id: string): void {
+  ;(groupSettingMeta[String(m.chatId)] ??= {})[id] = { by: m.userName, at: new Date().toISOString() }
+}
+
+// Apply one change. scope: g = the group's own value (topics with their own keep
+// it), e = the group's value AND every topic override cleared, t = this topic only.
+async function applySetting(m: ConfigMenu, i: number, ci: string, scope: 'g' | 'e' | 't'): Promise<string> {
+  const d = SETTINGS[i]
+  const value = ci === 'r' ? undefined : d.choices![Number(ci)]?.value
+  if (ci !== 'r' && value === undefined) return 'That choice no longer exists.'
+  const key = keyFor(m.chatId, m.threadId)
+  const label = value === undefined ? `the server default (${choiceLabel(d, serverDefault(d.id))})` : choiceLabel(d, value)
+  const note = d.id === 'topicMode' ? topicModeNote(value === undefined ? serverDefault('topicMode') : value) : undefined
+  if (scope === 't') {
+    const store = topicStore(d.id)
+    if (value === undefined) delete store[key]; else store[key] = value
+    // Picking a mode is picking what it presets: this topic's Answers and Records
+    // follow the mode again, even where the group had pinned one of them.
+    if (d.id === 'topicMode') for (const id of ['answers', 'records']) {
+      if (value === undefined) delete topicStore(id)[key]; else topicStore(id)[key] = 'mode'
+    }
+    saveState()
+    await announceConfig(m, value === undefined
+      ? `${m.userName} set ${d.label} in ${topicTitle(key)} to follow the group.`
+      : `${m.userName} set ${d.label} → ${label} for ${topicTitle(key)} only.`, note)
+    return 'Saved for this topic'
+  }
+  const g = (groupSettings[String(m.chatId)] ??= {})
+  if (value === undefined) delete g[d.id]; else g[d.id] = value
+  noteGroupChange(m, d.id)
+  let cleared = 0
+  const kept = overrideCount(m.chatId, d.id)
+  if (scope === 'e') {
+    const store = topicStore(d.id)
+    const pre = `${m.chatId}:`
+    for (const k of Object.keys(store)) if (k.startsWith(pre)) { delete store[k]; cleared++ }
+  }
+  // The group's own Answers and Records follow its mode again; "everywhere" clears
+  // every topic's too.
+  if (d.id === 'topicMode') for (const id of ['answers', 'records']) {
+    delete g[id]
+    if (scope === 'e') { const pre = `${m.chatId}:`; for (const k of Object.keys(topicStore(id))) if (k.startsWith(pre)) delete topicStore(id)[k] }
+  }
+  saveState()
+  if (d.id === 'retention') pruneConversations()
+  if (scope === 'e') {
+    await announceConfig(m, `${m.userName} set ${d.label} → ${label} everywhere in this group` +
+      (cleared ? ` (reset ${plural(cleared, 'topic')}).` : '.'), note)
+  } else {
+    await announceConfig(m, `${m.userName} set ${d.label} → ${label} for this group.` +
+      (kept ? ` ${plural(kept, 'topic')} keep their own setting.` : ''), note)
+  }
+  return 'Saved'
+}
+
+// A reply the bridge asked for with a force-reply prompt. Handled before anything
+// else looks at the message, so the text is never mistaken for a prompt to Claude.
+async function handleAwaitedInput(ctx: Context, a: AwaitedInput, promptKey: string): Promise<void> {
+  awaitingInput.delete(promptKey)
+  const msg = ctx.message!
+  const threadId = msg.message_thread_id
+  void ctx.api.deleteMessage(a.chatId, Number(promptKey.slice(promptKey.lastIndexOf(':') + 1))).catch(() => {})
+  if (Date.now() - a.at > INPUT_TTL_MS) { await send(ctx, threadId, 'That request expired. Open /config again.', true); return }
+  const m = configMenus.get(a.tok)
+  const isPrivate = ctx.chat!.type === 'private'
+  const access = await configAccess(a.chatId, isPrivate, ctx.from!)
+  const text = (msg.text ?? '').trim()
+  const menu: ConfigMenu = m ?? {
+    chatId: a.chatId, threadId: a.threadId, userId: a.userId, userName: userName(ctx.from!), isPrivate,
+    title: '', created: Date.now(), diff: [], seen: [], editors: [],
+  }
+  if (a.kind === 'instructions' || a.kind === 'topicInstructions') {
+    if (!access.canEdit) { await send(ctx, threadId, `Only ${editorsSummary(a.chatId)} can change instructions here.`, true); return }
+    if (!text) { await send(ctx, threadId, 'That was empty, so nothing changed.', true); return }
+    if (text.length > INSTRUCTIONS_MAX) {
+      await send(ctx, threadId, `That is ${text.length.toLocaleString('en-US')} characters; the limit is ${INSTRUCTIONS_MAX.toLocaleString('en-US')}. Nothing changed.`, true)
+      return
+    }
+    if (a.kind === 'topicInstructions') {
+      const tkey = keyFor(a.chatId, a.threadId)
+      topicStore('instructions')[tkey] = text
+      saveState()
+      await announceConfig(menu, `${menu.userName} updated the instructions for ${topicTitle(tkey)} (on top of the group's).`, INSTRUCTIONS_NOTE)
+    } else {
+      ;(groupSettings[String(a.chatId)] ??= {}).instructions = text
+      noteGroupChange(menu, 'instructions')
+      saveState()
+      await announceConfig(menu, `${menu.userName} updated this group's instructions for Claude.`, INSTRUCTIONS_NOTE)
+    }
+    if (isPrivate) await send(ctx, threadId, `📝 Saved. Note: ${INSTRUCTIONS_NOTE}`, true)
+    if (m) await showMenu(m, settingScreen(a.tok, m, access, SETTINGS.findIndex(d => d.id === 'instructions')))
+    return
+  }
+  // An editor, by @username or by picking someone from Telegram's mention list —
+  // the latter arrives as a text_mention and carries the id, which also covers
+  // people who have no username at all.
+  if (!access.isAdmin) { await send(ctx, threadId, 'Only Telegram admins can change who can edit settings.', true); return }
+  const p = editablePolicy(a.chatId)
+  const added: string[] = []
+  const bad: string[] = []
+  for (const e of msg.entities ?? []) {
+    if (e.type === 'text_mention' && e.user && !e.user.is_bot) {
+      if (!p.ids.includes(e.user.id)) p.ids.push(e.user.id)
+      p.names[String(e.user.id)] = userName(e.user)
+      added.push(userName(e.user))
+    }
+  }
+  for (const word of text.split(/[\s,]+/).filter(w => w.startsWith('@') || /^[A-Za-z0-9_]{5,32}$/.test(w))) {
+    const u = normalizeUsername(word)
+    if (!u) { bad.push(word); continue }
+    const known = Object.entries(seenUsers[String(a.chatId)] ?? {}).find(([, s]) => s.username?.toLowerCase() === u)
+    if (known) {
+      const id = Number(known[0])
+      if (!p.ids.includes(id)) p.ids.push(id)
+      p.names[known[0]] = known[1].name
+    } else if (!p.pending.includes(u)) {
+      p.pending.push(u)
+    }
+    added.push(`@${u}`)
+  }
+  if (!added.length) {
+    await send(ctx, threadId, bad.length
+      ? `${bad.join(', ')} ${bad.length === 1 ? 'is not a' : 'are not'} valid Telegram username${bad.length === 1 ? '' : 's'}. Nothing changed.`
+      : 'I could not find a username in that. Nothing changed.', true)
+    return
+  }
+  const switched = p.mode !== 'list'
+  p.mode = 'list'
+  saveState()
+  await announceConfig(menu, `${menu.userName} let ${added.join(', ')} change this group's settings.` +
+    (switched ? ' Settings are now editable by admins and the people they pick.' : ''))
+  if (bad.length) await send(ctx, threadId, `Skipped ${bad.join(', ')} — not valid usernames.`, true)
+  if (m) await showMenu(m, editorsScreen(a.tok, m, access))
+}
+
+async function askForInput(m: ConfigMenu, tok: string, kind: AwaitedInput['kind']): Promise<boolean> {
+  const who = `<a href="tg://user?id=${m.userId}">${escapeHtml(m.userName)}</a>`
+  const text = kind === 'editor'
+    ? `👥 ${who}, reply to this message with the @username of each person who should be able to change settings. They do not need to have posted here.`
+    : kind === 'topicInstructions'
+      ? `📝 ${who}, reply to this message with the instructions Claude should follow in ${escapeHtml(topicTitle(keyFor(m.chatId, m.threadId)))} only, on top of the group's (up to ${INSTRUCTIONS_MAX.toLocaleString('en-US')} characters). They replace this topic's current ones.`
+      : `📝 ${who}, reply to this message with the instructions Claude should follow in this group (up to ${INSTRUCTIONS_MAX.toLocaleString('en-US')} characters). They replace the current ones.`
+  const sent = await bot.api.sendMessage(m.chatId, text, {
+    ...destOpts({ threadId: m.threadId }), parse_mode: 'HTML',
+    reply_markup: { force_reply: true, selective: true, input_field_placeholder: kind === 'editor' ? '@username' : 'Prompts and instructions for Claude' },
+  }).catch(e => { console.error(`[config] input prompt: ${e}`); return null })
+  if (!sent) return false
+  for (const [k, a] of awaitingInput) if (Date.now() - a.at > INPUT_TTL_MS) awaitingInput.delete(k)
+  awaitingInput.set(`${m.chatId}:${sent.message_id}`, { kind, chatId: m.chatId, threadId: m.threadId, userId: m.userId, tok, at: Date.now() })
+  return true
+}
+
+async function handleConfigCallback(ctx: Context, data: string): Promise<void> {
+  const [, tok, act = ''] = data.split(':')
+  const m = configMenus.get(tok)
+  const toast = (text: string, alert = false) => ctx.answerCallbackQuery({ text, show_alert: alert }).catch(() => {})
+  if (!m || Date.now() - m.created > CONFIG_MENU_TTL_MS) { await toast('This menu has expired. Send /config again.', true); return }
+  if (ctx.from!.id !== m.userId) { await toast(`This menu is ${m.userName}'s. Send /config to open your own.`, true); return }
+  const msg = ctx.callbackQuery!.message as any
+  m.ref = { messageId: msg?.message_id || undefined, ephemeralId: msg?.ephemeral_message_id }
+  const access = await configAccess(m.chatId, m.isPrivate, ctx.from!)
+  const needEdit = async () => {
+    if (access.canEdit) return true
+    await toast(`Only ${editorsSummary(m.chatId)} can change settings here.`, true)
+    return false
+  }
+  const needAdmin = async () => {
+    if (access.isAdmin && !m.isPrivate) return true
+    await toast('Only Telegram admins can change who can edit settings.', true)
+    return false
+  }
+  let r: RegExpMatchArray | null
+  if (act === 'h' || act === 'H' || act === 'C') {
+    await toast('')
+    await showMenu(m, homeScreen(tok, m, access, act === 'h' ? 'basic' : act === 'C' ? 'context' : 'advanced'))
+    return
+  }
+  if (act === 'x') { await toast(''); await closeMenu(m); configMenus.delete(tok); return }
+  if (act === 'd') { await toast(''); await showMenu(m, diffScreen(tok, m, access)); return }
+  if (act === 'e') { await toast(''); await showMenu(m, editorsScreen(tok, m, access)); return }
+  if ((r = act.match(/^s(\d+)$/)) && SETTINGS[Number(r[1])]) {
+    await toast('')
+    const d = SETTINGS[Number(r[1])]
+    await showMenu(m, d.kind === 'editors' ? editorsScreen(tok, m, access) : settingScreen(tok, m, access, Number(r[1])))
+    return
+  }
+  if ((r = act.match(/^c(\d+)\.(\d+|r)$/)) && SETTINGS[Number(r[1])]?.kind === 'choice') {
+    if (!await needEdit()) return
+    const i = Number(r[1])
+    // A DM has one conversation and no topics to tell apart: apply it everywhere,
+    // so an old per-chat override from /model or /voice cannot shadow the change.
+    if (m.isPrivate) { await toast(await applySetting(m, i, r[2], 'e')); await showMenu(m, settingScreen(tok, m, access, i)); return }
+    // A setting only the whole group can have (retention) has nowhere else to land.
+    if (!SETTINGS[i].topic) { await toast(await applySetting(m, i, r[2], 'g')); await showMenu(m, settingScreen(tok, m, access, i)); return }
+    await toast('')
+    await showMenu(m, scopeScreen(tok, m, i, r[2]))
+    return
+  }
+  if ((r = act.match(/^a(\d+)\.(\d+|r)\.([get])$/)) && SETTINGS[Number(r[1])]?.kind === 'choice') {
+    if (!await needEdit()) return
+    const i = Number(r[1])
+    await toast(await applySetting(m, i, r[2], r[3] as 'g' | 'e' | 't'))
+    await showMenu(m, settingScreen(tok, m, access, i))
+    return
+  }
+  if ((r = act.match(/^dr(\d+)$/))) {
+    if (!await needEdit()) return
+    const k = m.diff[Number(r[1])]
+    if (!k) { await toast('That list is out of date. Open it again.', true); return }
+    for (const d of overridesOf(k)) delete topicStore(d.id)[k]
+    saveState()
+    await announceConfig(m, `${m.userName} reset ${topicTitle(k)} to follow the group's settings.`)
+    await toast('Reset')
+    await showMenu(m, diffScreen(tok, m, access))
+    return
+  }
+  if (act === 'it') {
+    if (!await needEdit()) return
+    const ok = await askForInput(m, tok, 'instructions')
+    await toast(ok ? 'Reply to my message with the instructions.' : 'Could not ask for them here.', !ok)
+    return
+  }
+  if (act === 'tt') {
+    if (!await needEdit()) return
+    if (m.isPrivate) { await toast(''); return }
+    const ok = await askForInput(m, tok, 'topicInstructions')
+    await toast(ok ? 'Reply to my message with the instructions for this topic.' : 'Could not ask for them here.', !ok)
+    return
+  }
+  if (act === 'tc') {
+    if (!await needEdit()) return
+    const tkey = keyFor(m.chatId, m.threadId)
+    delete topicStore('instructions')[tkey]
+    saveState()
+    await announceConfig(m, `${m.userName} removed the instructions for ${topicTitle(tkey)}; it follows the group's again.`, INSTRUCTIONS_NOTE)
+    await toast('Removed')
+    await showMenu(m, settingScreen(tok, m, access, SETTINGS.findIndex(d => d.id === 'instructions')))
+    return
+  }
+  if (act === 'ic') {
+    if (!await needEdit()) return
+    delete groupSettings[String(m.chatId)]?.instructions
+    noteGroupChange(m, 'instructions')
+    saveState()
+    await announceConfig(m, `${m.userName} removed this group's instructions for Claude.`, INSTRUCTIONS_NOTE)
+    await toast('Removed')
+    await showMenu(m, settingScreen(tok, m, access, SETTINGS.findIndex(d => d.id === 'instructions')))
+    return
+  }
+  if ((r = act.match(/^em([alw])$/))) {
+    if (!await needAdmin()) return
+    const mode: EditorMode = r[1] === 'a' ? 'admins' : r[1] === 'l' ? 'list' : 'everyone'
+    const p = editablePolicy(m.chatId)
+    if (p.mode !== mode) {
+      p.mode = mode
+      saveState()
+      await announceConfig(m, `${m.userName} changed who can edit settings: ` +
+        (mode === 'admins' ? 'Telegram admins only.' : mode === 'list' ? 'admins and the people they pick.' : 'everyone who can use the bot here.'))
+    }
+    await toast('')
+    await showMenu(m, editorsScreen(tok, m, access))
+    return
+  }
+  if (act === 'eu') {
+    if (!await needAdmin()) return
+    const ok = await askForInput(m, tok, 'editor')
+    await toast(ok ? 'Reply to my message with the @username.' : 'Could not ask for it here.', !ok)
+    return
+  }
+  if (act === 'es') {
+    if (!await needAdmin()) return
+    await toast('')
+    await showMenu(m, seenScreen(tok, m))
+    return
+  }
+  if ((r = act.match(/^ep(\d+)$/))) {
+    if (!await needAdmin()) return
+    const id = m.seen[Number(r[1])]
+    const u = id !== undefined ? seenUsers[String(m.chatId)]?.[String(id)] : undefined
+    if (id === undefined || !u) { await toast('That list is out of date. Open it again.', true); return }
+    const p = editablePolicy(m.chatId)
+    if (!p.ids.includes(id)) p.ids.push(id)
+    p.names[String(id)] = u.name
+    p.mode = 'list'
+    saveState()
+    await announceConfig(m, `${m.userName} let ${u.name} change this group's settings.`)
+    await toast('Added')
+    await showMenu(m, editorsScreen(tok, m, access))
+    return
+  }
+  if ((r = act.match(/^ex(\d+)$/))) {
+    if (!await needAdmin()) return
+    const e = m.editors[Number(r[1])]
+    if (!e) { await toast('That list is out of date. Open it again.', true); return }
+    const p = editablePolicy(m.chatId)
+    const label = e.id !== undefined ? (p.names[String(e.id)] ?? `user ${e.id}`) : `@${e.username}`
+    if (e.id !== undefined) p.ids = p.ids.filter(x => x !== e.id)
+    else p.pending = p.pending.filter(x => x !== e.username)
+    saveState()
+    await announceConfig(m, `${m.userName} removed ${label} from the people who can change settings.`)
+    await toast('Removed')
+    await showMenu(m, editorsScreen(tok, m, access))
+    return
+  }
+  await toast('')
+}
+
+// ---------------------------------------------------------------------------
+// Recorded conversation — what the bot keeps of a topic, and hands over on a mention
+// ---------------------------------------------------------------------------
+//
+// In a Conversation topic people talk to each other and call the bot now and then.
+// A mention used to reach Claude as just its own words: everything said in between
+// was dropped at the gate, so "@bot what do you think?" had nothing to think about.
+// The bridge now records the topic (Topic mode decides whether), and a mention
+// carries what was said since the bot's last turn, plus the message it replies to.
+//
+// One append-only JSONL file per topic: an edit is a later line with the same id
+// (foldRecords). Files are kept as Telegram file ids and downloaded only when a
+// mention's context includes them.
+
+const MSG_DIR = join(dirname(STATE_FILE), 'messages')
+// About 20k tokens of conversation inline. Past that the newest part is sent and the
+// block points at the conversation file, which holds all of it — a hard cut would
+// throw information away, and a whole weekend inline would make one question slow
+// and dear and push the session towards compaction.
+const CONV_INLINE_CHARS = 80_000
+// Files fetched for one mention's context, at most. Beyond this they are listed by
+// name and can still be asked for.
+const CONV_FILES_PER_TURN = 10
+
+const topicLogPath = (chatId: number | string, threadId?: number) => join(MSG_DIR, String(chatId), `${threadId ?? 'main'}.jsonl`)
+
+function recordOf(msg: any, toBot: boolean): ConvRecord | null {
+  const from = msg?.from
+  if (!from || from.is_bot) return null
+  const att = pickAttachment(msg)
+  // `||`, not `??`: a photo's words are its caption, and an empty text is no text.
+  const text = String(msg.text || msg.caption || '').trim()
+  if (!text && !att) return null
+  const kind = msg.photo ? 'photo' : msg.document ? 'document' : msg.voice ? 'voice note' : msg.video ? 'video'
+    : msg.video_note ? 'video note' : msg.audio ? 'audio' : msg.animation ? 'animation' : undefined
+  // In a forum every message "replies" to its topic's creation; that is not a reply.
+  const reply = msg.reply_to_message && !msg.reply_to_message.forum_topic_created ? msg.reply_to_message.message_id : undefined
+  return {
+    id: msg.message_id, t: msg.date, from: from.id, name: userName(from), username: from.username, text,
+    ...(reply ? { replyTo: reply } : {}),
+    ...(att ? { kind, file: { id: att.fileId, name: att.name, size: att.size } } : {}),
+    ...(toBot ? { toBot: true } : {}),
+  }
+}
+
+function appendRecord(chatId: number, threadId: number | undefined, r: ConvRecord): void {
+  try {
+    const p = topicLogPath(chatId, threadId)
+    mkdirSync(dirname(p), { recursive: true })
+    appendFileSync(p, JSON.stringify(r) + '\n')
+  } catch (e) { console.error(`[conv] could not record ${chatId}/${threadId ?? 'main'}#${r.id}: ${e}`) }
+}
+
+function recordMessage(msg: any, toBot: boolean, edited = false): void {
+  const r = recordOf(msg, toBot)
+  if (!r) return
+  appendRecord(msg.chat.id, msg.message_thread_id, edited ? { ...r, edited: true } : r)
+  contextAdd(msg.chat.id, msg.message_thread_id, [r])
+  if (r.kind === 'photo' && r.file) queuePhoto(msg.chat.id, r.id, r.file)
+}
+
+function readTopicLog(chatId: number, threadId: number | undefined): ConvRecord[] {
+  try {
+    const raw = readFileSync(topicLogPath(chatId, threadId), 'utf8')
+    const lines: ConvRecord[] = []
+    for (const l of raw.split('\n')) { if (!l) continue; try { lines.push(JSON.parse(l)) } catch {} }
+    return foldRecords(lines)
+  } catch { return [] }
+}
+
+// Drop what is past a group's retention. Forever (0) keeps everything.
+function pruneConversations(): void {
+  let dirs: string[] = []
+  try { dirs = readdirSync(MSG_DIR) } catch { return }
+  for (const chat of dirs) {
+    const days = Number(groupSettings[chat]?.retention ?? serverDefault('retention'))
+    if (!days) continue
+    const cutoff = Date.now() / 1000 - days * 86400
+    let files: string[] = []
+    try { files = readdirSync(join(MSG_DIR, chat)).filter(f => f.endsWith('.jsonl')) } catch { continue }
+    for (const f of files) {
+      const p = join(MSG_DIR, chat, f)
+      try {
+        const lines = readFileSync(p, 'utf8').split('\n').filter(Boolean)
+        const kept = lines.filter(l => { try { return JSON.parse(l).t >= cutoff } catch { return false } })
+        if (kept.length !== lines.length) {
+          if (kept.length) writeFileSync(p, kept.join('\n') + '\n'); else rmSync(p, { force: true })
+          console.log(`[conv] pruned ${lines.length - kept.length} message(s) older than ${days} days from ${chat}/${f}`)
+        }
+      } catch (e) { console.error(`[conv] prune ${p}: ${e}`) }
+    }
+    const gone = contextIndex()?.pruneBefore(chat, cutoff) ?? 0
+    if (gone) console.log(`[ctx] pruned ${gone} message(s) older than ${days} days from the index of ${chat}`)
+    // Photos downloaded to be read go with their messages (a photo is saved when it
+    // is posted, so its file is as old as the message).
+    const dir = join(MEDIA_DIR, chat)
+    let photos: string[] = []
+    try { photos = readdirSync(dir) } catch {}
+    let removed = 0
+    for (const f of photos) {
+      try { if (statSync(join(dir, f)).mtimeMs / 1000 < cutoff) { rmSync(join(dir, f), { force: true }); removed++ } } catch {}
+    }
+    if (removed) console.log(`[ctx] removed ${removed} photo(s) older than ${days} days from ${dir}`)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Context engine — what the group said, searchable (context/engine.ts)
+// ---------------------------------------------------------------------------
+//
+// The topic logs above stay the source of truth. The engine keeps a derived index of
+// them in one SQLite file, so a mention can bring back an earlier conversation from
+// ANY topic of the same group — "the pricing idea Sara floated last month" — without
+// replaying the history. Keywords always (FTS5); meaning as well when an embeddings
+// server is configured (context/setup.sh: bge-m3 on llama.cpp); digests when
+// TG_CONTEXT_DIGEST names a model to write them. A topic searches its own group's
+// history unless context-engines.json links it to another (an archive or a group).
+//
+// Deleting state/context.db loses nothing: it is rebuilt from the logs at startup.
+
+const CONTEXT_ON = !/^(0|false|no|off)$/i.test(process.env.TG_CONTEXT || '1')
+const CONTEXT_DB = process.env.TG_CONTEXT_DB || join(dirname(STATE_FILE), 'context.db')
+// Meaning search without a context-engines.json: TG_CONTEXT_EMBED=1 is bge-m3 on the
+// local embeddings server context/setup.sh runs (or the one TG_CONTEXT_EMBED_URL names,
+// TG_CONTEXT_EMBED then the model name it expects); a transformers.js model id runs
+// in the bridge instead (context/embed.ts). See envEmbedding().
+const CONTEXT_EMB = envEmbedding()
+// 'haiku' or 'sonnet': a few lines per finished stretch of conversation, written by
+// that model through the CLI. Off by default: it costs usage, like Claude-written search words.
+const CONTEXT_DIGEST = (process.env.TG_CONTEXT_DIGEST || '').trim().toLowerCase()
+// TG_CONTEXT_DIGEST=local: a local OpenAI-compatible server writes them instead
+// (llama.cpp's llama-server, Ollama, LM Studio): no Claude, no API key.
+const CONTEXT_DIGEST_URL = (process.env.TG_CONTEXT_DIGEST_URL || '').trim().replace(/\/+$/, '')
+const CONTEXT_DIGEST_MODEL = (process.env.TG_CONTEXT_DIGEST_MODEL || 'local').trim()
+// A stretch of talk counts as finished, and worth a summary, after this much quiet.
+const DIGEST_AFTER_S = 30 * 60
+const DIGEST_PER_TICK = 4
+
+// Which engine ranks a topic's history, and which histories there are besides each
+// group's own (context/engines.ts). The file is optional: without it, the variables
+// above describe the one engine there was before engines could be chosen.
+const CONTEXT_ENGINES_FILE = process.env.TG_CONTEXT_ENGINES || join(dirname(STATE_FILE), 'context-engines.json')
+let ctxCfg: EnginesConfig = loadEnginesConfig(undefined)
+let ctxEngines = new Map<string, Engine>()
+function loadContextEngines(): void {
+  try {
+    ctxCfg = loadEnginesConfig(CONTEXT_ENGINES_FILE)
+    ctxEngines = buildEngines(ctxCfg)
+  } catch (e) {
+    console.error(`[ctx] ${CONTEXT_ENGINES_FILE}: ${e} — using the built-in engine`)
+    ctxCfg = loadEnginesConfig(undefined)
+    ctxEngines = buildEngines(ctxCfg)
+  }
+  // /config offers the engines this server has, and nothing else.
+  const d = settingDef('contextEngine')
+  const dflt = ctxEngines.get(defaultEngineId(ctxCfg))
+  if (d) d.choices = [...[...ctxEngines.values()].map(e => ({ value: e.id, label: e.label })), { value: '', label: `server default (${dflt?.label ?? 'none'})` }]
+}
+loadContextEngines()
+// The model that writes stretch summaries on this server, if any.
+const summaryModel = (): string => (ctxCfg.summaries?.model || CONTEXT_DIGEST || '').toLowerCase()
+
+let ctxIndex: ContextIndex | undefined
+let ctxFailed = false
+// On (true) = when a message points back at something; 'always' = on every message.
+const recallFor = (key: string): boolean => CONTEXT_ON && setting('recall', key) !== false
+function contextIndex(): ContextIndex | undefined {
+  if (!CONTEXT_ON || ctxFailed) return undefined
+  if (ctxIndex) return ctxIndex
+  try {
+    mkdirSync(dirname(CONTEXT_DB), { recursive: true })
+    ctxIndex = new ContextIndex(CONTEXT_DB)
+  } catch (e) { ctxFailed = true; console.error(`[ctx] could not open ${CONTEXT_DB}, recall is off: ${e}`) }
+  return ctxIndex
+}
+
+// An imported history (context/import-telegram.ts) lives in its own file, named in
+// the engines config; everything else is in the one index.
+const archiveStores = new Map<string, ContextIndex>()
+function storeFor(chat: string): ContextIndex | undefined {
+  const a = ctxCfg.archives?.[chat]
+  if (!a) return contextIndex()
+  if (!archiveStores.has(chat)) {
+    try { archiveStores.set(chat, new ContextIndex(a.db)) } catch (e) { console.error(`[ctx] archive ${chat} (${a.db}): ${e}`); return undefined }
+  }
+  return archiveStores.get(chat)
+}
+// Every store with its name ('' for the index), for background upkeep.
+function ctxStores(): [string, ContextIndex][] {
+  const out: [string, ContextIndex][] = []
+  const main = contextIndex()
+  if (main) out.push(['', main])
+  for (const chat of Object.keys(ctxCfg.archives ?? {})) { const s = storeFor(chat); if (s) out.push([chat, s]) }
+  return out
+}
+// Whose history a topic searches: its group's own, or an archive the server linked it to.
+function historyOf(key: string): string {
+  return historyChat(ctxCfg, chatOfKey(key), key.slice(key.indexOf(':') + 1), names[key])
+}
+function historyTitle(chat: string): string | undefined {
+  return ctxCfg.archives?.[chat] ? (ctxCfg.archives[chat].title ?? `chat ${chat}`) : undefined
+}
+// The engine a topic uses: its own choice in /config if the server still has it,
+// else the server's default.
+function engineFor(key: string): Engine {
+  return ctxEngines.get(String(setting('contextEngine', key) || '')) ?? ctxEngines.get(defaultEngineId(ctxCfg))!
+}
+// Search with a topic's engine; one that fails (a service that is down) costs its
+// ranking, not the search: keywords from the index answer instead.
+async function ctxSearch(engine: Engine, store: ContextIndex, chat: string, query: string, o: SearchOptions): Promise<{ hits: Hit[]; fellBack?: string }> {
+  try { return { hits: await engine.search(store, chat, query, o) } }
+  catch (e) {
+    console.error(`[ctx] ${engine.id}: ${e} — keywords instead`)
+    return { hits: await store.search(chat, query, { ...o, meaning: false }), fellBack: String(e) }
+  }
+}
+
+function ctxMessages(chatId: number | string, threadId: number | string | undefined, recs: ConvRecord[]): CtxMessage[] {
+  const topic = String(threadId ?? 'main')
+  const title = names[`${chatId}:${topic}`] ?? ''
+  return recs.map(r => ({ chat: String(chatId), topic, topicTitle: title, id: r.id, t: r.t, from: r.name,
+    text: r.text + (r.file ? ` [${r.kind ?? 'file'}: ${r.file.name}]` : ''), replyTo: r.replyTo }))
+}
+function contextAdd(chatId: number, threadId: number | undefined, recs: ConvRecord[]): void {
+  try { contextIndex()?.add(ctxMessages(chatId, threadId, recs)) } catch (e) { console.error(`[ctx] index: ${e}`) }
+}
+
+// Photos, read for their text (context/ocr.ts) when the server has the service for it
+// ("ocr" in context-engines.json): a screenshot is found by what it says. Files are
+// otherwise kept as Telegram file ids and fetched only when a mention needs them; a
+// photo posted in a recorded topic is instead saved once, to state/media/<chat>/<id>,
+// and read in the background. Retention removes it with its message.
+const MEDIA_DIR = join(dirname(STATE_FILE), 'media')
+const OCR_PER_TICK = 3        // each is seconds of CPU on a small server
+const ocrUrl = (): string | undefined => ctxCfg.ocr?.url || process.env.TG_CONTEXT_OCR_URL || undefined
+const photoQueue: { chat: string; id: number; file: { id: string; size: number } }[] = []
+function queuePhoto(chatId: number, id: number, file: { id: string; size: number }): void {
+  if (CONTEXT_ON && ocrUrl() && photoQueue.length < 500) photoQueue.push({ chat: String(chatId), id, file })
+}
+async function savePhotos(idx: ContextIndex): Promise<void> {
+  for (let p = photoQueue.shift(); p; p = photoQueue.shift()) {
+    if (idx.mediaOf(p.chat, [p.id]).size || (p.file.size && p.file.size > TG_DOWNLOAD_LIMIT)) continue
+    const { chat, id } = p
+    try {
+      const dest = await fetchTelegramFile(bot.api, p.file.id, ext => join(ensureDir(join(MEDIA_DIR, chat)), `${id}${ext || '.jpg'}`))
+      idx.setMedia(chat, id, 'photo', dest)
+    } catch (e) { console.error(`[ocr] could not save photo ${chat}#${id}: ${e}`) }
+  }
+}
+// The saved photos an index lost track of (it was deleted and rebuilt from the logs).
+function relinkPhotos(idx: ContextIndex): void {
+  let chats: string[] = []
+  try { chats = readdirSync(MEDIA_DIR) } catch { return }
+  for (const chat of chats) {
+    let files: string[] = []
+    try { files = readdirSync(join(MEDIA_DIR, chat)) } catch { continue }
+    for (const f of files) {
+      const id = Number(f.replace(/\.[^.]*$/, ''))
+      if (!Number.isInteger(id) || idx.mediaOf(chat, [id]).size) continue
+      if (idx.db.query('SELECT 1 FROM msgs WHERE chat = ? AND id = ?').get(chat, id)) idx.setMedia(chat, id, 'photo', join(MEDIA_DIR, chat, f))
+    }
+  }
+}
+// The groups' photos: save what was posted since the last tick, and read a few.
+let ocrQuietUntil = 0
+async function ocrTick(idx: ContextIndex): Promise<void> {
+  const url = ocrUrl()
+  if (!url) return
+  await savePhotos(idx)
+  if (Date.now() < ocrQuietUntil) return
+  const n = await readPhotos(idx, url, { limit: OCR_PER_TICK }).catch(e => {
+    // A service that is down is said once, then left alone for a while.
+    console.error(`[ocr] ${url}: ${e} — trying again in 10 minutes`)
+    ocrQuietUntil = Date.now() + 10 * 60_000
+    return 0
+  })
+  if (n) { idx.refresh(); console.log(`[ocr] read the text in ${n} photo(s)`) }
+}
+
+// Bring the index up to date with the logs: at startup, and cheap when nothing
+// changed (a log whose size is what the index last saw is skipped).
+function contextBackfill(): void {
+  const idx = contextIndex()
+  if (!idx) return
+  let chats: string[] = []
+  try { chats = readdirSync(MSG_DIR) } catch { return }
+  let files = 0, msgs = 0
+  for (const chat of chats) {
+    let logs: string[] = []
+    try { logs = readdirSync(join(MSG_DIR, chat)).filter(f => f.endsWith('.jsonl')) } catch { continue }
+    for (const f of logs) {
+      const p = join(MSG_DIR, chat, f)
+      let size = 0
+      try { size = statSync(p).size } catch { continue }
+      if (idx.getMeta(`size:${p}`) === String(size)) continue
+      const topic = f.replace(/\.jsonl$/, '')
+      const lines: ConvRecord[] = []
+      try { for (const l of readFileSync(p, 'utf8').split('\n')) { if (!l) continue; try { lines.push(JSON.parse(l)) } catch {} } } catch { continue }
+      const recs = foldRecords(lines)
+      idx.add(ctxMessages(chat, topic, recs))
+      idx.setMeta(`size:${p}`, String(size))
+      files++; msgs += recs.length
+    }
+  }
+  relinkPhotos(idx)
+  idx.refresh()
+  const st = idx.stats()
+  console.log(`[ctx] index: ${st.messages} messages in ${st.episodes} stretches${files ? ` (read ${msgs} from ${files} log(s))` : ''}` +
+    `${st.vectors ? `, ${st.vectors} with vectors` : ''}${st.digests ? `, ${st.digests} with digests` : ''}`)
+}
+
+// The optional parts run in the background, a little at a time.
+async function contextTick(): Promise<void> {
+  const idx = contextIndex()
+  if (!idx) return
+  idx.refresh()
+  await ocrTick(idx)
+  if (idx.embedder) {
+    const n = await idx.embedPending(16, 64).catch(e => { console.error(`[ctx] embedding: ${e}`); return 0 })
+    if (n) console.log(`[ctx] embedded ${n} stretch(es)`)
+  }
+  // Summaries of finished stretches, in the topics that want them — several per call.
+  const model = summaryModel()
+  if (model && (model !== 'local' || CONTEXT_DIGEST_URL)) {
+    const now = Date.now() / 1000
+    const due = idx.episodesNeedingSummary(model, { endedBefore: now - DIGEST_AFTER_S, limit: 400 })
+      .filter(e => e.chat.startsWith('-') && setting('summaries', `${e.chat}:${e.topic}`) !== false).slice(0, DIGEST_PER_TICK)
+    if (due.length) {
+      const reply = model === 'local' ? await localComplete(DIGEST_BATCH_SYSTEM, digestBatchUser(due), 160 * due.length)
+        : await cliComplete(model, DIGEST_BATCH_SYSTEM, digestBatchUser(due))
+      const got = splitDigests(reply)
+      // A stretch the reply left out is stored as a dash, so one bad stretch is not
+      // retried forever; a reply with nothing in it is tried again next time.
+      if (got.size) due.forEach((e, i) => idx.setSummary(e.key, model, got.get(i + 1) ?? '-'))
+      console.log(`[ctx] wrote ${got.size} of ${due.length} summaries with ${model}`)
+    }
+  }
+  // Each engine's own upkeep — vectors for what it searches, stretches an external
+  // engine has not seen — for the groups here and every archive. Engines sharing an
+  // index (three modes of one txtai index) do it once.
+  const done = new Set<string>()
+  for (const e of ctxEngines.values()) {
+    if (!e.syncTarget) continue
+    for (const [name, store] of ctxStores()) {
+      const k = `${e.syncTarget}\n${name}`
+      // An archive does not change: once an engine has all of it, look again rarely.
+      if (done.has(k) || (name && (syncIdleUntil.get(k) ?? 0) > Date.now())) continue
+      done.add(k)
+      const n = await e.sync(store, { budget: 32 }).catch(err => { console.error(`[ctx] ${e.id}: ${err}`); return 0 })
+      if (n) console.log(`[ctx] ${e.id}: brought ${n} stretch(es) up to date${name ? ` in ${historyTitle(name)}` : ''}`)
+      else syncIdleUntil.set(k, Date.now() + 10 * 60_000)
+    }
+  }
+}
+const syncIdleUntil = new Map<string, number>()
+
+async function contextStart(): Promise<void> {
+  if (!contextIndex()) return
+  contextBackfill()
+  if (CONTEXT_EMB && 'url' in CONTEXT_EMB) {
+    // A separate embeddings server (llama-server --embedding): nothing native in the
+    // bridge. The model name is what the server expects, and what the vectors are
+    // filed under.
+    const { httpEmbedder } = await import('./context/embed')
+    contextIndex()!.useEmbedder(httpEmbedder(CONTEXT_EMB.url, CONTEXT_EMB.model))
+    console.log(`[ctx] meaning search on, ${CONTEXT_EMB.model} through ${CONTEXT_EMB.url}`)
+  } else if (CONTEXT_EMB && 'local' in CONTEXT_EMB) {
+    const { localEmbedder } = await import('./context/embed')
+    const model = CONTEXT_EMB.local
+    const e = await localEmbedder({ model }).catch(err => { console.error(`[ctx] ${model}: ${err}`); return undefined })
+    if (e) { contextIndex()!.useEmbedder(e); console.log(`[ctx] meaning search on, with ${model}`) }
+    else console.error(`[ctx] TG_CONTEXT_EMBED names an in-process model, but it could not be loaded (context/embed.ts says how to install its runtime). Keyword search still works.`)
+  }
+  // One tick at a time: embedding a backlog on a small CPU can outlast the minute.
+  let ticking = false
+  const tick = () => {
+    if (ticking) return
+    ticking = true
+    void contextTick().catch(e => console.error(`[ctx] ${e}`)).finally(() => { ticking = false })
+  }
+  setInterval(tick, 60_000).unref?.()
+  tick()
+}
+
+// One short completion from a local OpenAI-compatible server, for the same chores.
+async function localComplete(system: string, user: string, maxTokens = 300): Promise<string> {
+  try {
+    const r = await fetch(`${CONTEXT_DIGEST_URL}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(300_000),
+      body: JSON.stringify({ model: CONTEXT_DIGEST_MODEL, temperature: 0, max_tokens: maxTokens,
+        messages: [{ role: 'system', content: system }, { role: 'user', content: user }], chat_template_kwargs: { enable_thinking: false } }),
+    })
+    const d: any = await r.json()
+    return String(d.choices?.[0]?.message?.content ?? '')
+  } catch (e) { console.error(`[ctx] local digest: ${e}`); return '' }
+}
+
+// One short completion through the CLI, for background chores: no tools, no MCP, no
+// session file, from a directory outside any repository.
+function cliComplete(model: string, system: string, user: string, timeoutMs = 120_000): Promise<string> {
+  const dir = join(tmpdir(), `xesious-ctx-${process.getuid?.() ?? 'user'}`)
+  mkdirSync(dir, { recursive: true })
+  const args = ['-p', user, '--model', model, '--system-prompt', system, '--tools', '', '--strict-mcp-config',
+    '--no-session-persistence', '--disable-slash-commands', '--output-format', 'json', '--settings', '{"alwaysThinkingEnabled":false}']
+  return new Promise(resolve => {
+    const child = spawn(CLAUDE_BIN, args, { cwd: dir, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    const kill = setTimeout(() => child.kill('SIGKILL'), timeoutMs)
+    child.stdout.on('data', d => { out += d })
+    child.on('error', () => { clearTimeout(kill); resolve('') })
+    child.on('close', () => { clearTimeout(kill); try { resolve(String(JSON.parse(out).result ?? '')) } catch { resolve('') } })
+  })
+}
+
+// The history tools (context/mcp.ts) for a turn in a group that recalls: started by
+// the CLI for the turn, pinned to this one chat, and allowed without a prompt — they
+// only read what the group itself wrote.
+const HISTORY_TOOLS = ['mcp__history__search_history', 'mcp__history__read_messages', 'mcp__history__list_topics']
+function historyMcp(key: string): { args: string[]; tools: string[] } | undefined {
+  const chat = key.slice(0, key.indexOf(':'))
+  if (!chat.startsWith('-') || !recallFor(key) || !contextIndex()) return undefined
+  // Pinned to the history this topic searches (its group's, or a linked archive's),
+  // searched with this topic's engine.
+  const hchat = historyOf(key)
+  if (!storeFor(hchat)) return undefined
+  const env: Record<string, string> = { XESIOUS_CONTEXT_DB: ctxCfg.archives?.[hchat]?.db ?? CONTEXT_DB, XESIOUS_CONTEXT_CHAT: hchat,
+    XESIOUS_CONTEXT_ENGINE: engineFor(key).id }
+  if (existsSync(CONTEXT_ENGINES_FILE)) env.XESIOUS_CONTEXT_ENGINES = CONTEXT_ENGINES_FILE
+  const title = historyTitle(hchat)
+  if (title) env.XESIOUS_CONTEXT_TITLE = title
+  if (contextIndex()?.embedder) {
+    if (CONTEXT_EMB && 'url' in CONTEXT_EMB) { env.XESIOUS_CONTEXT_EMBED_URL = CONTEXT_EMB.url; env.XESIOUS_CONTEXT_EMBED = CONTEXT_EMB.model }
+    else env.XESIOUS_CONTEXT_EMBED = contextIndex()!.embedder!.name
+  }
+  for (const k of ['TG_CONTEXT_EMBED', 'TG_CONTEXT_EMBED_URL', 'TG_CONTEXT_DIGEST']) if (process.env[k]) env[k] = process.env[k]!
+  const config = { mcpServers: { history: { command: process.execPath, args: [join(HERE, 'context', 'mcp.ts')], env } } }
+  return { args: ['--mcp-config', JSON.stringify(config)], tools: HISTORY_TOOLS }
+}
+
+// The words the recall searches with: the message as typed, or — the topic's "Search
+// words" setting, on by default — written by Claude Haiku from the message and the
+// talk just before it (context/query.ts). A failed or empty answer falls back to the
+// message. Kept a few minutes, so asking again (or /recall) costs nothing more.
+const queryCache = new Map<string, { q: string; at: number }>()
+async function recallQuery(key: string, text: string, recent?: string): Promise<{ q: string; by: 'claude' | 'typed'; model?: string }> {
+  const how = String(setting('recallQuery', key))
+  if (how === 'typed') return { q: text, by: 'typed' }
+  const model = how === 'sonnet' ? 'sonnet' : 'haiku'
+  const ck = `${model}\n${text}\n\u0000${recent ?? ''}`
+  const cached = queryCache.get(ck)
+  if (cached && Date.now() - cached.at < 10 * 60_000) return { q: cached.q, by: 'claude', model }
+  const t0 = Date.now()
+  // The terms the searched history writes often, so a name typed in another script
+  // comes out spelled the way that history spells it.
+  const hchat = historyOf(key)
+  const terms = storeFor(hchat)?.vocabulary(hchat, 400)
+  const q = parseQuery(await cliComplete(model, QUERY_SYSTEM, queryUser(text, recent, languageNote(`${recent ?? ''}\n${text}`), terms), 60_000))
+  if (!q) { console.error(`[ctx] ${key}: no search words from ${model}; searching the message as typed`); return { q: text, by: 'typed' } }
+  if (queryCache.size > 200) queryCache.delete(queryCache.keys().next().value!)
+  queryCache.set(ck, { q, at: Date.now() })
+  console.log(`[ctx] ${key}: search words by ${model} (${Date.now() - t0} ms): ${JSON.stringify(q).slice(0, 160)}`)
+  return { q, by: 'claude', model }
+}
+const modelName = (m?: string) => m === 'sonnet' ? 'Claude Sonnet' : 'Claude Haiku'
+
+// /recall: every engine's top three for a question, as a few chat messages.
+async function recallCompare(key: string, question: string): Promise<string[]> {
+  const hchat = historyOf(key)
+  const store = storeFor(hchat)
+  if (!store) return ['The history index could not be opened.']
+  store.refresh()
+  const mine = engineFor(key).id
+  // The same words the recall would search with in this topic.
+  const { q, by, model } = await recallQuery(key, question)
+  const day = (t: number) => new Date(t * 1000).toISOString().slice(0, 10)
+  // The message that matched, else the first one: "author: what they said".
+  const snippet = (h: Hit): string => {
+    const lines = h.episode.text.split('\n').slice(1)
+    const line = (h.matched.length ? lines.find(l => l.includes(`#${h.matched[0]} `)) : undefined) ?? lines[0] ?? ''
+    const s = line.replace(/^\[\d\d:\d\d\] #\d+ /, '').replace(/\s+/g, ' ')
+    return s.length > 110 ? `${s.slice(0, 110)}…` : s
+  }
+  // HTML, so each result's topic and date can be a link to the message itself.
+  const h = escapeHtml
+  const blocks: string[] = [`🔎 ${h(question)}\n` + (by === 'claude' ? `Searched for (words by ${modelName(model)}): ${h(q)}\n` : '') +
+    `${h(historyTitle(hchat) ?? "This group's history")}, ${ctxEngines.size} engine(s). ★ = this topic's engine.`]
+  for (const e of ctxEngines.values()) {
+    const t0 = performance.now()
+    let hits: Hit[] = [], err = ''
+    try { hits = await e.search(store, hchat, q, { k: 3 }) } catch (x) { err = String(x).slice(0, 120) }
+    const lines = [`${e.id === mine ? '★ ' : ''}<b>${h(e.label)}</b> — ${err ? `not available (${h(err)})` : `${Math.round(performance.now() - t0)} ms`}`]
+    hits.forEach((x, i) => {
+      const where = `${h(x.episode.topicTitle)} · ${day(x.episode.t0)}`
+      const link = messageLink(x.episode.chat, x.episode.topic === 'main' ? undefined : Number(x.episode.topic), x.matched[0] ?? x.episode.first)
+      lines.push(`${i + 1}. ${link ? `<a href="${h(link)}">${where}</a>` : where} · ${h(snippet(x))}`)
+    })
+    if (!err && !hits.length) lines.push('nothing found')
+    blocks.push(lines.join('\n'))
+  }
+  // Telegram's limit is 4096 characters a message; a block is never split, so its
+  // tags stay whole.
+  const out: string[] = []
+  for (const b of blocks) {
+    if (out.length && out[out.length - 1].length + b.length + 2 <= 3800) out[out.length - 1] += `\n\n${b}`
+    else out.push(b)
+  }
+  return out
+}
+
+// What the automatic recall did for a topic's next turn — the words it searched with
+// and what it handed over — for that turn's live status (runStreaming).
+const recallSteps = new Map<string, { step: Step; at: number }>()
+
+// What was last asked in a topic, for the recall's search words: a follow-up ("no,
+// it was Sara who said it") does not say what "it" is, and a question the bot
+// answered is not in the topic's log. The last few questions, since a follow-up can
+// follow a follow-up. The questions only, not the answers: a follow-up that corrects
+// an answer would have the search look for what the answer claimed (measured on the
+// case that prompted this). Kept a few hours, and forgotten when the topic's session
+// changes (/new, /resume).
+const lastAsked = new Map<string, { q: string; at: number }[]>()
+function rememberAsked(key: string, q: string): void {
+  lastAsked.set(key, [...(lastAsked.get(key) ?? []), { q, at: Date.now() }].slice(-3))
+}
+function lastAskedFor(key: string): string | undefined {
+  const qs = (lastAsked.get(key) ?? []).filter(x => Date.now() - x.at < 3 * 3600_000)
+  if (!qs.length) return undefined
+  const cut = (s: string) => { const t = s.replace(/\s+/g, ' ').trim(); return t.length > 400 ? `${t.slice(0, 399)}…` : t }
+  return qs.map(x => `Asked before: ${cut(x.q)}`).join('\n')
+}
+
+// What a turn in a group is handed from the rest of the group's history: up to three
+// earlier stretches of conversation that match what was asked, from any topic, when
+// the message points back at something and they match well enough (recallPick).
+// Talk the turn already has (this topic's recent messages) is left out.
+async function recallBlock(chatId: number, key: string, text: string, o: { exclude: Set<number>; context?: string; asked?: string; recentSince?: number; onSearch?: () => void }): Promise<string> {
+  if (!text.trim() || !contextIndex()) return ''
+  const hchat = historyOf(key), linked = hchat !== String(chatId)
+  const store = storeFor(hchat)
+  if (!store) return ''
+  store.refresh()
+  const topic = key.slice(key.indexOf(':') + 1)
+  const engine = engineFor(key)
+  const always = setting('recall', key) === 'always'
+  const names = store.people(hchat)
+  const said = o.context ? `${text}\n${o.context}` : text
+  // Only a message the recall will act on is worth a model call for search words:
+  // unless recall is on for every message, one that points back at something. A
+  // topic linked to an archive exists to ask about it, so there every message does.
+  if (!always && !linked && !refersBack(said, { names })) return ''
+  // It searches: seconds, when a model writes the words. The turn's status says so.
+  o.onSearch?.()
+  // The questions asked just before help the search words (a follow-up), not the
+  // decision to search: "write me a haiku" after a question about the past is not one.
+  const { q, by, model } = await recallQuery(key, text, [o.asked, o.context].filter(Boolean).join('\n') || undefined)
+  // Words written from the message and the talk before it already carry that talk;
+  // the message as typed leans on it as before. A linked archive shares nothing with
+  // this topic's own recent talk.
+  const context = by === 'claude' ? undefined : o.context
+  const opts: SearchOptions = linked ? { k: 8, context }
+    : { k: 8, context, exclude: o.exclude, recent: o.recentSince !== undefined ? { topic, from: o.recentSince } : undefined }
+  let hits: Hit[]
+  try { hits = (await ctxSearch(engine, store, hchat, q, opts)).hits }
+  catch (e) { console.error(`[ctx] search: ${e}`); return '' }
+  // 'always': the best few, whatever the message. Otherwise the ones that match well
+  // enough (see recallPick): old talk that merely shares a word is noise.
+  const strong = always ? hits.slice(0, RECALL_MAX)
+    : recallPick(hits, said, { names, max: RECALL_MAX, strength: engine.def.kind === 'xesious', gate: !linked })
+  // Shown as the first step of the turn's live status: what was searched, and found.
+  const words = by === 'claude' ? `"${q.length > 70 ? `${q.slice(0, 69)}…` : q}" (${model === 'sonnet' ? 'Sonnet' : 'Haiku'}'s words)` : 'the message as typed'
+  if (!strong.length) {
+    recallSteps.set(key, { at: Date.now(), step: { label: `🔎 Searched the history for ${words} — nothing close enough`, detail: q } })
+    return ''
+  }
+  const { text: body, used } = recallBody(strong, { maxChars: RECALL_CHARS,
+    scrub: l => BRIDGE_NONCE ? l.split(BRIDGE_NONCE).join('*'.repeat(BRIDGE_NONCE.length)) : l })
+  const day = (t: number) => new Date(t * 1000).toISOString().slice(0, 10)
+  recallSteps.set(key, { at: Date.now(), step: {
+    label: `🔎 Recalled ${used.length} earlier conversation${used.length === 1 ? '' : 's'} — searched for ${words}`,
+    detail: [q, ...used.map(h => `${h.episode.topicTitle} · ${day(h.episode.t0)} · #${h.episode.first}–#${h.episode.last}`)].join('\n') } })
+  console.log(`[ctx] ${key}: ${engine.id} recalled ${used.length} earlier stretch(es)${linked ? ` from ${historyTitle(hchat)}` : ''}` +
+    ` (${by === 'claude' ? `words by ${modelName(model)}` : 'the message as typed'}): ` + used.map(h => `${h.episode.topicTitle}#${h.episode.first}(${h.why.join('+')})`).join(', '))
+  return `[xesious:${BRIDGE_NONCE}] ` + recallIntro(linked ? historyTitle(hchat) : undefined) + RECALL_CAVEAT + body + '\n\n'
+}
+
+// Files already fetched for a context, so a second mention does not download the
+// same photo again.
+const convFetched = new Map<string, string>()
+
+// The block that goes in front of a mention in a group: the message it replies to,
+// with a few around it, and — in a Conversation topic — what was said since the
+// bot last answered there. Also writes the topic's whole recorded conversation to a
+// file Claude can read when the inline part is not enough.
+// `through`: an Auto turn has no message of its own, so msgId is instead the newest
+// message it covers, and that one is included. It also carries what the context
+// engine recalls from the rest of the group's history for `text`, the message being
+// answered — or, on an Auto turn, what was just said (see recallBlock). `onSearch` is
+// told when the recall starts searching, which is the slow part.
+async function conversationContext(ctx: Context, key: string, threadId: number | undefined, msgId: number, reply: any, cwd: string,
+  o: { through?: boolean; text?: string; onSearch?: () => void } = {}): Promise<string> {
+  const { through = false, text = '' } = o
+  const chatId = ctx.chat!.id
+  const recording = recordsFor(key)
+  const recs = recording ? readTopicLog(chatId, threadId) : []
+  const mark = contextMarks[key] ?? 0
+  if (!contextMarks[key] || contextMarks[key] < msgId) { contextMarks[key] = msgId; saveState() }
+  // A reply to the bot's own message is just the conversation carrying on.
+  const targetId: number | undefined = reply && !reply.forum_topic_created && reply.from?.id !== ctx.me?.id ? reply.message_id : undefined
+  // In Bot chat every message is a turn of its own; there is nothing in between.
+  let { window, since } = contextParts(recs, { mark, currentId: through ? msgId + 1 : msgId, targetId, withSince: readsAlong(answersFor(key)) })
+  // Not recorded (before recording began, or recording is off): Telegram still
+  // hands over the message itself.
+  if (targetId !== undefined && !window.length) { const r = recordOf(reply, false); if (r) window = [r] }
+  const recalled = recallFor(key) ? await recallBlock(chatId, key, text, {
+    exclude: new Set([msgId, ...since.map(r => r.id), ...window.map(r => r.id)]),
+    context: [...window, ...since].slice(-6).map(r => r.text).join('\n') || undefined, asked: lastAskedFor(key),
+    recentSince: mark, onSearch: o.onSearch,
+  }).catch(e => { console.error(`[ctx] recall: ${e}`); return '' }) : ''
+  if (!since.length && !window.length) return recalled
+  const saved = new Map<number, string>()
+  let fetched = 0
+  for (const r of [...window, ...since.slice().reverse()]) {
+    if (!r.file || saved.has(r.id) || fetched >= CONV_FILES_PER_TURN) continue
+    const done = convFetched.get(r.file.id)
+    if (done && existsSync(done)) { saved.set(r.id, `./${relative(cwd, done)}`); continue }
+    try {
+      const abs = await receiveFile(ctx, { fileId: r.file.id, name: r.file.name, size: r.file.size }, cwd, key)
+      convFetched.set(r.file.id, abs)
+      saved.set(r.id, `./${relative(cwd, abs)}`)
+      fetched++
+    } catch (e) { console.error(`[conv] could not fetch ${r.file.name} for context: ${e}`) }
+  }
+  const { kept, omitted } = fitNewest(since.map(r => convLine(r, { nonce: BRIDGE_NONCE, saved: saved.get(r.id) })), CONV_INLINE_CHARS)
+  const replyLines = window.map(r => convLine(r, { nonce: BRIDGE_NONCE, saved: saved.get(r.id), targetId }))
+  let file: string | undefined
+  if (recs.length) {
+    try {
+      const abs = join(ensureDir(boxDir(cwd, key, INBOX_DIR)), 'conversation.md')
+      writeFileSync(abs, conversationFile(recs, BRIDGE_NONCE, topicTitle(key)))
+      file = `./${relative(cwd, abs)}`
+    } catch (e) { console.error(`[conv] could not write the conversation file: ${e}`) }
+  }
+  console.log(`[conv] ${key}: ${kept.length} since the last turn${omitted ? ` (+${omitted} in the file)` : ''}` +
+    `${replyLines.length ? `, ${replyLines.length} around the replied-to message` : ''}, ${fetched} file(s) fetched`)
+  return recalled + conversationPreamble(BRIDGE_NONCE, { since: kept, omitted, reply: replyLines, file, total: recs.length })
+}
+
+// "Replying to the bot" means replying to a message the bot WROTE. In a forum every
+// ordinary message arrives as a reply to its topic's creation — and in a topic the
+// bot created, that service message is the bot's, so every message looked addressed
+// to it and a Conversation topic answered everything. Found in production.
+const mentionsBot = (ctx: Context, msg: any): boolean => {
+  const me = botUsername || ctx.me?.username || ''
+  const text = String(msg.text || msg.caption || '').toLowerCase()
+  const reply = msg.reply_to_message
+  const toBotsMessage = !!ctx.me && !!reply && !reply.forum_topic_created && reply.from?.id === ctx.me.id
+  return (!!me && text.includes('@' + me.toLowerCase())) || toBotsMessage
+}
+
+// A mention in an Off topic gets a private word rather than silence that looks
+// like a broken bot. Once per person per topic per ten minutes, not per message.
+const offNoted = new Map<string, number>()
+async function offNote(ctx: Context, msg: any): Promise<void> {
+  const k = `${ctx.chat!.id}:${msg.message_thread_id ?? 'main'}:${ctx.from!.id}`
+  if (Date.now() - (offNoted.get(k) ?? 0) < 10 * 60 * 1000) return
+  offNoted.set(k, Date.now())
+  await ctx.api.sendMessage(ctx.chat!.id, "🔕 I'm off in this topic, so I'm not answering here. An editor can turn me on with /config.", {
+    ...destOpts({ threadId: msg.message_thread_id }), ephemeral_message_parameters: { receiver_user_id: ctx.from!.id },
+    reply_parameters: { message_id: msg.message_id },
+  }).catch(e => console.error(`[conv] off note: ${e}`))
+}
+
+// A group the bot has never had a Topic mode for gets one from its size the first
+// time it is seen: just you and the bot is a bot chat, anything bigger is people
+// talking. Said once in the group, which is also how everyone learns the bot reads
+// along. Skipped when the server pins a default with TG_REQUIRE_MENTION.
+const modeChecked = new Set<string>()
+async function ensureGroupMode(ctx: Context, threadId: number | undefined): Promise<void> {
+  const chat = String(ctx.chat!.id)
+  if (modeChecked.has(chat) || groupSettings[chat]?.topicMode !== undefined) return
+  if (process.env.TG_REQUIRE_MENTION !== undefined || !ALLOWED_CHATS.has(chat)) return
+  modeChecked.add(chat)
+  const n = await ctx.api.getChatMemberCount(ctx.chat!.id).catch(() => undefined)
+  if (typeof n !== 'number') return
+  const mode = n <= 2 ? 'bot' : 'conversation'
+  ;(groupSettings[chat] ??= {}).topicMode = mode
+  ;(groupSettingMeta[chat] ??= {}).topicMode = { by: `the bot (${n} members)`, at: new Date().toISOString() }
+  saveState()
+  console.log(`[config] chat=${chat} topic mode → ${mode} from its ${n} members`)
+  await ctx.api.sendMessage(ctx.chat!.id, mode === 'bot'
+    ? "💬 I'm in bot-chat mode here: it's just you and me, so I answer every message. An editor can change this in /config."
+    : "👥 I'm in conversation mode here: I read along and answer when someone mentions me or replies to me, with the conversation as context. An editor can change this in /config.",
+    { ...destOpts({ threadId }), disable_notification: true }).catch(e => console.error(`[config] mode announce: ${e}`))
+}
+
+// ---------------------------------------------------------------------------
+// Auto mode — joining in unasked
+// ---------------------------------------------------------------------------
+//
+// An Auto topic is a Conversation topic in which the bot may also speak up on its
+// own. An unmentioned message is recorded as usual and (re)arms a timer for the
+// topic; once people have been quiet for a moment, or a busy topic has waited long
+// enough, a cheap judge reads the recent messages and says JOIN or QUIET. Only a
+// JOIN reaches the topic's real model, and silently: no status message, and the
+// model may still decline with SILENT_REPLY, in which case nothing appears at all.
+//
+// The judge is Claude Haiku or Sonnet on the bot's own subscription — `claude -p`
+// with no tools and a short system prompt, about 1k tokens a look — or a local model
+// behind an OpenAI-compatible server (TG_AUTO_LOCAL_URL), scored from the first
+// token's logprobs. research/auto has the benchmark behind the defaults.
+//
+// Only a message from someone allowed to use the bot arms the timer. Everyone's
+// messages are read as background, but a stranger in the group cannot make the bot
+// act — the same line a mention draws.
+
+const AUTO_LOCAL_URL = (process.env.TG_AUTO_LOCAL_URL || '').replace(/\/+$/, '')
+const AUTO_LOCAL_MODEL = process.env.TG_AUTO_LOCAL_MODEL || 'local'
+// A ceiling on looks per topic per hour, whatever the pacing says. One look is
+// cheap; an unbounded number of them is not.
+const AUTO_MAX_LOOKS = Number(process.env.TG_AUTO_MAX_LOOKS_PER_HOUR || 40)
+// Messages the judge sees, new ones included: enough to tell "already answered"
+// and "meant for Sara", few enough to stay a small prompt.
+const AUTO_HISTORY = 14
+// The judge runs from a directory outside any git repository, with no tools, no MCP
+// servers and no session file: it cannot act, and it leaves nothing behind — no
+// transcript, no auto-memory, no project CLAUDE.md in its context.
+const TRIAGE_DIR = join(tmpdir(), `xesious-triage-${process.getuid?.() ?? 'user'}`)
+
+let botFirstName = ''
+type AutoWait = { ctx: Context; threadId?: number; firstAt: number; timer?: ReturnType<typeof setTimeout> }
+const autoWaiting = new Map<string, AutoWait>()
+// The newest message the judge has looked at, per topic, so a look covers only
+// what is new. In memory: after a restart the context mark is the floor.
+const autoLooked: Record<string, number> = {}
+const autoJoinedAt: Record<string, number> = {}
+const autoLooks = new Map<string, number[]>()
+// What the bot last said in each topic, so the judge can tell "thanks!" to the bot
+// from a question to the room. The bot's own messages are not in the topic's record.
+const lastSpoke: Record<string, { t: number; text: string }> = {}
+let localJudgeWarned = 0
+
+const autoEagerness = (key: string): Eagerness => asEagerness(setting('autoEagerness', key))
+// TG_AUTO_QUIET_MS shortens the wait, for tests and for anyone who finds the
+// defaults slow; the longest wait stays four times the quiet period.
+const AUTO_QUIET_OVERRIDE = Number(process.env.TG_AUTO_QUIET_MS || 0)
+function autoPace(key: string) {
+  const p = AUTO_PACE[autoEagerness(key)]
+  return AUTO_QUIET_OVERRIDE > 0 ? { ...p, quietMs: AUTO_QUIET_OVERRIDE, maxWaitMs: AUTO_QUIET_OVERRIDE * 4 } : p
+}
+// Who the bot is, from getMe at startup — or from grammY's own copy when main() has
+// not run (the tests drive the bot directly).
+function botIdentity(): { first: string; username: string } {
+  let first = botFirstName, username = botUsername
+  if (!first || !username) try { first ||= bot.botInfo.first_name; username ||= bot.botInfo.username } catch {}
+  return { first: first || username || 'the bot', username }
+}
+// The names people use for the bot without @-mentioning it: its display name, the
+// first word of that when it is a real word, and its username. Not fragments of the
+// username: "helper" out of helper_bot is a word people use about other things.
+function botNames(): string[] {
+  const { first, username } = botIdentity()
+  const word = first.split(/\s+/)[0]
+  const names = [first, word.length >= 4 ? word : '', username]
+  return [...new Set(names.map(n => n.trim().toLowerCase()).filter(n => n.length >= 3))]
+}
+function instructionsFor(key: string): string {
+  return [groupSettings[chatOfKey(key)]?.instructions, topicStore('instructions')[key]].map(s => String(s ?? '').trim()).filter(Boolean).join('\n')
+}
+
+function scheduleAutoLook(ctx: Context, key: string, threadId: number | undefined, text: string): void {
+  const pace = autoPace(key)
+  const now = Date.now()
+  const w = autoWaiting.get(key) ?? { ctx, threadId, firstAt: now }
+  w.ctx = ctx; w.threadId = threadId
+  if (w.timer) clearTimeout(w.timer)
+  const urgent = triageNeed([{ id: 0, t: 0, name: '', text }], botNames()) === 'urgent'
+  w.timer = setTimeout(() => void autoLook(key).catch(e => console.error(`[auto] ${key}: ${e}`)),
+    triageDelay({ now, firstAt: w.firstAt, urgent, quietMs: pace.quietMs, maxWaitMs: pace.maxWaitMs }))
+  autoWaiting.set(key, w)
+}
+
+async function autoLook(key: string): Promise<void> {
+  const w = autoWaiting.get(key)
+  if (!w) return
+  autoWaiting.delete(key)
+  const { ctx, threadId } = w
+  if (answersFor(key) !== 'auto') return
+  // A turn is running or queued: what it says changes what is worth adding. Look
+  // again once it has had its say.
+  if ((inFlight[key] ?? 0) > 0) {
+    autoWaiting.set(key, { ...w, timer: setTimeout(() => void autoLook(key).catch(e => console.error(`[auto] ${key}: ${e}`)), 20_000) })
+    return
+  }
+  const recs = readTopicLog(ctx.chat!.id, threadId)
+  const seen = Math.max(autoLooked[key] ?? 0, contextMarks[key] ?? 0)
+  // A message that was a turn of its own (a mention) has been answered already.
+  const fresh = recs.filter(r => r.id > seen && !r.toBot)
+  if (!fresh.length) return
+  const lastId = recs[recs.length - 1].id
+  autoLooked[key] = lastId
+  const recent = recs.slice(-AUTO_HISTORY)
+  const msgs: TriageMsg[] = recent.map(r => ({ id: r.id, t: r.t, name: r.name, text: r.text, replyTo: r.replyTo, kind: r.kind, isNew: r.id > seen && !r.toBot }))
+  const spoke = lastSpoke[key]
+  if (spoke && spoke.t >= (recent[0]?.t ?? 0)) {
+    const at = msgs.findIndex(m => m.t > spoke.t)
+    msgs.splice(at < 0 ? msgs.length : at, 0, { id: 0, t: spoke.t, name: botIdentity().first, text: spoke.text, bot: true })
+  }
+  const need = triageNeed(msgs.filter(m => m.isNew), botNames())
+  if (need === 'skip') { console.log(`[auto] ${key}: nothing to judge (acknowledgements only)`); return }
+  const eagerness = autoEagerness(key)
+  const pace = autoPace(key)
+  if (need !== 'urgent' && Date.now() - (autoJoinedAt[key] ?? 0) < pace.cooldownMs) { console.log(`[auto] ${key}: pausing after joining`); return }
+  const looks = (autoLooks.get(key) ?? []).filter(t => Date.now() - t < 3_600_000)
+  if (looks.length >= AUTO_MAX_LOOKS) { console.log(`[auto] ${key}: ${AUTO_MAX_LOOKS} looks this hour, skipping`); return }
+  looks.push(Date.now()); autoLooks.set(key, looks)
+  const t0 = Date.now()
+  const v = await judgeAuto(String(setting('autoJudge', key)), key, msgs, eagerness)
+  console.log(`[auto] ${key}: ${v.join ? 'JOIN' : 'QUIET'} (${v.by}, ${Date.now() - t0}ms${v.prob != null ? `, p=${v.prob.toFixed(2)}` : ''})${v.reason ? ` — ${v.reason}` : ''}`)
+  if (!v.join) return
+  // Someone mentioned the bot while the judge was thinking; that turn covers it.
+  if ((inFlight[key] ?? 0) > 0 || (contextMarks[key] ?? 0) >= lastId) return
+  autoJoinedAt[key] = Date.now()
+  // Everything up to the moment the turn starts, not the moment the judge looked:
+  // someone may have answered the question in the seconds the judge took, and the
+  // model can only decline to repeat it if it sees that. What was said is also what
+  // the context engine recalls earlier talk for.
+  await enqueue(key, () => {
+    const recs = readTopicLog(ctx.chat!.id, threadId)
+    const upTo = Math.max(lastId, recs.at(-1)?.id ?? lastId)
+    const said = recs.filter(r => r.id > seen && r.id <= upTo && !r.toBot).map(r => r.text).join('\n')
+    return handlePrompt(ctx, threadId, key, '', undefined, undefined, { conv: { msgId: upTo }, auto: { reason: v.reason, text: said } })
+  })
+}
+
+type AutoVerdict = { join: boolean; reason: string; by: string; prob?: number | null }
+async function judgeAuto(judge: string, key: string, msgs: TriageMsg[], eagerness: Eagerness): Promise<AutoVerdict> {
+  const { first: bot, username } = botIdentity()
+  // A small local model gets the short few-shot prompt: given the long one, the ones
+  // measured here (research/auto) said JOIN to almost everything.
+  const system = judge === 'local' ? triageCompactPrompt({ bot, eagerness }) : triageSystemPrompt({ bot, username: username || undefined, eagerness })
+  const user = triageUserPrompt({ topic: topicTitle(key), msgs, now: Math.floor(Date.now() / 1000), bot, instructions: instructionsFor(key) })
+  if (judge === 'local') {
+    if (AUTO_LOCAL_URL) return localJudge(system, user, AUTO_PACE[eagerness].threshold)
+    // Fail closed, and say so now and then: a judge that is not there must not turn
+    // into a bot that never speaks without anyone knowing why.
+    if (Date.now() - localJudgeWarned > 3_600_000) { localJudgeWarned = Date.now(); console.error('[auto] autoJudge is "local" but TG_AUTO_LOCAL_URL is not set; staying quiet') }
+    return { join: false, reason: '', by: 'local (not configured)' }
+  }
+  return claudeJudge(judge === 'sonnet' ? 'sonnet' : 'haiku', system, user)
+}
+
+function claudeJudge(model: string, system: string, user: string): Promise<AutoVerdict> {
+  mkdirSync(TRIAGE_DIR, { recursive: true })
+  const args = ['-p', user, '--model', model, '--system-prompt', system, '--tools', '', '--strict-mcp-config',
+    '--no-session-persistence', '--disable-slash-commands', '--output-format', 'json', '--settings', '{"alwaysThinkingEnabled":false}']
+  return new Promise(resolve => {
+    const child = spawn(CLAUDE_BIN, args, { cwd: TRIAGE_DIR, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = '', err = ''
+    const kill = setTimeout(() => child.kill('SIGKILL'), 90_000)
+    child.stdout.on('data', d => { out += d })
+    child.stderr.on('data', d => { err += d })
+    child.on('error', e => { clearTimeout(kill); resolve({ join: false, reason: '', by: `${model} (failed: ${e})` }) })
+    child.on('close', () => {
+      clearTimeout(kill)
+      try {
+        const d = JSON.parse(out)
+        const p = parseTriage(String(d.result ?? ''))
+        resolve({ join: !!p?.join, reason: p?.reason ?? '', by: model })
+      } catch { resolve({ join: false, reason: '', by: `${model} (unreadable: ${(err || out).slice(0, 120)})` }) }
+    })
+  })
+}
+
+async function localJudge(system: string, user: string, threshold: number): Promise<AutoVerdict> {
+  try {
+    const r = await fetch(`${AUTO_LOCAL_URL}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(120_000),
+      body: JSON.stringify({
+        model: AUTO_LOCAL_MODEL, temperature: 0, max_tokens: 1, logprobs: true, top_logprobs: 20,
+        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+        // Honoured by llama.cpp's server for models that think first; ignored elsewhere.
+        chat_template_kwargs: { enable_thinking: false },
+      }),
+    })
+    const d: any = await r.json()
+    const ch = d.choices?.[0]
+    const top = ch?.logprobs?.content?.[0]?.top_logprobs ?? []
+    const prob = joinProbability(top.map((x: any) => ({ token: String(x.token), logprob: Number(x.logprob) })))
+    const text = parseTriage(String(ch?.message?.content ?? ''))
+    return { join: prob != null ? prob >= threshold : !!text?.join, reason: '', by: 'local', prob }
+  } catch (e) { return { join: false, reason: '', by: `local (failed: ${e})` } }
+}
+
+// What an Auto turn is told instead of a person's message.
+function autoFrame(reason: string): string {
+  return `[xesious:${BRIDGE_NONCE}] nobody has mentioned you. This topic is in Auto mode: you read along, and you may join in when you have something useful to add. ` +
+    `A quick check of the messages above suggested you might${reason ? ` (its note: ${reason.replace(BRIDGE_NONCE, '')})` : ''}. ` +
+    `Read them and decide. If you have something worth saying, say it now, briefly, the way a colleague would chime in, to whoever it concerns. ` +
+    `If on reflection you do not, or someone has already covered it, reply with exactly ${SILENT_REPLY} and nothing else. That reply is never shown.`
 }
 
 // Gate on the SENDER's id, never the room.
@@ -1514,9 +3380,16 @@ async function receiveFile(ctx: Context, att: { fileId: string; name: string; si
     throw new Error(
       `file is ${fmtBytes(att.size)}, over the ${fmtBytes(TG_DOWNLOAD_LIMIT)} the cloud Bot API lets bots fetch.\n` +
       `To lift this, run a local Bot API server and set TG_API_ROOT (see README) — or copy the file to ${cwd}/${INBOX_DIR}/ directly.`)
-  const file = await ctx.api.getFile(att.fileId)
+  const dest = await fetchTelegramFile(ctx.api, att.fileId, ext => uniquePath(ensureDir(boxDir(cwd, key, INBOX_DIR)), safeName(att.name, ext)))
+  console.log(`[file<-] ${dest} (${fmtBytes(statSync(dest).size)})`)
+  return dest
+}
+
+// A Telegram file saved to disk, at the path `destFor` picks from its extension.
+async function fetchTelegramFile(api: Context['api'], fileId: string, destFor: (ext: string) => string): Promise<string> {
+  const file = await api.getFile(fileId)
   if (!file.file_path) throw new Error('Telegram returned no file_path')
-  const dest = uniquePath(ensureDir(boxDir(cwd, key, INBOX_DIR)), safeName(att.name, extname(file.file_path)))
+  const dest = destFor(extname(file.file_path))
   // A local server in --local mode has already written the file to its own disk
   // and hands back an absolute path; there is nothing to download.
   if (LOCAL_API && isAbsolute(file.file_path) && existsSync(file.file_path)) {
@@ -1530,7 +3403,6 @@ async function receiveFile(ctx: Context, att: { fileId: string; name: string; si
     if (!res.ok) throw new Error(`download failed (HTTP ${res.status})`)
     writeFileSync(dest, Buffer.from(await res.arrayBuffer()))
   }
-  console.log(`[file<-] ${dest} (${fmtBytes(statSync(dest).size)})`)
   return dest
 }
 
@@ -1727,19 +3599,20 @@ function answerCaption(text: string): { text: string; mode?: string; plain: stri
 // Deliver a Claude answer: inline (markdown) if short, else as an answer.md file
 // with a preview caption — so a huge reply isn't a dozen chunked messages.
 async function deliver(ctx: Context, threadId: number | undefined, text: string, replyTo?: number): Promise<number | undefined> {
-  if (answerGoesToFile(text)) {
+  const format = setting('replyFileFormat', keyFor(ctx.chat!.id, threadId)) as string
+  if (answerGoesToFile(text, keyFor(ctx.chat!.id, threadId))) {
     const dir = mkdtempSync(join(tmpdir(), 'tg-'))
     try {
       // The HTML goes first when both are sent: it is the one the user opens, and
       // the caption preview belongs on the file they will actually read. The .md
       // follows as the source of truth.
       const files: string[] = []
-      if (REPLY_FILE_FORMAT !== 'md') {
+      if (format !== 'md') {
         const h = join(dir, 'answer.html')
         writeFileSync(h, htmlDocument('Answer', markdownToHtml(text)))
         files.push(h)
       }
-      if (REPLY_FILE_FORMAT !== 'html') {
+      if (format !== 'html') {
         const m = join(dir, 'answer.md')
         writeFileSync(m, text)
         files.push(m)
@@ -1796,7 +3669,7 @@ function synthesize(text: string, ogg: string, key?: string): Promise<string | n
 // tool output carrying a prompt injection), and without this the pass — spawned in
 // HERE, next to .env — could be steered to Read ./.env and speak/return its contents.
 // disallowedTools overrides any operator allowlist; kept separate from plan mode,
-// which George dropped for producing meta-commentary.
+// which the maintainer dropped for producing meta-commentary.
 const STATELESS_NOTOOLS = ['--disallowedTools', 'Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'Task', 'NotebookEdit']
 
 function summarizeForSpeech(answer: string): Promise<string> {
@@ -2213,7 +4086,7 @@ async function speakChunked(ctx: Context, threadId: number | undefined, key: str
   if (!units.length) return true
   const dir = mkdtempSync(join(tmpdir(), 'tg-tts-'))
   const wantParts = partsMode(key)
-  const task: SpeechTask = { id: newJobId(), key, dir, chunkIds: [], cancelled: false, withFiles: answerGoesToFile(text),
+  const task: SpeechTask = { id: newJobId(), key, dir, chunkIds: [], cancelled: false, withFiles: answerGoesToFile(text, key),
                              sendParts: wantParts, held: [] }
   speechTasks.set(task.id, task)
   speechByTopic.set(key, task.id)
@@ -2694,7 +4567,7 @@ function makeWorktree(baseDir: string, fanoutId: string, n: number): { path: str
 // Start whichever parts are next, up to the concurrency cap.
 async function pumpFanout(ctx: Context, f: Fanout): Promise<void> {
   const running = f.children.filter(c => c.status === 'running').length
-  let slots = Math.max(0, FANOUT_CONCURRENCY - running)
+  let slots = Math.max(0, (setting('fanoutConcurrency', f.parentKey) as number) - running)
   for (const child of f.children) {
     if (slots <= 0) break
     if (child.status !== 'pending') continue
@@ -2904,18 +4777,17 @@ function fanoutBranchReport(f: Fanout): string {
 //
 // Deleting used to be automatic. It is destructive — the part's working-out goes
 // with it, and the combined answer becomes the only record — and whether a part is
-// worth reading is a judgement only the person reading it can make. Read at call
-// time so it can be changed without a restart.
-function topicDisposal(): 'ask' | 'delete' | 'close' | 'keep' {
-  const v = (process.env.TG_FANOUT_TOPICS || 'ask').toLowerCase()
-  return v === 'delete' || v === 'close' || v === 'keep' ? v : 'ask'
+// worth reading is a judgement only the person reading it can make. A group
+// setting, read at call time, so it can be changed without a restart.
+function topicDisposal(key: string): 'ask' | 'delete' | 'close' | 'keep' {
+  return setting('fanoutTopics', key) as 'ask' | 'delete' | 'close' | 'keep'
 }
 
 // Dispose of the part topics, falling back rather than giving up: deleting needs
 // Delete Messages and closing needs Manage Topics, and a bot that has neither must
 // still leave a way to clear up by hand instead of an unexplained mess.
 async function disposeFanoutTopics(ctx: Context, f: Fanout, force?: 'delete' | 'close'): Promise<void> {
-  const mode = force ?? topicDisposal()
+  const mode = force ?? topicDisposal(f.parentKey)
   if (mode === 'keep') return
   const live = f.children.filter(c => c.topicId !== undefined)
   if (!live.length) return
@@ -2947,7 +4819,7 @@ async function disposeFanoutTopics(ctx: Context, f: Fanout, force?: 'delete' | '
 
 async function cleanupFanout(ctx: Context, f: Fanout): Promise<void> {
   const kept: string[] = []
-  const keeping = topicDisposal() !== 'delete'   // 'ask' keeps them until you say otherwise
+  const keeping = topicDisposal(f.parentKey) !== 'delete'   // 'ask' keeps them until you say otherwise
   for (const c of f.children) {
     // Only worth saying where the topic will survive to be read. Posting it into a
     // topic that is about to be deleted is a message written to be thrown away.
@@ -3016,6 +4888,58 @@ type PromptKind = {
   // A message pushed past the queue by `— Run this now —`. Background, but the
   // user is sitting there waiting for it — unlike /bg, which they detached.
   promoted?: boolean
+  // A message in a group: hand over the conversation around it (see
+  // conversationContext). The id is the triggering message; reply is what it replies to.
+  conv?: { msgId: number; reply?: any }
+  // An Auto-mode turn nobody asked for: conv.msgId is then the newest message it
+  // covers. It runs without a status message and posts nothing if the model
+  // declines with SILENT_REPLY (or fails — nobody is waiting for an error).
+  auto?: { reason: string; text?: string }
+}
+// A person's message the way the model must see it to act on it: behind the marker
+// the system prompt declares. Anything the model is asked to DO goes through this —
+// text without the marker is, by that same prompt, material and never an instruction.
+const frameFrom = (ctx: Context, text: string) => frameUserMessage(text, {
+  nonce: BRIDGE_NONCE,
+  name: [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username,
+  id: ctx.from?.id,
+})
+// Put a turn's status up now, Interrupt and all, as a job with no process yet (see
+// handlePrompt). Undefined when Telegram refuses: the run then posts its own, as it
+// always did.
+async function postEarlyStatus(ctx: Context, threadId: number | undefined, key: string, prompt: string, askedBy?: number): Promise<EarlyTurn | undefined> {
+  const id = newJobId()
+  const status = await ctx.api.sendMessage(ctx.chat!.id, THINKING, { ...(threadId ? { message_thread_id: threadId } : {}),
+    disable_notification: true, reply_markup: interruptKeyboard(id) }).catch(() => null)
+  if (!status) return undefined
+  pending.push({ chat: ctx.chat!.id, id: status.message_id }); saveState()
+  const job: Job = { id, key, threadId, prompt, askedBy, pgid: 0, startedAt: Date.now(), statusMsgId: status.message_id, steps: () => 0 }
+  jobs.set(id, job)
+  return { job, statusId: status.message_id }
+}
+// What an early turn is busy with before its run takes the status over.
+function showEarlyStep(ctx: Context, e: EarlyTurn, label: string): Promise<void> {
+  // Already ended: its keyboard is gone, and this edit would put it back.
+  if (e.job.outcome) return Promise.resolve()
+  const steps: Step[] = [{ label }]
+  return editStatusMessage(ctx, e.statusId, renderSteps(steps, 1, false), steps, false, interruptKeyboard(e.job.id))
+}
+// Take down an early status no run took over — the turn ended before its run
+// started, or the run failed to start — and its job with it, and what its recall
+// left for the run to show (or the topic's next turn would show it). Once only.
+async function dropEarlyStatus(ctx: Context, e: EarlyTurn): Promise<void> {
+  if (!jobs.delete(e.job.id)) return
+  recallSteps.delete(e.job.key)
+  pending = pending.filter(p => !(p.chat === ctx.chat!.id && p.id === e.statusId)); saveState()
+  await ctx.api.deleteMessage(ctx.chat!.id, e.statusId).catch(() => {})
+}
+// A turn ended while it was still preparing — by Interrupt, /stop, or a newer message
+// in interrupt mode — never started a run, so there is nothing to stop. It ends the
+// way a run stopped before it produced anything does (a discard then returns on
+// `stopped`, as always).
+async function endEarly(ctx: Context, e: EarlyTurn): Promise<ClaudeResult> {
+  await dropEarlyStatus(ctx, e)
+  return { text: INTERRUPTED_EMPTY, isError: false }
 }
 async function handlePrompt(ctx: Context, threadId: number | undefined, key: string, prompt: string, mode?: string, replyTo?: number, kind: PromptKind = {}): Promise<void> {
   // Renamed off `promoted` on the way in, because `promoteBlock`'s result already
@@ -3054,14 +4978,16 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   // and /compact send literal CLI commands, which are not somebody speaking.
   // Hand over anything a background job found since the last turn, as
   // bridge-authored context rather than as something the user said.
-  const carried = !background && bgNotes[key]?.length ? bgNotes[key].splice(0) : []
+  // Not on an Auto turn: it may end in silence, and what it was handed would then
+  // be spent without anyone having been told.
+  const carried = !background && !kind.auto && bgNotes[key]?.length ? bgNotes[key].splice(0) : []
   const preamble = carried.length
     ? carried.map(t => `[xesious:${BRIDGE_NONCE}] a background task you started in this topic has finished. Its result:\n${t}`).join('\n\n') + '\n\n'
     : ''
   // Same idea for files that arrived without a caption. Foreground turns only: a
   // background job was asked for something specific and should not inherit an
   // upload that happened while it ran.
-  const arrived = !background && pendingFiles[key]?.length ? pendingFiles[key].splice(0) : []
+  const arrived = !background && !kind.auto && pendingFiles[key]?.length ? pendingFiles[key].splice(0) : []
   // A shared directory changes where files go, and the model only knows what it is
   // told: the standing profile says "./outbox/", which is a race when two topics
   // drain one directory. Said every turn rather than once at fork time, because the
@@ -3069,16 +4995,27 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   const shareNote = topicsSharing(cwd, key)
     ? `[xesious:${BRIDGE_NONCE}] this directory is shared with another topic (a fork). Files sent to THIS conversation are in ./${INBOX_DIR}/${topicTag(key)}/, and anything you want delivered here goes in ./${OUTBOX_DIR}/${topicTag(key)}/ — not the shared ./${OUTBOX_DIR}/ itself.\n\n`
     : ''
-  const framed = shareNote + filesPreamble(BRIDGE_NONCE, arrived) + preamble + frameUserMessage(prompt, {
-    nonce: BRIDGE_NONCE,
-    name: [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username,
-    id: ctx.from?.id,
-  })
+  const conv = !background && ctx.chat?.type !== 'private' ? kind.conv : undefined
+  // The status goes up before the conversation is gathered, not when the run starts:
+  // gathering it can take seconds (the recall has a model write its search words, then
+  // embeds them), and a bot that shows nothing for that long looks slow. The turn is a
+  // job from this moment, so Interrupt, /stop and /jobs reach it while it prepares.
+  // An Auto turn has no status at all.
+  const early = conv && !kind.auto ? await postEarlyStatus(ctx, threadId, key, prompt, replyTo) : undefined
+  const convBlock = conv
+    ? await conversationContext(ctx, key, threadId, conv.msgId, conv.reply, cwd, {
+        through: !!kind.auto, text: kind.auto ? kind.auto.text ?? '' : prompt,
+        onSearch: early && (() => { early.edit = showEarlyStep(ctx, early, '🔎 Searching the history…') }),
+      }).catch(e => { console.error(`[conv] ${key}: ${e}`); return '' })
+    : ''
+  // Landed before the run shows what the recall found, so it can never overwrite it.
+  await early?.edit
+  const framed = shareNote + filesPreamble(BRIDGE_NONCE, arrived) + preamble + convBlock + (kind.auto ? autoFrame(kind.auto.reason) : frameFrom(ctx, prompt))
   // If this topic has a live link, the shared link is the source of truth for the
   // session id, so a conversation held over the live web call continues here (and
   // vice-versa). Otherwise use the topic's own stored id.
   const linked = linkForKey(key)
-  const resumeId = linked?.link.sessionId ?? sessions[key]?.sessionId
+  const resumeId = resumeIdFor(key)
   // Bind the session the moment the CLI announces it, not only when the turn
   // completes. The completion path below is guarded by `stopped`, and that guard
   // returns BEFORE the line that persists — so a run killed with /stop on a
@@ -3111,12 +5048,15 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   }
 
   const bindSession = (sessionId: string) => {
-    sessions[key] = { ...sessions[key], cwd, sessionId, updated: new Date().toISOString() }
+    const at = new Date().toISOString()
+    sessions[key] = { ...sessions[key], cwd, sessionId, updated: at }
     saveState()
-    if (linked) { const l = loadLinks(); if (l[linked.uuid]) { l[linked.uuid].sessionId = sessionId; saveLinks(l) } }
+    // The same stamp on both sides: neither outranks the other until one moves.
+    if (linked) { const l = loadLinks(); if (l[linked.uuid]) { l[linked.uuid].sessionId = sessionId; l[linked.uuid].updated = at; saveLinks(l) } }
   }
   try {
-    const res = await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), { onInit: background ? undefined : bindSession, effort: effortFor(key), askedBy: replyTo, fork: background })
+    const res = early?.job.outcome ? await endEarly(ctx, early)
+      : await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), { onInit: background ? undefined : bindSession, effort: effortFor(key), askedBy: replyTo, fork: background, silent: !!kind.auto, early })
     if (stopped.has(key)) {
       stopped.delete(key)
       // Interrupting a part is not the same as the part finishing. It means you are
@@ -3146,10 +5086,17 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     // nothing.
     const forked = background && resumeId !== undefined
     if (res.sessionId && !forked) bindSession(res.sessionId)
+    // An Auto turn that thought better of it, or failed, leaves no trace in the chat:
+    // nobody asked, so nobody is waiting for a "no answer" or an error.
+    if (kind.auto && (res.isError || res.noAnswer || isSilentReply(res.text))) {
+      console.log(`[auto] ${key}: stayed quiet (${res.isError ? `error: ${res.text.slice(0, 80)}` : 'the model declined'})`)
+      return
+    }
     if (res.noAnswer) {
       await sendNoAnswer(ctx, threadId, key, prompt, replyLink())
       return
     }
+    if (!background && !res.isError && res.text.trim()) rememberAsked(key, prompt)
     // When the turn's closing block only promises future work or refers to work
     // the user never saw, deliver the substantive block before it as well. The
     // rest of the turn's text is in the run record above, so this is an
@@ -3207,6 +5154,9 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     }
     const answerId = await deliver(ctx, threadId, res.text, link)
     await flushOutbox(ctx, threadId, cwd, key, link)
+    // For Auto mode's judge, which otherwise sees only what people said.
+    if (ctx.chat?.type !== 'private') lastSpoke[key] = { t: Math.floor(Date.now() / 1000), text: res.text.slice(0, 400) }
+    if (kind.auto) console.log(`[auto] ${key}: joined in (${res.text.length} chars)`)
     // Speak the answer too when this topic is in voice mode.
     //
     // NOT awaited here, and not on this topic's queue. Synthesis was measured at 65s
@@ -3229,7 +5179,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
       // when the topic is calm. Chaining to it meant that whenever deliver could not
       // name a single message — a long answer sent as a file group, or a reply long
       // enough to be chunked — the note replied to NOTHING. Reported from production
-      // on a YouTube summary, which is precisely the long-answer case. The user's own
+      // on a long summary, which is precisely the long-answer case. The user's own
       // message is always there, and destOpts sets allow_sending_without_reply, so a
       // deleted question costs the reply and never the note.
       void enqueue(`${key}#voice`, () => speakAnswer(ctx, threadId, key, res.text, vm, answerId ?? link ?? replyTo)
@@ -3237,6 +5187,9 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     }
   } catch (e) {
     await send(ctx, threadId, `⚠️ ${e}`, false, replyLink())
+  } finally {
+    // Put up for a run that then failed to start: nothing else would take it down.
+    if (early && !early.job.child) await dropEarlyStatus(ctx, early)
   }
 }
 
@@ -3268,9 +5221,16 @@ const refreshing = new Set<string>()
 // the CLI mints a throwaway that would otherwise bind this topic to an empty session.
 // The button path goes through HERE rather than reaching for runStreaming directly,
 // so that guarantee is made in one place instead of two.
+//
+// Only the bare command is forwarded. In a group, Telegram adds the bot's name to a
+// command tapped from the menu — `/usage@some_bot` — and the CLI has no command by
+// that name, so it went to the model as an ordinary prompt. Unframed, since a
+// passthrough is not speech, and the model rightly refused it as unverified
+// (reported 2026-09-25).
+const passthroughCommand = (text: string) => text.trim().split(/\s+/)[0].toLowerCase().replace(/@\S+$/, '')
 async function runPassthrough(ctx: Context, threadId: number | undefined, key: string, text: string): Promise<string> {
   const cwd = resolveCwd(ctx, threadId)
-  const res = await runStreaming(ctx, threadId, key, text, cwd, sessions[key]?.sessionId, modeFor(key), modelFor(key), { silent: true })
+  const res = await runStreaming(ctx, threadId, key, passthroughCommand(text), cwd, sessions[key]?.sessionId, modeFor(key), modelFor(key), { silent: true })
   return res.text
 }
 
@@ -3286,7 +5246,7 @@ async function handlePassthrough(ctx: Context, threadId: number | undefined, key
     out = await runPassthrough(ctx, threadId, key, text)
   } catch (e) { await send(ctx, threadId, `⚠️ ${e}`); return }
   if (stopped.has(key)) { stopped.delete(key); return }
-  const cmd = text.trim().split(/\s+/)[0].toLowerCase().replace(/@\S+$/, '')
+  const cmd = passthroughCommand(text)
   const body = stamped(out.trim())
   // The button only goes on an answer that fits ONE message. A chunked report has
   // no single message to edit, and a Refresh that silently replaced the first of
@@ -3466,7 +5426,7 @@ function bindPastSession(key: string, id: string, ctx: Context, threadId: number
   }
   if (e.sessionId === id) return `Already on session ${id.slice(0, 8)} — nothing changed.`
   const from = e.sessionId
-  e.prevSessionId = e.sessionId; e.sessionId = id; saveState()
+  e.prevSessionId = e.sessionId; e.sessionId = id; topicSessionChanged(key)
   // prevSessionId holds exactly ONE step, so a second switch overwrites the original
   // binding and a bare /resume will not get it back. Say so rather than let it
   // surprise someone two switches later.
@@ -3539,6 +5499,10 @@ export const bot = new Bot(TOKEN, API_ROOT ? { client: { apiRoot: API_ROOT } } :
 bot.api.config.use(apiThrottler())
 bot.api.config.use(autoRetry({ maxRetryAttempts: 5, maxDelaySeconds: 60 }))
 let botUsername = ''
+bot.use(async (ctx, next) => { noteUser(ctx); await next() })
+
+// Ephemeral commands already handled, so one delivered again is left alone.
+const ephemeralCommands = new EphemeralCommands()
 
 bot.on('message', async ctx => {
   const msg = ctx.message
@@ -3560,6 +5524,29 @@ bot.on('message', async ctx => {
     names[keyFor(chatId, threadId)] = viaReply; saveState()
   }
 
+  // Topic mode, for every kind of message — text, voice notes and files alike (the
+  // mention check used to sit after the file and voice paths, so those skipped it).
+  // Commands always get through, and so does a reply to one of /config's questions.
+  if (ctx.chat.type !== 'private') {
+    const gKey = keyFor(chatId, threadId)
+    await ensureGroupMode(ctx, threadId)
+    const isCmd = (msg.text ?? '').startsWith('/')
+    const awaitedReply = !!msg.reply_to_message && awaitingInput.has(`${chatId}:${msg.reply_to_message.message_id}`)
+    if (!isCmd && !awaitedReply) {
+      const answers = answersFor(gKey)
+      const addressed = mentionsBot(ctx, msg)
+      if (recordsFor(gKey) && ALLOWED_CHATS.has(String(chatId))) recordMessage(msg, answers === 'all' || (readsAlong(answers) && addressed))
+      if (answers === 'never') { if (addressed && isAllowed(ctx)) await offNote(ctx, msg); return }
+      if (answers === 'mentions' && !addressed) return
+      // Auto: an unmentioned message may be worth joining in on. The judge decides,
+      // after a pause; see scheduleAutoLook.
+      if (answers === 'auto' && !addressed) {
+        if (isAllowed(ctx)) scheduleAutoLook(ctx, gKey, threadId, String(msg.text || msg.caption || ''))
+        return
+      }
+    }
+  }
+
   // File uploads: save into this topic's inbox. A caption (if any) runs as a prompt.
   // Voice note (or round video) → transcribe → run as a prompt, when the topic is
   // in voice mode. handlePrompt then speaks the answer back. Otherwise it falls
@@ -3578,7 +5565,7 @@ bot.on('message', async ctx => {
       const heard = await transcribe(saved)
       if (!heard) { await send(ctx, threadId, '🎙 Sorry — I couldn’t make out that voice note. Try again, a bit closer to the mic.'); return }
       await send(ctx, threadId, `🎙 “${heard}”`, true) // show what was heard, so a mis-hear is visible
-      await handlePrompt(ctx, threadId, vKey, heard)
+      await handlePrompt(ctx, threadId, vKey, heard, undefined, undefined, { conv: { msgId: msg.message_id, reply: msg.reply_to_message } })
     }).catch(e => console.error(`[error] voice task ${keyFor(chatId, threadId)}: ${e}`))
     return
   }
@@ -3595,7 +5582,8 @@ bot.on('message', async ctx => {
       try { saved = await receiveFile(ctx, attachment, cwd, aKey) }
       catch (e) { await send(ctx, threadId, `⚠️ couldn't save file: ${e}`); return }
       if (caption) {
-        await handlePrompt(ctx, threadId, aKey, `[The user attached a file, saved at ${saved} (./${relative(cwd, saved)}).]\n\n${caption}`, undefined, ctx.message?.message_id)
+        await handlePrompt(ctx, threadId, aKey, `[The user attached a file, saved at ${saved} (./${relative(cwd, saved)}).]\n\n${caption}`, undefined, ctx.message?.message_id,
+          { conv: { msgId: msg.message_id, reply: msg.reply_to_message } })
       } else {
         // A receipt, not an instruction. The next turn is told about the file by
         // the bridge, so there is nothing for the user to do — asking them to
@@ -3611,7 +5599,20 @@ bot.on('message', async ctx => {
   const text = msg.text?.trim()
   if (!text) return
   const key = keyFor(chatId, threadId)
-  console.log(`[in] chat=${chatId}(${ctx.chat.type}) topic=${threadId ?? '-'} from=${ctx.from.id} ${JSON.stringify(text).slice(0, 100)}`)
+  console.log(`[in] chat=${chatId}(${ctx.chat.type}) topic=${threadId ?? '-'} from=${ctx.from.id}${(msg as any).ephemeral_message_id ? ' (ephemeral)' : ''} ${JSON.stringify(text).slice(0, 100)}`)
+  // An ephemeral command (picked from the menu, e.g. /config) can be answered only
+  // privately and only for a few seconds; one Telegram delivers again later would get
+  // a menu the whole group sees (lib.ts: EphemeralCommands).
+  const ephemeralId = (msg as any).ephemeral_message_id as number | undefined
+  if (ephemeralId) {
+    const now = Math.floor(Date.now() / 1000)
+    const why = ephemeralCommands.check(chatId, ctx.from.id, ephemeralId, msg.date, now)
+    if (why) {
+      console.log(`[in] left alone: ${why === 'again' ? `ephemeral command ${ephemeralId} was already handled`
+        : `sent ${now - msg.date} s ago, past the ${EPHEMERAL_REPLY_WINDOW_S} s in which it can be answered privately`}`)
+      return
+    }
+  }
 
   const cmd = text.startsWith('/') ? text.split(/\s+/)[0].replace(/@.*$/, '').toLowerCase() : ''
   // Track EVERY inbound message, commands included. A /interrupt typed while a
@@ -3640,6 +5641,8 @@ bot.on('message', async ctx => {
       `/fanout <task> — split it into parts, run them in parallel topics, then combine\n` +
       `/jobs — what is running here, and what earlier runs left behind\n` +
       `/restart — restart the bridge; in-flight tasks finish first\n` +
+      `/config — this group's settings (model, voice, mentions, instructions, who can edit; More settings for the rest)\n` +
+      `/recall <question> — what each search engine finds for it in this group's history, side by side\n` +
 
       `/voice [on|summary|off] — speak answers back; full or summarized (text is always complete)\n` +
       `/live — get a private link to a real-time voice call bound to this session\n` +
@@ -3661,12 +5664,32 @@ bot.on('message', async ctx => {
 
   if (!isAllowed(ctx)) { if (cmd) await send(ctx, threadId, `Not authorized. Send /whoami to get the id to allowlist.`); return }
 
-  if (REQUIRE_MENTION && ctx.chat.type !== 'private' && !cmd) {
-    const mentioned = (botUsername && text.toLowerCase().includes('@' + botUsername.toLowerCase())) ||
-      msg.reply_to_message?.from?.username === botUsername
-    if (!mentioned) return
-  }
+  // A reply to one of the /config prompts ("reply with the @username…"). Claimed
+  // here, before the mention gate and the prompt path, so the text is never run as
+  // a turn — and only from the person who was asked.
+  const promptKey = msg.reply_to_message ? `${chatId}:${msg.reply_to_message.message_id}` : ''
+  const awaited = promptKey ? awaitingInput.get(promptKey) : undefined
+  if (awaited && awaited.userId === ctx.from.id) { await handleAwaitedInput(ctx, awaited, promptKey); return }
 
+
+  if (cmd === '/config') {
+    await openConfigMenu(ctx, threadId, msg.message_id || undefined, (msg as any).ephemeral_message_id)
+    return
+  }
+  // What every search engine finds for a question in this topic's history, side by
+  // side — no Claude turn, so it is instant and free.
+  if (cmd === '/recall') {
+    const q = text.slice(text.split(/\s+/)[0].length).trim()
+    if (!String(chatId).startsWith('-')) { await send(ctx, threadId, '/recall works in groups: it searches what the group has said.'); return }
+    if (!q) { await send(ctx, threadId, "Usage: /recall <question> — shows what each search engine on this server finds for it in this topic's history, without asking Claude."); return }
+    if (!CONTEXT_ON || !contextIndex()) { await send(ctx, threadId, 'The context engine is off on this server (TG_CONTEXT).'); return }
+    for (const part of await recallCompare(key, q)) {
+      noteBotMessage(key)
+      await ctx.api.sendMessage(chatId, part, { ...destOpts({ threadId }), parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
+        .catch(() => send(ctx, threadId, part.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&')))
+    }
+    return
+  }
   if (cmd === '/restart') {
     if (!requestDrain) { await send(ctx, threadId, 'Restart is not available in this process.', true); return }
     const n = jobs.size
@@ -3772,7 +5795,7 @@ bot.on('message', async ctx => {
       noteBotMessage(key)
       return
     } else { await send(ctx, threadId, 'Usage: /voice on | summary | off | parts on|off | speaker <id>'); return }
-    if (next === 'off') delete voice[key]; else voice[key] = next
+    setTopicVoice(key, next)
     saveState()
     await send(ctx, threadId,
       next === 'full' ? `🎙 Voice ON (full) — I speak the whole answer, and the complete answer also comes as text.`
@@ -3900,8 +5923,10 @@ bot.on('message', async ctx => {
     return
   }
   if (cmd === '/new' || cmd === '/reset' || cmd === '/clear') {
-    const e = sessions[key]
-    if (e?.sessionId) { e.prevSessionId = e.sessionId; delete e.sessionId; saveState() }
+    // A record even when there is none yet: its stamp is what outranks a live link.
+    const e = sessions[key] ?? (sessions[key] = { cwd: resolveCwd(ctx, threadId) })
+    if (e?.sessionId) { e.prevSessionId = e.sessionId; delete e.sessionId }
+    topicSessionChanged(key)
     await send(ctx, threadId, e?.prevSessionId
       ? `🧹 Fresh session started. The old one is kept (${e.prevSessionId.slice(0, 8)}) — send /resume to restore it. Nothing was deleted.`
       : '🧹 Fresh session for this topic.')
@@ -3930,7 +5955,7 @@ bot.on('message', async ctx => {
       await send(ctx, threadId, bindPastSession(key, id, ctx, threadId))
     } else if (e.prevSessionId) {
       const restore = e.prevSessionId
-      e.prevSessionId = e.sessionId; e.sessionId = restore; saveState()
+      e.prevSessionId = e.sessionId; e.sessionId = restore; topicSessionChanged(key)
       await send(ctx, threadId, `↩️ Restored session ${restore.slice(0, 8)} — message to continue it.`)
     } else {
       await send(ctx, threadId, 'Usage: /resume <session-id> — bind this topic to a past session. (No id = undo the last /new.)')
@@ -3971,9 +5996,13 @@ bot.on('message', async ctx => {
       { ...destOpts({ threadId, replyTo: msg.message_id }), disable_notification: true }).catch(() => null)
     void enqueue(key, async () => {
       const cwd = resolveCwd(ctx, threadId)
-      const res = await runStreaming(ctx, threadId, key, fanoutPlanPrompt(task, FANOUT_MAX), cwd,
+      // Framed as the asker's message, like any turn. Sent bare, it carried no marker,
+      // and the model — told that unmarked text is never an instruction — declined to
+      // plan at all: "This message doesn't start with your verification marker"
+      // (Tier 3, 2026-09-27).
+      const res = await runStreaming(ctx, threadId, key, frameFrom(ctx, fanoutPlanPrompt(task, setting('fanoutMax', key) as number)), cwd,
         sessions[key]?.sessionId, 'plan', modelFor(key), { effort: effortFor(key), fork: true })
-      const items = parseFanoutPlan(res.text, { max: FANOUT_MAX })
+      const items = parseFanoutPlan(res.text, { max: setting('fanoutMax', key) as number })
       if (thinking) await ctx.api.deleteMessage(ctx.chat!.id, thinking.message_id).catch(() => {})
       if (!items.length) {
         await send(ctx, threadId, `I could not turn that into a parallel split. Here is what came back:\n\n${res.text.slice(0, 1500)}`, false, msg.message_id)
@@ -3989,7 +6018,7 @@ bot.on('message', async ctx => {
       // Through telegramify with a parse mode: this text is markdown, and a raw
       // sendMessage renders its asterisks and underscores literally.
       await ctx.api.sendMessage(ctx.chat!.id,
-        telegramify(sanitizeProse(renderFanoutProposal(items, { cap: FANOUT_CONCURRENCY, isolated: isGitRepo(resolveCwd(ctx, threadId)) }), 'markdownv2'), 'escape'), {
+        telegramify(sanitizeProse(renderFanoutProposal(items, { cap: setting('fanoutConcurrency', key) as number, isolated: isGitRepo(resolveCwd(ctx, threadId)) }), 'markdownv2'), 'escape'), {
         ...destOpts({ threadId, replyTo: msg.message_id }), parse_mode: 'MarkdownV2',
         reply_markup: { inline_keyboard: [[
           { text: `— Run these ${items.length} —`, callback_data: `fan:${f.id}` },
@@ -4069,13 +6098,13 @@ bot.on('message', async ctx => {
       await send(ctx, threadId, `Usage: /cwd <absolute-existing-directory>`); return
     }
     sessions[key] = { cwd: arg } // new dir => new session
-    saveState()
+    topicSessionChanged(key)
     await send(ctx, threadId, `Working directory for this topic set to:\n${arg}\n(history reset)`)
     return
   }
   if (cmd === '/get') {
-    const arg = text.slice(text.indexOf(' ') + 1).trim()
-    if (!arg || arg.startsWith('/')) { await send(ctx, threadId, `Usage: /get <path>  (relative to this topic's directory, or absolute)`); return }
+    const arg = getPathArg(text, homedir())
+    if (!arg) { await send(ctx, threadId, `Usage: /get <path>  (relative to this topic's directory, or absolute)`); return }
     const cwd = resolveCwd(ctx, threadId)
     const target = isAbsolute(arg) ? arg : resolve(cwd, arg)
     await sendFile(ctx, threadId, target)
@@ -4237,8 +6266,17 @@ bot.on('message', async ctx => {
     ).catch(() => null)
     offered.set(msg.message_id, { key, threadId, prompt: text, offerMsgId: offer?.message_id })
   }
-  enqueue(key, () => handlePrompt(ctx, threadId, key, text, undefined, msg.message_id))
+  enqueue(key, () => handlePrompt(ctx, threadId, key, text, undefined, msg.message_id, { conv: { msgId: msg.message_id, reply: msg.reply_to_message } }))
     .catch(e => console.error(`[error] task ${key}: ${e}`))
+})
+
+// An edit updates what was recorded, so a mention hands over what the message says
+// now. The Bot API reports edits but never deletions; a deleted message stays until
+// retention removes it.
+bot.on('edited_message', ctx => {
+  const m: any = ctx.editedMessage
+  if (!m || ctx.chat.type === 'private' || !ALLOWED_CHATS.has(String(ctx.chat.id))) return
+  if (recordsFor(keyFor(ctx.chat.id, m.message_thread_id))) recordMessage(m, false, true)
 })
 
 // The bot cannot set a group photo the moment it's added — it isn't an admin yet,
@@ -4256,6 +6294,13 @@ bot.on('my_chat_member', async ctx => {
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
   if (!isAllowed(ctx)) { await ctx.answerCallbackQuery({ text: 'Not authorized.', show_alert: true }).catch(() => {}); return }
+  // Logged like every other tap: a /config tap that never reaches the bot and one
+  // whose menu edit never reaches the person look the same from the chat.
+  if (data.startsWith('cf:')) {
+    console.log(`[cb] ${data} chat=${ctx.chat?.id} from=${ctx.from?.id}${(ctx.callbackQuery.message as any)?.ephemeral_message_id ? ' (ephemeral menu)' : ''}`)
+    await handleConfigCallback(ctx, data)
+    return
+  }
   const key = keyFor(ctx.chat!.id, ctx.callbackQuery.message?.message_thread_id)
   // Every `[in]` line in the log is a message, so a tap used to be invisible: the log
   // could not tell "the button was never pressed" from "it was pressed and the run
@@ -4411,7 +6456,7 @@ bot.on('callback_query:data', async ctx => {
   if (data.startsWith('voice:')) {
     const v = data.slice(6)
     if (v !== 'full' && v !== 'summary' && v !== 'off') { await ctx.answerCallbackQuery({ text: 'Unknown voice mode.' }).catch(() => {}); return }
-    if (v === 'off') delete voice[key]; else voice[key] = v
+    setTopicVoice(key, v)
     saveState()
     await ctx.answerCallbackQuery({ text: `Voice: ${v}` }).catch(() => {})
     await ctx.editMessageText(voiceText(key), { reply_markup: voiceKeyboard(key) }).catch(() => {})
@@ -4577,9 +6622,61 @@ async function ensureGroupLogos(): Promise<void> {
   for (const id of ALLOWED_CHATS) await ensureGroupLogo(id)
 }
 
+// The "/" menu. Registering it is what lets a command be EPHEMERAL: with
+// is_ephemeral the message typing it is visible only to the sender and the bot, so
+// opening /config in a group no longer shows everyone a "/config". The list was
+// never registered before, so the menu was empty; registering only /config would
+// have made it the only one in it. Aliases and /logo (under
+// review, see FEEDBACK.md) are left out; everything still works when typed.
+const BOT_COMMANDS: { command: string; description: string; is_ephemeral?: boolean }[] = [
+  { command: 'config', description: "This group's settings (only you see the menu)", is_ephemeral: true },
+  { command: 'recall', description: "What each search engine finds in this group's history" },
+  { command: 'new', description: 'Fresh session in this topic (/resume undoes it)' },
+  { command: 'stop', description: 'Cancel the running task' },
+  { command: 'interrupt', description: 'Stop the running task but keep what it produced' },
+  { command: 'bg', description: 'Run a task alongside this topic' },
+  { command: 'fanout', description: 'Split a task into parts run in parallel topics' },
+  { command: 'plan', description: 'One read-only turn: propose without editing' },
+  { command: 'model', description: "This topic's model" },
+  { command: 'mode', description: "This topic's permission mode" },
+  { command: 'effort', description: "This topic's reasoning effort" },
+  { command: 'voice', description: 'Speak answers back' },
+  { command: 'status', description: "This topic's session, directory and settings" },
+  { command: 'jobs', description: 'What is running here' },
+  { command: 'compact', description: "Summarize this topic's history" },
+  { command: 'resume', description: 'Undo /new, or bind a past session' },
+  { command: 'fork', description: 'Continue this conversation in a second topic' },
+  { command: 'sessions', description: 'List past Claude sessions to bind' },
+  { command: 'history', description: 'Re-post the last turns of this session' },
+  { command: 'get', description: "Send a file from this topic's directory" },
+  { command: 'usage', description: 'Claude usage (free, no turn)' },
+  { command: 'whoami', description: 'Your user, chat and topic ids' },
+  { command: 'help', description: 'Everything the bot can do' },
+]
+const SET_COMMANDS = !/^(0|false|no)$/i.test(process.env.TG_SET_COMMANDS || '')
+async function ensureCommands(): Promise<void> {
+  if (!SET_COMMANDS) return
+  try {
+    const got: unknown = await bot.api.getMyCommands().catch(() => [])
+    const now = Array.isArray(got) ? got : []
+    const same = JSON.stringify(now.map(c => [c.command, c.description, !!(c as any).is_ephemeral])) ===
+      JSON.stringify(BOT_COMMANDS.map(c => [c.command, c.description, !!c.is_ephemeral]))
+    if (same) return
+    await bot.api.setMyCommands(BOT_COMMANDS)
+    console.log(`[ok] registered ${BOT_COMMANDS.length} commands (/config ephemeral)`)
+  } catch (e) { console.error(`[warn] could not register the command list: ${e}`) }
+}
+
 async function main() {
   const me = await bot.api.getMe()
   botUsername = me.username
+  botFirstName = me.first_name
+  await ensureCommands()
+  // Retention is enforced here and once a day, not on every write: a message that
+  // outlives its group's limit by a few hours is not worth a rewrite per message.
+  pruneConversations()
+  setInterval(pruneConversations, 24 * 60 * 60 * 1000).unref?.()
+  await contextStart()
   await ensureBotLogo(me.id)
   await ensureGroupLogos()
   console.log(`[ok] @${me.username} up`)
@@ -4747,6 +6844,14 @@ export const _makeWorktree = makeWorktree
 export const _disposeFanoutTopics = disposeFanoutTopics
 export const _fanouts = fanouts
 export const _sessions = () => sessions
+export const _groupSettings = () => groupSettings
+export const _topicStore = topicStore
+export const _editorPolicies = () => editorPolicies
+export const _seenUsers = () => seenUsers
+export const _setting = setting
+export const _awaitingInput = awaitingInput
+export const _clearAdminCache = () => adminCache.clear()
+export const _ensureCommands = ensureCommands
 export const _projectDir = projectDir
 export const _profileFor = profileFor
 export const _boxDir = boxDir
@@ -4767,6 +6872,18 @@ export function _setNormaliseSpeech(on: boolean): boolean {
 }
 
 export function _drainQueue(key: string): Promise<unknown> { return queues.get(key) ?? Promise.resolve() }
+// Auto mode: look now instead of after the pause, and wait for whatever it starts.
+export async function _autoLookNow(key: string): Promise<boolean> {
+  const w = autoWaiting.get(key)
+  if (!w) return false
+  if (w.timer) clearTimeout(w.timer)
+  await autoLook(key)
+  await (queues.get(key) ?? Promise.resolve())
+  return true
+}
+export const _autoWaiting = autoWaiting
+export const _autoJoinedAt = autoJoinedAt
+export const _lastSpoke = lastSpoke
 
 // Guarded so the module can be imported by a test without starting a poller.
 if (import.meta.main) main().catch(e => { console.error(`[fatal] ${e}`); process.exit(1) })

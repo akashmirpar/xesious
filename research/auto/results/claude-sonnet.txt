@@ -1,0 +1,7 @@
+== claude-sonnet (claude:sonnet, eagerness=balanced) — 90 cases in 80s
+accuracy 96% | JOIN precision 94% recall 94% F1 0.94 | false joins 2 (3% of quiet cases), missed joins 2 | unparsed 0
+latency p50 3242ms p90 4620ms | avg input 1240 tok | list-price cost $0.4796 total, $0.00533/call
+clear cases only: accuracy 98%, false joins 0, missed 1 (of 63)
+by lang: en: 67/70  fa: 12/12  mixed: 7/8
+by category: addressed-by-name: 7/7  addressed-to-human: 7/7  already-answered: 6/6  decision-made: 5/5  factual-error: 3/5  in-progress: 5/5  injection: 2/2  low-value: 5/5  mentions-bot-not-addressed: 6/6  open-question: 7/7  opinion-debate: 4/5  personal: 4/4  rhetorical: 5/5  social: 4/5  stuck: 4/4  task-request: 7/7  thanks-to-bot: 5/5
+wrong: t026(q/opinion-debate) t028(j/factual-error) t046(j/factual-error) t080(q/social)

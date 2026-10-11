@@ -70,6 +70,7 @@ CASES = [
     ("ERROR", "boom"),              # stub emits is_error with text "boom"
 ]
 
+
 # Real-claude features are exercised by the async functions in FEATURE_TESTS (defined
 # after send_and_wait). Each drives a real multi-step flow over Telegram and asserts
 # on replies and/or the filesystem, returning (name, passed, detail).
@@ -137,6 +138,13 @@ def rich_text(msg) -> str:
 
     walk(rm.to_dict() if hasattr(rm, "to_dict") else rm)
     return " ".join(t for t in out if t.strip())
+
+
+def btn_data(b) -> bytes:
+    """A button's callback data. MTProto layer 229 (Telethon 1.45, needed to read the
+    ephemeral /config menu) moved it from `button.data` to `button.type.data`; read
+    either, so no case depends on which layer the installed Telethon speaks."""
+    return getattr(b, "data", None) or getattr(getattr(b, "type", None), "data", None) or b""
 
 
 def reply_text(msg) -> str:
@@ -995,7 +1003,11 @@ async def feature_fork_carries_the_conversation(client, bot):
     await asyncio.sleep(3)
 
     print("  → establishing a codeword in the parent topic")
-    await client.send_message(group, "Remember this codeword for later: ZEBRA42. Reply with just OK.")
+    # Not "remember this": a real model with auto-memory on takes that literally and
+    # writes a memory file (it did, 2026-09-25 — see the ZEPHYR note in
+    # feature_promoted_run_keeps_the_topics_session). The codeword must live in the
+    # transcript only, which is the thing a fork is supposed to carry.
+    await client.send_message(group, "The codeword in this conversation is ZEBRA42. Do not write it down anywhere. Reply with just OK.")
     if not await _until(lambda: next((m for m in seen if "OK" in (reply_text(m) or "") and not m.out), None), 120):
         return fail("the parent never acknowledged the codeword")
 
@@ -1690,7 +1702,7 @@ async def feature_unicode_topic_directories(client, bot):
     name trimmed to the empty string, and the `|| 'topic'` fallback turned that into
     the constant `topic`. EVERY non-Latin topic on the deployment therefore shared
     <SESSIONS_BASE>/topic — one cwd, one git checkout, one outbox — and a YouTube
-    transcript generated in خلاصه یوتیوب was delivered into پک کادو.
+    transcript generated in گزارش هفتگی was delivered into برنامه سفر.
 
     Only this tier can prove the fix: it needs a REAL forum topic (so Telegram sends
     the forum_topic_created service message the bridge learns the name from) and the
@@ -1712,9 +1724,9 @@ async def feature_unicode_topic_directories(client, bot):
     async def handler(ev):
         seen.append(ev.message)
 
-    # Two Persian names, the exact pair from the production report, plus two topics
+    # Two Persian names with a space in them, plus two topics
     # deliberately given the SAME name, plus the dot-only name.
-    wanted = [("خلاصه یوتیوب", "خلاصه-یوتیوب"), ("پک کادو", "پک-کادو"),
+    wanted = [("گزارش هفتگی", "گزارش-هفتگی"), ("برنامه سفر", "برنامه-سفر"),
               ("notes", "notes"), ("notes", "notes"), ("..", None)]
     topics = []
     for title, _ in wanted:
@@ -1798,9 +1810,9 @@ async def feature_unicode_topic_directories(client, bot):
         a_files = delivered.get(topics[0], [])
         b_files = delivered.get(topics[1], [])
         if not any("alpha" in f for f in a_files):
-            problems.append(f"alpha.txt did not come back to خلاصه یوتیوب (got {a_files})")
+            problems.append(f"alpha.txt did not come back to گزارش هفتگی (got {a_files})")
         if not any("beta" in f for f in b_files):
-            problems.append(f"beta.txt did not come back to پک کادو (got {b_files})")
+            problems.append(f"beta.txt did not come back to برنامه سفر (got {b_files})")
         # The leak, stated as its own assertion: neither topic may receive the other's.
         if any("beta" in f for f in a_files) or any("alpha" in f for f in b_files):
             problems.append("a file crossed between the two topics — the outbox is still shared")
@@ -2151,7 +2163,7 @@ async def feature_sessions_picker(client, bot):
     problems = []
     body = reply_text(picker)
     buttons = [b for row in picker.reply_markup.rows for b in row.buttons
-               if (getattr(b, "data", b"") or b"").startswith(b"res:")]
+               if btn_data(b).startswith(b"res:")]
     labels = [b.text for b in buttons]
     # The listing prints each entry as "N. <title>" with "<id8> · N turns · <ago>"
     # underneath, so the ids come from the BODY. Reading them off the buttons is what
@@ -2181,7 +2193,7 @@ async def feature_sessions_picker(client, bot):
     # 64 bytes is Telegram's hard cap on callback_data; a path would not fit, which
     # is why the payload is an index into a server-side listing.
     for b in buttons:
-        data = getattr(b, "data", b"") or b""
+        data = btn_data(b)
         if len(data) > 64:
             problems.append(f"callback_data is {len(data)} bytes, over Telegram's 64-byte cap")
 
@@ -2284,7 +2296,7 @@ async def feature_voice_keyboard_and_speaker(client, bot):
     for want in ("Full", "Summary", "Off"):
         if not any(want in l for l in labels):
             problems.append(f"no {want!r} button — /voice is still a menu you type back at")
-    spk = [b for b in buttons if (getattr(b, "data", b"") or b"").startswith(b"vspk:")]
+    spk = [b for b in buttons if btn_data(b).startswith(b"vspk:")]
     if len(spk) < 4:
         problems.append(f"only {len(spk)} speaker buttons")
     # Named, not raw ids: "am_michael" tells you nothing. A flag, a name and a
@@ -2298,7 +2310,7 @@ async def feature_voice_keyboard_and_speaker(client, bot):
         problems.append("a speaker button carries an invented description of how it sounds")
     # All 28 English voices must be reachable by tapping, not only by typing.
     pager = [b for row in menu.reply_markup.rows for b in row.buttons
-             if (getattr(b, "data", b"") or b"").startswith(b"vspg:")]
+             if btn_data(b).startswith(b"vspg:")]
     if not pager:
         problems.append("no pager — the voices past the first page are unreachable by tap")
     if not any(l.startswith("● ") for l in labels):
@@ -2306,11 +2318,11 @@ async def feature_voice_keyboard_and_speaker(client, bot):
 
     # --- tapping a speaker changes it, per topic, without a restart ---------------
     before = speaker()
-    target = next((b for b in spk if not (b.data or b"").decode().endswith(before or "af_heart")), None)
+    target = next((b for b in spk if not btn_data(b).decode().endswith(before or "af_heart")), None)
     if not target:
         problems.append("no speaker to switch TO")
     else:
-        want = (target.data or b"").decode().split(":", 1)[1]
+        want = btn_data(target).decode().split(":", 1)[1]
         print(f"    tapping {target.text!r} -> {want}")
         idx = buttons.index(target)
         await menu.click(idx)
@@ -2995,6 +3007,489 @@ async def feature_voice_cancel_and_tidy(client, bot):
 
 
 
+async def feature_config_menu(client, bot):
+    """/config in a group: a menu, a change made by tapping, applied with no restart.
+
+    The setting used to be TG_MODEL in .env — SSH, edit, restart — for every topic
+    in every group at once. Now a group changes its own from Telegram. Only this tier
+    can show what Telegram really does with the menu: it is sent as an EPHEMERAL
+    message (Bot API 10.3, visible only to the person who asked), delivery of which
+    Telegram itself calls best-effort, and the bridge falls back to an ordinary
+    message when it is refused. Which of the two happened is reported either way.
+
+    Taps go by LABEL, following the menu as it is edited, the way a person uses it:
+    Telegram rejects a tap on an ephemeral message whose data is not on the message
+    as it currently stands (DATA_INVALID), so replaying remembered callback data
+    after the menu has moved to another screen is not something a user could do.
+    """
+    name = "/config changes a group setting from Telegram, live"
+    if not GROUP_ID:
+        return (name, False, "STAGING_GROUP_ID is not set, so there is no group to configure")
+    group = int(GROUP_ID)
+    tid = await _new_topic(client, group, "config check")
+    if not tid:
+        return (name, False, "could not create a topic to test in")
+    from telethon.tl import functions, types
+    seen, eph = [], []
+
+    @client.on(events.NewMessage(chats=group))
+    async def on_new(ev):
+        seen.append(ev.message)
+
+    @client.on(events.MessageEdited(chats=group))
+    async def on_edit(ev):
+        seen.append(ev.message)
+
+    # Ephemeral messages are not ordinary messages over MTProto: they arrive as their
+    # own updates, and a button on one is tapped with its own request.
+    @client.on(events.Raw)
+    async def on_raw(u):
+        if isinstance(u, (types.UpdateNewEphemeralMessage, types.UpdateEditEphemeralMessage)):
+            eph.append(u.message)
+
+    peer = await client.get_input_entity(group)
+    log = os.path.join("state", "staging", "bridge.log")
+    log_from = os.path.getsize(log) if os.path.exists(log) else 0
+    text_of = lambda m: getattr(m, "message", "") or ""
+    try:
+        await client.send_message(group, "/config", reply_to=tid)
+        is_menu = lambda m: m.reply_markup and "Settings" in text_of(m)
+        menu = await _until(lambda: next((m for m in reversed(eph + seen) if is_menu(m)), None), 20)
+        try:
+            with open(log, encoding="utf-8", errors="replace") as fh:
+                fh.seek(log_from)
+                refused = "ephemeral menu refused" in fh.read()
+        except OSError:
+            refused = False
+        how = "fell back to an ordinary message (Telegram refused the ephemeral one)" if refused \
+            else "sent as an ephemeral message"
+        private = menu in eph
+        print(f"    menu: {how}; test client saw it: {bool(menu)}"
+              + (" (as an ephemeral message, visible only to this account)" if private else ""))
+        if not menu:
+            return (name, False, f"menu {how}, but the test account never saw it")
+        pool = eph if private else seen
+        current = lambda: next((m for m in reversed(pool) if m.id == menu.id and m.reply_markup), menu)
+        labels = lambda: [b.text for row in current().reply_markup.rows for b in row.buttons]
+
+        async def tap(pattern):
+            """Tap the button whose label matches, then wait for the menu to change."""
+            before = current()
+            b = next((b for row in before.reply_markup.rows for b in row.buttons
+                      if re.search(pattern, b.text) and btn_data(b)), None)
+            if not b:
+                return None, f"no button matching {pattern!r} on the menu; it shows {labels()}"
+            n = sum(1 for m in pool if m.id == menu.id)
+            if private:
+                ans = await client(functions.ephemeral.GetCallbackAnswerRequest(peer=peer, id=menu.id, data=btn_data(b)))
+            else:
+                ans = await before.click(data=btn_data(b))
+            # Wait for THIS menu's next version: reading its buttons before the edit
+            # lands means tapping a button from the previous screen, which Telegram
+            # rejects for an ephemeral message (DATA_INVALID).
+            await _until(lambda: sum(1 for m in pool if m.id == menu.id) > n, 15)
+            return ans, None
+
+        me = await client.get_permissions(group, "me")
+        admin = bool(getattr(me, "is_admin", False) or getattr(me, "is_creator", False))
+        mark = max((m.id for m in seen), default=0)
+        _, err = await tap(r"Model")
+        if err:
+            return (name, False, err)
+        if not admin:
+            ok = not any(re.search(r"^(● )?haiku$", l) for l in labels())
+            return (name, ok, f"test account is not an admin here, so the menu must offer no choices: "
+                    f"it shows {labels()}; menu {how}")
+        for pattern in (r"^(● )?haiku$", r"The whole group"):
+            _, err = await tap(pattern)
+            if err:
+                return (name, False, err)
+        got = ((bridge_state().get("groupSettings") or {}).get(str(group)) or {}).get("model")
+        note = await _until(lambda: next((m for m in seen if m.id > mark
+                                          and "set Model" in text_of(m)), None), 15)
+        # Put it back, so the cases after this one run on the server's model.
+        for pattern in (r"Server default", r"The whole group"):
+            await tap(pattern)
+        after = ((bridge_state().get("groupSettings") or {}).get(str(group)) or {}).get("model")
+        problems = []
+        if got != "haiku":
+            problems.append(f"state.json has model={got!r} for the group, not 'haiku'")
+        if not note:
+            problems.append("no announcement of the change in the room")
+        if after is not None:
+            problems.append(f"resetting to the server default left model={after!r}")
+        return (name, not problems, "; ".join(problems) or
+                f"menu {how}; tapped Model → haiku → whole group; stored, announced "
+                f"({text_of(note)[:70]!r}) and reset")
+    finally:
+        for h in (on_new, on_edit, on_raw):
+            client.remove_event_handler(h)
+
+
+async def feature_config_menu_in_general(client, bot):
+    """/config in a forum's General must come back PLACED, or the app never shows it.
+
+    Reported from production: /config in a topic opened the menu, in General nothing
+    appeared. Telegram accepted the ephemeral send and delivered it — this client saw
+    it — but with top_msg_id unset: no topic and no reply, so a forum has nowhere to
+    put it and the official app does not display it. A client library shows no such
+    thing, so what is asserted is the placement the app needs, not the arrival.
+    """
+    name = "/config in General arrives placed in General"
+    if not GROUP_ID:
+        return (name, False, "STAGING_GROUP_ID is not set")
+    from telethon.tl import types
+    group = int(GROUP_ID)
+    eph = []
+
+    @client.on(events.Raw)
+    async def on_raw(u):
+        if isinstance(u, types.UpdateNewEphemeralMessage):
+            eph.append(u.message)
+
+    try:
+        sent = await client.send_message(group, "/config")
+        menu = await _until(lambda: next((m for m in eph if m.reply_markup and "Settings" in (m.message or "")), None), 20)
+        try:
+            await client.delete_messages(group, [sent.id])
+        except Exception:                                       # noqa: BLE001
+            pass
+        if not menu:
+            return (name, False, "no ephemeral menu arrived at all")
+        top = getattr(menu, "top_msg_id", None)
+        to = getattr(getattr(menu, "reply_to", None), "reply_to_msg_id", None)
+        ok = bool(top) and to == sent.id
+        return (name, ok, f"top_msg_id={top}, reply_to_msg_id={to} (the /config was {sent.id})"
+                + ("" if ok else " — unplaced, so the Telegram app will not show it"))
+    finally:
+        client.remove_event_handler(on_raw)
+
+
+async def feature_config_command_is_ephemeral(client, bot):
+    """/config itself is invisible to the room: registered with is_ephemeral.
+
+    Requested after the menu went private: the menu was, but the "/config" typed to
+    open it was still a message everyone saw. With the command registered as
+    ephemeral, the app sends it as an ephemeral message to the bot. This sends it
+    the same way — an ephemeral message addressed to the bot — and asserts it is
+    answered with a menu placed as a reply to it, visible only to this account.
+    """
+    name = "/config sent as an ephemeral command gets a private menu back"
+    if not GROUP_ID:
+        return (name, False, "STAGING_GROUP_ID is not set")
+    from telethon.tl import functions, types
+    group = int(GROUP_ID)
+    eph, visible = [], []
+
+    @client.on(events.Raw)
+    async def on_raw(u):
+        if isinstance(u, types.UpdateNewEphemeralMessage):
+            eph.append(u.message)
+
+    @client.on(events.NewMessage(chats=group))
+    async def on_new(ev):
+        visible.append(ev.message)
+
+    try:
+        # Ask Telegram, not the log: the bridge only re-registers when the list
+        # changed, so a second run says nothing about it.
+        import json as _json, urllib.request as _url
+        try:
+            got = _json.load(_url.urlopen(f"https://api.telegram.org/bot{os.environ['STAGING_BOT_TOKEN']}/getMyCommands", timeout=15))
+            registered = any(c.get("command") == "config" and c.get("is_ephemeral") for c in got.get("result", []))
+        except Exception:                                       # noqa: BLE001
+            registered = False
+        res = await client(functions.ephemeral.SendMessageRequest(
+            receiver_id=await client.get_input_entity(bot), message="/config",
+            peer=await client.get_input_entity(group)))
+        mine = next((getattr(u, "message", None) for u in getattr(res, "updates", []) or []
+                     if isinstance(getattr(u, "message", None), types.EphemeralMessage)), None)
+        menu = await _until(lambda: next((m for m in eph if m.reply_markup and "Settings" in (m.message or "")), None), 20)
+        problems = []
+        if not menu:
+            problems.append("no private menu came back")
+        else:
+            to = getattr(getattr(menu, "reply_to", None), "reply_to_msg_id", None)
+            placed = bool(getattr(menu, "top_msg_id", None)) or bool(getattr(getattr(menu, "reply_to", None), "reply_to_ephemeral", False))
+            if not placed:
+                problems.append(f"the menu came back unplaced (top_msg_id={menu.top_msg_id}, reply_to={to}) — the app would not show it")
+        leaked = [m for m in visible if "/config" in (m.message or "")]
+        if leaked:
+            problems.append("the /config was visible in the room")
+        if not registered:
+            problems.append("Telegram does not have /config registered as an ephemeral command for this bot")
+        return (name, not problems, "; ".join(problems) or
+                f"sent ephemerally (id {getattr(mine, 'id', '?')}), answered with a private menu "
+                f"(top_msg_id={menu.top_msg_id}, reply_to_ephemeral="
+                f"{getattr(menu.reply_to, 'reply_to_ephemeral', None) if menu.reply_to else None}); nothing visible in the room")
+    finally:
+        for h in (on_raw, on_new):
+            client.remove_event_handler(h)
+
+
+async def feature_config_topic_instructions(client, bot):
+    """A topic's own instructions, set from /config by replying to the bot's question.
+
+    The one /config path that is not a button: the bot asks with a force-reply
+    prompt (selective, addressed to the person by a mention), and the answer is a
+    reply to it. Only this tier shows the prompt reaching the right person and the
+    reply coming back as input rather than as a prompt for Claude.
+    """
+    name = "a topic's own instructions can be set from /config"
+    if not GROUP_ID:
+        return (name, False, "STAGING_GROUP_ID is not set")
+    group = int(GROUP_ID)
+    tid = await _new_topic(client, group, "instructions check")
+    if not tid:
+        return (name, False, "could not create a topic to test in")
+    from telethon.tl import functions, types
+    seen, eph = [], []
+
+    @client.on(events.NewMessage(chats=group))
+    async def on_new(ev):
+        seen.append(ev.message)
+
+    @client.on(events.MessageEdited(chats=group))
+    async def on_edit(ev):
+        seen.append(ev.message)
+
+    @client.on(events.Raw)
+    async def on_raw(u):
+        if isinstance(u, (types.UpdateNewEphemeralMessage, types.UpdateEditEphemeralMessage)):
+            eph.append(u.message)
+
+    peer = await client.get_input_entity(group)
+    text_of = lambda m: getattr(m, "message", "") or ""
+    try:
+        me = await client.get_permissions(group, "me")
+        if not (getattr(me, "is_admin", False) or getattr(me, "is_creator", False)):
+            return (name, False, "the test account is not an admin of the staging group, so it cannot edit settings")
+        await client.send_message(group, "/config", reply_to=tid)
+        menu = await _until(lambda: next((m for m in reversed(eph + seen) if m.reply_markup and "Settings" in text_of(m)), None), 20)
+        if not menu:
+            return (name, False, "no /config menu arrived")
+        private = menu in eph
+        pool = eph if private else seen
+        current = lambda: next((m for m in reversed(pool) if m.id == menu.id and m.reply_markup), menu)
+
+        async def tap(pattern):
+            b = next((b for row in current().reply_markup.rows for b in row.buttons
+                      if re.search(pattern, b.text) and btn_data(b)), None)
+            if not b:
+                return f"no button matching {pattern!r}: {[b.text for row in current().reply_markup.rows for b in row.buttons]}"
+            n = sum(1 for m in pool if m.id == menu.id)
+            if private:
+                await client(functions.ephemeral.GetCallbackAnswerRequest(peer=peer, id=menu.id, data=btn_data(b)))
+            else:
+                await current().click(data=btn_data(b))
+            # Wait for THIS menu's next version: reading its buttons before the edit
+            # lands means tapping a button from the previous screen, which Telegram
+            # rejects for an ephemeral message (DATA_INVALID).
+            await _until(lambda: sum(1 for m in pool if m.id == menu.id) > n, 15)
+            return None
+
+        for pattern in (r"More settings", r"^📝 Prompts and Instructions", r"Add instructions for .* only"):
+            err = await tap(pattern)
+            if err:
+                return (name, False, err)
+        prompt = await _until(lambda: next((m for m in seen if "reply to this message" in text_of(m)
+                                            and "only, on top of the group" in text_of(m)), None), 15)
+        if not prompt:
+            return (name, False, "the bot never asked for the instructions")
+        await client.send_message(group, "Only ever answer with a haiku.", reply_to=prompt.id)
+        key = f"{group}:{tid}"
+        stored = await _until(lambda: (((bridge_state().get("topicSettings") or {}).get("instructions") or {}).get(key)), 15)
+        note = await _until(lambda: next((m for m in seen if "updated the instructions for" in text_of(m)), None), 10)
+        problems = []
+        if stored != "Only ever answer with a haiku.":
+            problems.append(f"state.json has {stored!r} for this topic")
+        if not note:
+            problems.append("no announcement in the room")
+        # Put it back: the next cases share this bridge. The menu is refreshed right
+        # after the announcement, so wait for the refreshed screen, not the note.
+        if stored:
+            await _until(lambda: any(re.search(r"Remove .*'s own", b.text)
+                                     for row in current().reply_markup.rows for b in row.buttons), 10)
+            err = await tap(r"Remove .*'s own")
+            left = (((bridge_state().get("topicSettings") or {}).get("instructions") or {}).get(key))
+            if err or left:
+                problems.append(f"removing it failed ({err or left!r})")
+        return (name, not problems, "; ".join(problems) or
+                f"asked by force-reply, reply stored for {key}, announced ({text_of(note)[:60]!r}), removed again")
+    finally:
+        for h in (on_new, on_edit, on_raw):
+            client.remove_event_handler(h)
+
+
+async def feature_conversation_mode(client, bot):
+    """A Conversation topic reads along, stays quiet, and knows what was said when asked.
+
+    The point of the mode, end to end over real Telegram and the real model: people
+    talk without mentioning the bot, the bot does not answer, and a later mention can
+    use what they said — which before this was dropped at the gate and never stored.
+    """
+    name = "a Conversation topic reads along and answers from what was said"
+    if not GROUP_ID:
+        return (name, False, "STAGING_GROUP_ID is not set")
+    group = int(GROUP_ID)
+    tid = await _new_topic(client, group, "conversation check")
+    if not tid:
+        return (name, False, "could not create a topic to test in")
+    from telethon.tl import functions, types
+    seen, eph = [], []
+
+    @client.on(events.NewMessage(chats=group))
+    async def on_new(ev):
+        seen.append(ev.message)
+
+    @client.on(events.Raw)
+    async def on_raw(u):
+        if isinstance(u, (types.UpdateNewEphemeralMessage, types.UpdateEditEphemeralMessage)):
+            eph.append(u.message)
+
+    peer = await client.get_input_entity(group)
+    text_of = lambda m: getattr(m, "message", "") or ""
+    me_user = await client.get_me()
+    try:
+        me = await client.get_permissions(group, "me")
+        if not (getattr(me, "is_admin", False) or getattr(me, "is_creator", False)):
+            return (name, False, "the test account is not an admin of the staging group, so it cannot set the mode")
+        await client.send_message(group, "/config", reply_to=tid)
+        menu = await _until(lambda: next((m for m in reversed(eph + seen) if m.reply_markup and "Settings" in text_of(m)), None), 20)
+        if not menu:
+            return (name, False, "no /config menu arrived")
+        private = menu in eph
+        pool = eph if private else seen
+        current = lambda: next((m for m in reversed(pool) if m.id == menu.id and m.reply_markup), menu)
+
+        async def tap(pattern):
+            b = next((b for row in current().reply_markup.rows for b in row.buttons
+                      if re.search(pattern, b.text) and btn_data(b)), None)
+            if not b:
+                return f"no button matching {pattern!r}: {[b.text for row in current().reply_markup.rows for b in row.buttons]}"
+            n = sum(1 for m in pool if m.id == menu.id)
+            if private:
+                await client(functions.ephemeral.GetCallbackAnswerRequest(peer=peer, id=menu.id, data=btn_data(b)))
+            else:
+                await current().click(data=btn_data(b))
+            # Wait for THIS menu's next version: reading its buttons before the edit
+            # lands means tapping a button from the previous screen, which Telegram
+            # rejects for an ephemeral message (DATA_INVALID).
+            await _until(lambda: sum(1 for m in pool if m.id == menu.id) > n, 15)
+            return None
+
+        for pattern in (r"^🎛️ Topic mode", r"Conversation$", r"^📍 Only "):
+            err = await tap(pattern)
+            if err:
+                return (name, False, err)
+        mode = (((bridge_state().get("topicSettings") or {}).get("topicMode") or {}).get(f"{group}:{tid}"))
+        if mode != "conversation":
+            return (name, False, f"the topic's mode is {mode!r} after tapping Conversation")
+        mark = max((m.id for m in seen), default=0)
+        await client.send_message(group, "Heads up: the release codeword this week is PAPAYA.", reply_to=tid)
+        await asyncio.sleep(8)
+        spoke = [m for m in seen if m.id > mark and m.sender_id != me_user.id and _topic_of(m) == tid
+                 and text_of(m) and not is_status(text_of(m))]
+        if spoke:
+            return (name, False, f"the bot answered a message that did not mention it: {text_of(spoke[0])[:80]!r}")
+        mark = max((m.id for m in seen), default=0)
+        await client.send_message(group, f"@{BOT} what is this week's release codeword? Reply with just the word.", reply_to=tid)
+        answer = await _until(lambda: next((m for m in seen if m.id > mark and m.sender_id != me_user.id
+                                            and _topic_of(m) == tid and "PAPAYA" in text_of(m).upper()), None), 120)
+        log = os.path.join("state", "staging", "bridge.log")
+        try:
+            conv = [l.strip() for l in open(log, encoding="utf-8", errors="replace") if l.startswith("[conv]") and str(tid) in l]
+        except OSError:
+            conv = []
+        if not answer:
+            return (name, False, f"the mention was not answered with the codeword; bridge said {conv[-1:] or 'nothing'}")
+        return (name, True, f"quiet on the unmentioned message, then answered {text_of(answer)[:40]!r}; {conv[-1] if conv else ''}")
+    finally:
+        for h in (on_new, on_raw):
+            client.remove_event_handler(h)
+
+
+
+async def feature_auto_mode(client, bot):
+    """An Auto topic stays out of small talk and answers an open question nobody took.
+
+    End to end over real Telegram, the real judge (Claude Haiku through the CLI) and
+    the real model: nobody mentions the bot in either message. TG_AUTO_QUIET_MS in
+    run-staging.sh shortens the pause before a look, so this takes about a minute.
+    """
+    name = "an Auto topic joins in on an open question, and stays out of small talk"
+    if not GROUP_ID:
+        return (name, False, "STAGING_GROUP_ID is not set")
+    group = int(GROUP_ID)
+    tid = await _new_topic(client, group, "auto check")
+    if not tid:
+        return (name, False, "could not create a topic to test in")
+    from telethon.tl import functions, types
+    seen, eph = [], []
+
+    @client.on(events.NewMessage(chats=group))
+    async def on_new(ev):
+        seen.append(ev.message)
+
+    @client.on(events.Raw)
+    async def on_raw(u):
+        if isinstance(u, (types.UpdateNewEphemeralMessage, types.UpdateEditEphemeralMessage)):
+            eph.append(u.message)
+
+    peer = await client.get_input_entity(group)
+    text_of = lambda m: getattr(m, "message", "") or ""
+    me_user = await client.get_me()
+    log = os.path.join("state", "staging", "bridge.log")
+    auto_lines = lambda: [l.strip() for l in open(log, encoding="utf-8", errors="replace") if l.startswith("[auto]") and f":{tid}" in l] if os.path.exists(log) else []
+    bot_said = lambda mark: [m for m in seen if m.id > mark and m.sender_id != me_user.id and _topic_of(m) == tid and text_of(m) and not is_status(text_of(m))]
+    try:
+        me = await client.get_permissions(group, "me")
+        if not (getattr(me, "is_admin", False) or getattr(me, "is_creator", False)):
+            return (name, False, "the test account is not an admin of the staging group, so it cannot set the mode")
+        await client.send_message(group, "/config", reply_to=tid)
+        menu = await _until(lambda: next((m for m in reversed(eph + seen) if m.reply_markup and "Settings" in text_of(m)), None), 20)
+        if not menu:
+            return (name, False, "no /config menu arrived")
+        private = menu in eph
+        pool = eph if private else seen
+        current = lambda: next((m for m in reversed(pool) if m.id == menu.id and m.reply_markup), menu)
+
+        async def tap(pattern):
+            b = next((b for row in current().reply_markup.rows for b in row.buttons
+                      if re.search(pattern, b.text) and btn_data(b)), None)
+            if not b:
+                return f"no button matching {pattern!r}: {[b.text for row in current().reply_markup.rows for b in row.buttons]}"
+            n = len(pool)
+            if private:
+                await client(functions.ephemeral.GetCallbackAnswerRequest(peer=peer, id=menu.id, data=btn_data(b)))
+            else:
+                await current().click(data=btn_data(b))
+            await _until(lambda: len(pool) > n, 8)
+            return None
+
+        for pattern in (r"^🎛️ Topic mode", r"Auto$", r"^📍 Only "):
+            err = await tap(pattern)
+            if err:
+                return (name, False, err)
+        mode = (((bridge_state().get("topicSettings") or {}).get("topicMode") or {}).get(f"{group}:{tid}"))
+        if mode != "auto":
+            return (name, False, f"the topic's mode is {mode!r} after tapping Auto")
+        mark = max((m.id for m in seen), default=0)
+        await client.send_message(group, "haha that meme was great 😂 anyone up for lunch at 1?", reply_to=tid)
+        await asyncio.sleep(40)
+        if bot_said(mark):
+            return (name, False, f"it joined small talk: {text_of(bot_said(mark)[0])[:80]!r}; {auto_lines()[-2:]}")
+        mark = max((m.id for m in seen), default=0)
+        await client.send_message(group, "Does anyone remember the default port PostgreSQL listens on? I need it for a firewall rule.", reply_to=tid)
+        answer = await _until(lambda: next((m for m in bot_said(mark) if "5432" in text_of(m)), None), 180)
+        if not answer:
+            return (name, False, f"no unasked answer with 5432; bridge said {auto_lines()[-3:] or 'nothing'}")
+        return (name, True, f"quiet on small talk, then answered {text_of(answer)[:50]!r}; {auto_lines()[-2:]}")
+    finally:
+        for h in (on_new, on_raw):
+            client.remove_event_handler(h)
+
+
 FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_prose,
                  feature_rtl_answer_stays_rich,
                  feature_midturn_text, feature_attribution, feature_reply_threading,
@@ -3022,6 +3517,13 @@ FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_pro
                  feature_fanout_guard,
                  # Needs a real forum group and creates five topics of its own.
                  feature_unicode_topic_directories,
+                 # Group settings: creates one topic, changes the group's model and puts it back.
+                 feature_config_menu,
+                 feature_config_menu_in_general,
+                 feature_config_command_is_ephemeral,
+                 feature_config_topic_instructions,
+                 feature_conversation_mode,
+                 feature_auto_mode,
                  # Last, and in this order: they drive a group, spawn several sessions and
                  # keep talking for a while after they return. Ahead of the DM cases they
                  # simply make more noise for those to trip over.

@@ -1,0 +1,7 @@
+== claude-haiku-compact (claude:haiku, prompt=compact, eagerness=balanced) — 90 cases in 110s
+accuracy 78% | JOIN precision 93% recall 41% F1 0.57 | false joins 1 (2% of quiet cases), missed joins 19 | unparsed 0
+latency p50 4627ms p90 5918ms | avg input 784 tok | list-price cost $0.0978 total, $0.00109/call
+clear cases only: accuracy 81%, false joins 0, missed 12 (of 63)
+by lang: en: 55/70  fa: 10/12  mixed: 5/8
+by category: addressed-by-name: 5/7  addressed-to-human: 7/7  already-answered: 6/6  decision-made: 5/5  factual-error: 0/5  in-progress: 4/5  injection: 0/2  low-value: 5/5  mentions-bot-not-addressed: 6/6  open-question: 4/7  opinion-debate: 5/5  personal: 4/4  rhetorical: 5/5  social: 5/5  stuck: 1/4  task-request: 3/7  thanks-to-bot: 5/5
+wrong: t007(j/factual-error) t013(j/stuck) t019(j/task-request) t024(j/injection) t027(q/in-progress) t028(j/factual-error) t037(j/stuck) t043(j/addressed-by-name) t046(j/factual-error) t049(j/open-question) t055(j/stuck) t061(j/factual-error) t064(j/open-question) t067(j/task-request) t070(j/injection) t073(j/addressed-by-name) t082(j/task-request) t085(j/factual-error) t089(j/open-question) t090(j/task-request)

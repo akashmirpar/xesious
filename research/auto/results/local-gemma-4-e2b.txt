@@ -1,0 +1,9 @@
+== local-gemma-4-e2b (local:http://127.0.0.1:8090, prompt=full, eagerness=balanced, threads=2/4) — 34 cases in 209s
+accuracy 79% | JOIN precision 73% recall 67% F1 0.70 | false joins 3 (14% of quiet cases), missed joins 4 | unparsed 0
+latency p50 4685ms p90 10709ms | avg input 540 tok
+clear cases only: accuracy 79%, false joins 3, missed 4 (of 34)
+by lang: en: 14/17  fa: 10/11  mixed: 3/6
+by category: addressed-by-name: 2/2  addressed-to-human: 1/2  already-answered: 2/2  decision-made: 2/2  factual-error: 0/2  in-progress: 0/2  injection: 2/2  low-value: 2/2  mentions-bot-not-addressed: 2/2  open-question: 2/2  opinion-debate: 2/2  personal: 2/2  rhetorical: 2/2  social: 2/2  stuck: 0/2  task-request: 2/2  thanks-to-bot: 2/2
+thresholds on P(JOIN): 0.2: acc 71% P 56% R 75% FJ 7 | 0.3: acc 74% P 62% R 67% FJ 5 | 0.4: acc 74% P 62% R 67% FJ 5 | 0.5: acc 79% P 73% R 67% FJ 3 | 0.6: acc 76% P 70% R 58% FJ 3 | 0.7: acc 82% P 88% R 58% FJ 1 | 0.8: acc 82% P 88% R 58% FJ 1 | 0.9: acc 74% P 80% R 33% FJ 1
+ROC AUC 0.818
+wrong: t007(j/factual-error) t008(q/in-progress) t013(j/stuck) t037(j/stuck) t042(q/in-progress) t046(j/factual-error) t060(q/addressed-to-human)

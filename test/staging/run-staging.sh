@@ -39,7 +39,30 @@ mkdir -p "$STAGE_DIR"
 # Fresh session state every run. A session id persisted by a previous run must not
 # bleed in: the stub's fake id (sessTEST…) makes real claude error on --resume, and
 # even a stale REAL id would resume the wrong conversation. Hermetic > sticky here.
-rm -f "$STAGE_DIR/state.json"; rm -rf "$STAGE_DIR/sessions"
+# The topics' working directories live OUTSIDE this repository. Claude's auto-memory
+# belongs to the git repository a session runs in, so staging sessions inside the
+# repo read and wrote the developer's own memory for it: the fork case's codeword
+# turned up there as a saved memory (2026-09-25). Outside any repo, a staging
+# session's memory is its own.
+STAGE_SESSIONS="${STAGING_SESSIONS_BASE:-${XDG_STATE_HOME:-$HOME/.local/state}/xesious-staging/sessions}"
+if git -C "$(dirname "$STAGE_SESSIONS")" rev-parse --show-toplevel >/dev/null 2>&1 || \
+   git -C "$(dirname "$(dirname "$STAGE_SESSIONS")")" rev-parse --show-toplevel >/dev/null 2>&1; then
+  echo "[staging] $STAGE_SESSIONS is inside a git repository — staging sessions would share its Claude memory; set STAGING_SESSIONS_BASE elsewhere" >&2
+  exit 1
+fi
+# It is emptied every run, so it must never be a directory someone cares about.
+case "$STAGE_SESSIONS" in
+  *staging*) ;;
+  *) echo "[staging] refusing to use $STAGE_SESSIONS as the sessions base: it is wiped every run, so its path must contain 'staging'" >&2; exit 1 ;;
+esac
+rm -f "$STAGE_DIR/state.json"; rm -rf "$STAGE_DIR/sessions" "$STAGE_SESSIONS"
+# The same goes for Telegram's queue. The previous run's teardown is a clean exit, and
+# a clean exit leaves the marker that makes the next start KEEP messages received
+# while down — right for production, wrong here: whatever reached the staging bot
+# between runs was replayed into this one. A /restart typed from the test account
+# between runs did exactly that, and stopped the bridge before the first case
+# (2026-09-27). Without the marker the bridge drops the backlog at startup.
+rm -f "$STAGE_DIR/.clean-exit"
 LOG="$STAGE_DIR/bridge.log"; : > "$LOG"
 
 # Isolated environment for the staging bridge process. Both .env loaders are
@@ -49,10 +72,17 @@ LOG="$STAGE_DIR/bridge.log"; : > "$LOG"
 export TG_ENV_FILE=/dev/null
 export TELEGRAM_BOT_TOKEN="$STAGING_BOT_TOKEN"
 export TG_ALLOWED_USERS="$TEST_ACCOUNT_USER_ID"
+# Pinned, so the staging group is not given a Topic mode from its member count on
+# first sight: the older cases talk to the bot without mentioning it. The
+# conversation cases set the mode they need through /config.
+export TG_REQUIRE_MENTION=0
+# Auto mode's pause before a look, shortened so the Auto case takes a minute, not
+# several. The pacing itself is covered in tier 2.
+export TG_AUTO_QUIET_MS=5000
 # The fan-out tests drive a forum group; isAllowed() requires a non-private chat to
 # be listed, so an unset value here makes those cases look broken rather than skipped.
 [ -n "${STAGING_GROUP_ID:-}" ] && export TG_ALLOWED_CHATS="$STAGING_GROUP_ID"
-export TG_SESSIONS_BASE="$STAGE_DIR/sessions"
+export TG_SESSIONS_BASE="$STAGE_SESSIONS"
 export TG_STATE_FILE="$STAGE_DIR/state.json"
 # Real-Claude mode drives the actual `claude` CLI (real model, real answer);
 # otherwise the deterministic stub. STAGING_CLAUDE_BIN overrides either way.

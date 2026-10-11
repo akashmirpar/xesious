@@ -25,11 +25,13 @@ const LINKS_FILE = process.env.LIVE_LINKS_FILE || join(HERE, '..', 'state', 'liv
 const PROFILE = process.env.LIVE_PROFILE ||
   'You are on a live VOICE call. Answer in one or two short spoken sentences — plain words, no markdown, no code, no lists, no URLs read aloud. Be direct and conversational.'
 
-type LiveLink = { key: string; cwd: string; model?: string; sessionId?: string; created: string }
+type LiveLink = { key: string; cwd: string; model?: string; sessionId?: string; created: string; updated?: string }
 function loadLinks(): Record<string, LiveLink> { try { return JSON.parse(readFileSync(LINKS_FILE, 'utf8')) } catch { return {} } }
 function saveLinks(l: Record<string, LiveLink>) { try { writeFileSync(LINKS_FILE, JSON.stringify(l, null, 2)) } catch (e) { console.error(`[live] links: ${e}`) } }
-// Persist a link's advancing session id so the Telegram topic and the call stay in sync.
-function syncSession(uuid: string, sessionId: string) { const l = loadLinks(); if (l[uuid]) { l[uuid].sessionId = sessionId; saveLinks(l) } }
+// Persist a link's advancing session id so the Telegram topic and the call stay in
+// sync. The stamp is what tells the bridge the call is ahead of the topic — without
+// it the topic's own session wins (see resumeIdFor in bridge.ts).
+function syncSession(uuid: string, sessionId: string) { const l = loadLinks(); if (l[uuid]) { l[uuid].sessionId = sessionId; l[uuid].updated = new Date().toISOString(); saveLinks(l) } }
 
 function childEnv(): NodeJS.ProcessEnv {
   const e: NodeJS.ProcessEnv = { ...process.env }

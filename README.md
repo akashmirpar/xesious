@@ -45,6 +45,14 @@ cp .env.example .env          # then edit it
    - In @BotFather, `/setprivacy` → your bot → **Disable**, so it sees every message in topics (not just @mentions).
    - Add the bot, send `/whoami` in the group, put the chat id into `TG_ALLOWED_CHATS`, restart.
    - Now each topic is its own session.
+5. **(Optional) Meaning search for group history:** `context/setup.sh`. Keyword search
+   of what a group said works without it. This installs llama.cpp's `llama-server`
+   and the bge-m3 embedding model (~700 MB, into `~/xesious-data`), starts them,
+   writes `state/context-engines.json`, and checks that an embedding comes back.
+   Then restart with `./update.sh`. The services don't start themselves after a
+   reboot: `context/services.sh start emb && context/services.sh start cache`.
+   Details: [Group settings](#group-settings) → *Recall earlier talk*, and
+   `context/ENGINES.md`.
 
 ## Updating
 
@@ -84,6 +92,7 @@ off is now a **hard startup error**, not a warning.
 | `/mode [plan\|acceptEdits\|auto\|bypass]` | Show or set this topic's permission mode. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_PERMISSION_MODE`. |
 | `/plan <task>` | One read-only turn: Claude researches and proposes without editing. Doesn't change the topic's mode, so "go ahead" carries the plan out. |
 | `/model [opus\|sonnet\|haiku\|fable]` | Show or set this topic's model — an alias, a full id, or `default` to clear. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_MODEL`. |
+| `/config` | This group's settings as a button menu: model, reasoning effort, voice, **topic mode**, and who may change settings. **More settings** holds the rest: instructions for Claude (the group's, plus any a topic adds), what topic mode presets (answers, records messages), how long recorded messages are kept, topics that differ from the group, default permission mode (never bypass), interrupt, voice parts, tool details and run records in the status, long-reply files, fan-out limits. In a group only you see the menu (an ephemeral message); each change is announced in the room with one line. Changes apply at once — no restart. See [Group settings](#group-settings). |
 | `/usage` `/cost` `/context` | Claude's own commands, forwarded to the CLI as-is. They report rather than prompt the model, so they're free and take no turn. Each answer carries a **🔄 Refresh** button that re-reads the numbers into the same message, so checking twice doesn't leave two. |
 | `/logo bot\|group` | Set the bot's avatar (`setMyProfilePhoto`) or this group's photo (`setChatPhoto`) from `assets/`. Startup only fills these in when they're missing; this replaces an existing one. |
 | `/get <path>` | Send a file from this topic's directory back to you |
@@ -92,6 +101,7 @@ off is now a **hard startup error**, not a warning.
 | `/sessions <dir…>` | List the Claude sessions stored for one or more directories (what the IDE/CLI picker shows), as a **tappable picker** — tap one to bind this topic to it, page through with `‹ Prev` / `Next ›` |
 | `/import <dir…>` | Make a topic for each session in the given directories — bound + recent history backfilled |
 | `/history [N]` | Re-post the last N turns of this topic's bound session |
+| `/recall <question>` | What each context engine finds in this group's history for a question, side by side (no answer from Claude) |
 | `/help` | Usage |
 
 ## Import existing sessions
@@ -197,14 +207,145 @@ Then per topic send `/voice on` (or set `TG_VOICE=1` for all topics). With voice
 `TG_STT_LANG` (force a language), `TG_PIPER_VOICE`, `TG_VOICE_SUMMARY_MODEL`,
 `TG_VOICE_MAX_CHARS`, `TG_STT_CMD`/`TG_TTS_CMD` (swap in any engine).
 
+## Group settings
+
+Many settings no longer need SSH and a restart: a group changes its own with
+`/config`, from any topic, with buttons.
+
+**Topic mode** is the one most people need — what the bot does in a group or topic:
+
+| Mode | The bot answers | It records messages | For |
+| --- | --- | --- | --- |
+| 💬 Bot chat | every message | yes | people talking to the bot |
+| 👥 Conversation | when @mentioned or replied to | yes | people talking to each other, calling the bot now and then |
+| ✨ Auto | when @mentioned or replied to, **and on its own when it has something useful to add** | yes | a team that wants the bot to chime in, like a colleague |
+| 🔕 Off | never (commands still work) | no | a jokes topic — no cost, nothing stored |
+
+- **In a Conversation topic a mention carries the conversation.** Everything said
+  since the bot's last answer there goes in front of the question, marked as
+  background written by other people. Each message goes to Claude once, then lives
+  in the topic's session. About 20k tokens go inline; the whole recorded topic is
+  also written to `inbox/conversation.md`, which Claude can read for anything older.
+- **Replying to someone's message** while mentioning the bot brings that message and
+  up to 10 either side (anything also said since the bot's last answer is not sent
+  twice) — even from before recording began, since Telegram sends the
+  replied-to message along.
+- **Files are fetched only when needed.** A photo or document posted in the
+  conversation is recorded as a Telegram file id and downloaded when a mention's
+  context includes it (the cloud Bot API caps bot downloads at 20 MB).
+- **Recorded messages** live in `state/messages/<chat>/<topic>.jsonl`, edits included
+  (the Bot API never reports deletions). They are kept forever unless the group sets
+  a limit under *Keep recorded messages*.
+- **A new group gets a mode from its size** the first time the bot sees it: just you
+  and the bot is a bot chat, anything bigger is a conversation — said once in the
+  group. `TG_REQUIRE_MENTION` in `.env` pins the default instead.
+- **Reading along needs privacy mode off** for the bot (@BotFather → /setprivacy →
+  Disable); `/config` warns when it is on.
+- *Answers* and *Records messages* are under More settings, for when the preset is
+  not quite right. Picking a Topic mode resets them to follow it.
+- **How Auto decides.** After people go quiet for a moment (25 s by default; a busy
+  topic waits at most 2 minutes), a cheap *judge* reads the last ~14 messages and
+  answers JOIN or QUIET. Only a JOIN reaches the topic's real model, which runs
+  without a status message and may still decide it has nothing to add — then
+  nothing appears at all. After joining in, the bot pauses before it may do so
+  again; saying its name skips the wait. Acknowledgements and emoji alone are never
+  judged, and only a message from someone allowed to use the bot can wake the judge.
+  - *Auto: who decides* — **Claude Haiku** (default), **Claude Sonnet**, or a **local
+    model** on your server (`TG_AUTO_LOCAL_URL`, any OpenAI-compatible server that
+    returns logprobs, such as llama.cpp's `llama-server`; costs nothing per message).
+    Measured on a 90-case test set (`research/auto/REPORT.md`): Sonnet 96% right with
+    2 unwanted joins, Haiku 88% with 3, and locally **Qwen3-4B-Instruct-2507**
+    (Apache-2.0, with the short prompt the bridge gives local judges) 80% with 6, at
+    ~6 s a look on a 4-core VPS — best paired with *reserved*:
+    `llama-server -m Qwen3-4B-Instruct-2507-Q4_K_M.gguf --port 8090 -c 4096 -t 2 --reasoning off`.
+  - *Auto: how often it joins* — reserved / balanced / chatty: how high the bar is,
+    how long it waits, and how long it pauses after joining (15 / 5 / 1 minutes).
+  - A judge call is `claude -p` with no tools, no MCP servers and no session file,
+    from a directory outside any repository — about 1k input tokens a look. It uses
+    the same Claude login as the bot itself.
+- **Recall earlier talk (the context engine).** When a message in a group points
+  back at something — "is the Friday demo still on?", "what did we decide last
+  Tuesday?", "who suggested the discount?", a colleague's name, one of the group's
+  own names for things — the bot searches everything the group has said before, in
+  any of its topics, and hands Claude up to three earlier stretches of conversation
+  that match well. A message that doesn't point back gets none: old talk that
+  merely shares a word is noise. Either way Claude can search further on its own
+  with three history tools (search, read around a message, list topics). A topic or
+  group can search another history instead — an imported archive or another group —
+  through `links` in `state/context-engines.json` (`context/ENGINES.md`).
+  - The index is `state/context.db`, derived from the recorded topic logs: rebuilt
+    from them at startup, pruned with them by *Keep recorded messages*, and safe to
+    delete. Only recorded messages can be found.
+  - **Keywords** (SQLite FTS5, with Persian spelling normalised) need nothing extra.
+    **Meaning** search — finding "the Friday thing" from "weekly demo session" — uses
+    the bge-m3 embedding model on llama.cpp, in its own process on the server's CPU:
+    run `context/setup.sh` (it installs, starts and checks it, and writes
+    `state/context-engines.json` with keywords + bge-m3 as the default engine). To use
+    an embeddings server you already run, set `TG_CONTEXT_EMBED_URL` and
+    `TG_CONTEXT_EMBED` (its model name) instead, or edit the JSON file.
+    **Summaries** (also called digests) — a few lines per finished stretch naming its
+    ideas and decisions — are written when a model is set: `TG_CONTEXT_DIGEST=haiku`,
+    or `"summaries"` in the JSON file. Then every recorded topic gets them unless
+    `/config` turns them off there; one short call per few stretches.
+  - **Photos** are found by the text in them (a screenshot of an email, an error, a
+    dashboard) with a local OCR service: run `context/setup-ocr.sh`, then
+    `context/services.sh start ocr`, and add `"ocr": { "url": "http://127.0.0.1:8094" }`
+    to `context-engines.json` (or set `TG_CONTEXT_OCR_URL`). A photo posted in a
+    recorded topic is then saved to `state/media/` and read in the background, on the
+    server's CPU. The text read joins the history, so it reaches Claude like any
+    message. `context/OCR.md` has how it was chosen.
+  - **Settings** (`/config` → More settings → *Context engine*, per group or topic):
+    *Recall earlier talk* (when a message points back / on every message / off),
+    *Search words* (written by Sonnet — the default — by Haiku, or the message as typed), *Search
+    engine*, and *Summarise conversations*.
+  - **Cost:** keywords, meaning search and photo reading run locally for free. Two
+    parts use your Claude usage: summaries, and Claude-written search words — one
+    small call each time the recall searches (and for each `/recall`).
+
+- **Three levels, most specific wins:** a topic's own value → the group's value →
+  the server's `.env`. The `.env` keys below are now the *defaults*.
+- **Where a change lands** is asked each time: *the whole group* (topics that have
+  their own value keep it), *everywhere* (also resets every topic's own value, e.g.
+  turn voice off everywhere), or *only this topic*. The per-topic commands (`/model`,
+  `/mode`, `/effort`, `/voice`, `/interrupt`) still set this topic's own value.
+- **Who can change settings:** Telegram admins always can. An admin decides who
+  else can — nobody (the default), people they pick (by @username, even someone who
+  has never posted, or from the people who have), or everyone the bot lets in.
+  Everyone else can open the menu and look.
+- **Private menu, public record:** in a group the menu is an ephemeral message
+  (Bot API 10.3) only you see; if Telegram refuses one, an ordinary message is sent
+  instead. `/config` is registered as an *ephemeral command*, so
+  the command you send is invisible to the room too. Every change posts one line
+  in the room saying who changed what.
+- **The "/" menu:** on startup the bridge registers its command list (`/config`
+  ephemeral, the rest ordinary). `TG_SET_COMMANDS=0` leaves the list alone,
+  e.g. if you manage it in @BotFather.
+- **Prompts and instructions for Claude** (📝 *Prompts and Instructions* in
+  `/config`): the group can set instructions Claude follows on every turn, and a
+  topic can add its own on top — e.g. the group says "never push to main", the
+  *Summaries* topic adds "only ever summarise". A topic's are added
+  to the group's, never instead of them; both come after the built-in ones.
+  **Unlike the other settings, a change to instructions only reaches new sessions**:
+  the CLI fixes a session's system prompt when the session is created, so a topic
+  already mid-conversation keeps the instructions it started with until `/new`. The
+  announcement in the room says so.
+- **What stays in `.env`:** guardrails (`TG_ALLOW_BYPASS`, `TG_ALLOWED_TOOLS`,
+  `TG_TRUST_CHAT_MEMBERS`), allowlists, anything the bridge executes, credentials,
+  paths and timeouts. A setting a chat can flip is not a guardrail.
+
 ## Config
 
-All keys live in `.env` (see [.env.example](.env.example)). Highlights:
+All keys live in `.env` (see [.env.example](.env.example)). Several are only
+defaults now — a group can override them with `/config` (see above). Highlights:
 
 - `TG_WORKDIR` — default directory Claude runs in (override per topic with `/cwd`).
 - `TG_PERMISSION_MODE` — the **default** permission mode (see below); `/mode` overrides it per topic.
 - `TG_ALLOWED_TOOLS` — tools auto-approved in `acceptEdits` mode.
-- `TG_REQUIRE_MENTION` — in groups, only answer when @mentioned.
+- `TG_REQUIRE_MENTION` — the default Topic mode: 1 = Conversation, 0 = Bot chat. Unset, a new group gets one from its size. `/config` overrides it per group or topic.
+- `TG_AUTO_JUDGE` / `TG_AUTO_EAGERNESS` — defaults for Auto mode's judge (`haiku`, `sonnet`, `local`) and eagerness (`reserved`, `balanced`, `chatty`); `/config` overrides both.
+- `TG_AUTO_LOCAL_URL` / `TG_AUTO_LOCAL_MODEL` — the OpenAI-compatible server (e.g. `http://127.0.0.1:8090`) and model name for the *local* judge. It is scored from the first token's logprobs, so the server must return them (llama-server does).
+- `TG_AUTO_MAX_LOOKS_PER_HOUR` — a ceiling on judge calls per topic per hour (default 40).
+- `TG_CONTEXT` — the context engine (default on; `0` turns it off entirely). `state/context-engines.json` (written by `context/setup.sh`; `TG_CONTEXT_ENGINES` for another path) lists the search engines — see `context/ENGINES.md`. Without it, `TG_CONTEXT_EMBED=1` adds meaning search with bge-m3 on the local server `context/setup.sh` runs, or `TG_CONTEXT_EMBED_URL` (+ `TG_CONTEXT_EMBED`, the model name) another one; `TG_CONTEXT_DIGEST=haiku` adds summaries (see Group settings), `TG_CONTEXT_OCR_URL` reads the text in photos (or `"ocr"` in `context-engines.json`), `TG_CONTEXT_QUERY=haiku|typed` has Haiku write the recall's search words, or searches with the message as typed, instead of Sonnet, `TG_CONTEXT_DB` moves the index.
 - `TG_PROGRESS_DETAIL` — show the real command/path/query in the status message (default on).
 - `TG_BOT_LOGO` / `TG_SET_LOGO` — avatar to set on startup **if the bot has none**.
 - `TG_GROUP_LOGO` / `TG_SET_GROUP_LOGO` — group photo to set **if the group has none**

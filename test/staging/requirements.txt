@@ -2,4 +2,4 @@
 # staging bridge over real Telegram. Install into a venv:
 #   python3 -m venv test/staging/.venv && . test/staging/.venv/bin/activate
 #   pip install -r test/staging/requirements.txt
-telethon>=1.36,<2
+telethon>=1.45,<2   # 1.45 = MTProto layer 229: the first that decodes ephemeral messages (/config)

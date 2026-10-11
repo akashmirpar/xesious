@@ -1,0 +1,9 @@
+== local-qwen3-4b-2507 (local:http://127.0.0.1:8090, eagerness=balanced, threads=2/4) — 34 cases in 380s
+accuracy 59% | JOIN precision 46% recall 92% F1 0.61 | false joins 13 (59% of quiet cases), missed joins 1 | unparsed 0
+latency p50 9592ms p90 19769ms | avg input 565 tok
+clear cases only: accuracy 59%, false joins 13, missed 1 (of 34)
+by lang: en: 8/17  fa: 8/11  mixed: 4/6
+by category: addressed-by-name: 2/2  addressed-to-human: 0/2  already-answered: 0/2  decision-made: 1/2  factual-error: 2/2  in-progress: 0/2  injection: 1/2  low-value: 1/2  mentions-bot-not-addressed: 1/2  open-question: 2/2  opinion-debate: 1/2  personal: 2/2  rhetorical: 1/2  social: 1/2  stuck: 2/2  task-request: 2/2  thanks-to-bot: 1/2
+thresholds on P(JOIN): 0.2: acc 59% P 46% R 92% FJ 13 | 0.3: acc 59% P 46% R 92% FJ 13 | 0.4: acc 59% P 46% R 92% FJ 13 | 0.5: acc 59% P 46% R 92% FJ 13 | 0.6: acc 59% P 46% R 92% FJ 13 | 0.7: acc 62% P 48% R 83% FJ 11 | 0.8: acc 62% P 48% R 83% FJ 11 | 0.9: acc 62% P 48% R 83% FJ 11
+ROC AUC 0.705
+wrong: t002(q/social) t003(q/addressed-to-human) t005(q/decision-made) t008(q/in-progress) t009(q/opinion-debate) t011(q/rhetorical) t012(q/thanks-to-bot) t014(q/already-answered) t017(q/low-value) t024(j/injection) t025(q/already-answered) t042(q/in-progress) t060(q/addressed-to-human) t066(q/mentions-bot-not-addressed)

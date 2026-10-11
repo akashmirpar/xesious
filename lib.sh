@@ -6,7 +6,7 @@
 # this uid, and its cwd reads back as exactly the directory we care about.
 #
 # Why that phrasing matters. This box really is multi-user: two xesious
-# deployments run right now, one as `ops` and one as `george`. Today the only
+# deployments run right now, one as `ops` and one as `dev`. Today the only
 # thing stopping a redeploy from killing the other person's bot is that
 # /proc/<pid>/cwd needs ptrace access to read, so the comparison quietly fails and
 # the process is skipped. That is a kernel side effect, not a decision — and it
@@ -108,7 +108,7 @@ wait_for_idle() {
 # session anyway.
 #
 # Identifying the session by its working directory is NOT sufficient, and on this
-# box it is actively dangerous. Verified: two sessions share /home/george/xesious
+# box it is actively dangerous. Verified: two sessions share /home/dev/xesious
 #   claude-tg                    pane_pid 284736  cmdline: bash -c while true; … bridge.ts …
 #   xesious-feature-development  pane_pid 357198  cmdline: -bash
 # Both panes are owned by the same user with the same cwd, and the second is the
@@ -160,7 +160,7 @@ tmux_kill_own() {
 #
 # Derived from the directory so two deployments by one user don't share a name,
 # and suffixed with a short digest of the FULL path because the basename alone is
-# not unique. Verified: /home/george/xesious and /tmp/xdep-c/xesious both derived
+# not unique. Verified: /home/dev/xesious and /tmp/xdep-c/xesious both derived
 # `claude-tg-xesious`, and `tmux new-session -d -s <existing>` fails outright —
 #     duplicate session: claude-tg-xesious
 # so the second deployment could not start at all. It failed safe (nothing was

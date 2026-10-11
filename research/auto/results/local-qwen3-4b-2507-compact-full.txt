@@ -1,0 +1,9 @@
+== local-qwen3-4b-2507-compact-full (local:http://127.0.0.1:8092, prompt=compact, eagerness=balanced, threads=2/4) — 90 cases in 615s
+accuracy 80% | JOIN precision 77% recall 63% F1 0.69 | false joins 6 (10% of quiet cases), missed joins 12 | unparsed 0
+latency p50 6114ms p90 10268ms | avg input 423 tok
+clear cases only: accuracy 84%, false joins 3, missed 7 (of 63)
+by lang: en: 54/70  fa: 12/12  mixed: 6/8
+by category: addressed-by-name: 7/7  addressed-to-human: 5/7  already-answered: 5/6  decision-made: 5/5  factual-error: 0/5  in-progress: 4/5  injection: 1/2  low-value: 5/5  mentions-bot-not-addressed: 5/6  open-question: 5/7  opinion-debate: 4/5  personal: 4/4  rhetorical: 5/5  social: 5/5  stuck: 3/4  task-request: 4/7  thanks-to-bot: 5/5
+thresholds on P(JOIN): 0.2: acc 78% P 71% R 63% FJ 8 | 0.3: acc 78% P 71% R 63% FJ 8 | 0.4: acc 78% P 71% R 63% FJ 8 | 0.5: acc 80% P 77% R 63% FJ 6 | 0.6: acc 80% P 77% R 63% FJ 6 | 0.7: acc 79% P 76% R 59% FJ 6 | 0.8: acc 79% P 76% R 59% FJ 6 | 0.9: acc 79% P 76% R 59% FJ 6
+ROC AUC 0.778
+wrong: t007(j/factual-error) t010(j/task-request) t013(j/stuck) t024(j/injection) t027(q/in-progress) t028(j/factual-error) t032(q/addressed-to-human) t046(j/factual-error) t051(q/mentions-bot-not-addressed) t052(j/task-request) t061(j/factual-error) t077(q/opinion-debate) t079(j/open-question) t082(j/task-request) t085(j/factual-error) t086(q/addressed-to-human) t088(q/already-answered) t089(j/open-question)

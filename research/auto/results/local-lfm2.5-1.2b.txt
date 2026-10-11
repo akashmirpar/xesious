@@ -1,0 +1,9 @@
+== local-lfm2.5-1.2b (local:http://127.0.0.1:8090, eagerness=balanced, threads=2/4) — 34 cases in 146s
+accuracy 47% | JOIN precision 36% recall 67% F1 0.47 | false joins 14 (64% of quiet cases), missed joins 4 | unparsed 0
+latency p50 4210ms p90 6045ms | avg input 607 tok
+clear cases only: accuracy 47%, false joins 14, missed 4 (of 34)
+by lang: en: 8/17  fa: 4/11  mixed: 4/6
+by category: addressed-by-name: 2/2  addressed-to-human: 0/2  already-answered: 1/2  decision-made: 1/2  factual-error: 1/2  in-progress: 1/2  injection: 1/2  low-value: 1/2  mentions-bot-not-addressed: 1/2  open-question: 1/2  opinion-debate: 0/2  personal: 1/2  rhetorical: 1/2  social: 0/2  stuck: 2/2  task-request: 1/2  thanks-to-bot: 1/2
+thresholds on P(JOIN): 0.2: acc 32% P 32% R 83% FJ 21 | 0.3: acc 32% P 32% R 83% FJ 21 | 0.4: acc 47% P 38% R 83% FJ 16 | 0.5: acc 47% P 36% R 67% FJ 14 | 0.6: acc 53% P 39% R 58% FJ 11 | 0.7: acc 50% P 27% R 25% FJ 8 | 0.8: acc 62% P 40% R 17% FJ 3 | 0.9: acc 59% P 0% R 0% FJ 2
+ROC AUC 0.511
+wrong: t002(q/social) t003(q/addressed-to-human) t004(j/open-question) t006(q/mentions-bot-not-addressed) t007(j/factual-error) t009(q/opinion-debate) t017(q/low-value) t019(j/task-request) t020(q/social) t024(j/injection) t025(q/already-answered) t029(q/rhetorical) t038(q/decision-made) t042(q/in-progress) t044(q/opinion-debate) t047(q/thanks-to-bot) t054(q/personal) t060(q/addressed-to-human)

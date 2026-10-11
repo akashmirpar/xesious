@@ -1,0 +1,8 @@
+{
+  "default": "xesious-bge-m3",
+  "embeddings": { "url": "http://127.0.0.1:8093", "model": "bge-m3", "maxChars": 2000 },
+  "engines": {
+    "xesious-keywords": { "kind": "xesious", "label": "keywords" },
+    "xesious-bge-m3":   { "kind": "xesious", "label": "keywords + bge-m3", "meaning": true }
+  }
+}

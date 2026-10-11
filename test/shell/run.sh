@@ -438,5 +438,33 @@ NOFF="$(cd "$ROOT" && echo hi | env PATH="$VBIN" HOME="$HOME" bash "$ROOT/voice/
 has "tts.sh names the missing ffmpeg instead of failing blank" "$NOFF" "no ffmpeg"
 
 echo
+echo "== context/setup.sh picks the plain llama.cpp build and changes nothing on --check =="
+CS="$ROOT/context/setup.sh"
+contains() { case "$2" in *"$3"*) ok "$1" ;; *) no "$1 — '$3' not in '$2'" ;; esac; }
+bash -n "$CS" && ok "context/setup.sh parses" || no "context/setup.sh has a syntax error"
+CDATA="$TMP/xdata"; mkdir -p "$CDATA"
+CHK="$(XESIOUS_DATA="$CDATA" TG_CONTEXT_ENGINES="$TMP/ce.json" CACHE_PORT=1 bash "$CS" --check 2>&1)"
+contains "--check reports a missing llama-server" "$CHK" "llama-server: not installed"
+[ -z "$(ls -A "$CDATA")" ] && [ ! -e "$TMP/ce.json" ] && ok "--check wrote nothing" || no "--check changed files"
+# A curl that answers the release lookup with GPU builds listed first, then fails the
+# download: the script must have chosen the CPU build for this machine.
+CBIN="$TMP/cbin"; mkdir -p "$CBIN"
+case "$(uname -m)" in aarch64|arm64) CARCH=arm64 ;; *) CARCH=x64 ;; esac
+cat > "$CBIN/curl" <<CURL
+#!/bin/sh
+case "\$*" in *api.github.com*) cat <<'J'
+{ "assets": [
+  { "browser_download_url": "https://example.test/llama-b9999-bin-ubuntu-vulkan-$CARCH.tar.gz" },
+  { "browser_download_url": "https://example.test/llama-b9999-bin-ubuntu-$CARCH.tar.gz" },
+  { "browser_download_url": "https://example.test/llama-b9999-bin-win-cpu-x64.zip" } ] }
+J
+;; *) exit 22 ;; esac
+CURL
+chmod +x "$CBIN/curl"
+PICK="$(PATH="$CBIN:$PATH" XESIOUS_DATA="$CDATA" TG_CONTEXT_ENGINES="$TMP/ce.json" bash "$CS" 2>&1; true)"
+contains "setup.sh downloads the CPU build, not the Vulkan one" "$PICK" "downloading https://example.test/llama-b9999-bin-ubuntu-$CARCH.tar.gz"
+contains "a failed download stops the setup" "$PICK" "download failed"
+
+echo
 echo "-- $PASS passed, $FAIL failed --"
 [ "$FAIL" -eq 0 ]

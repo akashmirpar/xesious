@@ -1,0 +1,2 @@
+# the transformers.js runtime and its models, for in-process embeddings (context/embed.ts)
+.deps/

@@ -27,8 +27,12 @@
  * tokens that survive MarkdownV2 escaping, so tests can assert on the reply:
  *   hadResume / noResume   — was --resume passed (session persistence round-trip)
  *   modelSet / modelDefault — was --model passed
+ *   modelIs<name>          — which model, when one was passed (letters only)
+ *   groupInstr / noGroupInstr — did the system prompt carry a group's own
+ *                            instructions from /config
+ *   topicInstr / noTopicInstr — …and a topic's own, on top of the group's
  */
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 
@@ -39,6 +43,12 @@ const val = (flag: string): string | undefined => {
 }
 
 const rawPrompt = val('-p') ?? ''
+// Tests that need to read exactly what the bridge handed over (the conversation
+// block before a mention) point this at a file.
+if (process.env.XESIOUS_STUB_LAST_PROMPT) writeFileSync(process.env.XESIOUS_STUB_LAST_PROMPT, rawPrompt)
+// …and the whole command line, for what the bridge passes besides the prompt
+// (the history tools' --mcp-config, the allowed tools).
+if (process.env.XESIOUS_STUB_LAST_ARGS) writeFileSync(process.env.XESIOUS_STUB_LAST_ARGS, JSON.stringify(argv))
 // The bridge wraps a user message in an attribution frame whose first line carries
 // a per-process nonce. Strip it the way the real CLI's model would look past it,
 // or every scenario token below would be shadowed by the marker.
@@ -56,6 +66,8 @@ const resumeId = val('--resume')
 const model = val('--model')
 const effort = val('--effort')
 const forked = argv.includes('--fork-session')
+const groupInstr = /Instructions this group set for you/.test(val('--append-system-prompt') ?? '')
+const topicInstr = /Instructions for this topic in particular/.test(val('--append-system-prompt') ?? '')
 // A stable-ish session id derived from the resume arg: a new turn mints one, a
 // resumed turn keeps reporting a session so bridge re-persists it.
 //
@@ -71,7 +83,7 @@ const initLine = () => emit({ type: 'system', subtype: 'init', session_id: sessi
 const result = (extra: Record<string, unknown>) =>
   emit({ type: 'result', subtype: 'success', is_error: false, session_id: sessionId, ...extra })
 
-const tag = `${resumeId ? 'hadResume' : 'noResume'} ${model ? 'modelSet' : 'modelDefault'} ${framed ? 'framed' : 'unframed'} ${effort ? 'effort' + effort : 'effortDefault'} ${forked ? 'forked' : 'notForked'} ${carriedBg ? 'sawBgResult' : 'noBgResult'}`
+const tag = `${resumeId ? 'hadResume' : 'noResume'} ${model ? 'modelSet' : 'modelDefault'} ${framed ? 'framed' : 'unframed'} ${effort ? 'effort' + effort : 'effortDefault'} ${forked ? 'forked' : 'notForked'} ${carriedBg ? 'sawBgResult' : 'noBgResult'} ${model ? 'modelIs' + model.replace(/[^A-Za-z]/g, '') : 'modelIsNone'} ${groupInstr ? 'groupInstr' : 'noGroupInstr'} ${topicInstr ? 'topicInstr' : 'noTopicInstr'}`
 
 async function main() {
   // BEFORE initLine, because this call uses --output-format json and the caller does
@@ -82,6 +94,30 @@ async function main() {
   // deliberately NOT a real normalisation — the assertion that matters is that the
   // synthesiser was handed `speak` while the page and index kept `text`, and a marker
   // proves that where a plausible rewrite could be mistaken for the original.
+  // Auto mode's judge: its own system prompt, --output-format json, no tools. The
+  // verdict comes from tokens in the messages marked new, so a test chooses it; every
+  // call is logged so a test can check how the judge was run.
+  if (/should speak up now, unprompted/.test(val('--system-prompt') ?? '')) {
+    if (process.env.XESIOUS_STUB_JUDGE_LOG) {
+      appendFileSync(process.env.XESIOUS_STUB_JUDGE_LOG, JSON.stringify({ model, cwd: process.cwd(), tools: val('--tools'),
+        persist: !argv.includes('--no-session-persistence'), prompt: rawPrompt }) + '\n')
+    }
+    const fresh = rawPrompt.split(/\nNew since [^\n]*\n/)[1] ?? ''
+    result({ result: /stubJOIN|stubSILENT/.test(fresh) ? 'JOIN — the stub says so' : 'QUIET' })
+    return
+  }
+  // The recall's query writer (context/query.ts): hands back the message itself, so
+  // recall behaves as it would with the message as typed, marked so a test can tell
+  // the written words were used; every call is logged.
+  if (/You write the search query for a search over a team chat/.test(val('--system-prompt') ?? '')) {
+    if (process.env.XESIOUS_STUB_QUERY_LOG) appendFileSync(process.env.XESIOUS_STUB_QUERY_LOG, JSON.stringify({ model, prompt: rawPrompt }) + '\n')
+    // As slow as a real writer when the test asks: time to act while the recall is
+    // still searching.
+    if (process.env.XESIOUS_STUB_QUERY_SLOW && existsSync(process.env.XESIOUS_STUB_QUERY_SLOW)) await new Promise(r => setTimeout(r, 1500))
+    const msg = (rawPrompt.match(/<message>\n([\s\S]*?)\n<\/message>/)?.[1] ?? '').replace(/\s+/g, ' ').trim()
+    result({ result: `${msg} stubQueryWords` })
+    return
+  }
   if (/Rewrite the line below so a speech synthesiser/.test(rawPrompt)) {
     const line = (rawPrompt.match(/<line>\n([\s\S]*)\n<\/line>/)?.[1] ?? '').trim()
     result({ result: `SPOKEN(${line})` })
@@ -89,6 +125,13 @@ async function main() {
   }
 
   initLine()
+
+  // A turn Auto mode started on its own. stubSILENT in the conversation makes the
+  // model decline, the way a real one does when it has nothing to add.
+  if (/This topic is in Auto mode/.test(rawPrompt)) {
+    result({ result: /stubSILENT/.test(rawPrompt) ? 'NO_REPLY' : `autoJoined ${tag}` })
+    return
+  }
 
   if (scenario === 'HANG') {
     // Stay genuinely alive (a real timer — a bare pending promise wouldn't keep the
@@ -212,10 +255,12 @@ async function main() {
     return
   }
   if (scenario === 'OUTBOX') {
-    // Simulate Claude staging a file for delivery: cwd = the topic's dir, so ./outbox/
-    // is exactly where the bridge's flushOutbox looks. It should send this as a document.
-    mkdirSync('outbox', { recursive: true })
-    writeFileSync(join('outbox', 'report.txt'), 'generated by the stub\n')
+    // Simulate Claude staging a file for delivery where the system prompt says to:
+    // ./outbox/, or ./outbox/t-NN/ when the topic shares its directory. A model that
+    // ignored it and used the shared root would have its file held back, not sent.
+    const box = /put it in \.\/(.+?)\/ and it is delivered/.exec(val('--append-system-prompt') ?? '')?.[1] ?? 'outbox'
+    mkdirSync(box, { recursive: true })
+    writeFileSync(join(box, 'report.txt'), 'generated by the stub\n')
     result({ result: 'wroteOutbox' })
     return
   }

@@ -1,0 +1,9 @@
+== local-gemma-4-e2b-compact-full (local:http://127.0.0.1:8092, prompt=compact, eagerness=balanced, threads=2/4) — 90 cases in 299s
+accuracy 73% | JOIN precision 75% recall 38% F1 0.50 | false joins 4 (7% of quiet cases), missed joins 20 | unparsed 0
+latency p50 2956ms p90 4426ms | avg input 412 tok
+clear cases only: accuracy 79%, false joins 1, missed 12 (of 63)
+by lang: en: 51/70  fa: 11/12  mixed: 4/8
+by category: addressed-by-name: 4/7  addressed-to-human: 6/7  already-answered: 6/6  decision-made: 5/5  factual-error: 0/5  in-progress: 4/5  injection: 2/2  low-value: 5/5  mentions-bot-not-addressed: 5/6  open-question: 3/7  opinion-debate: 5/5  personal: 4/4  rhetorical: 5/5  social: 4/5  stuck: 0/4  task-request: 3/7  thanks-to-bot: 5/5
+thresholds on P(JOIN): 0.2: acc 70% P 59% R 50% FJ 11 | 0.3: acc 70% P 62% R 41% FJ 8 | 0.4: acc 70% P 63% R 38% FJ 7 | 0.5: acc 73% P 75% R 38% FJ 4 | 0.6: acc 77% P 92% R 38% FJ 1 | 0.7: acc 78% P 100% R 38% FJ 0 | 0.8: acc 76% P 100% R 31% FJ 0 | 0.9: acc 72% P 100% R 22% FJ 0
+ROC AUC 0.751
+wrong: t004(j/open-question) t007(j/factual-error) t010(j/task-request) t013(j/stuck) t027(q/in-progress) t028(j/factual-error) t031(j/addressed-by-name) t037(j/stuck) t043(j/addressed-by-name) t046(j/factual-error) t049(j/open-question) t051(q/mentions-bot-not-addressed) t052(j/task-request) t055(j/stuck) t060(q/addressed-to-human) t061(j/factual-error) t073(j/addressed-by-name) t076(j/stuck) t079(j/open-question) t080(q/social) t082(j/task-request) t085(j/factual-error) t089(j/open-question) t090(j/task-request)

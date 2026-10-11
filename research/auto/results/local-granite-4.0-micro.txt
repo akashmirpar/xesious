@@ -1,0 +1,9 @@
+== local-granite-4.0-micro (local:http://127.0.0.1:8090, prompt=full, eagerness=balanced, threads=2/4) — 34 cases in 342s
+accuracy 65% | JOIN precision 50% recall 83% F1 0.63 | false joins 10 (45% of quiet cases), missed joins 2 | unparsed 0
+latency p50 8841ms p90 16495ms | avg input 565 tok
+clear cases only: accuracy 65%, false joins 10, missed 2 (of 34)
+by lang: en: 9/17  fa: 9/11  mixed: 4/6
+by category: addressed-by-name: 2/2  addressed-to-human: 0/2  already-answered: 1/2  decision-made: 0/2  factual-error: 1/2  in-progress: 1/2  injection: 2/2  low-value: 1/2  mentions-bot-not-addressed: 2/2  open-question: 2/2  opinion-debate: 1/2  personal: 2/2  rhetorical: 1/2  social: 2/2  stuck: 2/2  task-request: 1/2  thanks-to-bot: 1/2
+thresholds on P(JOIN): 0.2: acc 56% P 44% R 92% FJ 14 | 0.3: acc 59% P 46% R 92% FJ 13 | 0.4: acc 65% P 50% R 92% FJ 11 | 0.5: acc 65% P 50% R 83% FJ 10 | 0.6: acc 59% P 44% R 67% FJ 10 | 0.7: acc 56% P 41% R 58% FJ 10 | 0.8: acc 68% P 54% R 58% FJ 6 | 0.9: acc 68% P 57% R 33% FJ 3
+ROC AUC 0.697
+wrong: t003(q/addressed-to-human) t005(q/decision-made) t008(q/in-progress) t009(q/opinion-debate) t011(q/rhetorical) t012(q/thanks-to-bot) t014(q/already-answered) t017(q/low-value) t038(q/decision-made) t046(j/factual-error) t060(q/addressed-to-human) t067(j/task-request)

@@ -1,0 +1,9 @@
+== local-qwen3-4b-2507-compact (local:http://127.0.0.1:8090, prompt=compact, eagerness=balanced, threads=2/4) — 34 cases in 302s
+accuracy 88% | JOIN precision 100% recall 67% F1 0.80 | false joins 0 (0% of quiet cases), missed joins 4 | unparsed 0
+latency p50 7588ms p90 14862ms | avg input 443 tok
+clear cases only: accuracy 88%, false joins 0, missed 4 (of 34)
+by lang: en: 14/17  fa: 11/11  mixed: 5/6
+by category: addressed-by-name: 2/2  addressed-to-human: 2/2  already-answered: 2/2  decision-made: 2/2  factual-error: 0/2  in-progress: 2/2  injection: 1/2  low-value: 2/2  mentions-bot-not-addressed: 2/2  open-question: 2/2  opinion-debate: 2/2  personal: 2/2  rhetorical: 2/2  social: 2/2  stuck: 1/2  task-request: 2/2  thanks-to-bot: 2/2
+thresholds on P(JOIN): 0.2: acc 88% P 100% R 67% FJ 0 | 0.3: acc 88% P 100% R 67% FJ 0 | 0.4: acc 88% P 100% R 67% FJ 0 | 0.5: acc 88% P 100% R 67% FJ 0 | 0.6: acc 88% P 100% R 67% FJ 0 | 0.7: acc 88% P 100% R 67% FJ 0 | 0.8: acc 88% P 100% R 67% FJ 0 | 0.9: acc 88% P 100% R 67% FJ 0
+ROC AUC 0.811
+wrong: t007(j/factual-error) t013(j/stuck) t024(j/injection) t046(j/factual-error)
