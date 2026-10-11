@@ -3920,9 +3920,9 @@ describe('/private — carry a group topic on in your own DM', () => {
     // it was started, the latest message in the topic.
     expect(banner.split('\n')[0]).toMatch(/^🔒 Private: <a href="https:\/\/t\.me\/c\/888\/851\/\d+">.*topic 851.*\(Team\)<\/a>$/)
     expect(banner).toContain('/private off or /new')
-    // The exit button under the typing box rides on it.
-    expect(intro[0].payload.reply_markup).toEqual({ keyboard: [[{ text: '🔓 Exit private: topic 851' }]], is_persistent: true, resize_keyboard: true,
-      input_field_placeholder: 'Private: topic 851 (Team)' })
+    // Short, and its button leaves — worded like the one under the typing box.
+    expect(banner.length).toBeLessThan(260)
+    expect(intro[0].payload.reply_markup).toEqual({ inline_keyboard: [[{ text: '🔓 Exit private: topic 851', callback_data: 'pvoff' }]] })
     // …and it is pinned, quietly.
     const pin = cs.find(c => c.method === 'pinChatMessage')
     expect(pin?.payload).toMatchObject({ chat_id: 1, disable_notification: true })
@@ -3945,6 +3945,9 @@ describe('/private — carry a group topic on in your own DM', () => {
     const cs = await dm('what did the vendor quote?', ADA)
     const answer = sends(cs).find(c => textOf(c).includes('okReply'))
     expect(answer).toBeDefined()
+    // The first answer brings the exit button under the typing box…
+    expect(answer!.payload.reply_markup).toEqual({ keyboard: [[{ text: '🔓 Exit private: topic 851' }]], is_persistent: true, resize_keyboard: true,
+      input_field_placeholder: 'Private: topic 851 (Team)' })
     // Every answer says where it is, with a way back to the topic and a way out.
     expect(textOf(answer!)).toContain('🔒 Private')
     // The exit is the only link, on a line of its own; the topic's name is plain.
@@ -3960,8 +3963,10 @@ describe('/private — carry a group topic on in your own DM', () => {
     expect(p).not.toContain('the budget review is on Thursday')
     // Nothing of the DM turn reached the group.
     expect(inGroup(cs)).toEqual([])
-    await dm('and anything else?', ADA)
+    const next = await dm('and anything else?', ADA)
     expect(handed()).not.toContain('vendor quote came in')
+    // …once: later answers do not send it again.
+    expect(sends(next).find(c => textOf(c).includes('okReply'))!.payload.reply_markup).toBeUndefined()
   }, 20000)
 
   test('its files go to an outbox of its own, not the General topic\'s', async () => {
@@ -4069,7 +4074,9 @@ describe('/private — carry a group topic on in your own DM', () => {
     const dmSends = toDm(opened, 3).filter(c => !textOf(c).includes('okReply') && !textOf(c).includes('Thinking'))
     expect(dmSends.length).toBe(1)
     expect(textOf(dmSends[0])).toContain('You asked: what changed since Monday?')
-    expect(dmSends[0].payload.reply_markup?.keyboard).toBeDefined()
+    expect(dmSends[0].payload.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data).toBe('pvoff')
+    // The question's answer brings the keyboard.
+    expect(sends(opened).find(c => textOf(c).includes('okReply'))!.payload.reply_markup?.keyboard).toBeDefined()
     expect(opened.some(c => c.method === 'pinChatMessage' && c.payload.chat_id === 3)).toBe(true)
     expect(sends(opened).some(c => textOf(c).includes('okReply'))).toBe(true)
     expect(handed()).toContain('what changed since Monday?')

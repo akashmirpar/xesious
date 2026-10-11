@@ -606,7 +606,9 @@ let contextMarks: Record<string, number> = {}
 // what that DM held before, so /private off can put it back.
 type PrivateLink = { chat: number; thread?: number; topic: string; group: string; at: string; before?: Entry; settings?: { mode?: string; model?: string; effort?: string }
   // Where it was started (a link into the topic), and the DM's pinned banner.
-  origin?: string; pinned?: number }
+  origin?: string; pinned?: number
+  // Whether the exit button under the typing box has gone out (with the first answer).
+  keyboard?: boolean }
 let privateLinks: Record<string, PrivateLink> = {}
 
 function loadState(): void {
@@ -1524,12 +1526,14 @@ async function sendLegacyMd(ctx: Context, opts: any, text: string): Promise<numb
 // can be threaded to the answer rather than to the question. Several chunks, or a
 // send that fell back to a path whose id we do not see, yields undefined and the
 // caller threads to the question instead.
-async function sendRich(ctx: Context, threadId: number | undefined, text: string, replyTo?: number): Promise<number | undefined> {
+// `markup` goes on the last part only.
+async function sendRich(ctx: Context, threadId: number | undefined, text: string, replyTo?: number, markup?: any): Promise<number | undefined> {
   noteBotMessage(keyFor(ctx.chat!.id, threadId))
-  const opts: any = destOpts({ threadId, replyTo })
+  const base: any = destOpts({ threadId, replyTo })
   const parts = chunk(text, RICH_MAX)
   let only: number | undefined
-  for (const part of parts) {
+  for (const [i, part] of parts.entries()) {
+    const opts = markup && i === parts.length - 1 ? { ...base, reply_markup: markup } : base
     if (!needsRich(part)) { only = await sendLegacyMd(ctx, opts, part); continue }
     try {
       const m: any = await ctx.api.sendRichMessage(ctx.chat!.id, { markdown: sanitizeProse(part, 'rich') }, opts)
@@ -3660,7 +3664,8 @@ function answerCaption(text: string, footer = ''): { text: string; mode?: string
 // with a preview caption — so a huge reply isn't a dozen chunked messages.
 // `footer` is markdown that goes under the answer: at the end of the text, or of the
 // caption when the answer goes as a file.
-async function deliver(ctx: Context, threadId: number | undefined, text: string, replyTo?: number, footer = ''): Promise<number | undefined> {
+// `markup` (a reply keyboard) goes with an inline answer only; a file has none.
+async function deliver(ctx: Context, threadId: number | undefined, text: string, replyTo?: number, footer = '', markup?: any): Promise<number | undefined> {
   const format = setting('replyFileFormat', keyFor(ctx.chat!.id, threadId)) as string
   if (answerGoesToFile(text, keyFor(ctx.chat!.id, threadId))) {
     const dir = mkdtempSync(join(tmpdir(), 'tg-'))
@@ -3685,7 +3690,7 @@ async function deliver(ctx: Context, threadId: number | undefined, text: string,
       return await sendFileGroup(ctx, threadId, files, cap.text, replyTo, cap.mode, cap.plain)
     } finally { rmSync(dir, { recursive: true, force: true }) }
   }
-  return sendRich(ctx, threadId, text + footer, replyTo)
+  return sendRich(ctx, threadId, text + footer, replyTo, markup)
 }
 
 // ---------------------------------------------------------------------------
@@ -5220,7 +5225,11 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     }
     // A private continuation says so under every answer, with a way out.
     const footer = plink ? privateFooter({ topic: plink.topic, group: plink.group, origin: plink.origin, exitUrl: privateExitUrl() }) : ''
-    const answerId = await deliver(ctx, threadId, res.text, link, footer)
+    // The exit button under the typing box goes out with the first answer that can
+    // carry it (inline, not a file), once per continuation.
+    const exitKb = plink && !plink.keyboard && !answerGoesToFile(res.text, key) ? privateExitKeyboard(plink.topic, plink.group) : undefined
+    const answerId = await deliver(ctx, threadId, res.text, link, footer, exitKb)
+    if (exitKb && privateLinks[key] === plink) { plink.keyboard = true; saveState() }
     await flushOutbox(ctx, threadId, cwd, key, link)
     // For Auto mode's judge, which otherwise sees only what people said.
     if (ctx.chat?.type !== 'private') lastSpoke[key] = { t: Math.floor(Date.now() / 1000), text: res.text.slice(0, 400) }
@@ -5648,19 +5657,17 @@ const PRIVATE_LEAVE = 'pvoff'
 
 // The one message a private continuation opens with, pinned for as long as it lasts:
 // its first line is what the pin bar shows, its topic name links back to where it
-// started, and it carries the exit button under the typing box. A message holds
-// either buttons of its own or that keyboard, never both — the keyboard won, so the
-// way out is always in reach and nothing else needs sending. HTML.
+// started, and its button leaves. The same exit also goes under the typing box, but
+// a message holds its own buttons or that keyboard, never both — so the keyboard
+// rides on the first answer instead (see handlePrompt). HTML.
 function privateBanner(src: PrivateSource, keptOwn: boolean, question?: string): { text: string; kb: any } {
   const where = `"${escapeHtml(src.topic)}" (${escapeHtml(src.group)})`
   return {
     text: `🔒 Private: ${src.origin ? `<a href="${escapeHtml(src.origin)}">${where}</a>` : where}\n\n` +
-      `This chat carries that topic on, just for you. Everything said there up to now is context here, and what people say there next reaches me as background. ` +
-      `Nobody in the group sees what you say here.\n\n` +
-      `To leave: the 🔓 button under the typing box, /private off or /new. ` +
-      (keptOwn ? `Your own conversation with me comes back.` : `This chat then starts fresh.`) +
+      `Only you see this chat; what the topic says reaches me here.\n` +
+      `Leave with the button, /private off or /new${keptOwn ? ' — your own chat with me comes back' : ''}.` +
       (question ? `\n\nYou asked: ${escapeHtml(question)}` : ''),
-    kb: privateExitKeyboard(src.topic, src.group),
+    kb: { inline_keyboard: [[{ text: privateExitKeyboard(src.topic, src.group).keyboard[0][0].text, callback_data: PRIVATE_LEAVE }]] },
   }
 }
 async function pinBanner(dmKey: string, msgId: number): Promise<void> {
@@ -6620,7 +6627,7 @@ bot.on('my_chat_member', async ctx => {
 // so callback_data only has to carry the mode (it's capped at 64 bytes).
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
-  // The Leave button on banners sent before the exit keyboard replaced it. Ungated, like the exit link: it only ever ends the
+  // The banner's exit button. Ungated, like the exit link: it only ever ends the
   // tapper's own continuation, in their own DM.
   if (data === PRIVATE_LEAVE && ctx.chat?.type === 'private' && ctx.from?.id === ctx.chat.id) {
     const was = await leavePrivate(keyFor(ctx.chat.id, undefined))
