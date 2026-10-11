@@ -2381,7 +2381,9 @@ export function privateStartToken(text: string): string | undefined {
   return m?.[1]
 }
 
-export type PrivateInvite = { userId: number; chat: number; thread?: number; cwd: string; topic: string; group: string; origin?: string; reply?: ConvRecord; question?: string; created: number }
+export type PrivateInvite = { userId: number; chat: number; thread?: number; cwd: string; topic: string; group: string; origin?: string; reply?: ConvRecord; question?: string; created: number
+  // From a private answer in the topic: carry on from its session, not the topic's.
+  sessionId?: string; mark?: number }
 export class PrivateInvites {
   private byToken = new Map<string, PrivateInvite>()
   constructor(private ttlMs = PRIVATE_INVITE_TTL_MS, private max = 1000) {}
@@ -2413,7 +2415,12 @@ export function isGroupMember(m: { status?: string; is_member?: boolean } | unde
 
 // Said in front of every turn of a private continuation, so the model knows where
 // it is: not in the group, and with no business posting there.
-export function privatePreamble(nonce: string, o: { topic: string; group: string; person?: string }): string {
+export function privatePreamble(nonce: string, o: { topic: string; group: string; person?: string; inTopic?: boolean }): string {
+  // Asked in the topic with a hidden command: the answer is shown to them alone, there.
+  if (o.inTopic) return `[xesious:${nonce}] this is a private question${o.person ? ` from ${o.person}` : ''}, asked in the topic "${o.topic}" of the group "${o.group}" ` +
+    `with a hidden command: only they will see your answer, and nobody else in the group sees the question or the answer. ` +
+    `Answer it — never post, forward or copy anything into the group from this conversation. ` +
+    `What people said in that topic reaches you as background, and the group's history tools search that group.\n\n`
   return `[xesious:${nonce}] this is a private conversation${o.person ? ` with ${o.person}` : ''} in their direct messages with you, ` +
     `continued from the topic "${o.topic}" in the group "${o.group}". Nobody else in the group sees it, and nothing said here reaches the group. ` +
     `Answer here only — never post, forward or copy anything into the group from this conversation. ` +

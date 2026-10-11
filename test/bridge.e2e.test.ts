@@ -116,6 +116,8 @@ let denyEphemeral = false
 // only just arrived.
 let denyEphemeralOnce = false
 let nextEphemeralId = 1
+// Refuse edits of ephemeral messages: what a private answer does when its message is gone.
+let failEphemeralEdit = false
 // getChatMemberCount, per chat. Unset means the call fails, and a group whose size
 // cannot be read is not given a Topic mode from it.
 const memberCount: Record<number, number> = {}
@@ -155,6 +157,7 @@ bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
       chat: { id: payload.chat_id, type: 'supergroup' }, text: payload.text,
       receiver_user: { id: payload.ephemeral_message_parameters.receiver_user_id, is_bot: false, first_name: 'U' } } }
   }
+  if (method === 'editEphemeralMessageText' && failEphemeralEdit) return { ok: false, error_code: 400, description: 'Bad Request: message to edit not found' }
   if (method === 'sendMessage' && cannotWriteFirst.has(payload.chat_id)) {
     return { ok: false, error_code: 403, description: "Forbidden: bot can't initiate conversation with a user" }
   }
@@ -4102,7 +4105,7 @@ describe('/private — carry a group topic on in your own DM', () => {
 
   test('when the bot cannot write first, a start link carries the request — for that person only', async () => {
     cannotWriteFirst.add(3)
-    const cs = await privately('/private what changed since Monday?', BEA)
+    const cs = await privately('/private', BEA)
     cannotWriteFirst.delete(3)
     const g = inGroup(cs)
     expect(g.length).toBe(1)
@@ -4114,21 +4117,27 @@ describe('/private — carry a group topic on in your own DM', () => {
     expect(sends(await dm(`/start pv_${token}`, ADA)).map(textOf).join('\n')).toMatch(/expired or is not yours/)
     expect(bridge._privateLinks()['1:main']).toBeUndefined()
     const opened = await dm(`/start pv_${token}`, BEA)
-    // The question is in the banner: still one message, with the exit button.
-    const dmSends = toDm(opened, 3).filter(c => !textOf(c).includes('okReply') && !textOf(c).includes('Thinking'))
-    expect(dmSends.length).toBe(1)
-    // The question stands out: a quote under a bold label.
-    expect(textOf(dmSends[0])).toContain('<b>You asked:</b>\n<blockquote>what changed since Monday?</blockquote>')
-    expect(dmSends[0].payload.parse_mode).toBe('HTML')
-    expect(dmSends[0].payload.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data).toBe('pvoff')
-    // The question's answer brings the keyboard.
-    expect(sends(opened).find(c => textOf(c).includes('okReply'))!.payload.reply_markup?.keyboard).toBeDefined()
+    expect(toDm(opened, 3).length).toBe(1)
+    expect(toDm(opened, 3)[0].payload.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data).toBe('pvoff')
     expect(opened.some(c => c.method === 'pinChatMessage' && c.payload.chat_id === 3)).toBe(true)
-    expect(sends(opened).some(c => textOf(c).includes('okReply'))).toBe(true)
-    expect(handed()).toContain('what changed since Monday?')
     expect(bridge._privateLinks()['3:main']).toMatchObject({ chat: C, thread: T })
     // Spent: a second tap does nothing.
     expect(sends(await dm(`/start pv_${token}`, BEA)).map(textOf).join('\n')).toMatch(/expired or is not yours/)
+    await dm('/private off', BEA)
+  }, 20000)
+
+  test('a question whose private reply Telegram refuses goes to the DM instead, quoted on the banner', async () => {
+    denyEphemeral = true
+    let opened: Call[]
+    try { opened = await privately('/private what changed since Monday?', BEA) } finally { denyEphemeral = false }
+    await bridge._drainQueue('3:main')
+    const all = calls.slice(calls.length - 200)
+    const banner = sends(opened).find(c => c.payload.chat_id === 3 && c.payload.parse_mode === 'HTML')!
+    expect(textOf(banner)).toContain('<b>You asked:</b>\n<blockquote>what changed since Monday?</blockquote>')
+    expect(banner.payload.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data).toBe('pvoff')
+    // The question is answered in the DM, and that answer brings the typing-box button.
+    expect(sends(all).find(c => c.payload.chat_id === 3 && textOf(c).includes('okReply'))!.payload.reply_markup?.keyboard).toBeDefined()
+    expect(handed()).toContain('what changed since Monday?')
     await dm('/private off', BEA)
   }, 20000)
 
@@ -4147,5 +4156,113 @@ describe('/private — carry a group topic on in your own DM', () => {
     }
     // Without trust, an unlisted person's DM is not served, link or no link.
     expect(sends(await dm('and now?', GUEST)).some(c => textOf(c).includes('okReply'))).toBe(false)
+  }, 20000)
+})
+
+describe('/private <question> — an answer only the asker sees, where they asked', () => {
+  const C = -100888, T = 861
+  let mid = 887000
+  const ADA = { id: 1, is_bot: false, first_name: 'Ada' }, BEA = { id: 3, is_bot: false, first_name: 'Bea' }
+  const nowS = () => Math.floor(Date.now() / 1000)
+  const gKey = `${C}:${T}`
+  const handed = () => readFileSync(LAST_PROMPT, 'utf8')
+  async function say(text: string, from: any, extra: any = {}): Promise<Call[]> {
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: {
+      message_id: mid++, date: nowS(), text, message_thread_id: T, is_topic_message: true,
+      chat: { id: C, type: 'supergroup', title: 'Team', is_forum: true }, from, ...extra } })
+    await bridge._drainQueue(gKey)
+    return calls.slice(before)
+  }
+  const ask = (q: string, from: any) => say(`/private ${q}`, from, { message_id: 0, ephemeral_message_id: mid, date: nowS() })
+  async function waitFor(pred: () => boolean, ms = 8000): Promise<void> {
+    const end = Date.now() + ms
+    while (!pred()) { if (Date.now() > end) throw new Error('timed out'); await new Promise(r => setTimeout(r, 25)) }
+  }
+  let token = ''
+
+  test('it is acknowledged at once to the asker only, then that message becomes the answer, with a way to the DM', async () => {
+    bridge._topicStore('topicMode')[gKey] = 'conversation'
+    await say('the launch slipped to Thursday', BEA)
+    await say('@testbot noted?', ADA)
+    const parent = bridge._sessions()[gKey].sessionId
+    expect(parent).toBeDefined()
+    await say('and the press note moves with it', BEA)
+    const before = calls.length
+    const cs = await ask('when is the launch now?', ADA)
+    // The only thing in the topic so far: a hidden acknowledgement.
+    const g = sends(cs).filter(c => c.payload.chat_id === C)
+    expect(g.length).toBe(1)
+    expect(g[0].payload.ephemeral_message_parameters).toEqual({ receiver_user_id: 1 })
+    expect(textOf(g[0])).toContain('Looking into it')
+    await waitFor(() => calls.slice(before).some(c => c.method === 'editEphemeralMessageText'))
+    const after = calls.slice(before)
+    const edit = after.find(c => c.method === 'editEphemeralMessageText')!
+    expect(edit.payload).toMatchObject({ chat_id: C, receiver_user_id: 1 })
+    expect(textOf(edit)).toContain('okReply')
+    // It ran on a copy of the topic's session, silently.
+    expect(textOf(edit)).toContain('forked')
+    const btn = edit.payload.reply_markup.inline_keyboard[0][0]
+    expect(btn.text).toBe('🔒 Continue in DM')
+    token = btn.callback_data.slice(4)
+    // Nothing anyone else can see: no status, no ordinary message, nothing in a DM.
+    expect(after.filter(c => c.method === 'sendMessage' && !c.payload.ephemeral_message_parameters)).toEqual([])
+    const p = handed()
+    expect(p).toContain('this is a private question from Ada, asked in the topic')
+    // Handed what was said since the topic's session last read — the rest is in the copy.
+    expect(p).toContain('and the press note moves with it')
+    expect(p).not.toContain('the launch slipped to Thursday')
+    // The topic keeps its own session…
+    expect(bridge._sessions()[gKey].sessionId).toBe(parent)
+    expect(bridge._privateAsks.get(token).sessionId).toBe(`fork-of-${parent}`)
+  }, 20000)
+
+  test('…and its next turn is never handed the private answer', async () => {
+    const cs = await say('@testbot anything else?', ADA)
+    const reply = sends(cs).find(c => textOf(c).includes('okReply'))!
+    expect(textOf(reply)).toContain('noBgResult')
+    expect(handed()).not.toContain('when is the launch now?')
+  }, 20000)
+
+  test('Continue in DM carries on from the answer\'s own copy, with the question on the banner', async () => {
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, callback_query: { id: 'pva1', from: ADA, chat_instance: 'x', data: `pva:${token}`,
+      message: { message_id: 0, date: 0, chat: { id: C, type: 'supergroup' } } } })
+    const cs = calls.slice(before)
+    const banner = sends(cs).find(c => c.payload.chat_id === 1)!
+    expect(textOf(banner)).toContain('<blockquote>when is the launch now?</blockquote>')
+    expect(bridge._privateLinks()['1:main']).toMatchObject({ chat: C, thread: T })
+    expect(bridge._sessions()['1:main'].sessionId).toBe(bridge._privateAsks.get(token).sessionId)
+    expect(cs.find(c => c.method === 'answerCallbackQuery')?.payload.text).toBe('Carried on in your DM.')
+    // Not answered again: it was answered in the topic.
+    expect(sends(cs).some(c => textOf(c).includes('okReply'))).toBe(false)
+    const before2 = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: mid++, date: nowS(), text: '/private off',
+      chat: { id: 1, type: 'private', first_name: 'Ada' }, from: ADA } })
+    await bridge._drainQueue('1:main')
+    expect(bridge._privateLinks()['1:main']).toBeUndefined()
+    expect(calls.slice(before2).length).toBeGreaterThan(0)
+  }, 20000)
+
+  test('the button is the asker\'s alone', async () => {
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, callback_query: { id: 'pva2', from: BEA, chat_instance: 'x', data: `pva:${token}`,
+      message: { message_id: 0, date: 0, chat: { id: C, type: 'supergroup' } } } })
+    const cs = calls.slice(before)
+    expect(cs.find(c => c.method === 'answerCallbackQuery')?.payload).toMatchObject({ show_alert: true })
+    expect(bridge._privateLinks()['3:main']).toBeUndefined()
+  })
+
+  test('an answer that cannot be shown in the topic goes to the DM', async () => {
+    failEphemeralEdit = true
+    const before = calls.length
+    try {
+      await ask('and the venue?', ADA)
+      await waitFor(() => calls.slice(before).some(c => c.method === 'sendMessage' && c.payload.chat_id === 1 && textOf(c).includes('okReply')))
+    } finally { failEphemeralEdit = false }
+    const dmSends = calls.slice(before).filter(c => c.method === 'sendMessage' && c.payload.chat_id === 1).map(textOf).join('\n')
+    expect(dmSends).toContain('🔒 Your private question in "topic 861" (Team):\nand the venue?')
+    // The DM stays the person's own chat: answered, not linked.
+    expect(bridge._privateLinks()['1:main']).toBeUndefined()
   }, 20000)
 })
