@@ -181,26 +181,42 @@ const OUTBOX_DIR = 'outbox'  // anything Claude drops here is delivered, then ar
 // Per-process, never reused, and never shown to the user. It is what makes the
 // speaker marker unforgeable by anything that merely passes through the chat.
 const BRIDGE_NONCE = randomUUID().replace(/-/g, '').slice(0, 12)
-const TELEGRAM_PROFILE = process.env.TG_PROFILE ?? [
-  "You are replying through a Telegram bridge on the user's phone, not in an IDE. Every turn:",
-  '- Be concise and phone-first: short messages, short paragraphs, minimal preamble.',
-  '- Write in your normal markdown; Telegram renders it natively: real headings, lists, tables, code blocks.',
-  '- LaTeX renders too: $x^2$ inline and $$...$$ on its own line. Also available: ==marked==, ||spoiler||, - [ ] task lists, footnotes[^1].',
-  '- Tables render as real tables, so use one whenever data has columns. Cap it at 20 columns; keep cells short so they fit a phone screen.',
-  '- If a request is ambiguous or needs a decision, ask one clarifying question and stop.',
-  '- Assume no editor or file selection is open. Ignore any IDE/editor framing from earlier in this conversation; the user is in a chat.',
-  `- Files the user sends are saved in ./${INBOX_DIR}/. To send a file back, put it in ./${OUTBOX_DIR}/ and it is delivered then cleared.`,
-  ...attributionProfileLines(BRIDGE_NONCE),
-].join('\n')
+// Built PER TOPIC, not once at startup. The file-routing line must name the SAME
+// dirs boxDir() uses — which are tagged (./outbox/t-NN/) when a topic shares its
+// directory (a fork). Before, this line always said the generic ./outbox/, and being
+// the system prompt it outranked the per-turn "use ./outbox/t-NN/" note — so the model
+// wrote to the shared root, where flushOutbox cross-delivered the file to whichever
+// sharing topic flushed first. TG_PROFILE overrides this built-in text (then per-topic
+// routing is the operator's to include); empty disables it.
+const PROFILE_OVERRIDE = process.env.TG_PROFILE
+function baseProfile(cwd: string, key: string): string {
+  if (PROFILE_OVERRIDE !== undefined) return PROFILE_OVERRIDE
+  const inb = relative(cwd, boxDir(cwd, key, INBOX_DIR)) || INBOX_DIR
+  const out = relative(cwd, boxDir(cwd, key, OUTBOX_DIR)) || OUTBOX_DIR
+  return [
+    "You are replying through a Telegram bridge on the user's phone, not in an IDE. Every turn:",
+    '- Be concise and phone-first: short messages, short paragraphs, minimal preamble.',
+    '- Write in your normal markdown; Telegram renders it natively: real headings, lists, tables, code blocks.',
+    '- LaTeX renders too: $x^2$ inline and $$...$$ on its own line. Also available: ==marked==, ||spoiler||, - [ ] task lists, footnotes[^1].',
+    '- Tables render as real tables, so use one whenever data has columns. Cap it at 20 columns; keep cells short so they fit a phone screen.',
+    '- If a request is ambiguous or needs a decision, ask one clarifying question and stop.',
+    '- Assume no editor or file selection is open. Ignore any IDE/editor framing from earlier in this conversation; the user is in a chat.',
+    `- Files the user sends are saved in ./${inb}/. To send a file back, put it in ./${out}/ and it is delivered then cleared.`,
+    ...attributionProfileLines(BRIDGE_NONCE),
+  ].join('\n')
+}
 // A group's own instructions (/config) go after the built-in ones, never in place
 // of them: the built-in text carries the speaker-attribution scheme, and a group
 // replacing it would silently turn that off. A topic's own go after the group's —
 // added, not substituted, so a rule the whole group set still holds in every topic.
-function profileFor(key: string): string {
+// They are added after a TG_PROFILE override too: that replaces the built-in text,
+// not what a group set for itself.
+function profileFor(cwd: string, key: string): string {
+  const base = baseProfile(cwd, key)
   const group = String(groupSettings[chatOfKey(key)]?.instructions ?? '').trim()
   const topic = String(topicStore('instructions')[key] ?? '').trim()
-  if (!group && !topic) return TELEGRAM_PROFILE
-  return [TELEGRAM_PROFILE,
+  if (!group && !topic) return base
+  return [base,
     group ? `Instructions this group set for you in its settings. Follow them on every turn here:\n${group}` : '',
     topic ? `Instructions for this topic in particular, on top of the group's. Follow them on every turn in this topic:\n${topic}` : '',
   ].filter(s => s.trim()).join('\n\n')
@@ -1168,7 +1184,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   const { onInit, effort = EFFORT_TIER, askedBy, fork, silent, early } = ro
   const history = historyMcp(key)
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs(mode, history?.tools), ...(history?.args ?? [])]
-  const profile = profileFor(key)
+  const profile = profileFor(cwd, key)
   if (profile.trim()) args.push('--append-system-prompt', profile)
   // Read once per run: a setting changed mid-run applies from the next one, so a
   // single status message never mixes the two renderings.
@@ -3492,13 +3508,34 @@ async function sendFileGroup(ctx: Context, threadId: number | undefined, paths: 
 
 // After a run, deliver anything Claude left in the topic's outbox, then archive
 // each sent file to outbox/.sent so it isn't delivered twice.
+// Direct files (not subdirs, not dotfiles) sitting in an outbox dir.
+function outboxFiles(dir: string): string[] {
+  if (!existsSync(dir)) return []
+  try {
+    return readdirSync(dir).filter(n => {
+      if (n.startsWith('.')) return false
+      try { return statSync(join(dir, n)).isFile() } catch { return false }
+    })
+  } catch { return [] }
+}
+
 async function flushOutbox(ctx: Context, threadId: number | undefined, cwd: string, key: string, replyTo?: number): Promise<void> {
-  // This topic's own outbox first, then the shared root — which is drained too
-  // rather than left to strand files, since a model that ignored the note (or a
-  // delivery that failed earlier) would otherwise leave them there forever.
+  // Deliver only THIS topic's own outbox. When own === root (the directory isn't
+  // shared) that is the plain ./outbox/, exactly as before.
   const own = boxDir(cwd, key, OUTBOX_DIR)
+  await drainOutbox(ctx, threadId, own)
+  // When the directory IS shared (a fork), the shared ./outbox/ root is NOT ours to
+  // drain: a file there could belong to any sharing topic, and delivering it to
+  // whoever flushed first was the cross-delivery bug. Leave it and name it, so a
+  // misplaced file is neither stranded silently nor sent to the wrong conversation.
   const root = join(cwd, OUTBOX_DIR)
-  for (const dir of own === root ? [root] : [own, root]) await drainOutbox(ctx, threadId, dir)
+  if (own !== root) {
+    const stray = outboxFiles(root)
+    if (stray.length) await send(ctx, threadId,
+      `⚠️ ${stray.length} file(s) are in the shared ./${OUTBOX_DIR}/ instead of this topic's ./${relative(cwd, own)}/. ` +
+      `This directory is shared with another topic, so I can't tell whose they are — I left them: ${stray.join(', ')}. ` +
+      `If they're meant for here, tell me and I'll send them.`)
+  }
 }
 
 async function drainOutbox(ctx: Context, threadId: number | undefined, dir: string): Promise<void> {
@@ -6816,6 +6853,7 @@ export const _awaitingInput = awaitingInput
 export const _clearAdminCache = () => adminCache.clear()
 export const _ensureCommands = ensureCommands
 export const _projectDir = projectDir
+export const _profileFor = profileFor
 export const _boxDir = boxDir
 export const _answerCaption = answerCaption
 export const _probeVoice = probeVoice
