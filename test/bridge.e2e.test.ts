@@ -3141,7 +3141,7 @@ describe('/config — group settings from Telegram', () => {
     await bridge._ensureCommands()
     const set = calls.slice(before).find(c => c.method === 'setMyCommands')!
     const eph = set.payload.commands.filter((c: any) => c.is_ephemeral).map((c: any) => c.command)
-    expect(eph).toEqual(['config', 'private'])
+    expect(eph).toEqual(['config', 'private', 'recall', 'status', 'jobs', 'usage', 'live', 'whoami', 'help'])
     expect(set.payload.commands.map((c: any) => c.command)).not.toContain('config_advanced')
     expect(set.payload.commands.map((c: any) => c.command)).toContain('help')
   })
@@ -4294,5 +4294,81 @@ describe('/private <question> — an answer only the asker sees, where they aske
     expect(dmSends).toContain('🔒 Your private question in "topic 861" (Team):\nand the venue?')
     // The DM stays the person's own chat: answered, not linked.
     expect(bridge._privateLinks()['1:main']).toBeUndefined()
+  }, 20000)
+})
+
+describe('commands that only inform the asker are answered to them alone in a group', () => {
+  const C = -100888, T = 871
+  let mid = 889000
+  const ADA = { id: 1, is_bot: false, first_name: 'Ada' }
+  const nowS = () => Math.floor(Date.now() / 1000)
+  const gKey = `${C}:${T}`
+  async function say(text: string, extra: any = {}, from: any = ADA): Promise<Call[]> {
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: {
+      message_id: mid++, date: nowS(), text, message_thread_id: T, is_topic_message: true,
+      chat: { id: C, type: 'supergroup', title: 'Team', is_forum: true }, from, ...extra } })
+    await bridge._drainQueue(gKey)
+    await bridge._drainQueue(`${gKey}#pt`)
+    return calls.slice(before)
+  }
+  // Picked from the command menu: hidden, so it has no message id.
+  const hidden = (text: string) => say(text, { message_id: 0, ephemeral_message_id: mid, date: nowS() })
+  const visibleInGroup = (cs: Call[]) => cs.filter(c => ['sendMessage', 'sendRichMessage', 'sendDocument'].includes(c.method) && c.payload.chat_id === C && !c.payload.ephemeral_message_parameters)
+  // The bot is no admin here (an earlier case makes it one): Telegram then refuses a
+  // hidden reply to a typed command.
+  let wasAdmin = false
+  beforeAll(() => { wasAdmin = adminIds.has(42); adminIds.delete(42); bridge._clearAdminCache() })
+  afterAll(() => { if (wasAdmin) adminIds.add(42); bridge._clearAdminCache() })
+
+  test('/status from the menu is answered privately, through the hidden command', async () => {
+    const cs = await hidden('/status')
+    const r = sends(cs).find(c => textOf(c).includes('directory:'))!
+    expect(r.payload.ephemeral_message_parameters).toEqual({ receiver_user_id: 1 })
+    expect(r.payload.reply_parameters?.ephemeral_message_id).toBeDefined()
+    expect(visibleInGroup(cs)).toEqual([])
+  })
+
+  test('typed in a group where the bot is no admin, it is answered as before — no doomed private attempt', async () => {
+    const cs = await say('/whoami')
+    expect(cs.some(c => c.payload?.ephemeral_message_parameters)).toBe(false)
+    expect(textOf(visibleInGroup(cs)[0])).toContain('your user id: 1')
+  })
+
+  test('/live from the menu gives its link privately, and never to the room', async () => {
+    const cs = await hidden('/live')
+    const r = sends(cs).find(c => textOf(c).includes('Live voice call'))!
+    expect(r.payload.ephemeral_message_parameters).toEqual({ receiver_user_id: 1 })
+    expect(visibleInGroup(cs)).toEqual([])
+  })
+
+  test('/live typed where no private reply is possible goes to the DM; with no DM, no link at all', async () => {
+    let cs = await say('/live')
+    expect(sends(cs).find(c => c.payload.chat_id === 1 && textOf(c).includes('Live voice call'))).toBeDefined()
+    expect(visibleInGroup(cs).map(textOf)).toEqual(['🎙 Sent you the live link in our DM.'])
+    cannotWriteFirst.add(1)
+    try { cs = await say('/live') } finally { cannotWriteFirst.delete(1) }
+    expect(cs.some(c => textOf(c).includes('Live voice call') && c.payload.chat_id === C)).toBe(false)
+    expect(visibleInGroup(cs).map(textOf).join('\n')).toContain('can only be given privately')
+    // …and the link it would have given is not left working.
+    expect(Object.values(JSON.parse(readFileSync(LINKS_FILE, 'utf8'))).some((l: any) => l.key === gKey)).toBe(false)
+  })
+
+  test('/usage from the menu: a private "checking" at once, edited into the report, refreshed privately', async () => {
+    const cs = await hidden('/usage')
+    const ack = sends(cs).find(c => textOf(c) === '⏳ Checking…')!
+    expect(ack.payload.ephemeral_message_parameters).toEqual({ receiver_user_id: 1 })
+    const edit = cs.find(c => c.method === 'editEphemeralMessageText')!
+    expect(edit.payload).toMatchObject({ chat_id: C, receiver_user_id: 1 })
+    expect(edit.payload.reply_markup.inline_keyboard[0][0].callback_data).toBe('psx:usage')
+    expect(visibleInGroup(cs)).toEqual([])
+    const ephId = edit.payload.ephemeral_message_id
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, callback_query: { id: 'psx1', from: ADA, chat_instance: 'x', data: 'psx:usage',
+      message: { message_id: 0, ephemeral_message_id: ephId, date: 0, message_thread_id: T, chat: { id: C, type: 'supergroup' } } } })
+    await bridge._drainQueue(`${gKey}#pt`)
+    const again = calls.slice(before)
+    expect(again.find(c => c.method === 'editEphemeralMessageText')?.payload.ephemeral_message_id).toBe(ephId)
+    expect(again.some(c => c.method === 'editMessageText')).toBe(false)
   }, 20000)
 })

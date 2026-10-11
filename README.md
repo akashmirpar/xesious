@@ -78,6 +78,8 @@ off is now a **hard startup error**, not a warning.
 
 ## Commands
 
+In a group, the commands that only inform the person asking — `/status`, `/jobs`, `/usage` `/cost` `/context`, `/recall`, `/whoami`, `/help` and `/live` — are answered to that person alone: picked from the command menu, neither the command nor the reply is seen by the rest of the group. A slower one shows a private "checking" first and turns it into the answer. Typed by hand, the reply is private only where the bot is an admin (Telegram's rule), and otherwise visible as before — except `/live`, whose link is a key to the session: it then goes to your DM, and never into the group. Commands that change the topic for everyone (`/new`, `/mode`, `/model`, `/stop`, …) stay visible.
+
 | Command | Effect |
 | --- | --- |
 | *(any text)* | Send a prompt to this topic's Claude session |

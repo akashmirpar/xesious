@@ -5354,6 +5354,40 @@ async function handlePassthrough(ctx: Context, threadId: number | undefined, key
     .catch(e => console.error(`[warn] passthrough send: ${e}`))
 }
 
+// The same report, for a hidden command: edited into the private "checking" message,
+// with the Refresh button (which then edits it again, privately).
+async function handlePassthroughHidden(ctx: Context, threadId: number | undefined, key: string, text: string, ackId: number): Promise<void> {
+  let out: string
+  try { out = await runPassthrough(ctx, threadId, key, text) } catch (e) { out = `⚠️ ${e}` }
+  if (stopped.has(key)) { stopped.delete(key); return }
+  await showHiddenReport(ctx.chat!.id, ctx.from!.id, ackId, passthroughCommand(text), out)
+}
+async function showHiddenReport(chat: number, userId: number, ephId: number, cmd: string, out: string): Promise<void> {
+  const body = stamped(out.trim())
+  const fits = chunk(body).length === 1
+  const markup = fits ? refreshKb(cmd) : undefined
+  const ok = fits && await bot.api.editEphemeralMessageText(chat, userId, ephId, telegramify(sanitizeProse(mdTablesToCode(body), 'markdownv2'), 'escape'),
+    { parse_mode: 'MarkdownV2', reply_markup: markup }).then(() => true, () => false)
+  if (!ok) await bot.api.editEphemeralMessageText(chat, userId, ephId, stripMd(body).slice(0, 4096), { reply_markup: markup })
+    .catch(e => console.error(`[warn] hidden report: ${e}`))
+}
+// Parts of a reply, shown in a private placeholder: together when they fit one
+// message, else the first there and the rest as hidden messages after it.
+async function showHidden(chat: number, threadId: number | undefined, userId: number, ephId: number, parts: string[], mode?: 'HTML'): Promise<void> {
+  const plain = (t: string) => t.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&')
+  const joined = parts.join('\n\n')
+  const groups = joined.length <= 4096 ? [joined] : parts
+  const o: any = { link_preview_options: { is_disabled: true }, ...(mode ? { parse_mode: mode } : {}) }
+  const [first, ...rest] = groups
+  await bot.api.editEphemeralMessageText(chat, userId, ephId, first, o)
+    .catch(() => bot.api.editEphemeralMessageText(chat, userId, ephId, plain(first).slice(0, 4096)))
+    .catch(e => console.error(`[warn] hidden reply: ${e}`))
+  for (const part of rest) {
+    await bot.api.sendMessage(chat, part, { ...destOpts({ threadId }), ...o, ephemeral_message_parameters: { receiver_user_id: userId } } as any)
+      .catch(e => console.error(`[warn] hidden reply part: ${e}`))
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Discover & import existing Claude Code sessions (what the IDE/CLI picker shows).
 // A directory's sessions live at CLAUDE_PROJECTS/<encoded-cwd>/<id>.jsonl.
@@ -5608,6 +5642,10 @@ const ephemeralCommands = new EphemeralCommands()
 // DM reaches the group, and the group's transcript stays what the group saw. The DM's
 // own conversation is put aside, and /private off puts it back.
 const privateInvites = new PrivateInvites()
+// Commands whose reply only informs the person asking: in a group they are answered
+// to that person alone (and registered hidden, so the room does not see the command
+// either). Those that change the topic for everyone stay visible.
+const HIDDEN_REPLIES = new Set(['/whoami', '/id', '/help', '/status', '/jobs', '/ps', '/live', '/recall', '/usage', '/cost', '/context'])
 type PrivateSource = { chat: number; thread?: number; cwd: string; topic: string; group: string; origin?: string; reply?: ConvRecord }
 type DmSettings = { mode?: string; model?: string; effort?: string }
 
@@ -5786,20 +5824,23 @@ function dmContext(user: NonNullable<Context['from']>): Context {
 
 // A reply only the asker sees, to the command that asked: ephemeral, retried once.
 // Falls back to an ordinary message only when `orVisible` — it must reach them.
-async function replyOnlyTo(ctx: Context, threadId: number | undefined, text: string, kb: any, replyTo?: number, replyToEphemeral?: number, orVisible = false): Promise<any> {
+async function replyOnlyTo(ctx: Context, threadId: number | undefined, text: string, kb: any, replyTo?: number, replyToEphemeral?: number, orVisible = false, extra: any = {}): Promise<any> {
   const reply = replyToEphemeral ? { ephemeral_message_id: replyToEphemeral } : replyTo ? { message_id: replyTo } : undefined
   const sendPrivate = () => ctx.api.sendMessage(ctx.chat!.id, text, {
     ...destOpts({ threadId }), reply_markup: kb, ephemeral_message_parameters: { receiver_user_id: ctx.from!.id },
-    ...(reply ? { reply_parameters: reply } : {}),
+    ...(reply ? { reply_parameters: reply } : {}), ...extra,
   })
-  const sent = await sendPrivate().catch(async e => {
+  // A hidden reply to an ordinary (typed) message is refused unless the bot is an
+  // admin (BOT_NOT_ADMIN): not worth two failed calls and a second's wait.
+  const doomed = !replyToEphemeral && ctx.chat!.type !== 'private' && bot.botInfo && !await isChatAdmin(ctx.chat!.id, bot.botInfo.id)
+  const sent = doomed ? null : await sendPrivate().catch(async e => {
     console.error(`[private] ephemeral reply refused, retrying once: ${e}`)
     await sleep(1000)
     return sendPrivate().catch(e2 => { console.error(`[private] ephemeral reply refused again: ${e2}`); return null })
   })
   if (!sent && orVisible) {
-    await ctx.api.sendMessage(ctx.chat!.id, text, { ...destOpts({ threadId, replyTo }), reply_markup: kb, disable_notification: true })
-      .catch(e => console.error(`[private] reply: ${e}`))
+    return ctx.api.sendMessage(ctx.chat!.id, text, { ...destOpts({ threadId, replyTo }), reply_markup: kb, disable_notification: true, ...extra })
+      .catch(e => { console.error(`[private] reply: ${e}`); return null })
   }
   return sent
 }
@@ -6168,6 +6209,14 @@ bot.on('message', async ctx => {
   // answer arriving after it is no longer adjacent to what it answers.
   if (cmd) latestIncoming[keyFor(ctx.chat!.id, threadId)] = msg.message_id
 
+  // Commands that only inform the person asking are answered to them alone in a group:
+  // the room sees neither the command (registered hidden) nor the reply.
+  const hiddenReply = ctx.chat.type !== 'private' && HIDDEN_REPLIES.has(cmd)
+  const answer = async (t: string): Promise<void> => {
+    if (hiddenReply) await replyOnlyTo(ctx, threadId, t, undefined, msg.message_id || undefined, ephemeralId, true)
+    else await send(ctx, threadId, t, true)
+  }
+
   // A /private start link, opened: checked against the invite itself, since the
   // person may not be allowed in a DM until it links them.
   const pvToken = ctx.chat.type === 'private' && cmd === '/start' ? privateStartToken(text) : undefined
@@ -6181,12 +6230,12 @@ bot.on('message', async ctx => {
 
   // Ungated: only reveals the caller's own ids.
   if (cmd === '/whoami' || cmd === '/id') {
-    await send(ctx, threadId,
+    await answer(
       `your user id: ${ctx.from.id}\nchat id: ${chatId} (${ctx.chat.type})\ntopic id: ${threadId ?? '(none / general)'}`)
     return
   }
   if (cmd === '/help') {
-    await send(ctx, threadId,
+    await answer(
       `claude-tg-bridge — one Claude session per topic.\n\n` +
       `Send any text to talk to Claude in this topic.\n\n` +
       `Send a file to drop it in this topic's ./${INBOX_DIR}/; ask Claude to put a file in ` +
@@ -6249,8 +6298,15 @@ bot.on('message', async ctx => {
   if (cmd === '/recall') {
     const q = text.slice(text.split(/\s+/)[0].length).trim()
     if (!String(chatId).startsWith('-')) { await send(ctx, threadId, '/recall works in groups: it searches what the group has said.'); return }
-    if (!q) { await send(ctx, threadId, "Usage: /recall <question> — shows what each search engine on this server finds for it in this topic's history, without asking Claude."); return }
-    if (!CONTEXT_ON || !contextIndex()) { await send(ctx, threadId, 'The context engine is off on this server (TG_CONTEXT).'); return }
+    if (!q) { await answer("Usage: /recall <question> — shows what each search engine on this server finds for it in this topic's history, without asking Claude."); return }
+    if (!CONTEXT_ON || !contextIndex()) { await answer('The context engine is off on this server (TG_CONTEXT).'); return }
+    // Seconds of searching: a private "searching" at once, edited into the results.
+    const ack = await replyOnlyTo(ctx, threadId, '🔎 Searching…', undefined, msg.message_id || undefined, ephemeralId)
+    if (ack?.ephemeral_message_id) {
+      const parts = await recallCompare(key, q)
+      await showHidden(chatId, threadId, ctx.from.id, ack.ephemeral_message_id, parts, 'HTML')
+      return
+    }
     for (const part of await recallCompare(key, q)) {
       noteBotMessage(key)
       await ctx.api.sendMessage(chatId, part, { ...destOpts({ threadId }), parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
@@ -6394,10 +6450,22 @@ bot.on('message', async ctx => {
     const uuid = randomUUID()
     links[uuid] = { key, cwd, model: models[key], sessionId: sessions[key]?.sessionId, created: new Date().toISOString() }
     saveLinks(links)
-    await send(ctx, threadId,
-      `🎙 Live voice call for *this* session:\n${LIVE_URL}/${uuid}\n\n` +
+    const liveText = `🎙 Live voice call for *this* session:\n${LIVE_URL}/${uuid}\n\n` +
       `Open it on your phone — no password, the link itself is the key, so keep it private (anyone with it talks as you). ` +
-      `It continues this exact conversation, in ${cwd}. Send /live again for a fresh link (revokes this one).`)
+      `It continues this exact conversation, in ${cwd}. Send /live again for a fresh link (revokes this one).`
+    if (ctx.chat.type === 'private') { await send(ctx, threadId, liveText); return }
+    // The link is a key to the session: in a group it goes to the asker alone, or to
+    // their DM, and never into the room.
+    if (await replyOnlyTo(ctx, threadId, liveText, undefined, msg.message_id || undefined, ephemeralId)) return
+    if (await bot.api.sendMessage(ctx.from.id, `${liveText}\n\n(For the topic "${topicTitle(key)}".)`).then(() => true, () => false)) {
+      await send(ctx, threadId, '🎙 Sent you the live link in our DM.', true); return
+    }
+    for (const [u, l] of Object.entries(links)) if (l.key === key) delete links[u]
+    saveLinks(links)
+    const me = botUsername || bot.botInfo?.username
+    await ctx.api.sendMessage(chatId, '🎙 The live link can only be given privately: open a chat with me, then send /live here again.',
+      { ...destOpts({ threadId }), disable_notification: true, ...(me ? { reply_markup: { inline_keyboard: [[{ text: 'Open a chat with me', url: `https://t.me/${me}` }]] } } : {}) })
+      .catch(e => console.error(`[warn] /live: ${e}`))
     return
   }
   // Startup only fills in a MISSING photo; this is how you replace one on purpose.
@@ -6636,9 +6704,9 @@ bot.on('message', async ctx => {
       lines.push(`⏳ ${alive.length} process${alive.length === 1 ? '' : 'es'} left running by job ${v.id} (pids ${alive.slice(0, 6).join(', ')})` +
         `\n   /kill ${v.id} to stop them`)
     }
-    await send(ctx, threadId, lines.length
+    await answer(lines.length
       ? `Jobs in this topic:\n\n${lines.join('\n\n')}`
-      : 'Nothing running in this topic, and nothing left behind.', true)
+      : 'Nothing running in this topic, and nothing left behind.')
     return
   }
   if (cmd === '/kill') {
@@ -6654,7 +6722,7 @@ bot.on('message', async ctx => {
   }
   if (cmd === '/status') {
     const e = sessions[key]
-    await send(ctx, threadId,
+    await answer(
       (privateLinks[key] ? `private continuation of: ${privateLinks[key].topic} (${privateLinks[key].group})\n` : '') +
       `directory: ${e?.cwd ?? resolveCwd(ctx, threadId)}\n` +
       `session: ${e?.sessionId ?? '(none yet)'}\n` +
@@ -6809,7 +6877,12 @@ bot.on('message', async ctx => {
   // Client-side CLI commands (/usage, /cost, …) — forward them rather than
   // rejecting: `claude -p "/usage"` answers them for free, without a turn.
   if (PASSTHROUGH.has(cmd)) {
-    enqueue(passthroughQueueKey(key), () => handlePassthrough(ctx, threadId, key, text))
+    // In a group, to the asker alone: a private "checking" at once (the reply window is
+    // 15 seconds, a CLI start is not far off), edited into the report.
+    const ack = hiddenReply ? await replyOnlyTo(ctx, threadId, '⏳ Checking…', undefined, msg.message_id || undefined, ephemeralId) : null
+    enqueue(passthroughQueueKey(key), () => ack?.ephemeral_message_id
+      ? handlePassthroughHidden(ctx, threadId, key, text, ack.ephemeral_message_id)
+      : handlePassthrough(ctx, threadId, key, text))
       .catch(e => console.error(`[error] passthrough ${key}: ${e}`))
     return
   }
@@ -7113,7 +7186,9 @@ bot.on('callback_query:data', async ctx => {
   if (data.startsWith('psx:')) {
     const cmd = `/${data.slice(4)}`
     if (!PASSTHROUGH.has(cmd)) { await ctx.answerCallbackQuery({ text: 'Unknown report.' }).catch(() => {}); return }
-    const msgId = ctx.callbackQuery.message?.message_id
+    // A report shown privately is edited privately, by its ephemeral id.
+    const eph: number | undefined = (ctx.callbackQuery.message as any)?.ephemeral_message_id
+    const msgId = eph ? `e${eph}` : ctx.callbackQuery.message?.message_id
     const guard = `${ctx.chat!.id}:${msgId}`
     if (refreshing.has(guard)) { await ctx.answerCallbackQuery({ text: 'Already refreshing…' }).catch(() => {}); return }
     refreshing.add(guard)
@@ -7124,6 +7199,7 @@ bot.on('callback_query:data', async ctx => {
     try {
       await enqueue(passthroughQueueKey(key), async () => {
         const out = await runPassthrough(ctx, threadId, key, cmd)
+        if (eph) { await showHiddenReport(ctx.chat!.id, ctx.from!.id, eph, cmd, out); return }
         const body = stamped(out.trim())
         if (chunk(body).length !== 1) {
           await ctx.answerCallbackQuery({ text: 'Too long to edit in place — sending it below.' }).catch(() => {})
@@ -7214,7 +7290,7 @@ async function ensureGroupLogos(): Promise<void> {
 const BOT_COMMANDS: { command: string; description: string; is_ephemeral?: boolean }[] = [
   { command: 'config', description: "This group's settings (only you see the menu)", is_ephemeral: true },
   { command: 'private', description: 'Carry this topic on in your DM, where only you see it', is_ephemeral: true },
-  { command: 'recall', description: "What each search engine finds in this group's history" },
+  { command: 'recall', description: "What each search engine finds in this group's history", is_ephemeral: true },
   { command: 'new', description: 'Fresh session in this topic (/resume undoes it)' },
   { command: 'stop', description: 'Cancel the running task' },
   { command: 'interrupt', description: 'Stop the running task but keep what it produced' },
@@ -7225,17 +7301,18 @@ const BOT_COMMANDS: { command: string; description: string; is_ephemeral?: boole
   { command: 'mode', description: "This topic's permission mode" },
   { command: 'effort', description: "This topic's reasoning effort" },
   { command: 'voice', description: 'Speak answers back' },
-  { command: 'status', description: "This topic's session, directory and settings" },
-  { command: 'jobs', description: 'What is running here' },
+  { command: 'status', description: "This topic's session, directory and settings", is_ephemeral: true },
+  { command: 'jobs', description: 'What is running here', is_ephemeral: true },
   { command: 'compact', description: "Summarize this topic's history" },
   { command: 'resume', description: 'Undo /new, or bind a past session' },
   { command: 'fork', description: 'Continue this conversation in a second topic' },
   { command: 'sessions', description: 'List past Claude sessions to bind' },
   { command: 'history', description: 'Re-post the last turns of this session' },
   { command: 'get', description: "Send a file from this topic's directory" },
-  { command: 'usage', description: 'Claude usage (free, no turn)' },
-  { command: 'whoami', description: 'Your user, chat and topic ids' },
-  { command: 'help', description: 'Everything the bot can do' },
+  { command: 'usage', description: 'Claude usage (free, no turn)', is_ephemeral: true },
+  { command: 'live', description: 'A private link to a live voice call on this session', is_ephemeral: true },
+  { command: 'whoami', description: 'Your user, chat and topic ids', is_ephemeral: true },
+  { command: 'help', description: 'Everything the bot can do', is_ephemeral: true },
 ]
 const SET_COMMANDS = !/^(0|false|no)$/i.test(process.env.TG_SET_COMMANDS || '')
 async function ensureCommands(): Promise<void> {
@@ -7247,7 +7324,7 @@ async function ensureCommands(): Promise<void> {
       JSON.stringify(BOT_COMMANDS.map(c => [c.command, c.description, !!c.is_ephemeral]))
     if (same) return
     await bot.api.setMyCommands(BOT_COMMANDS)
-    console.log(`[ok] registered ${BOT_COMMANDS.length} commands (/config ephemeral)`)
+    console.log(`[ok] registered ${BOT_COMMANDS.length} commands (hidden: ${BOT_COMMANDS.filter(c => c.is_ephemeral).map(c => '/' + c.command).join(' ')})`)
   } catch (e) { console.error(`[warn] could not register the command list: ${e}`) }
 }
 
