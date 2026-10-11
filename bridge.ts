@@ -45,7 +45,7 @@ import {
   effectiveAnswers, effectiveRecords, foldRecords, contextParts, sinceMark, convLine, fitNewest,
   conversationPreamble, conversationFile, type ConvRecord, type Answers, type SettingValue, type SettingSource, type EditorPolicy, type EditorMode,
   EphemeralCommands, EPHEMERAL_REPLY_WINDOW_S,
-  PRIVATE_START_PREFIX, PRIVATE_EXIT_START, privateStartToken, PrivateInvites, isGroupMember, privatePreamble, privateFooter,
+  PRIVATE_START_PREFIX, PRIVATE_EXIT_START, privateStartToken, PrivateInvites, isGroupMember, privatePreamble, privateFooter, privateExitKeyboard, isPrivateExitButton,
   readsAlong, AUTO_PACE, asEagerness, triageDelay, triageSystemPrompt, triageCompactPrompt, triageUserPrompt, parseTriage, joinProbability, triageNeed,
   isSilentReply, SILENT_REPLY, type TriageMsg, type Eagerness,
   needsRich, sanitizeProse,
@@ -5219,7 +5219,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
       await send(ctx, threadId, `🌿 Background task finished.`, true, link)
     }
     // A private continuation says so under every answer, with a way out.
-    const footer = plink ? privateFooter({ topic: plink.topic, group: plink.group, origin: plink.origin, exitUrl: privateExitUrl() }) : ''
+    const footer = plink ? privateFooter({ topic: plink.topic, group: plink.group, exitUrl: privateExitUrl() }) : ''
     const answerId = await deliver(ctx, threadId, res.text, link, footer)
     await flushOutbox(ctx, threadId, cwd, key, link)
     // For Auto mode's judge, which otherwise sees only what people said.
@@ -5680,6 +5680,19 @@ async function leavePrivate(dmKey: string): Promise<PrivateLink | undefined> {
   if (was) await retireBanner(Number(chatOfKey(dmKey)), was, `🔓 Left "${was.topic}" (${was.group}).`)
   return was
 }
+// The keyboard goes up with one message when a continuation starts — the question,
+// when there is one, so it costs no message of its own — and comes down with the
+// message that says it has ended. A message carries inline buttons or this keyboard,
+// never both, which is why the banner cannot carry it.
+async function sendExitKeyboard(userId: number, src: PrivateSource, text: string): Promise<void> {
+  await bot.api.sendMessage(userId, text, { reply_markup: privateExitKeyboard(src.topic, src.group), disable_notification: true })
+    .catch(e => console.error(`[private] exit keyboard: ${e}`))
+}
+async function sayRemovingKeyboard(chatId: number, text: string): Promise<void> {
+  await bot.api.sendMessage(chatId, text, { reply_markup: { remove_keyboard: true } })
+    .catch(e => console.error(`[private] ${e}`))
+}
+const EXIT_KEYBOARD_NOTE = '🔓 The button under the typing box takes you back to your own chat.'
 const leftText = (was: PrivateLink) => was.before?.sessionId
   ? `🔓 Left "${was.topic}". Back to your own conversation — message to continue it.`
   : `🔓 Left "${was.topic}". This chat starts fresh.`
@@ -5753,10 +5766,10 @@ async function privateFromGroup(ctx: Context, threadId: number | undefined, ques
   }
   await replyOnlyTo(ctx, threadId, `🔒 Continued in our DM — only you see it.`,
     me ? { inline_keyboard: [[{ text: '🔒 Open DM', url: `https://t.me/${me}` }]] } : undefined, replyTo, replyToEphemeral)
+  // Nobody saw a question asked, the asker included: the command was hidden.
+  await sendExitKeyboard(user.id, src, question ? `You asked: ${question}` : EXIT_KEYBOARD_NOTE)
   if (question) {
     const dctx = dmContext(user)
-    // Nobody saw it asked, the asker included: the command was hidden.
-    await send(dctx, undefined, `You asked: ${question}`, true)
     enqueue(dmKey, () => handlePrompt(dctx, undefined, dmKey, question)).catch(e => console.error(`[error] private ${dmKey}: ${e}`))
   }
 }
@@ -5776,8 +5789,8 @@ async function privateFromInvite(ctx: Context, token: string): Promise<void> {
   if (!intro) return
   const why = await openPrivate(user.id, src, intro.message_id)
   if (why) { await ctx.api.editMessageText(user.id, intro.message_id, `⚠️ Could not carry "${src.topic}" over: ${why}.`).catch(() => {}); return }
+  await sendExitKeyboard(user.id, src, inv.question ? `You asked: ${inv.question}` : EXIT_KEYBOARD_NOTE)
   if (inv.question) {
-    await send(ctx, undefined, `You asked: ${inv.question}`, true)
     enqueue(dmKey, () => handlePrompt(ctx, undefined, dmKey, inv.question!)).catch(e => console.error(`[error] private ${dmKey}: ${e}`))
   }
 }
@@ -5788,7 +5801,8 @@ async function privateInDm(ctx: Context, arg: string): Promise<void> {
   const link = privateLinks[dmKey]
   if (/^(off|end|stop|leave)$/i.test(arg)) {
     const was = await leavePrivate(dmKey)
-    await send(ctx, undefined, was ? leftText(was) : 'This chat is not continuing a group topic.')
+    // Removing the keyboard either way: a tap on one left over is how this is reached too.
+    await sayRemovingKeyboard(ctx.chat!.id, was ? leftText(was) : 'This chat is not continuing a group topic.')
     return
   }
   await send(ctx, undefined, link
@@ -5919,6 +5933,8 @@ bot.on('message', async ctx => {
   if (pvToken) { await privateFromInvite(ctx, pvToken); return }
   // The "click to exit" link under a private answer. Ungated: leaving is always allowed.
   if (ctx.chat.type === 'private' && cmd === '/start' && text.split(/\s+/)[1] === PRIVATE_EXIT_START) { await privateInDm(ctx, 'off'); return }
+  // The exit button under the typing box: a message from the person, never a turn.
+  if (ctx.chat.type === 'private' && isPrivateExitButton(text)) { await privateInDm(ctx, 'off'); return }
 
   // Ungated: only reveals the caller's own ids.
   if (cmd === '/whoami' || cmd === '/id') {
@@ -6237,9 +6253,10 @@ bot.on('message', async ctx => {
     const e = sessions[key] ?? (sessions[key] = { cwd: resolveCwd(ctx, threadId) })
     if (e?.sessionId) { e.prevSessionId = e.sessionId; delete e.sessionId }
     topicSessionChanged(key)
-    await send(ctx, threadId, (left ? `🔓 Left "${left.topic}". ` : '') + (e?.prevSessionId
+    const fresh = (left ? `🔓 Left "${left.topic}". ` : '') + (e?.prevSessionId
       ? `🧹 Fresh session started. The old one is kept (${e.prevSessionId.slice(0, 8)}) — send /resume to restore it. Nothing was deleted.`
-      : '🧹 Fresh session for this topic.'))
+      : '🧹 Fresh session for this topic.')
+    if (left) await sayRemovingKeyboard(chatId, fresh); else await send(ctx, threadId, fresh)
     return
   }
   if (cmd === '/resume') {
@@ -6609,7 +6626,7 @@ bot.on('callback_query:data', async ctx => {
   if (data === PRIVATE_LEAVE && ctx.chat?.type === 'private' && ctx.from?.id === ctx.chat.id) {
     const was = await leavePrivate(keyFor(ctx.chat.id, undefined))
     await ctx.answerCallbackQuery(was ? { text: `Left "${was.topic}".` } : { text: 'Already left.' }).catch(() => {})
-    if (was) await send(ctx, undefined, leftText(was))
+    if (was) await sayRemovingKeyboard(ctx.chat.id, leftText(was))
     return
   }
   if (ctx.chat?.type === 'private' && ctx.from) await refreshPrivateGuest(ctx.from.id)

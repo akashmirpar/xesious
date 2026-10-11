@@ -3911,7 +3911,7 @@ describe('/private — carry a group topic on in your own DM', () => {
     writeFileSync(join(pdir, `${parent.sessionId}.jsonl`), JSON.stringify({ type: 'user', sessionId: parent.sessionId, message: { role: 'user', content: 'x' } }) + '\n')
 
     const cs = await privately('/private', ADA)
-    const intro = toDm(cs, 1)
+    const intro = toDm(cs, 1).filter(c => c.payload.reply_markup?.inline_keyboard)
     expect(intro.length).toBe(1)
     // The banner: its first line is what the pin bar shows.
     expect(String(intro[0].payload.text).split('\n')[0]).toBe('🔒 Private: "topic 851" (Team)')
@@ -3924,6 +3924,11 @@ describe('/private — carry a group topic on in your own DM', () => {
     const pin = cs.find(c => c.method === 'pinChatMessage')
     expect(pin?.payload).toMatchObject({ chat_id: 1, disable_notification: true })
     expect(bridge._privateLinks()['1:main'].pinned).toBe(pin!.payload.message_id)
+    // …and the exit button goes under the typing box, on a message of its own.
+    const kb = toDm(cs, 1).length ? cs.find(c => c.method === 'sendMessage' && c.payload.reply_markup?.keyboard) : undefined
+    expect(kb?.payload.chat_id).toBe(1)
+    expect(kb!.payload.reply_markup).toMatchObject({ keyboard: [[{ text: '🔓 Exit private: topic 851' }]], is_persistent: true, resize_keyboard: true,
+      input_field_placeholder: 'Private: topic 851 (Team)' })
     // The group gets one message, and only Ada sees it.
     const g = inGroup(cs)
     expect(g.length).toBe(1)
@@ -3944,8 +3949,9 @@ describe('/private — carry a group topic on in your own DM', () => {
     expect(answer).toBeDefined()
     // Every answer says where it is, with a way back to the topic and a way out.
     expect(textOf(answer!)).toContain('🔒 Private')
-    expect(textOf(answer!)).toMatch(/click to exit\]\(https:\/\/t\.me\/testbot\?start=pvoff\)/)
-    expect(textOf(answer!)).toMatch(/\(https:\/\/t\.me\/c\/888\/851\/\d+\)/)
+    // The exit is the only link, on a line of its own; the topic's name is plain.
+    expect(textOf(answer!)).toMatch(/\n\[🔓 Exit to your own chat\]\(https:\/\/t\.me\/testbot\?start=pvoff\)\n?$/)
+    expect(textOf(answer!)).not.toContain('t.me/c/888')
     const p = handed()
     expect(p).toContain('this is a private conversation with Ada')
     expect(p).toContain('continued from the topic "topic 851" in the group "Team"')
@@ -3974,6 +3980,8 @@ describe('/private — carry a group topic on in your own DM', () => {
     expect(textOf(edit!)).toContain('🔓 Left "topic 851"')
     expect(edit!.payload.reply_markup).toBeUndefined()
     expect(cs.find(c => c.method === 'unpinChatMessage')?.payload).toMatchObject({ chat_id: 1, message_id: pinned })
+    // The message saying so takes the exit button away.
+    expect(sends(cs).find(c => textOf(c).includes('Back to your own conversation'))!.payload.reply_markup).toEqual({ remove_keyboard: true })
     expect(bridge._sessions()['1:main'].sessionId).toBe(ownDmSession)
     expect(bridge._privateLinks()['1:main']).toBeUndefined()
     expect(sends(await dm('/private', ADA)).map(textOf).join('\n')).toContain('Send /private in a group topic')
@@ -3990,6 +3998,19 @@ describe('/private — carry a group topic on in your own DM', () => {
     expect(bridge._sessions()['1:main'].sessionId).toBe(ownDmSession)
     expect(cs.some(c => c.method === 'unpinChatMessage')).toBe(true)
     expect(sends(cs).map(textOf).join('\n')).toContain('Back to your own conversation')
+  }, 20000)
+
+  test('the button under the typing box leaves, and one left over only clears itself', async () => {
+    await privately('/private', ADA)
+    const cs = await dm('🔓 Exit private: topic 851', ADA)
+    expect(bridge._privateLinks()['1:main']).toBeUndefined()
+    expect(bridge._sessions()['1:main'].sessionId).toBe(ownDmSession)
+    // Never a turn: the tap is not a question for Claude.
+    expect(sends(cs).some(c => textOf(c).includes('okReply'))).toBe(false)
+    expect(sends(cs).find(c => textOf(c).includes('Back to your own conversation'))!.payload.reply_markup).toEqual({ remove_keyboard: true })
+    const stale = await dm('🔓 Exit private: topic 851', ADA)
+    expect(sends(stale).some(c => textOf(c).includes('okReply'))).toBe(false)
+    expect(sends(stale).find(c => c.payload.reply_markup?.remove_keyboard)).toBeDefined()
   }, 20000)
 
   test('the "click to exit" link leaves', async () => {
@@ -4010,7 +4031,7 @@ describe('/private — carry a group topic on in your own DM', () => {
     expect(e.prevSessionId).toBe(ownDmSession)
     expect(e.prevSessionId).not.toBe(forked)
     expect(e.cwd).not.toBe(bridge._sessions()[gKey].cwd)
-    expect(sends(cs).map(textOf).join('\n')).toContain('🔓 Left "topic 851"')
+    expect(sends(cs).find(c => textOf(c).includes('🔓 Left "topic 851"'))!.payload.reply_markup).toEqual({ remove_keyboard: true })
     await dm('/resume', ADA)
     expect(bridge._sessions()['1:main'].sessionId).toBe(ownDmSession)
   }, 20000)
@@ -4045,7 +4066,9 @@ describe('/private — carry a group topic on in your own DM', () => {
     expect(sends(await dm(`/start pv_${token}`, ADA)).map(textOf).join('\n')).toMatch(/expired or is not yours/)
     expect(bridge._privateLinks()['1:main']).toBeUndefined()
     const opened = await dm(`/start pv_${token}`, BEA)
-    expect(sends(opened).map(textOf).join('\n')).toContain('You asked: what changed since Monday?')
+    // The question carries the exit button: no message of its own for it.
+    const asked = sends(opened).find(c => textOf(c) === 'You asked: what changed since Monday?')
+    expect(asked?.payload.reply_markup?.keyboard).toBeDefined()
     expect(opened.some(c => c.method === 'pinChatMessage' && c.payload.chat_id === 3)).toBe(true)
     expect(sends(opened).some(c => textOf(c).includes('okReply'))).toBe(true)
     expect(handed()).toContain('what changed since Monday?')

@@ -2418,12 +2418,29 @@ export function privatePreamble(nonce: string, o: { topic: string; group: string
     `What people say in that topic reaches you here as background, and the group's history tools search that group.\n\n`
 }
 
-// The line under every answer in a private continuation, so it can never be mistaken
-// for the person's own chat with the bot: which topic it continues (a link back to
-// it) and a link that leaves. Markdown; brackets in names would break the links.
-export function privateFooter(o: { topic: string; group: string; origin?: string; exitUrl?: string }): string {
+// The lines under every answer in a private continuation, so it can never be mistaken
+// for the person's own chat with the bot: which topic it continues, and — on a line
+// of its own, the only link, so it cannot read as part of the topic's name — a way
+// out. The way back to the topic is on the pinned banner.
+export function privateFooter(o: { topic: string; group: string; exitUrl?: string }): string {
   const clean = (t: string) => t.replace(/[\[\]()]/g, ' ').replace(/\s+/g, ' ').trim()
-  const where = `${clean(o.topic)} (${clean(o.group)})`
-  return `\n\n🔒 Private · ${o.origin ? `[${where}](${o.origin})` : where}` +
-    (o.exitUrl ? ` · [click to exit](${o.exitUrl})` : ' · /private off to exit')
+  return `\n\n🔒 Private · ${clean(o.topic)} (${clean(o.group)})\n` +
+    (o.exitUrl ? `[🔓 Exit to your own chat](${o.exitUrl})` : '🔓 /private off to exit to your own chat')
 }
+
+// The button under the typing box while a DM continues a topic: Telegram's reply
+// keyboard, one row, shown whenever the letter keyboard is closed (is_persistent).
+// Tapping it sends its text as the person's message, which the bridge reads as a
+// leave. Matched by its start, so the topic name in it never matters.
+export const PRIVATE_EXIT_BUTTON = '🔓 Exit private'
+export function privateExitKeyboard(topic: string, group: string): {
+  keyboard: { text: string }[][]; is_persistent: true; resize_keyboard: true; input_field_placeholder: string
+} {
+  const cut = (t: string, n: number) => t.length > n ? `${t.slice(0, n - 1)}…` : t
+  return {
+    keyboard: [[{ text: `${PRIVATE_EXIT_BUTTON}: ${cut(topic, 40)}` }]],
+    is_persistent: true, resize_keyboard: true,
+    input_field_placeholder: cut(`Private: ${topic} (${group})`, 64),
+  }
+}
+export const isPrivateExitButton = (text: string | undefined): boolean => !!text && text.trim().startsWith(PRIVATE_EXIT_BUTTON)
