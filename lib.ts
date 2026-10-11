@@ -2444,7 +2444,9 @@ export function privatePreamble(nonce: string, o: { topic: string; group: string
 export function privateFooter(o: { topic: string; group: string; origin?: string; exitUrl?: string }): string {
   const clean = (t: string) => t.replace(/[\[\]()]/g, ' ').replace(/\s+/g, ' ').trim()
   const where = `${clean(o.topic)} (${clean(o.group)})`
-  return `\n\n🔒 Private: ${o.origin ? `[${where}](${o.origin})` : where}\n` +
+  // A blank line, not a line break: in a rich message a single break is soft, and the
+  // exit link ran on after the topic's name on the same line.
+  return `\n\n🔒 Private: ${o.origin ? `[${where}](${o.origin})` : where}\n\n` +
     (o.exitUrl ? `[🔓 Exit to your own chat](${o.exitUrl})` : '🔓 /private off to exit to your own chat')
 }
 

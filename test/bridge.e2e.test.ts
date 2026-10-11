@@ -3966,7 +3966,7 @@ describe('/private — carry a group topic on in your own DM', () => {
     // Every answer says where it is, with a way back to the topic and a way out.
     expect(textOf(answer!)).toContain('🔒 Private')
     // The exit is the only link, on a line of its own; the topic's name is plain.
-    expect(textOf(answer!)).toMatch(/\n\[🔓 Exit to your own chat\]\(https:\/\/t\.me\/testbot\?start=pvoff\)\n?$/)
+    expect(textOf(answer!)).toMatch(/\n\n\[🔓 Exit to your own chat\]\(https:\/\/t\.me\/testbot\?start=pvoff\)\n?$/)
     // …and the topic's name on the line above links back to where it started.
     expect(textOf(answer!)).toMatch(/🔒 Private: \[topic 851 \\\(Team\\\)\]\(https:\/\/t\.me\/c\/888\/851\/\d+\)\n/)
     const p = handed()

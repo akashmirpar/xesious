@@ -1849,8 +1849,8 @@ describe('/private — continuing a group topic in a DM', () => {
   })
   test('the label under a private answer links back to the topic, and the exit sits on a line of its own', () => {
     const f = L.privateFooter({ topic: '[Backend] Bugs', group: 'Team (core)', origin: 'https://t.me/c/777/5/90', exitUrl: 'https://t.me/bot?start=pvoff' })
-    expect(f).toBe('\n\n🔒 Private: [Backend Bugs (Team core)](https://t.me/c/777/5/90)\n[🔓 Exit to your own chat](https://t.me/bot?start=pvoff)')
-    expect(L.privateFooter({ topic: 'General', group: 'Team' })).toBe('\n\n🔒 Private: General (Team)\n🔓 /private off to exit to your own chat')
+    expect(f).toBe('\n\n🔒 Private: [Backend Bugs (Team core)](https://t.me/c/777/5/90)\n\n[🔓 Exit to your own chat](https://t.me/bot?start=pvoff)')
+    expect(L.privateFooter({ topic: 'General', group: 'Team' })).toBe('\n\n🔒 Private: General (Team)\n\n🔓 /private off to exit to your own chat')
   })
   test('the exit button under the typing box: one row, persistent, names the topic', () => {
     const k = L.privateExitKeyboard('Plans', 'Team')
