@@ -10,7 +10,7 @@
  * We then assert on exactly what the user would have seen. Run with `bun test`.
  */
 import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
@@ -56,6 +56,8 @@ const localJudge = Bun.serve({ port: 0, async fetch(req) {
 process.env.TG_AUTO_LOCAL_URL = `http://127.0.0.1:${localJudge.port}`
 const LAST_ARGS = join(TMP, 'last-args.json')
 process.env.XESIOUS_STUB_LAST_ARGS = LAST_ARGS
+const LAST_ENV = join(TMP, 'last-env.json')
+process.env.XESIOUS_STUB_LAST_ENV = LAST_ENV
 process.env.TG_SESSIONS_BASE = join(TMP, 'sessions')
 process.env.TG_STATE_FILE = STATE_FILE
 // Never the real state/live-links.json: the bridge reads it on every turn.
@@ -4370,5 +4372,73 @@ describe('commands that only inform the asker are answered to them alone in a gr
     const again = calls.slice(before)
     expect(again.find(c => c.method === 'editEphemeralMessageText')?.payload.ephemeral_message_id).toBe(ephId)
     expect(again.some(c => c.method === 'editMessageText')).toBe(false)
+  }, 20000)
+})
+
+describe('group memory — shared by every topic of a group', () => {
+  const C = -100777
+  let mid = 891000
+  const ADA = { id: 1, is_bot: false, first_name: 'Ada' }
+  const nowS = () => Math.floor(Date.now() / 1000)
+  const memDir = join(TMP, 'sessions', '.groups', String(C))
+  const lastRun = () => JSON.parse(readFileSync(LAST_ENV, 'utf8'))
+  const lastArgs = (): string[] => JSON.parse(readFileSync(LAST_ARGS, 'utf8'))
+  async function inTopic(thread: number, text: string, extra: any = {}): Promise<Call[]> {
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: {
+      message_id: mid++, date: nowS(), text, message_thread_id: thread, is_topic_message: true,
+      chat: { id: C, type: 'supergroup', title: 'G', is_forum: true }, from: ADA, ...extra } })
+    await bridge._drainQueue(`${C}:${thread}`)
+    return calls.slice(before)
+  }
+  async function dm(text: string): Promise<void> {
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: mid++, date: nowS(), text,
+      chat: { id: 1, type: 'private', first_name: 'Ada' }, from: ADA } })
+    await bridge._drainQueue('1:main')
+  }
+
+  test('a turn in a topic gets the group\'s folder, and its CLAUDE.md from there', async () => {
+    await inTopic(9101, 'hello')
+    const args = lastArgs()
+    expect(args[args.indexOf('--add-dir') + 1]).toBe(memDir)
+    const run = lastRun()
+    expect(run.addDirClaudeMd).toBe('1')
+    expect(run.claudeMd).toContain('# Group memory: "G"')
+    expect(run.claudeMd).toContain('## Saving a fact')
+    expect(run.claudeMd).toContain(`${memDir}/memory/<short-name>.md`)
+    expect(run.claudeMd).toContain('(nothing saved yet)')
+  }, 20000)
+
+  test('a fact saved in one topic is in the index for every topic from its next turn', async () => {
+    mkdirSync(join(memDir, 'memory'), { recursive: true })
+    writeFileSync(join(memDir, 'memory', 'release-day.md'), '---\nname: release day\ndescription: releases go out on Thursdays after the standup\n---\nDecided 2026-10-10.\n')
+    writeFileSync(join(memDir, 'memory', 'loose-note.md'), 'Staging is reset every Monday night\n')
+    await inTopic(9102, 'another topic, same group')
+    const md = lastRun().claudeMd
+    expect(md).toContain('- [loose-note](memory/loose-note.md) — Staging is reset every Monday night')
+    expect(md).toContain('- [release day](memory/release-day.md) — releases go out on Thursdays after the standup')
+    expect(readFileSync(join(memDir, 'CLAUDE.md'), 'utf8')).toBe(md)
+  }, 20000)
+
+  test('a plain DM gets no group memory', async () => {
+    await dm('just me')
+    expect(lastArgs()).not.toContain('--add-dir')
+    expect(lastRun().addDirClaudeMd).toBeNull()
+  }, 20000)
+
+  test('a private continuation reads a copy, marked read-only; what it writes never reaches the group', async () => {
+    await inTopic(9103, '/private', { message_id: 0, ephemeral_message_id: mid, date: nowS() })
+    expect(bridge._privateLinks()['1:main']).toBeDefined()
+    await dm('what do we know?')
+    const run = lastRun()
+    expect(run.dir).not.toBe(memDir)
+    expect(run.claudeMd).toContain('## Read-only here')
+    expect(run.claudeMd).not.toContain('## Saving a fact')
+    expect(run.claudeMd).toContain('release day')
+    // The copy is gone once the run is over…
+    expect(existsSync(run.dir)).toBe(false)
+    // …and the group's own memory holds only what the group saved.
+    expect(readdirSync(join(memDir, 'memory')).sort()).toEqual(['loose-note.md', 'release-day.md'])
+    await dm('/private off')
   }, 20000)
 })

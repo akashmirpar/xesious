@@ -32,7 +32,7 @@
  *                            instructions from /config
  *   topicInstr / noTopicInstr — …and a topic's own, on top of the group's
  */
-import { mkdirSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
+import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 
@@ -49,6 +49,15 @@ if (process.env.XESIOUS_STUB_LAST_PROMPT) writeFileSync(process.env.XESIOUS_STUB
 // …and the whole command line, for what the bridge passes besides the prompt
 // (the history tools' --mcp-config, the allowed tools).
 if (process.env.XESIOUS_STUB_LAST_ARGS) writeFileSync(process.env.XESIOUS_STUB_LAST_ARGS, JSON.stringify(argv))
+// Group memory: whether the CLI was told to read CLAUDE.md from added dirs, and what
+// the added dir held while the run was going (a read-only copy is gone afterwards).
+if (process.env.XESIOUS_STUB_LAST_ENV) {
+  const i = argv.indexOf('--add-dir')
+  const dir = i >= 0 ? argv[i + 1] : undefined
+  let claudeMd: string | undefined
+  try { claudeMd = dir ? readFileSync(dir + '/CLAUDE.md', 'utf8') : undefined } catch {}
+  writeFileSync(process.env.XESIOUS_STUB_LAST_ENV, JSON.stringify({ addDirClaudeMd: process.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD ?? null, dir, claudeMd }))
+}
 // The bridge wraps a user message in an attribution frame whose first line carries
 // a per-process nonce. Strip it the way the real CLI's model would look past it,
 // or every scenario token below would be shadowed by the marker.

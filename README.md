@@ -336,6 +336,15 @@ Many settings no longer need SSH and a restart: a group changes its own with
   `TG_TRUST_CHAT_MEMBERS`), allowlists, anything the bridge executes, credentials,
   paths and timeouts. A setting a chat can flip is not a guardrail.
 
+## Group memory
+
+Claude Code keeps its own memory per working directory, and every topic has its own directory, so on its own a fact saved in one topic is invisible in the others. Each group therefore also gets a **shared memory**, in `~/tg-topics/.groups/<chat id>/` (`TG_GROUPS_DIR` to move it):
+
+- `memory/<short-name>.md` — one fact per file, with a `name` and a one-line `description` at the top. Claude saves a fact here when it matters to the whole group (a decision, a convention, who looks after what); facts for one topic stay in its own memory. Anyone in the group can add to it, by asking the bot to remember something or by the bot noticing.
+- `CLAUDE.md` — written by the bridge before every turn: the rules, and an index of every fact (one line each). Each run in the group adds this folder (`--add-dir`, with `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1`), and the CLI reads that `CLAUDE.md` on every run — so a fact saved in one topic is known in every other from its next message, resumed sessions included, with no `/new`.
+- In a private continuation or a private answer (`/private`) the memory is **read-only**: the run gets a copy, thrown away afterwards, so private talk never reaches what the group sees. A plain DM gets no group memory.
+- The facts are plain files — read, edit or delete them on the server. `TG_GROUP_MEMORY=0` turns the whole thing off.
+
 ## Config
 
 All keys live in `.env` (see [.env.example](.env.example)). Several are only

@@ -23,7 +23,7 @@ import telegramify from 'telegramify-markdown'
 import { autoRetry } from '@grammyjs/auto-retry'
 import { apiThrottler } from '@grammyjs/transformer-throttler'
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync, rmdirSync, copyFileSync, readlinkSync, openSync, readSync, closeSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, statSync, readdirSync, renameSync, mkdtempSync, rmSync, rmdirSync, cpSync, copyFileSync, readlinkSync, openSync, readSync, closeSync } from 'node:fs'
 import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 'node:path'
 import { homedir, tmpdir, freemem as osFreemem } from 'node:os'
 import { randomUUID, createHash } from 'node:crypto'
@@ -45,7 +45,7 @@ import {
   effectiveAnswers, effectiveRecords, foldRecords, contextParts, sinceMark, replyWindow, convLine, fitNewest,
   conversationPreamble, conversationFile, type ConvRecord, type Answers, type SettingValue, type SettingSource, type EditorPolicy, type EditorMode,
   EphemeralCommands, EPHEMERAL_REPLY_WINDOW_S,
-  PRIVATE_START_PREFIX, PRIVATE_EXIT_START, privateStartToken, PRIVATE_ASK_START_PREFIX, privateAskStartToken, PrivateInvites, isGroupMember, privatePreamble, privateFooter, privateExitKeyboard, isPrivateExitButton, richMessageText,
+  PRIVATE_START_PREFIX, PRIVATE_EXIT_START, privateStartToken, PRIVATE_ASK_START_PREFIX, privateAskStartToken, PrivateInvites, isGroupMember, privatePreamble, privateFooter, privateExitKeyboard, isPrivateExitButton, richMessageText, parseGroupFact, groupMemoryClaudeMd, type GroupFact,
   readsAlong, AUTO_PACE, asEagerness, triageDelay, triageSystemPrompt, triageCompactPrompt, triageUserPrompt, parseTriage, joinProbability, triageNeed,
   isSilentReply, SILENT_REPLY, type TriageMsg, type Eagerness,
   needsRich, sanitizeProse,
@@ -1192,6 +1192,63 @@ type RunOpts = {
   // instead of posting its own.
   early?: EarlyTurn
 }
+// ---------------------------------------------------------------------------
+// Group memory — what the whole group keeps, across its topics (lib.ts explains how)
+// ---------------------------------------------------------------------------
+const GROUP_MEMORY = !/^(0|false|no)$/i.test(process.env.TG_GROUP_MEMORY || '')
+const GROUPS_BASE = process.env.TG_GROUPS_DIR || join(SESSIONS_BASE, '.groups')
+const groupMemoryDir = (chat: number | string) => join(GROUPS_BASE, String(chat))
+// The CLI refuses writes under ~/.claude as sensitive (seen in testing), so a folder
+// there would be read-only in practice: nothing could ever be saved.
+if (GROUP_MEMORY && resolve(GROUPS_BASE).startsWith(join(homedir(), '.claude') + '/'))
+  console.error(`[warn] TG_GROUPS_DIR=${GROUPS_BASE} is inside ~/.claude: Claude Code refuses writes there, so the group memory could never be saved to. Move it.`)
+
+function groupFacts(dir: string): GroupFact[] {
+  const mem = join(dir, 'memory')
+  let files: string[] = []
+  try { files = readdirSync(mem).filter(f => f.endsWith('.md') && !f.startsWith('.')) } catch { return [] }
+  const out: GroupFact[] = []
+  for (const f of files) { try { out.push(parseGroupFact(f, readFileSync(join(mem, f), 'utf8'))) } catch {} }
+  return out
+}
+// Written whole and renamed into place: a run starting meanwhile never reads half of it.
+function writeGroupClaudeMd(dir: string, text: string): void {
+  const tmp = join(dir, `.CLAUDE.md.${process.pid}.${randomUUID().slice(0, 8)}`)
+  writeFileSync(tmp, text)
+  renameSync(tmp, join(dir, 'CLAUDE.md'))
+}
+// Whose memory a run gets, and whether it may write to it. A topic of a group: that
+// group's, to read and write. A private continuation or a private answer: its group's,
+// read only — private talk never reaches what the whole group sees. A plain DM: none.
+function groupMemoryFor(key: string): { chat: string; readOnly: boolean } | undefined {
+  if (!GROUP_MEMORY) return undefined
+  const link = privateLinks[key]
+  if (link) return { chat: String(link.chat), readOnly: true }
+  const asked = askSource.get(key)
+  if (asked) return { chat: chatOfKey(asked), readOnly: true }
+  const chat = chatOfKey(key)
+  return chat.startsWith('-') ? { chat, readOnly: false } : undefined
+}
+// The folder a run adds, with its CLAUDE.md rebuilt from the facts as they are now.
+// Read-only runs get a copy, thrown away afterwards, so whatever they write is lost.
+function prepareGroupMemory(key: string, group: string): { dir: string; cleanup: () => void } | undefined {
+  const gm = groupMemoryFor(key)
+  if (!gm) return undefined
+  try {
+    const real = groupMemoryDir(gm.chat)
+    mkdirSync(join(real, 'memory'), { recursive: true })
+    const facts = groupFacts(real)
+    if (!gm.readOnly) {
+      writeGroupClaudeMd(real, groupMemoryClaudeMd({ group, dir: real, facts, readOnly: false }))
+      return { dir: real, cleanup: () => {} }
+    }
+    const copy = mkdtempSync(join(tmpdir(), 'xesious-groupmem-'))
+    cpSync(join(real, 'memory'), join(copy, 'memory'), { recursive: true })
+    writeFileSync(join(copy, 'CLAUDE.md'), groupMemoryClaudeMd({ group, dir: copy, facts, readOnly: true }))
+    return { dir: copy, cleanup: () => { try { rmSync(copy, { recursive: true, force: true }) } catch {} } }
+  } catch (e) { console.error(`[memory] ${key}: could not prepare the group's memory: ${e}`); return undefined }
+}
+
 async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL, ro: RunOpts = {}): Promise<ClaudeResult> {
   const { onInit, effort = EFFORT_TIER, askedBy, fork, silent, early } = ro
   const history = historyMcp(key)
@@ -1206,6 +1263,10 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   if (model) args.push('--model', model)
   if (effort) args.push('--effort', effort)
   if (fork && resumeId) args.push('--fork-session')
+  // The group's memory: its folder added, and its CLAUDE.md read from there.
+  const groupMem = prepareGroupMemory(key, String((ctx.chat as any)?.title ?? privateLinks[key]?.group ?? 'this group'))
+  if (groupMem) args.push('--add-dir', groupMem.dir)
+  const runEnv = groupMem ? { ...childEnv(), CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1' } : childEnv()
 
   const opts: any = threadId ? { message_thread_id: threadId } : {}
   // Minted before the status message so its keyboard can name this run from the
@@ -1255,6 +1316,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   // first event seconds later. With nothing to show this edits nothing.
   void editStatus()
 
+  try {
   return await new Promise<ClaudeResult>(resolve => {
     let buf = '', err = '', finalText = '', sessionId: string | undefined, isError = false, got = false
     const textBlocks: string[] = []
@@ -1266,7 +1328,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     // stops the whole tree it built. Without it the child sits in the bridge's
     // group — where a group signal would kill the bridge — and killing the child
     // alone orphans every grandchild it spawned.
-    const child = spawn(CLAUDE_BIN, args, { cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+    const child = spawn(CLAUDE_BIN, args, { cwd, env: runEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
     // An early turn's job has been registered since its status went up, with the
     // prompt as it was asked (for /jobs); the run gives it its process.
     const job: Job = early?.job ?? { id: jobId, key, threadId, prompt, pgid: 0, askedBy, startedAt: Date.now(), statusMsgId: status?.message_id, steps: () => 0 }
@@ -1391,6 +1453,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
       else void finish({ text: `Could not parse Claude output.\n\n${(err || `exit ${code}`).slice(-1500)}`, isError: true })
     })
   })
+  } finally { groupMem?.cleanup() }
 }
 
 // ---------------------------------------------------------------------------
