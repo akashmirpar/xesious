@@ -45,7 +45,7 @@ import {
   effectiveAnswers, effectiveRecords, foldRecords, contextParts, sinceMark, replyWindow, convLine, fitNewest,
   conversationPreamble, conversationFile, type ConvRecord, type Answers, type SettingValue, type SettingSource, type EditorPolicy, type EditorMode,
   EphemeralCommands, EPHEMERAL_REPLY_WINDOW_S,
-  PRIVATE_START_PREFIX, PRIVATE_EXIT_START, privateStartToken, PRIVATE_ASK_START_PREFIX, privateAskStartToken, PrivateInvites, isGroupMember, privatePreamble, privateFooter, privateExitKeyboard, isPrivateExitButton, richMessageText, parseGroupFact, groupMemoryClaudeMd, type GroupFact,
+  PRIVATE_START_PREFIX, PRIVATE_EXIT_START, privateStartToken, PRIVATE_ASK_START_PREFIX, privateAskStartToken, PrivateInvites, isGroupMember, privatePreamble, privateFooter, privateExitKeyboard, isPrivateExitButton, incomingText, forwardedFrom, forwardedPreamble, parseGroupFact, groupMemoryClaudeMd, type GroupFact,
   readsAlong, AUTO_PACE, asEagerness, triageDelay, triageSystemPrompt, triageCompactPrompt, triageUserPrompt, parseTriage, joinProbability, triageNeed,
   isSilentReply, SILENT_REPLY, type TriageMsg, type Eagerness,
   needsRich, sanitizeProse,
@@ -977,7 +977,7 @@ const leftBehind = new Map<number, { id: string; key: string; at: number }>()
 
 // Messages that were offered "run this now" and are still waiting their turn, and
 // those that took the offer (whose queued turn must therefore do nothing).
-const offered = new Map<number, { key: string; threadId?: number; prompt: string; offerMsgId?: number }>()
+const offered = new Map<number, { key: string; threadId?: number; prompt: string; forwarded?: Forwarded; offerMsgId?: number }>()
 const skipQueued = new Set<number>()
 
 // What a background job found, held until the topic's next ordinary turn.
@@ -2233,7 +2233,7 @@ async function handleAwaitedInput(ctx: Context, a: AwaitedInput, promptKey: stri
   const m = configMenus.get(a.tok)
   const isPrivate = ctx.chat!.type === 'private'
   const access = await configAccess(a.chatId, isPrivate, ctx.from!)
-  const text = (msg.text ?? '').trim()
+  const text = incomingText(msg)
   const menu: ConfigMenu = m ?? {
     chatId: a.chatId, threadId: a.threadId, userId: a.userId, userName: userName(ctx.from!), isPrivate,
     title: '', created: Date.now(), diff: [], seen: [], editors: [],
@@ -2504,9 +2504,10 @@ function recordOf(msg: any, toBot: boolean): ConvRecord | null {
   const from = msg?.from
   if (!from || from.is_bot) return null
   const att = pickAttachment(msg)
-  // `||`, not `??`: a photo's words are its caption, and an empty text is no text.
-  const text = String(msg.text || msg.caption || '').trim()
+  // Its words in whatever form they came: text, a photo's caption, a rich message.
+  const text = incomingText(msg)
   if (!text && !att) return null
+  const fwd = forwardedFrom(msg)
   const kind = msg.photo ? 'photo' : msg.document ? 'document' : msg.voice ? 'voice note' : msg.video ? 'video'
     : msg.video_note ? 'video note' : msg.audio ? 'audio' : msg.animation ? 'animation' : undefined
   // In a forum every message "replies" to its topic's creation; that is not a reply.
@@ -2516,6 +2517,7 @@ function recordOf(msg: any, toBot: boolean): ConvRecord | null {
     ...(reply ? { replyTo: reply } : {}),
     ...(att ? { kind, file: { id: att.fileId, name: att.name, size: att.size } } : {}),
     ...(toBot ? { toBot: true } : {}),
+    ...(fwd ? { fwd } : {}),
   }
 }
 
@@ -3174,7 +3176,7 @@ async function privateContext(ctx: Context, key: string, link: PrivateLink, text
 // to it and a Conversation topic answered everything. Found in production.
 const mentionsBot = (ctx: Context, msg: any): boolean => {
   const me = botUsername || ctx.me?.username || ''
-  const text = String(msg.text || msg.caption || '').toLowerCase()
+  const text = incomingText(msg).toLowerCase()
   const reply = msg.reply_to_message
   const toBotsMessage = !!ctx.me && !!reply && !reply.forum_topic_created && reply.from?.id === ctx.me.id
   return (!!me && text.includes('@' + me.toLowerCase())) || toBotsMessage
@@ -3191,6 +3193,27 @@ async function offNote(ctx: Context, msg: any): Promise<void> {
     ...destOpts({ threadId: msg.message_thread_id }), ephemeral_message_parameters: { receiver_user_id: ctx.from!.id },
     reply_parameters: { message_id: msg.message_id },
   }).catch(e => console.error(`[conv] off note: ${e}`))
+}
+
+// A message with no words the bridge can read used to vanish without a trace — not
+// logged, not recorded, not answered. Now it is logged with its fields, so a new kind
+// shows up in bridge.log, and a person who sent content (not a service message such
+// as someone joining) is told once per topic per ten minutes rather than ignored.
+const UNREADABLE_CONTENT = ['story', 'game', 'invoice', 'giveaway', 'giveaway_winners', 'paid_media', 'rich_message']
+const unreadableNoted = new Map<string, number>()
+async function noteUnreadable(ctx: Context, msg: any, key: string): Promise<void> {
+  const fields = Object.keys(msg).filter(k => !['message_id', 'from', 'chat', 'date', 'message_thread_id', 'is_topic_message'].includes(k))
+  console.log(`[in] skipped: nothing readable in #${msg.message_id} chat=${ctx.chat!.id} topic=${msg.message_thread_id ?? '-'} (fields: ${fields.join(', ') || 'none'})`)
+  const kind = UNREADABLE_CONTENT.find(k => k in msg)
+  if (!kind || !isAllowed(ctx)) return
+  const k = `${key}:${ctx.from!.id}`
+  if (Date.now() - (unreadableNoted.get(k) ?? 0) < 10 * 60 * 1000) return
+  unreadableNoted.set(k, Date.now())
+  const what = kind === 'rich_message' ? 'message' : kind.replace(/_/g, ' ')
+  await ctx.api.sendMessage(ctx.chat!.id, `I can't read this kind of ${what} yet, so it didn't reach me.`, {
+    ...destOpts({ threadId: msg.message_thread_id, replyTo: msg.message_id }), disable_notification: true,
+    ...(ctx.chat!.type === 'private' ? {} : { ephemeral_message_parameters: { receiver_user_id: ctx.from!.id } }),
+  }).catch(e => console.error(`[in] unreadable note: ${e}`))
 }
 
 // A group the bot has never had a Topic mode for gets one from its size the first
@@ -4668,14 +4691,14 @@ async function speakAnswer(ctx: Context, threadId: number | undefined, key: stri
 // Prompts kept so a "no answer" can be retried with one tap. In memory only and
 // capped: a retry after a restart is not worth persisting state for, and the
 // button says so rather than silently doing nothing.
-const retryPrompts = new Map<string, { key: string; threadId?: number; prompt: string; replyTo?: number }>()
+const retryPrompts = new Map<string, { key: string; threadId?: number; prompt: string; replyTo?: number; forwarded?: Forwarded }>()
 const RETRY_MAX = 50
 
 // A turn that came back with nothing is reported as such, with the offer to run it
 // again. Deliberately a button rather than an automatic resend: the turn may
 // already have edited files or run commands, and repeating those without being
 // asked is worse than the missing answer.
-async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: string, prompt: string, replyTo?: number): Promise<void> {
+async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: string, prompt: string, replyTo?: number, forwarded?: Forwarded): Promise<void> {
   const opts: any = destOpts({ threadId, replyTo })
   const msg = await ctx.api.sendMessage(ctx.chat!.id,
     '⚠️ No answer came back for that message. Nothing was lost — tap to send it again.',
@@ -4683,7 +4706,7 @@ async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: str
   ).catch(() => null)
   if (!msg) return
   if (retryPrompts.size >= RETRY_MAX) retryPrompts.delete(retryPrompts.keys().next().value as string)
-  retryPrompts.set(String(msg.message_id), { key, threadId, prompt, replyTo })
+  retryPrompts.set(String(msg.message_id), { key, threadId, prompt, replyTo, ...(forwarded ? { forwarded } : {}) })
   await ctx.api.editMessageReplyMarkup(ctx.chat!.id, msg.message_id, {
     reply_markup: { inline_keyboard: [[{ text: '🔁 Retry', callback_data: `retry:${msg.message_id}` }]] },
   }).catch(() => {})
@@ -5042,10 +5065,20 @@ type PromptKind = {
   // covers. It runs without a status message and posts nothing if the model
   // declines with SILENT_REPLY (or fails — nobody is waiting for an error).
   auto?: { reason: string; text?: string }
+  // Messages the person forwarded: a forwardedPreamble block, handed over before their
+  // own message, and the forwarded words themselves for the status and the search.
+  forwarded?: Forwarded
 }
+type Forwarded = { block: string; text: string }
 // A person's message the way the model must see it to act on it: behind the marker
 // the system prompt declares. Anything the model is asked to DO goes through this —
 // text without the marker is, by that same prompt, material and never an instruction.
+// A forwarded message's words as material for the turn, or undefined if it is not one.
+function forwardedOf(ctx: Context, msg: any, text: string): Forwarded | undefined {
+  const from = forwardedFrom(msg)
+  if (!from) return undefined
+  return { block: forwardedPreamble(BRIDGE_NONCE, userName(ctx.from!), [{ from, date: msg.forward_origin.date, text }]), text }
+}
 const frameFrom = (ctx: Context, text: string) => frameUserMessage(text, {
   nonce: BRIDGE_NONCE,
   name: [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username,
@@ -5149,19 +5182,23 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   // embeds them), and a bot that shows nothing for that long looks slow. The turn is a
   // job from this moment, so Interrupt, /stop and /jobs reach it while it prepares.
   // An Auto turn has no status at all.
-  const early = (conv || plink) && !kind.auto ? await postEarlyStatus(ctx, threadId, key, prompt, replyTo) : undefined
+  // What the turn is about, for the status, the search and what was asked: the
+  // person's own words, or what they forwarded when they added none.
+  const said = prompt || kind.forwarded?.text || ''
+  const early = (conv || plink) && !kind.auto ? await postEarlyStatus(ctx, threadId, key, said, replyTo) : undefined
   const convBlock = plink
-    ? await privateContext(ctx, key, plink, prompt, cwd, early && (() => { early.edit = showEarlyStep(ctx, early, '🔎 Searching the history…') }))
+    ? await privateContext(ctx, key, plink, said, cwd, early && (() => { early.edit = showEarlyStep(ctx, early, '🔎 Searching the history…') }))
       .catch(e => { console.error(`[private] ${key}: ${e}`); return '' })
     : conv
     ? await conversationContext(ctx, key, threadId, conv.msgId, conv.reply, cwd, {
-        through: !!kind.auto, text: kind.auto ? kind.auto.text ?? '' : prompt,
+        through: !!kind.auto, text: kind.auto ? kind.auto.text ?? '' : said,
         onSearch: early && (() => { early.edit = showEarlyStep(ctx, early, '🔎 Searching the history…') }),
       }).catch(e => { console.error(`[conv] ${key}: ${e}`); return '' })
     : ''
   // Landed before the run shows what the recall found, so it can never overwrite it.
   await early?.edit
-  const framed = shareNote + filesPreamble(BRIDGE_NONCE, arrived) + preamble + convBlock + (kind.auto ? autoFrame(kind.auto.reason) : frameFrom(ctx, prompt))
+  const framed = shareNote + filesPreamble(BRIDGE_NONCE, arrived) + preamble + convBlock + (kind.auto ? autoFrame(kind.auto.reason)
+    : (kind.forwarded?.block ?? '') + frameFrom(ctx, prompt || (kind.forwarded ? '(nothing of their own: only the forwarded messages above)' : '')))
   // If this topic has a live link, the shared link is the source of truth for the
   // session id, so a conversation held over the live web call continues here (and
   // vice-versa). Otherwise use the topic's own stored id.
@@ -5244,10 +5281,10 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
       return
     }
     if (res.noAnswer) {
-      await sendNoAnswer(ctx, threadId, key, prompt, replyLink())
+      await sendNoAnswer(ctx, threadId, key, prompt, replyLink(), kind.forwarded)
       return
     }
-    if (!background && !res.isError && res.text.trim()) rememberAsked(key, prompt)
+    if (!background && !res.isError && res.text.trim()) rememberAsked(key, said)
     // When the turn's closing block only promises future work or refers to work
     // the user never saw, deliver the substantive block before it as well. The
     // rest of the turn's text is in the run record above, so this is an
@@ -5769,7 +5806,7 @@ function privateReplyRecord(reply: any): ConvRecord | undefined {
   if (r) return r
   // An answer with a table or the like went out as a rich message, whose words are in
   // blocks rather than `text`.
-  const text = String(reply.text || reply.caption || richMessageText(reply.rich_message)).trim()
+  const text = incomingText(reply)
   if (!reply.from?.is_bot || !text) return undefined
   return { id: reply.message_id, t: reply.date, from: reply.from.id, name: reply.from.first_name || 'the bot',
     ...(reply.from.username ? { username: reply.from.username } : {}), text }
@@ -6182,7 +6219,7 @@ bot.on('message', async ctx => {
   if (ctx.chat.type !== 'private') {
     const gKey = keyFor(chatId, threadId)
     await ensureGroupMode(ctx, threadId)
-    const isCmd = (msg.text ?? '').startsWith('/')
+    const isCmd = !(msg as any).forward_origin && (msg.text ?? '').startsWith('/')
     const awaitedReply = !!msg.reply_to_message && awaitingInput.has(`${chatId}:${msg.reply_to_message.message_id}`)
     if (!isCmd && !awaitedReply) {
       const answers = answersFor(gKey)
@@ -6193,7 +6230,7 @@ bot.on('message', async ctx => {
       // Auto: an unmentioned message may be worth joining in on. The judge decides,
       // after a pause; see scheduleAutoLook.
       if (answers === 'auto' && !addressed) {
-        if (isAllowed(ctx)) scheduleAutoLook(ctx, gKey, threadId, String(msg.text || msg.caption || ''))
+        if (isAllowed(ctx)) scheduleAutoLook(ctx, gKey, threadId, incomingText(msg))
         return
       }
     }
@@ -6233,9 +6270,11 @@ bot.on('message', async ctx => {
       let saved: string
       try { saved = await receiveFile(ctx, attachment, cwd, aKey) }
       catch (e) { await send(ctx, threadId, `⚠️ couldn't save file: ${e}`); return }
+      const forwarded = caption ? forwardedOf(ctx, msg, caption) : undefined
       if (caption) {
-        await handlePrompt(ctx, threadId, aKey, `[The user attached a file, saved at ${saved} (./${relative(cwd, saved)}).]\n\n${caption}`, undefined, ctx.message?.message_id,
-          { conv: { msgId: msg.message_id, reply: msg.reply_to_message } })
+        const note = `[The user ${forwarded ? 'forwarded' : 'attached'} a file, saved at ${saved} (./${relative(cwd, saved)}).]`
+        await handlePrompt(ctx, threadId, aKey, forwarded ? note : `${note}\n\n${caption}`, undefined, ctx.message?.message_id,
+          { conv: { msgId: msg.message_id, reply: msg.reply_to_message }, forwarded })
       } else {
         // A receipt, not an instruction. The next turn is told about the file by
         // the bridge, so there is nothing for the user to do — asking them to
@@ -6248,9 +6287,12 @@ bot.on('message', async ctx => {
     return
   }
 
-  const text = msg.text?.trim()
-  if (!text) return
+  // Only typed text can be a command: a forwarded "/new" is someone else's words, and a
+  // rich message or a poll has no command in it. Everything else is read for its words.
+  const typed = (msg as any).forward_origin ? '' : msg.text?.trim() ?? ''
+  const text = typed || incomingText(msg)
   const key = keyFor(chatId, threadId)
+  if (!text) { await noteUnreadable(ctx, msg, key); return }
   console.log(`[in] chat=${chatId}(${ctx.chat.type}) topic=${threadId ?? '-'} from=${ctx.from.id}${(msg as any).ephemeral_message_id ? ' (ephemeral)' : ''} ${JSON.stringify(text).slice(0, 100)}`)
   // An ephemeral command (picked from the menu, e.g. /config) can be answered only
   // privately and only for a few seconds; one Telegram delivers again later would get
@@ -6266,7 +6308,7 @@ bot.on('message', async ctx => {
     }
   }
 
-  const cmd = text.startsWith('/') ? text.split(/\s+/)[0].replace(/@.*$/, '').toLowerCase() : ''
+  const cmd = typed.startsWith('/') ? typed.split(/\s+/)[0].replace(/@.*$/, '').toLowerCase() : ''
   // Track EVERY inbound message, commands included. A /interrupt typed while a
   // turn runs is as much of a separator as another question would be, and an
   // answer arriving after it is no longer adjacent to what it answers.
@@ -6951,6 +6993,10 @@ bot.on('message', async ctx => {
   }
   if (cmd) { await send(ctx, threadId, `Unknown command. Try /help`, true); return }
 
+  // A forward is someone else's words: handed over as material, not as this person's.
+  const forwarded = forwardedOf(ctx, msg, text)
+  const prompt = forwarded ? '' : text
+
   // Interrupt mode: cancel the run in progress so this message starts immediately
   // (its reply arrives as a new message, after the interrupted one stops).
   if (isInterrupt(key) && jobsFor(key).length) {
@@ -6973,9 +7019,9 @@ bot.on('message', async ctx => {
       { ...destOpts({ threadId, replyTo: msg.message_id }), disable_notification: true,
         reply_markup: { inline_keyboard: [[{ text: PARALLEL_LABEL, callback_data: `par:${msg.message_id}` }]] } },
     ).catch(() => null)
-    offered.set(msg.message_id, { key, threadId, prompt: text, offerMsgId: offer?.message_id })
+    offered.set(msg.message_id, { key, threadId, prompt, forwarded, offerMsgId: offer?.message_id })
   }
-  enqueue(key, () => handlePrompt(ctx, threadId, key, text, undefined, msg.message_id, { conv: { msgId: msg.message_id, reply: msg.reply_to_message } }))
+  enqueue(key, () => handlePrompt(ctx, threadId, key, prompt, undefined, msg.message_id, { conv: { msgId: msg.message_id, reply: msg.reply_to_message }, forwarded }))
     .catch(e => console.error(`[error] task ${key}: ${e}`))
 })
 
@@ -7106,7 +7152,7 @@ bot.on('callback_query:data', async ctx => {
     if (rec.offerMsgId) await ctx.api.deleteMessage(ctx.chat!.id, rec.offerMsgId).catch(() => {})
     else await ctx.editMessageReplyMarkup(undefined).catch(() => {})
     void enqueue(`${rec.key}#bg-${id}`,
-      () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, id, { forceReplyLink: true, background: true, promoted: true }))
+      () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, id, { forceReplyLink: true, background: true, promoted: true, forwarded: rec.forwarded }))
       .catch(e => console.error(`[error] parallel ${rec.key}: ${e}`))
     return
   }
@@ -7124,7 +7170,7 @@ bot.on('callback_query:data', async ctx => {
     retryPrompts.delete(data.slice(6))
     await ctx.answerCallbackQuery({ text: 'Retrying…' }).catch(() => {})
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})   // one tap only
-    void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo, { forceReplyLink: true }))
+    void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo, { forceReplyLink: true, forwarded: rec.forwarded }))
       .catch(e => console.error(`[error] retry ${rec.key}: ${e}`))
     return
   }
