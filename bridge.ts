@@ -3079,7 +3079,7 @@ const convFetched = new Map<string, string>()
 // answered — or, on an Auto turn, what was just said (see recallBlock). `onSearch` is
 // told when the recall starts searching, which is the slow part.
 async function conversationContext(ctx: Context, key: string, threadId: number | undefined, msgId: number, reply: any, cwd: string,
-  o: { through?: boolean; text?: string; onSearch?: () => void } = {}): Promise<string> {
+  o: { through?: boolean; text?: string; onSearch?: () => void; skip?: number[] } = {}): Promise<string> {
   const { through = false, text = '' } = o
   const chatId = ctx.chat!.id
   const recording = recordsFor(key)
@@ -3090,11 +3090,13 @@ async function conversationContext(ctx: Context, key: string, threadId: number |
   const targetId: number | undefined = reply && !reply.forum_topic_created && reply.from?.id !== ctx.me?.id ? reply.message_id : undefined
   // In Bot chat every message is a turn of its own; there is nothing in between.
   let { window, since } = contextParts(recs, { mark, currentId: through ? msgId + 1 : msgId, targetId, withSince: readsAlong(answersFor(key)) })
+  // A burst's own messages are the turn itself, not talk around it.
+  if (o.skip?.length) { const own = new Set(o.skip); window = window.filter(r => !own.has(r.id)); since = since.filter(r => !own.has(r.id)) }
   // Not recorded (before recording began, or recording is off): Telegram still
   // hands over the message itself.
   if (targetId !== undefined && !window.length) { const r = recordOf(reply, false); if (r) window = [r] }
   const recalled = recallFor(key) ? await recallBlock(chatId, key, text, {
-    exclude: new Set([msgId, ...since.map(r => r.id), ...window.map(r => r.id)]),
+    exclude: new Set([msgId, ...(o.skip ?? []), ...since.map(r => r.id), ...window.map(r => r.id)]),
     context: [...window, ...since].slice(-6).map(r => r.text).join('\n') || undefined, asked: lastAskedFor(key),
     recentSince: mark, onSearch: o.onSearch,
   }).catch(e => { console.error(`[ctx] recall: ${e}`); return '' }) : ''
@@ -3530,7 +3532,8 @@ function uniquePath(dir: string, name: string): string {
 }
 
 // The downloadable attachment on a message, if any (largest size for photos).
-function pickAttachment(msg: any): { fileId: string; name: string; size: number } | null {
+type Attachment = { fileId: string; name: string; size: number }
+function pickAttachment(msg: any): Attachment | null {
   const d = msg.document; if (d) return { fileId: d.file_id, name: d.file_name || 'document', size: d.file_size || 0 }
   if (msg.photo?.length) { const p = msg.photo[msg.photo.length - 1]; return { fileId: p.file_id, name: `photo-${p.file_unique_id}.jpg`, size: p.file_size || 0 } }
   const v = msg.video; if (v) return { fileId: v.file_id, name: v.file_name || `video-${v.file_unique_id}.mp4`, size: v.file_size || 0 }
@@ -5060,7 +5063,7 @@ type PromptKind = {
   promoted?: boolean
   // A message in a group: hand over the conversation around it (see
   // conversationContext). The id is the triggering message; reply is what it replies to.
-  conv?: { msgId: number; reply?: any }
+  conv?: { msgId: number; reply?: any; skip?: number[] }
   // An Auto-mode turn nobody asked for: conv.msgId is then the newest message it
   // covers. It runs without a status message and posts nothing if the model
   // declines with SILENT_REPLY (or fails — nobody is waiting for an error).
@@ -5192,7 +5195,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     : conv
     ? await conversationContext(ctx, key, threadId, conv.msgId, conv.reply, cwd, {
         through: !!kind.auto, text: kind.auto ? kind.auto.text ?? '' : said,
-        onSearch: early && (() => { early.edit = showEarlyStep(ctx, early, '🔎 Searching the history…') }),
+        onSearch: early && (() => { early.edit = showEarlyStep(ctx, early, '🔎 Searching the history…') }), skip: conv.skip,
       }).catch(e => { console.error(`[conv] ${key}: ${e}`); return '' })
     : ''
   // Landed before the run shows what the recall found, so it can never overwrite it.
@@ -6224,12 +6227,21 @@ bot.on('message', async ctx => {
     if (!isCmd && !awaitedReply) {
       const answers = answersFor(gKey)
       const addressed = mentionsBot(ctx, msg)
-      if (recordsFor(gKey) && ALLOWED_CHATS.has(String(chatId))) recordMessage(msg, answers === 'all' || (readsAlong(answers) && addressed))
+      // Sent in the same burst as a mention (the comment typed with a forward arrives
+      // before the forwards): part of that turn, though it names nobody.
+      const joining = !addressed && inBurst(gKey, ctx.from.id)
+      if (recordsFor(gKey) && ALLOWED_CHATS.has(String(chatId))) recordMessage(msg, answers === 'all' || (readsAlong(answers) && (addressed || joining)))
       if (answers === 'never') { if (addressed && isAllowed(ctx)) await offNote(ctx, msg); return }
-      if (answers === 'mentions' && !addressed) return
+      // Opened here, before anything slower: the rest of the burst is handled
+      // concurrently and must find it open.
+      if (addressed && answers !== 'all' && !msg.voice && !msg.video_note && isAllowed(ctx)) openBurst(ctx, gKey, threadId, msg.message_id)
+      // Not part of a burst yet, but it may be: handled concurrently, a forward can get
+      // here before the comment typed with it has opened one.
+      if (!addressed && !joining && readsAlong(answers) && isAllowed(ctx)) holdStray(gKey, ctx.from.id, msg)
+      if (answers === 'mentions' && !addressed && !joining) return
       // Auto: an unmentioned message may be worth joining in on. The judge decides,
       // after a pause; see scheduleAutoLook.
-      if (answers === 'auto' && !addressed) {
+      if (answers === 'auto' && !addressed && !joining) {
         if (isAllowed(ctx)) scheduleAutoLook(ctx, gKey, threadId, incomingText(msg))
         return
       }
@@ -6262,28 +6274,8 @@ bot.on('message', async ctx => {
   const attachment = pickAttachment(msg)
   if (attachment) {
     if (!isAllowed(ctx)) return
-    const aKey = keyFor(chatId, threadId)
-    const caption = msg.caption?.trim()
     console.log(`[in] chat=${chatId} topic=${threadId ?? '-'} from=${ctx.from.id} file=${attachment.name} (${fmtBytes(attachment.size)})`)
-    enqueue(aKey, async () => {
-      const cwd = resolveCwd(ctx, threadId)
-      let saved: string
-      try { saved = await receiveFile(ctx, attachment, cwd, aKey) }
-      catch (e) { await send(ctx, threadId, `⚠️ couldn't save file: ${e}`); return }
-      const forwarded = caption ? forwardedOf(ctx, msg, caption) : undefined
-      if (caption) {
-        const note = `[The user ${forwarded ? 'forwarded' : 'attached'} a file, saved at ${saved} (./${relative(cwd, saved)}).]`
-        await handlePrompt(ctx, threadId, aKey, forwarded ? note : `${note}\n\n${caption}`, undefined, ctx.message?.message_id,
-          { conv: { msgId: msg.message_id, reply: msg.reply_to_message }, forwarded })
-      } else {
-        // A receipt, not an instruction. The next turn is told about the file by
-        // the bridge, so there is nothing for the user to do — asking them to
-        // repeat a path back was bookkeeping the bridge was already doing.
-        const rel = `./${relative(cwd, saved)}`
-        ;(pendingFiles[aKey] ??= []).push({ abs: saved, rel })
-        await send(ctx, threadId, `📎 Saved → ${rel}`, true)
-      }
-    }).catch(e => console.error(`[error] file task ${aKey}: ${e}`))
+    await gather(ctx, keyFor(chatId, threadId), threadId, { msg, text: msg.caption?.trim() ?? '', att: attachment })
     return
   }
 
@@ -6993,10 +6985,37 @@ bot.on('message', async ctx => {
   }
   if (cmd) { await send(ctx, threadId, `Unknown command. Try /help`, true); return }
 
-  // A forward is someone else's words: handed over as material, not as this person's.
-  const forwarded = forwardedOf(ctx, msg, text)
-  const prompt = forwarded ? '' : text
+  await gather(ctx, key, threadId, { msg, text })
+})
 
+// One file, on its own: saved, and its caption (if any) run as the prompt.
+function takeAttachment(ctx: Context, key: string, threadId: number | undefined, msg: any, attachment: Attachment): void {
+  const caption = msg.caption?.trim()
+  enqueue(key, async () => {
+    const cwd = resolveCwd(ctx, threadId)
+    let saved: string
+    try { saved = await receiveFile(ctx, attachment, cwd, key) }
+    catch (e) { await send(ctx, threadId, `⚠️ couldn't save file: ${e}`); return }
+    const forwarded = caption ? forwardedOf(ctx, msg, caption) : undefined
+    if (caption) {
+      const note = `[The user ${forwarded ? 'forwarded' : 'attached'} a file, saved at ${saved} (./${relative(cwd, saved)}).]`
+      await handlePrompt(ctx, threadId, key, forwarded ? note : `${note}\n\n${caption}`, undefined, msg.message_id,
+        { conv: { msgId: msg.message_id, reply: msg.reply_to_message }, forwarded })
+    } else {
+      // A receipt, not an instruction. The next turn is told about the file by
+      // the bridge, so there is nothing for the user to do — asking them to
+      // repeat a path back was bookkeeping the bridge was already doing.
+      const rel = `./${relative(cwd, saved)}`
+      ;(pendingFiles[key] ??= []).push({ abs: saved, rel })
+      await send(ctx, threadId, `📎 Saved → ${rel}`, true)
+    }
+  }).catch(e => console.error(`[error] file task ${key}: ${e}`))
+}
+
+// Queue a turn for a person's message (or a burst of them, `msg` being the first).
+async function startTurn(ctx: Context, key: string, threadId: number | undefined, msg: any, prompt: string,
+  o: { forwarded?: Forwarded; conv?: PromptKind['conv']; prepare?: () => Promise<void> } = {}): Promise<void> {
+  const { forwarded } = o
   // Interrupt mode: cancel the run in progress so this message starts immediately
   // (its reply arrives as a new message, after the interrupted one stops).
   if (isInterrupt(key) && jobsFor(key).length) {
@@ -7013,7 +7032,7 @@ bot.on('message', async ctx => {
     const ahead = jobsFor(key)[0]
     const waited = ahead ? Math.max(1, Math.round((Date.now() - ahead.startedAt) / 1000)) : 0
     const how = waited >= 90 ? `${Math.round(waited / 60)}m` : `${waited}s`
-    const offer = await ctx.api.sendMessage(ctx.chat.id,
+    const offer = await ctx.api.sendMessage(ctx.chat!.id,
       ahead ? `⏳ Still working on an earlier message (${how}). This one will run after it.`
             : `⏳ Something is already queued here. This one will run after it.`,
       { ...destOpts({ threadId, replyTo: msg.message_id }), disable_notification: true,
@@ -7021,9 +7040,128 @@ bot.on('message', async ctx => {
     ).catch(() => null)
     offered.set(msg.message_id, { key, threadId, prompt, forwarded, offerMsgId: offer?.message_id })
   }
-  enqueue(key, () => handlePrompt(ctx, threadId, key, prompt, undefined, msg.message_id, { conv: { msgId: msg.message_id, reply: msg.reply_to_message }, forwarded }))
-    .catch(e => console.error(`[error] task ${key}: ${e}`))
-})
+  enqueue(key, async () => {
+    await o.prepare?.()
+    await handlePrompt(ctx, threadId, key, prompt, undefined, msg.message_id, { conv: o.conv ?? { msgId: msg.message_id, reply: msg.reply_to_message }, forwarded })
+  }).catch(e => console.error(`[error] task ${key}: ${e}`))
+}
+
+// ---------------------------------------------------------------------------
+// Bursts: several messages sent at once are one turn
+// ---------------------------------------------------------------------------
+//
+// A batch of forwards, a long text the client splits at 4,096 characters, an album:
+// each arrives as a message of its own, and each used to run as a turn that saw only
+// its own piece. Measured 2026-10-15, they land within a fraction of a second of each
+// other (forwards and split parts 0–110 ms apart, the comment typed with a forward
+// usually ~50 ms before them), while messages typed one by one were 1.3 s apart at
+// the fastest. So a person's messages in a topic wait for a short quiet and run as
+// one turn; a stream that never goes quiet runs at the cap. Gathered by timing alone:
+// forwards of your own messages arrive with no forward_origin at all.
+let BURST_QUIET_MS = Number(process.env.TG_BURST_QUIET_MS ?? 250)
+let BURST_CAP_MS = Number(process.env.TG_BURST_CAP_MS ?? 1000)
+type BurstPart = { msg: any; text: string; att?: Attachment }
+type Burst = { ctx: Context; key: string; threadId?: number; parts: BurstPart[]; firstAt: number; timer?: ReturnType<typeof setTimeout> }
+const bursts = new Map<string, Burst>()
+const burstRuns = new Set<Promise<void>>()
+const burstKey = (key: string, userId: number) => `${key}|${userId}`
+const inBurst = (key: string, userId: number) => bursts.has(burstKey(key, userId))
+
+function burstFor(ctx: Context, key: string, threadId: number | undefined): Burst {
+  const bk = burstKey(key, ctx.from!.id)
+  let b = bursts.get(bk)
+  if (!b) { b = { ctx, key, threadId, parts: [], firstAt: Date.now() }; bursts.set(bk, b) }
+  return b
+}
+// (Re)arm the timer: the quiet after the newest message, never past the cap.
+function armBurst(b: Burst): void {
+  if (b.timer) clearTimeout(b.timer)
+  const bk = burstKey(b.key, b.ctx.from!.id)
+  b.timer = setTimeout(() => {
+    bursts.delete(bk)
+    const run = runBurst(b).catch(e => console.error(`[error] burst ${b.key}: ${e}`)).finally(() => burstRuns.delete(run))
+    burstRuns.add(run)
+  }, Math.max(0, Math.min(BURST_QUIET_MS, b.firstAt + BURST_CAP_MS - Date.now())))
+}
+// A mention opens the burst before its own handling is done, so the messages after
+// it, handled concurrently, are seen to belong to it. Any that got past the topic's
+// gate first are adopted: sent after the mention (a higher id), within the cap.
+function openBurst(ctx: Context, key: string, threadId: number | undefined, msgId: number): void {
+  if (BURST_QUIET_MS <= 0 || inBurst(key, ctx.from!.id)) return
+  const b = burstFor(ctx, key, threadId)
+  const bk = burstKey(key, ctx.from!.id)
+  const held = (strays.get(bk) ?? []).filter(h => Date.now() - h.at <= BURST_CAP_MS && h.part.msg.message_id > msgId)
+  strays.delete(bk)
+  b.parts.push(...held.map(h => h.part))
+  armBurst(b)
+}
+// A person's unaddressed messages in a reading-along topic, kept for the length of the
+// cap in case a mention they sent just before turns out to own them.
+const strays = new Map<string, { at: number; part: BurstPart }[]>()
+function holdStray(key: string, userId: number, msg: any): void {
+  if (BURST_QUIET_MS <= 0 || msg.voice || msg.video_note) return
+  const bk = burstKey(key, userId)
+  const now = Date.now()
+  const kept = (strays.get(bk) ?? []).filter(h => now - h.at <= BURST_CAP_MS)
+  kept.push({ at: now, part: { msg, text: incomingText(msg), att: pickAttachment(msg) ?? undefined } })
+  strays.set(bk, kept.slice(-50))
+  // Nothing claims them after the cap; don't keep the map growing.
+  setTimeout(() => { const l = strays.get(bk); if (l && l.every(h => Date.now() - h.at > BURST_CAP_MS)) strays.delete(bk) }, BURST_CAP_MS + 50)
+}
+// Off (a quiet of 0) runs each message at once, as before bursts.
+async function gather(ctx: Context, key: string, threadId: number | undefined, part: BurstPart): Promise<void> {
+  if (BURST_QUIET_MS <= 0) return runBurst({ ctx, key, threadId, parts: [part], firstAt: Date.now() })
+  const b = burstFor(ctx, key, threadId)
+  b.parts.push(part)
+  armBurst(b)
+}
+
+async function runBurst(b: Burst): Promise<void> {
+  const { ctx, key, threadId } = b
+  // Handled concurrently, so possibly gathered out of order.
+  const parts = b.parts.sort((x, y) => x.msg.message_id - y.msg.message_id)
+  if (!parts.length) return
+  if (parts.length === 1) {
+    const [p] = parts
+    if (p.att) return takeAttachment(ctx, key, threadId, p.msg, p.att)
+    const forwarded = forwardedOf(ctx, p.msg, p.text)
+    return startTurn(ctx, key, threadId, p.msg, forwarded ? '' : p.text, { forwarded })
+  }
+  const first = parts[0].msg, last = parts[parts.length - 1].msg
+  console.log(`[in] ${key}: ${parts.length} messages from ${ctx.from!.id} at once (#${first.message_id}–#${last.message_id}), one turn`)
+  // What the person wrote, split parts and captions included, in order; what they
+  // forwarded goes to the model as material.
+  const own = parts.filter(p => p.text && !forwardedFrom(p.msg)).map(p => p.text).join('\n')
+  const fwds = parts.filter(p => p.text && forwardedFrom(p.msg))
+    .map(p => ({ from: forwardedFrom(p.msg)!, date: p.msg.forward_origin.date, text: p.text }))
+  const forwarded = fwds.length
+    ? { block: forwardedPreamble(BRIDGE_NONCE, userName(ctx.from!), fwds), text: fwds.map(f => f.text).join('\n') } : undefined
+  const files = parts.filter(p => p.att)
+  // Saved before the turn, and handed to it the way an uncaptioned file always is.
+  const save = async (): Promise<string[]> => {
+    const cwd = resolveCwd(ctx, threadId)
+    const rels: string[] = []
+    for (const p of files) {
+      try {
+        const abs = await receiveFile(ctx, p.att!, cwd, key)
+        const rel = `./${relative(cwd, abs)}`
+        ;(pendingFiles[key] ??= []).push({ abs, rel })
+        rels.push(rel)
+      } catch (e) { await send(ctx, threadId, `⚠️ couldn't save ${p.att!.name}: ${e}`) }
+    }
+    return rels
+  }
+  if (!own && !forwarded) {
+    // Only files with nothing said: one receipt, as a single file gets.
+    enqueue(key, async () => {
+      const rels = await save()
+      if (rels.length) await send(ctx, threadId, `📎 Saved → ${rels.join(', ')}`, true)
+    }).catch(e => console.error(`[error] file task ${key}: ${e}`))
+    return
+  }
+  await startTurn(ctx, key, threadId, first, own, { forwarded, prepare: async () => { await save() },
+    conv: { msgId: last.message_id, reply: first.reply_to_message, skip: parts.map(p => p.msg.message_id) } })
+}
 
 // An edit updates what was recorded, so a mention hands over what the message says
 // now. The Bot API reports edits but never deletions; a deleted message stays until
@@ -7647,6 +7785,11 @@ export function _setNormaliseSpeech(on: boolean): boolean {
 }
 
 export function _drainQueue(key: string): Promise<unknown> { return queues.get(key) ?? Promise.resolve() }
+export function _setBurst(quietMs: number, capMs: number): void { BURST_QUIET_MS = quietMs; BURST_CAP_MS = capMs }
+// Until every open burst has run and queued its turn.
+export async function _settleBursts(): Promise<void> {
+  while (bursts.size || burstRuns.size) { await Bun.sleep(5); await Promise.all([...burstRuns]) }
+}
 // Auto mode: look now instead of after the pause, and wait for whatever it starts.
 export async function _autoLookNow(key: string): Promise<boolean> {
   const w = autoWaiting.get(key)

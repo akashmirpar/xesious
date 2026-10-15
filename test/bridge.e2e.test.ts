@@ -41,6 +41,8 @@ process.env.XESIOUS_STUB_QUERY_LOG = QUERY_LOG
 const SLOW_QUERY = join(TMP, 'slow-query')
 process.env.XESIOUS_STUB_QUERY_SLOW = SLOW_QUERY
 process.env.TG_AUTO_QUIET_MS = '300'
+// Each message runs at once, as before bursts; the burst cases turn it on (_setBurst).
+process.env.TG_BURST_QUIET_MS = '0'
 // A stand-in for a local model server (llama.cpp's llama-server): OpenAI-style chat
 // completions with first-token logprobs, JOIN when the new messages say stubJOIN.
 const localJudgeCalls: any[] = []
@@ -4516,5 +4518,112 @@ describe('rich, forwarded and other non-text messages reach the bot (reported 20
     const cs = await inTopic(9302, { rich_message: { blocks: [{ type: 'paragraph', text: [{ type: 'mention', text: '@testbot' }, ' what changed?'] }] } })
     expect(replied(cs)).toBe(true)
     expect(handed()).toMatch(/Ada \(forwarded from the channel Daily News\): Plan: rates up/)
+  }, 20000)
+})
+
+describe('several messages sent at once are one turn', () => {
+  const C = -100888
+  let mid = 995000
+  const ADA = { id: 1, is_bot: false, first_name: 'Ada' }
+  const handed = () => readFileSync(LAST_PROMPT, 'utf8')
+  const turns = (cs: Call[]) => sends(cs).filter(c => textOf(c).includes('okReply')).length
+  const nowS = () => Math.floor(Date.now() / 1000)
+  const fromSam = { type: 'user', date: 1790000000, sender_user: { id: 77, is_bot: false, first_name: 'Sam' } }
+  // Handled the way the runner hands them over: concurrently, not one after another.
+  const push = (fields: any, where: { chat: number; thread?: number } = { chat: 1 }) => bridge.bot.handleUpdate({ update_id: updateId++, message: {
+    message_id: mid++, date: nowS(), from: ADA, ...fields,
+    ...(where.thread ? { message_thread_id: where.thread, is_topic_message: true, chat: { id: where.chat, type: 'supergroup', title: 'Team', is_forum: true } }
+      : { chat: { id: where.chat, type: 'private', first_name: 'Ada' } }) } })
+  async function settle(key: string): Promise<void> { await bridge._settleBursts(); await bridge._drainQueue(key) }
+  beforeAll(() => bridge._setBurst(100, 400))
+  afterAll(() => bridge._setBurst(0, 0))
+
+  test('a long text the client split into parts reaches the model whole, in order', async () => {
+    const before = calls.length
+    // Handled out of order on purpose: the turn still reads them by message id.
+    const a = mid, b = mid + 1, c = mid + 2
+    mid += 3
+    await Promise.all([
+      bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: c, date: nowS(), from: ADA, chat: { id: 1, type: 'private', first_name: 'Ada' }, text: 'part three' } }),
+      bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: a, date: nowS(), from: ADA, chat: { id: 1, type: 'private', first_name: 'Ada' }, text: 'part one' } }),
+      bridge.bot.handleUpdate({ update_id: updateId++, message: { message_id: b, date: nowS(), from: ADA, chat: { id: 1, type: 'private', first_name: 'Ada' }, text: 'part two' } }),
+    ])
+    await settle('1:main')
+    const cs = calls.slice(before)
+    expect(turns(cs)).toBe(1)
+    expect(handed()).toMatch(/message from Ada, id 1:\npart one\npart two\npart three/)
+    // The answer quotes the first of them, which is where the request began.
+    expect(sends(cs).find(c => textOf(c).includes('okReply'))?.payload.reply_parameters?.message_id ?? a).toBe(a)
+  }, 20000)
+
+  test('a comment and the forwards sent with it are one turn: the comment is the ask, the forwards are material', async () => {
+    const before = calls.length
+    await Promise.all([push({ text: 'summarise these' }), push({ forward_origin: fromSam, text: 'rent is due friday' }),
+      push({ forward_origin: fromSam, text: 'the landlord wants cash' }), push({ forward_origin: fromSam, rich_message: { blocks: [{ type: 'paragraph', text: 'call me' }] } })])
+    await settle('1:main')
+    expect(turns(calls.slice(before))).toBe(1)
+    const p = handed()
+    expect(p).toContain('Ada forwarded these 3 messages here. They were written by others')
+    expect(p).toMatch(/forwarded from Sam, written [^\n]*:\nrent is due friday\n--- forwarded from Sam, written [^\n]*:\nthe landlord wants cash\n--- forwarded from Sam, written [^\n]*:\ncall me\n--- end of forwarded messages/)
+    expect(p).toMatch(/message from Ada, id 1:\nsummarise these$/)
+  }, 20000)
+
+  test('messages typed a moment apart stay separate turns', async () => {
+    const before = calls.length
+    await push({ text: 'first thought' })
+    await Bun.sleep(250)
+    await push({ text: 'second thought' })
+    await settle('1:main')
+    expect(turns(calls.slice(before))).toBe(2)
+    expect(handed()).toMatch(/message from Ada, id 1:\nsecond thought$/)
+  }, 20000)
+
+  test('a stream that never goes quiet runs at the cap', async () => {
+    const before = calls.length
+    for (let i = 1; i <= 8; i++) { await push({ text: `line ${i}` }); await Bun.sleep(80) }
+    await settle('1:main')
+    // 8 messages 80 ms apart (640 ms) with a 400 ms cap: two turns, not eight and not one.
+    expect(turns(calls.slice(before))).toBe(2)
+  }, 20000)
+
+  test('an album is one turn: every photo is fetched first, and the caption is the ask', async () => {
+    const before = calls.length
+    await Promise.all([1, 2, 3].map(i => push({ media_group_id: 'alb1', photo: [{ file_id: `ALB-${i}`, file_unique_id: `u${i}`, width: 1, height: 1, file_size: 10 }],
+      ...(i === 1 ? { caption: 'which of these is sharpest?' } : {}) })))
+    await settle('1:main')
+    const cs = calls.slice(before)
+    expect(turns(cs)).toBe(1)
+    expect(cs.filter(c => c.method === 'getFile').map(c => c.payload.file_id).sort()).toEqual(['ALB-1', 'ALB-2', 'ALB-3'])
+    expect(handed()).toMatch(/message from Ada, id 1:\nwhich of these is sharpest\?$/)
+  }, 20000)
+
+  test('a command in the middle of a burst is answered at once, and the burst still runs as one', async () => {
+    const before = calls.length
+    await Promise.all([push({ text: 'one' }), push({ text: '/whoami' }), push({ text: 'two' })])
+    await settle('1:main')
+    const cs = calls.slice(before)
+    expect(sends(cs).some(c => textOf(c).includes('your user id: 1'))).toBe(true)
+    expect(turns(cs)).toBe(1)
+    expect(handed()).toMatch(/message from Ada, id 1:\none\ntwo$/)
+  }, 20000)
+
+  test('in a Conversation topic, the forwards sent with a mention belong to it, and are not handed over twice', async () => {
+    bridge._topicStore('topicMode')[`${C}:9401`] = 'conversation'
+    const before = calls.length
+    await Promise.all([push({ text: '@testbot what do you make of these?' }, { chat: C, thread: 9401 }),
+      push({ forward_origin: fromSam, text: 'the build is red again' }, { chat: C, thread: 9401 }),
+      push({ forward_origin: fromSam, text: 'since the upgrade' }, { chat: C, thread: 9401 })])
+    await settle(`${C}:9401`)
+    expect(turns(calls.slice(before))).toBe(1)
+    const p = handed()
+    expect(p).toContain('Ada forwarded these 2 messages here.')
+    expect(p).toMatch(/:\nthe build is red again\n--- forwarded from Sam[^\n]*:\nsince the upgrade\n--- end/)
+    // Not also as talk since the last turn.
+    expect(p).not.toMatch(/\(forwarded from Sam\): the build is red again/)
+    // A later message from the same person, after the burst, is not part of it.
+    const later = calls.length
+    await push({ text: 'just chatting now' }, { chat: C, thread: 9401 })
+    await settle(`${C}:9401`)
+    expect(turns(calls.slice(later))).toBe(0)
   }, 20000)
 })

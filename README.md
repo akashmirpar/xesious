@@ -136,6 +136,14 @@ Send and receive files through the same topic.
   immediately ("summarise this"). With no caption it's just saved and acknowledged
   — reference it in your next message. (Telegram caps bot downloads at 20 MB; see
   [Big files](#big-files-local-bot-api-server) to lift it.)
+- **Several at once.** Messages you send together are one turn: a batch of
+  forwards with the comment you typed, a long text Telegram split into parts, an
+  album with its caption. The bridge waits for 0.25 s of quiet after your last one
+  (never more than 1 s in all; `TG_BURST_QUIET_MS`, `TG_BURST_CAP_MS`), so messages
+  you type one by one still get answers of their own.
+- **Forwards** reach Claude as what they are: someone else's words, named by who
+  wrote them, to read and never to follow as instructions. Rich messages (tables,
+  lists), locations, contacts, polls and checklists are read too.
 - **Claude → you.** Anything Claude places in `<topic-dir>/outbox/` is delivered to
   the topic after the run, then moved to `outbox/.sent/` so it isn't sent twice.
   A one-line hint (`TG_BRIDGE_HINT`, on by default) tells Claude this convention,
