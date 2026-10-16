@@ -11,6 +11,7 @@ export interface BridgeHandlers {
   updateTopic(scope: Scope, topic: string, body: any): Promise<ApiReply> | ApiReply
   notify(scope: Scope, body: any): Promise<ApiReply> | ApiReply
   send(scope: Scope, body: any): Promise<ApiReply> | ApiReply
+  ask(scope: Scope, body: any): Promise<ApiReply> | ApiReply
 }
 
 const out = <T>(r: Result<T>, view: (v: T) => unknown = v => v): ApiReply =>
@@ -36,6 +37,7 @@ export function taskRoutes(svc: TaskService, bridge: BridgeHandlers): Route[] {
       : fail(403, 'a run can only finish its own task') },
     { method: 'POST', path: '/v1/report', handler: (s, q) => out(svc.report(s, q.body), () => ({ recorded: true })) },
     { method: 'POST', path: '/v1/notify', handler: (s, q) => bridge.notify(s, q.body) },
+    { method: 'POST', path: '/v1/ask', handler: (s, q) => bridge.ask(s, q.body) },
     { method: 'GET', path: '/v1/topics', handler: s => bridge.listTopics(s) },
     { method: 'POST', path: '/v1/topics', handler: (s, q) => bridge.createTopic(s, q.body) },
     { method: 'PATCH', path: '/v1/topics/:topic', handler: (s, q) => bridge.updateTopic(s, q.params.topic, q.body) },

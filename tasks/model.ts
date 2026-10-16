@@ -123,8 +123,9 @@ export type RunState =
   | 'skipped'        // not run: still running, or missed while the bot was down
   | 'interrupted'    // the bridge stopped mid-run; never replayed on its own
   | 'deferred'       // a usage limit stopped it; not a failure
+  | 'waiting'        // it asked a question nobody has answered yet; an answer carries it on
 
-export type RunTrigger = 'schedule' | 'catchup' | 'manual' | 'event'
+export type RunTrigger = 'schedule' | 'catchup' | 'manual' | 'event' | 'answer'
 
 // What a run says about itself through the report tool.
 export type ReportOutcome = 'nothing_new' | 'done' | 'progress' | 'blocked' | 'needs_attention'
@@ -161,10 +162,34 @@ export interface Run {
   lateMs?: number         // how late it started, for a catch-up
   events?: WatchEvent[]   // what set off an event run (the newest, at most eventsPerRun)
   folded?: number         // how many events it covers in all
+  waitId?: string         // an answer run: the question it carries on from
+}
+
+// A question a task's run asked a person (the ask tool). The run waits a few minutes
+// for the answer; if none comes it stops, parked, and the answer carries it on later,
+// in its own session. After a day the default answer is used, or the question let go.
+export interface Wait {
+  id: string
+  task: string
+  run: string
+  chat: string
+  thread?: number
+  question: string
+  options?: string[]
+  defaultAnswer?: string
+  askedMsg?: number
+  askedAt: string
+  deadline: string
+  state: 'open' | 'parked' | 'answered' | 'expired'
+  answer?: string
+  answeredBy?: string
+  answeredById?: string
+  answeredAt?: string
+  sessionId?: string      // the asking run's session, to carry on in
 }
 
 // One glyph per run, for lists and the strip on a card.
-export type RunMark = 'posted' | 'quiet' | 'blocked' | 'failed' | 'skipped' | 'deferred' | 'interrupted' | 'running'
+export type RunMark = 'posted' | 'quiet' | 'blocked' | 'failed' | 'skipped' | 'deferred' | 'interrupted' | 'running' | 'waiting'
 
 export const LIMITS = {
   tasksPerTopic: 20,
@@ -184,6 +209,9 @@ export const LIMITS = {
   pollTimeoutMs: 5 * 60_000,         // a polled watcher must print and exit within this
   watchUpResetMs: 10 * 60_000,       // a streaming watcher up this long starts its failure count afresh
   watchBackoffMs: [5_000, 15_000, 60_000, 5 * 60_000, 15 * 60_000],
+  // Questions:
+  askWaitMaxMs: 10 * 60_000,         // a run waits this long at most for an answer, then parks
+  askKeepMs: 24 * 60 * 60_000,       // a parked question is kept this long
   // Scripts:
   scriptTimeoutMs: 30 * 60_000,
   scriptTimeoutMaxMs: 4 * 60 * 60_000,

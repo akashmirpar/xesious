@@ -5266,6 +5266,58 @@ describe('tasks: watchers (phase 2)', () => {
     expect(digest.payload.disable_notification).toBe(true)
   }, 30000)
 
+  test("a task's run asks, with options; a tap answers it while the run waits, through the real tasks server", async () => {
+    const before = calls.length
+    const t = make({ name: 'Release check', prompt: 'MCPTASK ask {"question":"Ship it today?","options":["Yes","Not yet"],"wait_minutes":1}', cron: '7 3 * * *' })
+    T().runtime.runNow(t.id)
+    await waitFor(() => sent(before, 'Ship it today?').length > 0, 10000)
+    const q = sent(before, 'Ship it today?')[0]
+    expect(textOf(q)).toContain('<a href="tg://user?id=1">Ada</a>, <b>Release check</b> asks: Ship it today?')
+    expect(q.payload.disable_notification).toBe(false)
+    const btns = q.payload.reply_markup.inline_keyboard.flat()
+    expect(btns.map((b: any) => b.text)).toEqual(['Yes', 'Not yet'])
+    const cs = await press(btns[1].callback_data, 701)
+    expect(answers(cs)).toContain('Answered: Not yet')
+    await waitFor(() => T().store.runsFor(t.id).some((r: any) => r.state === 'succeeded'), 10000)
+    const call = JSON.parse(readFileSync(MCP_LOG, 'utf8').trim().split('\n').pop()!)
+    expect(call).toMatchObject({ tool: 'ask', isError: false })
+    expect(call.text).toContain('Ada answered: Not yet')
+    // The question now says how it was answered, and its buttons are gone.
+    const edited = calls.find(c => c.method === 'editMessageText' && String(c.payload.text).includes('✅ Ada answered: Not yet'))!
+    expect(edited.payload.reply_markup).toEqual({ inline_keyboard: [] })
+  }, 20000)
+
+  test('no answer in time: the run stops waiting; a reply later carries the task on, in the session that asked', async () => {
+    const { LIMITS } = await import('../tasks/model')
+    const keep = LIMITS.askWaitMaxMs
+    LIMITS.askWaitMaxMs = 300
+    try {
+      const before = calls.length
+      const t = make({ name: 'Launch prep', prompt: 'MCPTASK ask {"question":"Which day works for the launch?"}', cron: '7 4 * * *' })
+      T().runtime.runNow(t.id)
+      await waitFor(() => T().store.runsFor(t.id).some((r: any) => r.state === 'waiting'), 10000)
+      const w = T().store.openWaits().find((x: any) => x.task === t.id)!
+      expect(w).toMatchObject({ state: 'parked', sessionId: 'sessTESTAAA' })
+      expect(JSON.parse(readFileSync(MCP_LOG, 'utf8').trim().split('\n').pop()!).text).toContain('Nobody has answered yet')
+      // A reply to the question, in their own words, is the answer.
+      await bridge.bot.handleUpdate({ update_id: updateId++, message: {
+        message_id: 990777, date: Math.floor(Date.now() / 1000), message_thread_id: 701, is_topic_message: true,
+        chat: { id: C, type: 'supergroup', title: 'G', is_forum: true }, from: ADA,
+        text: 'MCPTASK report {"outcome":"done","notify":true,"summary":"carried on","text":"Launch on Thursday, then."}',
+        reply_to_message: { message_id: w.askedMsg, date: 0, chat: { id: C, type: 'supergroup' }, message_thread_id: 701 },
+      } })
+      await waitFor(() => T().store.runsFor(t.id).some((r: any) => r.trigger === 'answer' && r.state === 'succeeded'), 10000)
+      expect(calls.some(c => c.method === 'setMessageReaction' && c.payload.message_id === 990777)).toBe(true)
+      const carried = T().store.runsFor(t.id).find((r: any) => r.trigger === 'answer')!
+      expect(carried).toMatchObject({ state: 'succeeded', waitId: w.id })
+      // Its result is posted; the question itself was edited to show the answer.
+      expect(sent(before, 'Launch on Thursday').filter(c => !textOf(c).includes('answered:')).length).toBe(1)
+      const args: string[] = JSON.parse(readFileSync(LAST_ARGS, 'utf8'))
+      expect(args[args.indexOf('--resume') + 1]).toBe('sessTESTAAA')
+      expect(readFileSync(LAST_PROMPT, 'utf8')).toContain('asked “Which day works for the launch?” and stopped to wait')
+    } finally { LIMITS.askWaitMaxMs = keep }
+  }, 20000)
+
   test('at the end it was given it stops and says so; a tap keeps it running, with no end', async () => {
     const t = make({ name: 'Sync loop', watch: { command: 'sleep 30' }, keep_running: true, until: new Date(Date.now() + 3600_000).toISOString() })
     await waitFor(() => T().watchers.list().includes(t.id))

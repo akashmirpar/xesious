@@ -643,3 +643,77 @@ test('a digest lists what the topic\'s other tasks did since it last ran, silent
   expect(second).not.toContain('✅')
   expect(store.getTask(news.id)!.state).toBe('active')
 })
+
+describe('questions', () => {
+  const ask = (t: Task, runId: string, over: any = {}) => rt.ask(t.id, runId, { question: 'Which one goes first?', options: ['A', 'B'], waitMs: 60_000, ...over })
+  const asked: any[] = []
+  beforeEach(() => {
+    asked.length = 0
+    rt.stop()
+    rt = new TaskRuntime(deps({ questionDone: w => { asked.push(w) } }))
+  })
+
+  test('posted for its owner, loud, with its options; an answer in time goes straight back to the run', async () => {
+    const t = mk()
+    const p = ask(t, `${t.id}@r1`)
+    await new Promise(r => setTimeout(r, 0))
+    expect(posts).toMatchObject([{ kind: 'question', text: 'Which one goes first?', opts: { loud: true, wait: { options: ['A', 'B'], state: 'open' } } }])
+    const w = posts[0].opts.wait
+    expect(store.getWait(w.id)!.askedMsg).toBe(101)
+    expect(rt.answer(w.id, 'B', 'Ada', '1').ok).toBe(true)
+    expect(await p).toEqual({ answer: 'B', by: 'Ada' })
+    expect(store.getWait(w.id)).toMatchObject({ state: 'answered', answer: 'B', answeredBy: 'Ada', answeredById: '1' })
+    expect(asked.map(x => x.state)).toEqual(['answered'])
+    expect(rt.answer(w.id, 'A', 'Ben').error).toContain('answered already')
+  })
+
+  test("no answer in time: the run is told to stop, it ends waiting, and the answer carries it on in its session", async () => {
+    const seen: Run[] = []
+    let p: Promise<any> | undefined
+    claude = async (_t, r) => {
+      seen.push(r)
+      if (seen.length === 1) {
+        p = ask(_t, r.id)
+        await new Promise(res => setTimeout(res, 0))
+        timers.find(x => x.ms === 60_000)!.fn()       // nobody answered within its wait
+        expect(await p).toEqual({ parked: true })
+        return { ok: true, text: 'Waiting for the person.', sessionId: 'sess-asked' }
+      }
+      return OK('Done, with B first.')
+    }
+    const t = mk()
+    await tick()
+    const first = store.runsFor(t.id)[0]
+    expect(first).toMatchObject({ state: 'waiting' })
+    expect(first.reason).toContain('waiting for an answer: “Which one goes first?”')
+    expect(store.getTask(t.id)!.lastMark).toBe('waiting')
+    expect(posts.filter(x => x.kind === 'result')).toEqual([])
+    const w = store.waitsForRun(first.id)[0]
+    expect(w).toMatchObject({ state: 'parked', sessionId: 'sess-asked' })
+    expect(rt.answer(w.id, 'B', 'Ada', '1').ok).toBe(true)
+    await rt.idle()
+    expect(seen[1]).toMatchObject({ trigger: 'answer', waitId: w.id })
+    expect(store.getRun(first.id)).toMatchObject({ state: 'succeeded' })
+    expect(posts.filter(x => x.kind === 'result').map(x => x.text)).toEqual(['Done, with B first.'])
+  })
+
+  test('after a day: the default answer if it had one, or let go', async () => {
+    const t = mk({ trigger: { kind: 'cron', expr: '0 3 * * *' }, nextDue: '2026-10-17T03:00:00.000Z' })
+    void ask(t, `${t.id}@r1`, { defaultAnswer: 'A' })
+    void ask(t, `${t.id}@r2`, { question: 'Anything else?', options: undefined })
+    await new Promise(r => setTimeout(r, 0))
+    for (const w of store.openWaits()) store.updateWait(w.id, { state: 'parked' })
+    now = new Date(now.getTime() + 25 * 3600_000)
+    await rt.tick()
+    const [a, b] = [store.openWaits(), asked]
+    expect(a).toEqual([])
+    expect(b.map(x => [x.question, x.state, x.answer ?? null])).toEqual([['Which one goes first?', 'answered', 'A'], ['Anything else?', 'expired', null]])
+  })
+
+  test('a restart parks a question whose run it cut off', () => {
+    const t = mk()
+    store.createWait({ task: t.id, run: `${t.id}@r9`, chat: t.chat, question: 'Go?', askedAt: now.toISOString(), deadline: new Date(now.getTime() + 3600_000).toISOString(), state: 'open' })
+    rt.start()
+    expect(store.openWaits()[0].state).toBe('parked')
+  })
+})

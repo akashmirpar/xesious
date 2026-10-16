@@ -134,7 +134,7 @@ export function frequencyText(t: Task, now = new Date()): string | undefined {
 }
 
 export const MARK: Record<RunMark, string> = {
-  posted: '✅', quiet: '🔇', blocked: '⚠️', failed: '❌', skipped: '⏭', deferred: '⏳', interrupted: '✂️', running: '⏳',
+  posted: '✅', quiet: '🔇', blocked: '⚠️', failed: '❌', skipped: '⏭', deferred: '⏳', interrupted: '✂️', running: '⏳', waiting: '❔',
 }
 
 export function markOf(r: Run): RunMark {
@@ -144,6 +144,7 @@ export function markOf(r: Run): RunMark {
     case 'skipped': return 'skipped'
     case 'deferred': return 'deferred'
     case 'interrupted': case 'canceled': return 'interrupted'
+    case 'waiting': return 'waiting'
     case 'succeeded':
       if (r.outcome === 'blocked' || (r.denials?.length && !r.postedMsg)) return 'blocked'
       return r.postedMsg ? 'posted' : 'quiet'
@@ -211,6 +212,8 @@ export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchSt
   if (t.until && (t.state === 'active' || t.state === 'paused')) lines.push(`Ends ${tgTime(new Date(t.until), t.tz)}`)
   const running = runs.find(r => r.state === 'running')
   if (running) lines.push(`⏳ running since ${esc(whenText(new Date(running.startedAt ?? now.toISOString()), t.tz))}`)
+  const waiting = runs.find(r => r.state === 'waiting')
+  if (waiting) lines.push(`❔ ${esc(clip(waiting.reason ?? 'waiting for an answer', 200))}`)
   const last = runs.find(r => r.state !== 'queued' && r.state !== 'running')
   if (runs.length) {
     const strip = runs.slice(0, 8).reverse().map(r => MARK[markOf(r)]).join('')
@@ -267,7 +270,7 @@ export function runLine(r: Run, tz: string): string {
   if (u) bits.push(esc(u))
   if (r.state === 'skipped') bits.push(esc(r.reason ?? 'skipped'))
   else if (r.state === 'deferred') bits.push(esc(r.reason ?? 'usage limit'))
-  else if (r.state === 'failed' || r.state === 'timed_out' || r.state === 'interrupted') bits.push(esc(clip(r.reason ?? r.state, 120)))
+  else if (r.state === 'failed' || r.state === 'timed_out' || r.state === 'interrupted' || r.state === 'waiting') bits.push(esc(clip(r.reason ?? r.state, 120)))
   else if (r.summary) bits.push(esc(clip(r.summary, 120)))
   else if (markOf(r) === 'quiet') bits.push('nothing new')
   if (r.denials?.length) bits.push(`blocked: ${esc(clip(r.denials.join(', '), 80))}`)

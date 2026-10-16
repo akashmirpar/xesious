@@ -24,7 +24,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
-import { LIMITS, eventLimits, isStreaming, isWatch, type Run, type RunMark, type Task, type Usage, type WatchEvent } from './model'
+import { LIMITS, eventLimits, isStreaming, isWatch, type Run, type RunMark, type Task, type Usage, type Wait, type WatchEvent } from './model'
 import type { TaskStore } from './store'
 import { manualRunId, nextAfter, resolveDue, slotRunId } from './schedule'
 import { digestMarkdown, elapsedText, markOf, whenText, type Activity } from './render'
@@ -45,7 +45,7 @@ export interface ClaudeOutcome {
   denials?: string[]       // actions the permission mode blocked
 }
 
-export type PostKind = 'reminder' | 'result' | 'failure' | 'alert' | 'notice'
+export type PostKind = 'reminder' | 'result' | 'failure' | 'alert' | 'notice' | 'question'
 
 export interface PostOpts {
   loud: boolean
@@ -53,7 +53,11 @@ export interface PostOpts {
   edit?: number            // edit this message instead of sending a new one
   buttons?: 'reminder' | 'alert' | 'paused' | 'rerun' | 'renew' | 'pause'
   run?: Run
+  wait?: Wait              // a question: its options become buttons
 }
+
+export interface AskInput { question: string; options?: string[]; waitMs: number; defaultAnswer?: string }
+export interface AskResult { answer?: string; by?: string; parked?: boolean; error?: string }
 
 // What the runtime needs of the watcher supervisor (watchers.ts).
 export interface WatcherControl {
@@ -90,6 +94,8 @@ export interface RuntimeDeps {
   // A script's run (scripts.ts); without it, scripts fail.
   runScript?(task: Task, run: Run): Promise<ScriptOutcome>
   maxScripts?: number      // scripts at once, across every task (2)
+  // A question was answered, or let go: its message says so.
+  questionDone?(wait: Wait): void
 }
 
 export interface FilterVerdict { pass: { n: number; why: string }[]; by: string }
@@ -113,6 +119,7 @@ export class TaskRuntime {
   private pending = new Set<Promise<void>>()
   private polling = new Set<string>()
   private filtering = new Set<string>()
+  private waiters = new Map<string, (r: { answer: string; by: string }) => void>()
   private later = new Map<string, unknown>()     // per task: a cooldown's end, a watcher's restart
 
   constructor(private d: RuntimeDeps) {}
@@ -169,6 +176,9 @@ export class TaskRuntime {
   }
 
   private recover(): Run[] {
+    // A question whose run the restart cut off waits on, parked: an answer starts the
+    // task afresh, told what was asked.
+    for (const w of this.store.openWaits()) if (w.state === 'open') this.store.updateWait(w.id, { state: 'parked' })
     const open = this.store.openRuns()
     for (const r of open) {
       const run = this.store.updateRun(r.id, { state: 'interrupted', reason: 'the bot restarted during this run', endedAt: this.d.now().toISOString() })!
@@ -188,6 +198,7 @@ export class TaskRuntime {
     try { this.sync() } catch (e) { this.d.log(`[tasks] watchers: ${e}`) }
     for (const id of this.store.tasksWithEvents()) this.fireEvents(id)
     for (const id of this.store.tasksWithEvents('candidate')) this.scheduleFilter(id)
+    for (const w of this.store.openWaits()) if (Date.parse(w.deadline) <= this.d.now().getTime()) this.expireWait(w)
     const now = this.d.now()
     const warm = now.getTime() - this.d.startedAt.getTime() < WARMUP_MS
     let started = 0
@@ -353,6 +364,73 @@ export class TaskRuntime {
     }
   }
 
+  // --- questions --------------------------------------------------------------------
+
+  // A run's question: posted for its owner, waited on for a few minutes. Answered in
+  // time, the run has its answer; otherwise it is told to stop, and the question waits
+  // for an answer that carries the task on later.
+  async ask(taskId: string, runId: string, q: AskInput): Promise<AskResult> {
+    const t = this.store.getTask(taskId)
+    if (!t || t.state === 'deleted') return { error: 'no such task' }
+    const now = this.d.now()
+    let w = this.store.createWait({
+      task: t.id, run: runId, chat: t.chat, thread: t.thread, question: q.question, options: q.options, defaultAnswer: q.defaultAnswer,
+      askedAt: now.toISOString(), deadline: new Date(now.getTime() + LIMITS.askKeepMs).toISOString(), state: 'open',
+    })
+    const msg = await this.safePost(t, 'question', q.question, { loud: true, wait: w })
+    if (msg !== undefined) w = this.store.updateWait(w.id, { askedMsg: msg })!
+    this.d.cardChanged(this.store.getTask(t.id) ?? t)
+    const got = await new Promise<{ answer: string; by: string } | undefined>(resolve => {
+      this.waiters.set(w.id, resolve)
+      this.setTimer(() => { if (this.waiters.delete(w.id)) resolve(undefined) }, Math.min(q.waitMs, LIMITS.askWaitMaxMs))
+    })
+    if (got) return got
+    this.store.updateWait(w.id, { state: 'parked' })
+    return { parked: true }
+  }
+
+  // An answer, from a button or a reply. A run still waiting has it at once; one that
+  // stopped is carried on, in its own session, by a run of its own.
+  answer(waitId: string, answer: string, by: string, byId?: string): { ok: boolean; error?: string; wait?: Wait } {
+    const w = this.store.getWait(waitId)
+    if (!w) return { ok: false, error: 'That question is gone.' }
+    if (w.state === 'answered') return { ok: false, error: `It was answered already: ${w.answer}` }
+    if (w.state === 'expired') return { ok: false, error: 'That question was let go.' }
+    const done = this.store.updateWait(w.id, { state: 'answered', answer, answeredBy: by, answeredById: byId, answeredAt: this.d.now().toISOString() })!
+    this.d.questionDone?.(done)
+    const waiter = this.waiters.get(w.id)
+    if (waiter) { this.waiters.delete(w.id); waiter({ answer, by }); return { ok: true, wait: done } }
+    this.carryOn(done)
+    return { ok: true, wait: done }
+  }
+
+  // The run that carries a task on from an answered question; after the one going, if
+  // one is.
+  private carryOn(w: Wait): void {
+    const t = this.store.getTask(w.task)
+    if (!t || t.state === 'deleted' || t.action.kind !== 'claude') return
+    if (this.inFlight.has(t.id)) { this.soon(`${t.id}:answer:${w.id}`, 5000, () => this.carryOn(w)); return }
+    const asked = this.store.getRun(w.run)
+    if (asked?.state === 'waiting') this.store.updateRun(asked.id, { state: 'succeeded', summary: `asked “${clipText(w.question, 80)}”, answered “${clipText(w.answer ?? '', 80)}”` })
+    const now = this.d.now().getTime()
+    const run: Run = { id: `${t.id}@answer-${now.toString(36)}.${randomBytes(3).toString('hex')}`, task: t.id, trigger: 'answer', state: 'queued', waitId: w.id }
+    if (!this.store.insertRun(run)) return
+    this.dispatch(t, run)
+  }
+
+  // A day without an answer: its default, if it had one; otherwise let go.
+  private expireWait(w: Wait): void {
+    if (w.defaultAnswer) { this.answer(w.id, w.defaultAnswer, 'nobody, so its default'); return }
+    const done = this.store.updateWait(w.id, { state: 'expired' })!
+    this.waiters.get(w.id)?.({ answer: '', by: '' })
+    this.waiters.delete(w.id)
+    const run = this.store.getRun(w.run)
+    if (run?.state === 'waiting') this.store.updateRun(run.id, { state: 'canceled', reason: 'no answer within a day' })
+    this.d.questionDone?.(done)
+    const t = this.store.getTask(w.task)
+    if (t) this.d.cardChanged(t)
+  }
+
   // --- scripts ------------------------------------------------------------------
 
   private async execScript(t: Task, run: Run): Promise<void> {
@@ -502,6 +580,15 @@ export class TaskRuntime {
       this.d.activity(t, `⏳ ${t.name}: deferred by the usage limit`)
       this.d.cardChanged(t)
       this.arm()
+      return
+    }
+    // It stopped to wait for an answer: parked, not done. The answer carries it on.
+    const parked = this.store.waitsForRun(run.id).find(w => w.state === 'parked')
+    if (parked && !o.canceled) {
+      this.store.updateWait(parked.id, { sessionId: o.sessionId })
+      run = this.store.updateRun(run.id, { ...base, state: 'waiting', reason: `waiting for an answer: “${clipText(parked.question, 120)}”` })!
+      t = this.store.updateTask(t.id, { lastMark: 'waiting', lastRunAt: run.startedAt })!
+      this.d.cardChanged(t)
       return
     }
     if (o.canceled) {
@@ -882,3 +969,5 @@ export function activityOf(store: TaskStore, t: Task, ids: string[], since: Date
     : store.listTasks({ chat: t.chat, thread: t.thread ?? null }).filter(x => x.id !== t.id && x.action.kind !== 'digest')
   return tasks.map(task => ({ task, runs: store.runsFor(task.id, 60).filter(r => Date.parse(r.startedAt ?? r.slot ?? '') >= since.getTime()) }))
 }
+
+const clipText = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)

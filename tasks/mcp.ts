@@ -178,6 +178,21 @@ const SCHEDULED_TOOLS = [
     },
   },
   {
+    name: 'ask',
+    description: "Ask the person a question and wait for the answer, when you can't go on without them: a choice, a missing detail, a go-ahead. Posted in the task's topic, mentioning its owner; options become buttons, and they can also reply in their own words. " +
+      "You get the answer back here if it comes within wait_minutes (at most 10). If it doesn't, stop: call report with outcome blocked, saying what you are waiting for. The task then carries on from where you stopped, in this session, when they answer (up to a day later; after that default is used if you gave one).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string' },
+        options: { type: 'array', items: { type: 'string' }, description: 'Up to 8 short answers to choose from.' },
+        default: { type: 'string', description: 'Used if nobody answers within a day.' },
+        wait_minutes: { type: 'number', description: 'How long to wait here, 1 to 10 (default 10).' },
+      },
+      required: ['question'],
+    },
+  },
+  {
     name: 'notify',
     description: "Post a short message in this task's topic now, in the middle of the run: a milestone or a warning. Your final result is posted by the bot, so don't repeat it here.",
     inputSchema: { type: 'object', properties: { text: { type: 'string' }, silent: { type: 'boolean' } }, required: ['text'] },
@@ -208,6 +223,7 @@ export function routeOf(name: string, a: any, kind: 'interactive' | 'scheduled')
     case 'task_done': return { method: 'POST', path: '/v1/tasks/self/done', body: {} }
     case 'report': return { method: 'POST', path: '/v1/report', body: a }
     case 'notify': return { method: 'POST', path: '/v1/notify', body: a }
+    case 'ask': return { method: 'POST', path: '/v1/ask', body: a }
     case 'topic_list': return { method: 'GET', path: '/v1/topics' }
     case 'topic_create': return { method: 'POST', path: '/v1/topics', body: a }
     case 'topic_rename': return { method: 'PATCH', path: `/v1/topics/${enc(String(a?.topic ?? 'this'))}`, body: { name: a?.name } }

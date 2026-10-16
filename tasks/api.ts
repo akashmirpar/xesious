@@ -27,6 +27,7 @@ export interface Scope {
   taskId?: string        // a scheduled run: the task it belongs to
   runId?: string
   hub?: boolean          // a turn in the group's 🗂 Tasks topic, where every topic's tasks are managed
+  jobId?: string         // the bridge's job for this run, so a wait on a person can hold its watchdog
 }
 
 export class TokenRegistry {

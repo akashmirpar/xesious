@@ -69,7 +69,7 @@ import { TaskService, type Action as TaskAction } from './tasks/service'
 import { taskRoutes, type BridgeHandlers } from './tasks/routes'
 import { TokenRegistry, startApi, loadOperatorToken, reply, fail, type Scope, type ApiServer } from './tasks/api'
 import { whenText, elapsedText, cardHtml, historyHtml, scheduleText, watchedText, taskListHtml, type TaskSection } from './tasks/render'
-import { LIMITS, type Task, type Run } from './tasks/model'
+import { LIMITS, type Task, type Run, type Wait } from './tasks/model'
 import type { RunUsage } from './lib'
 
 // ---------------------------------------------------------------------------
@@ -925,8 +925,18 @@ type Job = {
   outcome?: RunOutcome     // set when a human ends it early
   statusMsgId?: number
   steps: () => number
+  // Waiting on a person (a question, an approval): no output is expected, so its idle
+  // watchdog waits with it, and counts afresh from when the wait ended.
+  holds?: number
+  heldUntil?: number
 }
 const jobs = new Map<string, Job>()
+function holdJob(jobId: string | undefined): () => void {
+  const j = jobId ? jobs.get(jobId) : undefined
+  if (!j) return () => {}
+  j.holds = (j.holds ?? 0) + 1
+  return () => { j.holds = Math.max(0, (j.holds ?? 1) - 1); j.heldUntil = Date.now() }
+}
 const jobsFor = (key: string) => [...jobs.values()].filter(j => j.key === key)
 // Every job of a topic, its detached ones (/bg, tasks) included: what /jobs lists.
 const jobsIn = (key: string) => [...jobs.values()].filter(j => j.key === key || j.key.startsWith(`${key}#`))
@@ -1330,8 +1340,13 @@ function prepareGroupMemory(key: string, group: string): { dir: string; cleanup:
 
 async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL, ro: RunOpts = {}): Promise<ClaudeResult> {
   const { onInit, effort = EFFORT_TIER, askedBy, fork, silent, early } = ro
+  // Minted before the status message so its keyboard can name this run from the
+  // start, and before the tools, whose token names it too. If the spawn below fails
+  // the id never registers, and a tap on it is told the task has already finished,
+  // which is true. An early turn has both already.
+  const jobId = early?.job.id ?? newJobId()
   const history = historyMcp(key)
-  const own = tasksMcpFor(ctx, key, threadId, ro)
+  const own = tasksMcpFor(ctx, key, threadId, ro, jobId)
   const servers = { ...(history?.servers ?? {}), ...(own?.servers ?? {}) }
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose',
     ...permissionArgs(mode, [...(history?.tools ?? []), ...(own?.tools ?? [])]),
@@ -1353,10 +1368,6 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   const runEnv = groupMem ? { ...childEnv(), CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1' } : childEnv()
 
   const opts: any = threadId ? { message_thread_id: threadId } : {}
-  // Minted before the status message so its keyboard can name this run from the
-  // start. If the spawn below fails the id never registers, and a tap on it is told
-  // the task has already finished — which is true. An early turn has both already.
-  const jobId = early?.job.id ?? newJobId()
   const interruptKb = interruptKeyboard(jobId)
   // Status is machine chatter, not an answer — post and edit it silently so only
   // the real reply buzzes the user's phone.
@@ -1430,7 +1441,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     // when each step takes minutes, while a hung child emits nothing at all.
     let stalled = false
     const idleTimer = setInterval(() => {
-      if (Date.now() - lastEventAt < IDLE_TIMEOUT_MS) return
+      if (job.holds || Date.now() - Math.max(lastEventAt, job.heldUntil ?? 0) < IDLE_TIMEOUT_MS) return
       stalled = true
       console.error(`[warn] no stream activity for ${Math.round((Date.now() - lastEventAt) / 1000)}s — killing a stalled run in ${cwd}`)
       child.kill('SIGKILL')
@@ -3017,7 +3028,7 @@ function historyMcp(key: string): { servers: Record<string, unknown>; tools: str
 // for a private continuation or a private answer (private talk doesn't drive the
 // group), nor for runs that pass tasksTools: false (helpers, Auto turns, passthrough).
 // A task's own run gets the scheduled set, scoped to that task.
-function tasksMcpFor(ctx: Context, key: string, threadId: number | undefined, ro: RunOpts): { servers: Record<string, unknown>; tools: string[]; revoke: () => void } | undefined {
+function tasksMcpFor(ctx: Context, key: string, threadId: number | undefined, ro: RunOpts, jobId?: string): { servers: Record<string, unknown>; tools: string[]; revoke: () => void } | undefined {
   if (!TASKS || !taskApi || ro.tasksTools === false) return undefined
   if (privateLinks[key] || askSource.has(key)) return undefined
   const person = ctx.from
@@ -3036,6 +3047,7 @@ function tasksMcpFor(ctx: Context, key: string, threadId: number | undefined, ro
     kind: 'run', chat: String(ctx.chat.id), thread: threadId, person: String(person.id), personName: userName(person),
     runKind: ro.task ? 'scheduled' : 'interactive', ...(ro.task ? { taskId: ro.task.taskId, runId: ro.task.runId } : {}),
     ...(!ro.task && isTasksHub(ctx.chat.id, threadId) ? { hub: true } : {}),
+    ...(jobId ? { jobId } : {}),
   }
   const token = apiTokens.mint(scope)
   const env = { XESIOUS_API_SOCK: taskApi.socket, XESIOUS_API_TOKEN: token, XESIOUS_RUN_KIND: scope.runKind! }
@@ -6563,6 +6575,15 @@ bot.on('message', async ctx => {
 
   if (!isAllowed(ctx)) { if (cmd) await send(ctx, threadId, `Not authorized. Send /whoami to get the id to allowlist.`); return }
 
+  // A reply to a task's question is its answer, not a turn.
+  const question = TASKS && taskStore && msg.reply_to_message && text.trim() && !cmd ? taskStore.waitByMessage(String(chatId), msg.reply_to_message.message_id) : undefined
+  if (question) {
+    const r = taskRuntime!.answer(question.id, text.trim().slice(0, 2000), userName(ctx.from), String(ctx.from.id))
+    if (r.ok) await ctx.api.setMessageReaction(chatId, msg.message_id, [{ type: 'emoji', emoji: '👍' }]).catch(() => send(ctx, threadId, '👍 Passed on.', true))
+    else await send(ctx, threadId, r.error ?? 'That question is gone.', true)
+    return
+  }
+
   // A reply to one of the /config prompts ("reply with the @username…"). Claimed
   // here, before the mention gate and the prompt path, so the text is never run as
   // a turn — and only from the person who was asked.
@@ -7883,6 +7904,34 @@ function taskFrame(t: Task, run: Run): string {
   return lines.join(' ') + '\n\n' + eventsBlock(run) + watchedBlock(t) + frameUserMessage(t.action.prompt, { nonce: BRIDGE_NONCE, name: t.ownerName, id: Number(t.owner) })
 }
 
+// A run that carries a task on from an answered question: what it asked, and the
+// answer, in the words of whoever gave it. In the asking run's own session when there
+// is one, so it remembers the rest; otherwise told the task's instruction again.
+function answerFrame(t: Task, w: Wait): string {
+  if (t.action.kind !== 'claude') return ''
+  const mask = (s: string) => s.split(BRIDGE_NONCE).join('*'.repeat(BRIDGE_NONCE.length))
+  const resumed = !!w.sessionId
+  const lines = [
+    `[xesious:${BRIDGE_NONCE}] This run carries on the task "${t.name}" (id ${t.id}). ${resumed ? 'Earlier in this session it' : 'An earlier run of it'} asked “${mask(w.question)}” and stopped to wait for the answer, which follows.`,
+    `Carry on from where it stopped, with that answer. Nobody is watching it live: finish within this run.`,
+    TASK_SAYS[t.says],
+    'When you are done, call the report tool once: an outcome, notify (true to post, false to stay silent) and a one-line summary.',
+    ...(resumed ? [] : [`Its instruction, in ${t.ownerName || `user ${t.owner}`}'s words as stored when the task was set up, comes after the answer.`]),
+  ]
+  const answer = frameUserMessage(w.answer ?? '', { nonce: BRIDGE_NONCE, name: w.answeredBy, id: w.answeredById })
+  return lines.join(' ') + '\n\n' + answer + (resumed ? '' : '\n\n' + frameUserMessage(t.action.prompt, { nonce: BRIDGE_NONCE, name: t.ownerName, id: Number(t.owner) }))
+}
+
+// A question answered or let go: its message says so, and its buttons go.
+async function questionDone(w: Wait): Promise<void> {
+  const t = taskStore?.getTask(w.task)
+  if (!t || w.askedMsg === undefined) return
+  const chatId = t.where === 'dm' ? Number(t.owner) : Number(t.chat)
+  const end = w.state === 'answered' ? `✅ ${escapeHtml(w.answeredBy ?? 'someone')} answered: ${escapeHtml(w.answer ?? '')}` : '⌛ No answer within a day; the task let it go.'
+  await bot.api.editMessageText(chatId, w.askedMsg, `❔ <b>${escapeHtml(t.name)}</b> asked: ${escapeHtml(w.question)}\n${end}`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } })
+    .catch(e => { if (!String(e).includes('not modified')) console.error(`[tasks] question ${w.id}: ${e}`) })
+}
+
 // What the tasks a watchdog watches did since its last run, from the bot's own
 // records. Run summaries can carry what a page or a feed said, so it is material too.
 function watchedBlock(t: Task): string {
@@ -7915,8 +7964,10 @@ async function runTaskClaude(t: Task, run: Run): Promise<ClaudeOutcome> {
   const ctx = taskContext(t)
   const key = taskKey(t)
   const cwd = resolveCwd(ctx, t.thread)
-  const resumeId = t.action.session === 'own' ? t.sessionId : undefined
-  const res = await runStreaming(ctx, t.thread, key, taskFrame(t, run), cwd, resumeId, modeFor(key), modelFor(key), {
+  // Carrying on from an answer: in the session that asked, when it can.
+  const wait = run.trigger === 'answer' && run.waitId ? taskStore?.getWait(run.waitId) : undefined
+  const resumeId = wait?.sessionId ?? (t.action.session === 'own' ? t.sessionId : undefined)
+  const res = await runStreaming(ctx, t.thread, key, wait ? answerFrame(t, wait) : taskFrame(t, run), cwd, resumeId, modeFor(key), modelFor(key), {
     effort: effortFor(key), silent: t.says !== 'live', jobKey: `${key}#task-${t.id}`, task: { taskId: t.id, runId: run.id },
     // A changed topic instruction reaches a task that keeps its own session.
     ...(t.action.session === 'own' ? { extraArgs: ['--system-prompt-snapshot', 'off'] } : {}),
@@ -7989,6 +8040,19 @@ async function postTask(t: Task, kind: PostKind, text: string, o: PostOpts): Pro
     // Files the run left in the topic's outbox go with its result.
     await flushOutbox(ctx, threadId, resolveCwd(taskContext(t), t.thread), taskKey(t), id)
     return id
+  }
+  // A question: its options as buttons, naming its owner so they hear of it in a busy
+  // group; a reply in their own words counts too.
+  if (kind === 'question' && o.wait) {
+    const w = o.wait
+    const mention = !toDm && Number(t.chat) < 0 ? `<a href="tg://user?id=${t.owner}">${escapeHtml(t.ownerName || 'you')}</a>, ` : ''
+    const html = `❔ ${mention}<b>${escapeHtml(t.name)}</b> asks: ${escapeHtml(text)}\n<i>${w.options?.length ? 'Tap an answer, or reply' : 'Reply'} to this message with your own.</i>`
+    const opts = w.options ?? []
+    const rows: any[][] = []
+    for (let i = 0; i < opts.length; i += 2) rows.push(opts.slice(i, i + 2).map((label, j) => ({ text: label, callback_data: `tk:ans:${w.id}:${i + j}` })))
+    const m = await bot.api.sendMessage(chatId, html, { ...destOpts({ threadId }), parse_mode: 'HTML', disable_notification: false, ...(rows.length ? { reply_markup: { inline_keyboard: rows } } : {}) })
+    noteBotMessage(keyFor(chatId, threadId))
+    return m.message_id
   }
   const who = kind === 'reminder' && !toDm && Number(t.chat) < 0 ? `<a href="tg://user?id=${t.owner}">${escapeHtml(t.ownerName || 'you')}</a> ` : ''
   const html = (kind === 'reminder' ? `${t.trigger.kind === 'watch' ? '👀' : '🔔'} ${who}${escapeHtml(text)}` : escapeHtml(text)) + (late ? ` <i>(${escapeHtml(late)})</i>` : '')
@@ -8149,6 +8213,26 @@ const taskBridge: BridgeHandlers = {
     if (!text) return fail(400, 'text is required')
     const id = await postTask(t, 'notice', clipTo(text, 3500), { loud: !body?.silent })
     return reply(200, { message: 'Posted.', message_id: id })
+  },
+  // A task's run asking someone something, and waiting for the answer: a few minutes
+  // here, holding its watchdog; after that it is told to stop, and the answer carries
+  // the task on later (TaskRuntime.ask).
+  async ask(s, body) {
+    if (s.runKind !== 'scheduled' || !s.taskId || !s.runId) return fail(403, "ask is for a task's own run; in a conversation, just ask in your answer")
+    const question = String(body?.question ?? '').trim()
+    if (!question) return fail(400, 'question is required')
+    if (question.length > 1000) return fail(400, 'question is at most 1000 characters')
+    const options = Array.isArray(body?.options) ? body.options.map((o: any) => String(o ?? '').trim()).filter(Boolean).slice(0, 8) : undefined
+    if (options?.some((o: string) => o.length > 60)) return fail(400, 'each option is at most 60 characters')
+    const minutes = body?.wait_minutes === undefined || body.wait_minutes === null ? 10 : Number(body.wait_minutes)
+    if (!(minutes > 0 && minutes <= 10)) return fail(400, 'wait_minutes is between 1 and 10')
+    const release = holdJob(s.jobId)
+    try {
+      const r = await taskRuntime!.ask(s.taskId, s.runId, { question, options: options?.length ? options : undefined, waitMs: minutes * 60_000, defaultAnswer: body?.default ? String(body.default).slice(0, 200) : undefined })
+      if (r.error) return fail(404, r.error)
+      if (r.parked) return reply(200, { message: 'Nobody has answered yet. Stop here: call report with outcome blocked, saying what you are waiting for. When someone answers, the task carries on from where you stopped, with the answer.', answer: null })
+      return reply(200, { message: `${r.by} answered: ${r.answer}`, answer: r.answer, by: r.by })
+    } finally { release() }
   },
   // A script on the host posting into a chat this bot serves: `xesious send`.
   async send(s, body) {
@@ -8390,6 +8474,15 @@ async function handleTaskCallback(ctx: Context, data: string): Promise<void> {
   const [, act, id] = data.split(':')
   const answer = (text = '', alert = false) => ctx.answerCallbackQuery(text ? { text, show_alert: alert } : {}).catch(() => {})
   if (!taskService || !taskStore) { await answer('Tasks are off on this bot.', true); return }
+  // An answer to a task's question: tk:ans:<question>:<option>.
+  if (act === 'ans') {
+    const w = taskStore.getWait(id ?? '')
+    const opt = w?.options?.[Number(data.split(':')[3])]
+    if (!w || opt === undefined) { await answer('That question is gone.', true); return }
+    const r = taskRuntime!.answer(w.id, opt, userName(ctx.from!), String(ctx.from!.id))
+    await answer(r.ok ? `Answered: ${opt}` : r.error, !r.ok)
+    return
+  }
   const t = taskStore.getTask(id ?? '')
   if (!t || t.state === 'deleted') { await answer('That task no longer exists.', true); return }
   const here = String(ctx.chat?.id)
@@ -8502,6 +8595,7 @@ function startTasks(): void {
       watchers: taskWatchers, maxWatchers: TASKS_MAX_WATCHERS,
       filter: filterTaskEvents,
       runScript: runTaskScript,
+      questionDone: w => void questionDone(w),
     })
     taskService = new TaskService({
       store, now: () => taskNow(),

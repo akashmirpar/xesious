@@ -10,10 +10,10 @@
  */
 import { Database } from 'bun:sqlite'
 import { randomBytes } from 'node:crypto'
-import { LIMITS, type Run, type Task, type TaskState, type WatchEvent } from './model'
+import { LIMITS, type Run, type Task, type TaskState, type Wait, type WatchEvent } from './model'
 import type { RuleState } from './filters'
 
-const SCHEMA = 2
+const SCHEMA = 3
 
 // A streaming watcher as the bridge started it: enough to find it again after a
 // restart (its pid, and the start time that proves the pid is still it) and to read on
@@ -69,6 +69,8 @@ export class TaskStore {
       );
       CREATE INDEX IF NOT EXISTS events_task ON events (task, stage, id);
       CREATE TABLE IF NOT EXISTS rule_state (task TEXT PRIMARY KEY, doc TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS waits (id TEXT PRIMARY KEY, task TEXT NOT NULL, state TEXT NOT NULL, doc TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS waits_state ON waits (state);
     `)
     this.db.query("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)").run(String(SCHEMA))
   }
@@ -85,7 +87,7 @@ export class TaskStore {
 
   // --- tasks ---------------------------------------------------------------------
 
-  private newId(table: 'tasks'): string {
+  private newId(table: 'tasks' | 'waits'): string {
     for (;;) {
       // Six base-36 characters: short enough for a card's buttons and to type, and two
       // billion of them.
@@ -286,6 +288,38 @@ export class TaskStore {
   }
   setRuleState(task: string, st: RuleState): void {
     this.db.query('INSERT OR REPLACE INTO rule_state (task, doc) VALUES (?, ?)').run(task, JSON.stringify(st))
+  }
+
+  // --- questions a run asked -----------------------------------------------------
+
+  createWait(w: Omit<Wait, 'id'>): Wait {
+    const wait: Wait = { ...w, id: this.newId('waits') }
+    this.db.query('INSERT INTO waits (id, task, state, doc) VALUES (?, ?, ?, ?)').run(wait.id, wait.task, wait.state, JSON.stringify(wait))
+    return wait
+  }
+  getWait(id: string): Wait | undefined {
+    const row = this.db.query('SELECT doc FROM waits WHERE id = ?').get(id) as any
+    return row ? JSON.parse(row.doc) : undefined
+  }
+  updateWait(id: string, patch: Partial<Wait>): Wait | undefined {
+    const cur = this.getWait(id)
+    if (!cur) return undefined
+    const next: Wait = { ...cur, ...patch, id }
+    for (const k of Object.keys(patch) as (keyof Wait)[]) if (patch[k] === undefined) delete (next as any)[k]
+    this.db.query('UPDATE waits SET state = ?, doc = ? WHERE id = ?').run(next.state, JSON.stringify(next), id)
+    return next
+  }
+  // Questions still waiting for an answer, oldest first.
+  openWaits(): Wait[] {
+    return (this.db.query("SELECT doc FROM waits WHERE state IN ('open','parked')").all() as any[]).map(r => JSON.parse(r.doc))
+      .sort((a: Wait, b: Wait) => a.askedAt.localeCompare(b.askedAt))
+  }
+  // The question asked in this message, if it is one still waiting.
+  waitByMessage(chat: string, msg: number): Wait | undefined {
+    return this.openWaits().find(w => w.chat === chat && w.askedMsg === msg)
+  }
+  waitsForRun(run: string): Wait[] {
+    return (this.db.query('SELECT doc FROM waits').all() as any[]).map(r => JSON.parse(r.doc)).filter((w: Wait) => w.run === run)
   }
 }
 
