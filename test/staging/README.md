@@ -90,6 +90,21 @@ thing that broke:
 | `run_alongside` / `promoted_run_keeps_the_topics_session` | A real inline-keyboard **tap** is the only thing that produces the callback the promotion runs on — tier 2 hand-builds that update — and the real CLI is the only thing that mints a real forked session id, which tier 2 has to stub. The second case then asks the topic itself whether it remembers what was said inside the fork, which is the harm a state file cannot show. |
 | `sessions_picker` | A callback button is the only in-chat tap that carries a payload back to the bot, so the picker cannot be exercised any other way. |
 
+## Two bots: hand-offs between them
+
+`run-peers.sh` runs two staging bridges in the staging group, the staging bot and a
+second bot (`STAGING_PEER_BOT_TOKEN`, `STAGING_PEER_BOT_USERNAME`), each listing the
+other as a peer, both on the stub CLI and answering only when named. `peer_driver.py`
+makes two topics and has each bot hand work to the other: it checks the hand-off
+message that names the other bot, that bot's `✅ #handoff-… done` reply, the ➡️ line
+edited to ✅ Done, and that a file sent along reaches the other bridge's inbox. Both
+bots need privacy mode off and Bot-to-Bot Communication Mode on in @BotFather.
+
+```bash
+test/staging/run-peers.sh
+STAGING_KEEP_TOPICS=1 test/staging/run-peers.sh   # leave the two topics, to look at
+```
+
 ## Notes / caveats
 
 - The staging bot needs its own token bound to the **cloud** Bot API (don't point it
