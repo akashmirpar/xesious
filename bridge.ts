@@ -63,12 +63,13 @@ import { recallBody, recallIntro, RECALL_CAVEAT, RECALL_CHARS, RECALL_MAX } from
 import { TaskStore } from './tasks/store'
 import { TaskRuntime, type ClaudeOutcome, type FilterVerdict, type PostKind, type PostOpts } from './tasks/runtime'
 import { FILTER_SYSTEM, filterUser, parseFilterAnswer } from './tasks/filters'
+import { runScript, type ScriptOutcome } from './tasks/scripts'
 import { Watchers } from './tasks/watchers'
 import { TaskService, type Action as TaskAction } from './tasks/service'
 import { taskRoutes, type BridgeHandlers } from './tasks/routes'
 import { TokenRegistry, startApi, loadOperatorToken, reply, fail, type Scope, type ApiServer } from './tasks/api'
 import { whenText, elapsedText, cardHtml, historyHtml, listLine, scheduleText } from './tasks/render'
-import type { Task, Run } from './tasks/model'
+import { LIMITS, type Task, type Run } from './tasks/model'
 import type { RunUsage } from './lib'
 
 // ---------------------------------------------------------------------------
@@ -7923,6 +7924,36 @@ async function runTaskClaude(t: Task, run: Run): Promise<ClaudeOutcome> {
   }
 }
 
+// A task's script, run as its owner's: in its topic's folder, without the bot's
+// secrets, with a token for this run alone (so `bun "$XESIOUS_CLI" notify …` posts in
+// its topic) and, for a watcher's run, its events in a file. Stoppable from its card.
+const scriptStops = new Map<string, AbortController>()
+async function runTaskScript(t: Task, run: Run): Promise<ScriptOutcome> {
+  if (t.action.kind !== 'script') return { code: null, out: '', err: 'not a script', timedOut: false, durationMs: 0 }
+  const cwd = resolveCwd(taskContext(t), t.thread)
+  const token = apiTokens.mint({ kind: 'run', runKind: 'scheduled', chat: t.chat, thread: t.thread, person: t.owner, personName: t.ownerName, taskId: t.id, runId: run.id })
+  const env: NodeJS.ProcessEnv = {
+    ...childEnv(), XESIOUS_TASK: t.id, XESIOUS_RUN: run.id,
+    XESIOUS_API_SOCK: API_SOCK, XESIOUS_API_TOKEN: token, XESIOUS_CLI: join(HERE, 'tasks', 'cli.ts'),
+  }
+  let events: string | undefined
+  if (run.events?.length) {
+    events = join(TASKS_DIR, t.id, `${run.id.replace(/[^\w.-]+/g, '_')}.events.json`)
+    mkdirSync(dirname(events), { recursive: true })
+    writeFileSync(events, JSON.stringify(run.events, null, 1))
+    env.XESIOUS_EVENTS = events
+  }
+  const stop = new AbortController()
+  scriptStops.set(t.id, stop)
+  try {
+    return await runScript({ command: t.action.command, cwd, env, timeoutMs: t.action.timeoutMs ?? LIMITS.scriptTimeoutMs, signal: stop.signal })
+  } finally {
+    apiTokens.revoke(token)
+    scriptStops.delete(t.id)
+    if (events) rmSync(events, { force: true })
+  }
+}
+
 const TASK_BUTTONS: Record<NonNullable<PostOpts['buttons']>, (t: Task) => any[][]> = {
   reminder: t => [[{ text: '✅ Done', callback_data: `tk:ok:${t.id}` }, { text: '⏰ +15 min', callback_data: `tk:snz:${t.id}` }]],
   alert: t => [[{ text: t.trigger.kind === 'watch' ? '🔄 Try again' : '▶️ Run now', callback_data: `tk:run:${t.id}` }, { text: '⏸ Pause', callback_data: `tk:pause:${t.id}` }]],
@@ -8144,7 +8175,7 @@ function cardKeyboard(t: Task): { inline_keyboard: any[][] } {
   if (t.state === 'deleted') return { inline_keyboard: [] }
   const row: any[] = []
   // While it runs, the run can be stopped from here: /stop in the topic leaves it be.
-  if (taskRuntime?.isRunning(t.id) && t.action.kind === 'claude') row.push({ text: '⏹ Stop', callback_data: `tk:stop:${t.id}` })
+  if (taskRuntime?.isRunning(t.id) && (t.action.kind === 'claude' || t.action.kind === 'script')) row.push({ text: '⏹ Stop', callback_data: `tk:stop:${t.id}` })
   else if (t.state === 'active') row.push({ text: t.trigger.kind === 'watch' ? '🔄 Check now' : '▶️ Run now', callback_data: `tk:run:${t.id}` })
   if (t.state === 'active') row.push({ text: '⏸ Pause', callback_data: `tk:pause:${t.id}` })
   else if (t.state === 'paused') row.push({ text: '▶️ Resume', callback_data: `tk:resume:${t.id}` })
@@ -8291,6 +8322,13 @@ async function handleTaskCallback(ctx: Context, data: string): Promise<void> {
     case 'hist': await showTaskHistory(ctx, t); await answer(); return
     // Its run in progress, stopped: anyone who may pause it may stop it.
     case 'stop': {
+      const script = scriptStops.get(t.id)
+      if (script) {
+        console.log(`[tasks] ${taskKey(t)} ${t.id}: script stopped by ${userName(user)}`)
+        script.abort()
+        await answer('Stopping it.')
+        return
+      }
       const job = taskJob(t)
       if (!job) { await answer(taskRuntime?.isRunning(t.id) ? "It hasn't started yet; try again in a moment." : "It isn't running.", true); return }
       console.log(`[tasks] ${taskKey(t)} ${t.id}: run stopped by ${userName(user)}`)
@@ -8361,6 +8399,7 @@ function startTasks(): void {
       activity: taskActivity,
       watchers: taskWatchers, maxWatchers: TASKS_MAX_WATCHERS,
       filter: filterTaskEvents,
+      runScript: runTaskScript,
     })
     taskService = new TaskService({
       store, now: () => taskNow(),

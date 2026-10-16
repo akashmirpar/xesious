@@ -31,6 +31,9 @@ export type Action =
   // keeps across its runs, so it remembers what earlier runs did. A watcher's events
   // come with its run.
   | { kind: 'claude'; prompt: string; session: 'fresh' | 'own' }
+  // A command with no AI (bash -c, in the topic's folder): its exit status decides,
+  // and what it printed is posted as `says` decides.
+  | { kind: 'script'; command: string; timeoutMs?: number }
   // A watcher kept running for its own sake ("keep the sync loop running"): its output
   // goes nowhere, and only its failures are said.
   | { kind: 'none' }
@@ -181,6 +184,9 @@ export const LIMITS = {
   pollTimeoutMs: 5 * 60_000,         // a polled watcher must print and exit within this
   watchUpResetMs: 10 * 60_000,       // a streaming watcher up this long starts its failure count afresh
   watchBackoffMs: [5_000, 15_000, 60_000, 5 * 60_000, 15 * 60_000],
+  // Scripts:
+  scriptTimeoutMs: 30 * 60_000,
+  scriptTimeoutMaxMs: 4 * 60 * 60_000,
 }
 
 // What a watcher's events may start, unless the task says otherwise: a Claude run at

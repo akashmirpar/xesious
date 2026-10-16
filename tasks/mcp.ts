@@ -79,6 +79,17 @@ const TASK_FIELDS = {
   name: { type: 'string', description: "A short name for the task's card, e.g. 'Nightly news'." },
   message: { type: 'string', description: 'For a reminder: the exact text the bot sends at the time. For a watcher: the text sent for each event: {event} is the line the watcher printed, {value} what its rule looked at, {why} why it passed.' },
   prompt: { type: 'string', description: "For work Claude does when the task runs: a complete, self-contained instruction. The run starts without this conversation, in this topic's folder and with its instructions. For a watcher, the events that set it off come with the run." },
+  script: {
+    type: 'object',
+    description: "Instead of message or prompt: a command the bot runs, with no AI, for work a command does (a backup, a sync, a health check). Run with bash in this topic's folder; status 0 is success. " +
+      'What it prints is posted as says decides: result (the default) posts its output; noteworthy only when it printed something; problems only when it fails (every failure, loud); never nothing. ' +
+      'It gets $XESIOUS_CLI (bun "$XESIOUS_CLI" notify "halfway" posts in this topic) and, set off by a watcher, $XESIOUS_EVENTS, a JSON file of the events.',
+    properties: {
+      command: { type: 'string', description: 'e.g. "bash scripts/backup.sh"' },
+      timeout_minutes: { type: 'number', description: 'Stopped after this long (default 30, at most 240).' },
+    },
+    required: ['command'],
+  },
   ...WHEN_PROPS,
   ...WATCH_PROPS,
   tz: { type: 'string', description: "The person's IANA time zone, e.g. Europe/Berlin. Work it out from what you know of them and this conversation; if you can't tell, ask them before creating the task." },

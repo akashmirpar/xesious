@@ -6,6 +6,7 @@ import { TaskStore } from './store'
 import { TaskRuntime, eventText, type ClaudeOutcome, type FilterVerdict, type RuntimeDeps, type WatcherControl } from './runtime'
 import type { Run, Task, WatchEvent } from './model'
 import type { PollResult } from './watchers'
+import type { ScriptOutcome } from './scripts'
 
 let dir: string
 let store: TaskStore
@@ -559,4 +560,65 @@ test('a watcher message: {event} is the newest line, and folded ones are counted
   const run = { id: 'x', task: 'x', trigger: 'event', state: 'queued', events: [{ at: '', text: 'a' }, { at: '', text: 'b' }], folded: 5 } as Run
   expect(eventText('Saw {event}!', run)).toBe('Saw b!\n(+4 more since)')
   expect(eventText('Something happened', { ...run, folded: 1, events: [{ at: '', text: 'c' }] })).toBe('Something happened\nc')
+})
+
+describe('scripts', () => {
+  let outcome: ScriptOutcome
+  let ran: Run[]
+  beforeEach(() => {
+    outcome = { code: 0, out: 'backup: 12 files\n', err: '', timedOut: false, durationMs: 1200 }
+    ran = []
+    rt.stop()
+    rt = new TaskRuntime(deps({ runScript: async (_t, r) => { ran.push(r); return outcome } }))
+  })
+  const script = (over: Partial<Task> = {}) => mk({ name: 'Backup', action: { kind: 'script', command: 'bash backup.sh' }, says: 'result', ...over })
+
+  test('result: what it printed is posted as a code block, and the next turn hears of it', async () => {
+    const t = script()
+    await tick()
+    expect(posts).toMatchObject([{ kind: 'result', text: '```\nbackup: 12 files\n```', opts: { loud: true } }])
+    expect(store.runsFor(t.id)[0]).toMatchObject({ state: 'succeeded', summary: 'backup: 12 files', usage: { durationMs: 1200 } })
+    expect(notes[0]).toContain('ran its command')
+  })
+
+  test('noteworthy: only when it printed something', async () => {
+    outcome = { ...outcome, out: '' }
+    const t = script({ says: 'noteworthy' })
+    await tick()
+    expect(posts).toEqual([])
+    expect(store.runsFor(t.id)[0]).toMatchObject({ state: 'succeeded', summary: 'nothing printed' })
+  })
+
+  test('problems: nothing when it works; every failure, loud, with its last lines', async () => {
+    const t = script({ says: 'problems' })
+    await tick()
+    expect(posts).toEqual([])
+    outcome = { code: 2, out: '', err: 'rsync: connection refused\n', timedOut: false, durationMs: 300 }
+    now = new Date('2026-10-17T19:07:00Z'); await tick()
+    expect(posts).toMatchObject([{ kind: 'failure', opts: { loud: true } }])
+    expect(posts[0].text).toBe('⚠️ Backup failed: it exited with status 2: rsync: connection refused')
+    expect(store.getTask(t.id)!.failStreak).toBe(1)
+  })
+
+  test('stopped by a person: canceled, not a failure', async () => {
+    outcome = { code: null, out: '', err: '', timedOut: false, stopped: true, durationMs: 100 }
+    const t = script()
+    await tick()
+    expect(store.runsFor(t.id)[0]).toMatchObject({ state: 'canceled', reason: 'stopped' })
+    expect(store.getTask(t.id)!.failStreak).toBe(0)
+  })
+
+  test('at most so many at once; the rest wait their turn', async () => {
+    let release!: () => void
+    rt.stop()
+    rt = new TaskRuntime(deps({ maxScripts: 1, runScript: async (_t, r) => { ran.push(r); if (ran.length === 1) await new Promise<void>(res => { release = res }); return outcome } }))
+    script({ name: 'A' })
+    script({ name: 'B', action: { kind: 'script', command: 'bash other.sh' } })
+    await rt.tick()
+    await new Promise(r => setTimeout(r, 0))
+    expect(ran.length).toBe(1)
+    release()
+    await rt.idle()
+    expect(ran.length).toBe(2)
+  })
 })

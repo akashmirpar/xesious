@@ -34,6 +34,7 @@ export interface TaskInput extends WhenInput {
   cooldown_minutes?: number
   max_per_hour?: number
   stale_minutes?: number
+  script?: string | { command?: string; timeout_minutes?: number }   // a command, no AI
   rule?: any              // filters.ruleError says what it may be; null removes it
   ai_filter?: { question?: string; every_minutes?: number } | null
 }
@@ -86,6 +87,7 @@ export function taskView(t: Task, runs: Run[] = []) {
     } : {}),
     ...(t.action.kind === 'message' ? { message: t.action.text }
       : t.action.kind === 'claude' ? { prompt: t.action.prompt, session: t.action.session, says: t.says }
+      : t.action.kind === 'script' ? { script: { command: t.action.command, timeout_minutes: (t.action.timeoutMs ?? LIMITS.scriptTimeoutMs) / 60_000 }, says: t.says }
       : { keep_running: true }),
     sound: t.sound, deliver_to: t.where === 'dm' ? 'dm' : 'topic',
     topic: t.thread, runs_done: t.runsDone,
@@ -160,7 +162,9 @@ export class TaskService {
     const hasMsg = typeof input.message === 'string' && input.message.trim() !== ''
     const hasPrompt = typeof input.prompt === 'string' && input.prompt.trim() !== ''
     const keep = input.keep_running === true
-    if ([hasMsg, hasPrompt, keep].filter(Boolean).length > 1) return err(400, 'give one of message (a reminder, or a line for each event), prompt (a Claude run) or keep_running')
+    const scriptIn: any = typeof input.script === 'string' ? { command: input.script } : input.script
+    const hasScript = scriptIn !== undefined && scriptIn !== null
+    if ([hasMsg, hasPrompt, hasScript, keep].filter(Boolean).length > 1) return err(400, 'give one of message (a reminder, or a line for each event), prompt (a Claude run), script (a command) or keep_running')
     if (keep && !watching) return err(400, 'keep_running is for a watcher: give watch too')
     if (hasMsg) {
       if (input.message!.length > MAX.message) return err(400, `message is too long (at most ${MAX.message} characters)`)
@@ -169,6 +173,17 @@ export class TaskService {
       if (input.prompt!.length > MAX.prompt) return err(400, `prompt is too long (at most ${MAX.prompt} characters)`)
       const session = input.session ?? (base?.action.kind === 'claude' ? base.action.session : 'fresh')
       action = { kind: 'claude', prompt: input.prompt!.trim(), session }
+    } else if (hasScript) {
+      const command = String(scriptIn.command ?? '').trim()
+      if (!command) return err(400, 'script needs command: what to run with bash in this topic\'s folder, e.g. "bash backup.sh"')
+      if (command.length > LIMITS.watchCommandMax) return err(400, `script.command is too long (at most ${LIMITS.watchCommandMax} characters)`)
+      let timeoutMs: number | undefined
+      if (scriptIn.timeout_minutes !== undefined && scriptIn.timeout_minutes !== null) {
+        const m = minutesIn(scriptIn.timeout_minutes, 'script.timeout_minutes', 1, LIMITS.scriptTimeoutMaxMs / 60_000)
+        if (m.error) return err(400, m.error)
+        timeoutMs = m.ms
+      }
+      action = { kind: 'script', command, ...(timeoutMs ? { timeoutMs } : {}) }
     } else if (keep) {
       action = { kind: 'none' }
     } else if (!base) {
@@ -195,7 +210,8 @@ export class TaskService {
 
     let name = (input.name ?? base?.name ?? '').trim()
     if (!name) {
-      const src = action!.kind === 'message' ? action!.text : action!.kind === 'claude' ? action!.prompt : trigger!.kind === 'watch' ? trigger!.command : 'task'
+      const src = action!.kind === 'message' ? action!.text : action!.kind === 'claude' ? action!.prompt
+        : action!.kind === 'script' ? action!.command : trigger!.kind === 'watch' ? trigger!.command : 'task'
       name = src.replace(/\s+/g, ' ').slice(0, 40).trim() + (src.length > 40 ? '…' : '')
     }
 

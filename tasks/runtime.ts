@@ -30,6 +30,7 @@ import { manualRunId, nextAfter, resolveDue, slotRunId } from './schedule'
 import { elapsedText, markOf, whenText } from './render'
 import type { PollResult, WatcherExit } from './watchers'
 import { applyRule } from './filters'
+import { lastLines, outputBlock, type ScriptOutcome } from './scripts'
 
 export interface ClaudeOutcome {
   ok: boolean              // the run finished and produced an answer
@@ -86,6 +87,9 @@ export interface RuntimeDeps {
   // The AI filter: which of these lines answer the task's question. undefined when
   // it couldn't answer (they are asked about again next time).
   filter?(task: Task, question: string, items: string[]): Promise<FilterVerdict | undefined>
+  // A script's run (scripts.ts); without it, scripts fail.
+  runScript?(task: Task, run: Run): Promise<ScriptOutcome>
+  maxScripts?: number      // scripts at once, across every task (2)
 }
 
 export interface FilterVerdict { pass: { n: number; why: string }[]; by: string }
@@ -103,6 +107,7 @@ export class TaskRuntime {
   private inFlight = new Map<string, string>()       // task id → its open run
   private waiting: { task: string; run: string }[] = []
   private claudeActive = 0
+  private scriptActive = 0
   private timer: unknown
   private stopped = false
   private pending = new Set<Promise<void>>()
@@ -282,11 +287,26 @@ export class TaskRuntime {
 
   private dispatch(t: Task, run: Run): void {
     this.inFlight.set(t.id, run.id)
-    if (t.action.kind === 'claude' && this.claudeActive >= this.d.maxClaude) {
+    if (!this.free(t)) {
       this.waiting.push({ task: t.id, run: run.id })
       return
     }
-    this.track(t.action.kind === 'message' ? this.execMessage(t, run, 0) : this.execClaude(t, run))
+    this.track(this.exec(t, run))
+  }
+
+  // Room for one more of its kind: Claude runs and scripts have their caps.
+  private free(t: Task): boolean {
+    if (t.action.kind === 'claude') return this.claudeActive < this.d.maxClaude
+    if (t.action.kind === 'script') return this.scriptActive < (this.d.maxScripts ?? 2)
+    return true
+  }
+
+  private exec(t: Task, run: Run): Promise<void> {
+    switch (t.action.kind) {
+      case 'message': return this.execMessage(t, run, 0)
+      case 'script': return this.execScript(t, run)
+      default: return this.execClaude(t, run)
+    }
   }
 
   private track(p: Promise<void>): void {
@@ -295,13 +315,80 @@ export class TaskRuntime {
   }
 
   private startWaiting(): void {
-    while (this.claudeActive < this.d.maxClaude && this.waiting.length) {
-      const w = this.waiting.shift()!
+    for (let i = 0; i < this.waiting.length;) {
+      const w = this.waiting[i]
       const t = this.store.getTask(w.task)
       const run = this.store.getRun(w.run)
-      if (!t || !run || t.state === 'deleted') { this.inFlight.delete(w.task); if (run) this.store.updateRun(run.id, { state: 'canceled', reason: 'the task was deleted' }); continue }
-      this.track(this.execClaude(t, run))
+      if (!t || !run || t.state === 'deleted') {
+        this.waiting.splice(i, 1)
+        this.inFlight.delete(w.task)
+        if (run) this.store.updateRun(run.id, { state: 'canceled', reason: 'the task was deleted' })
+        continue
+      }
+      if (!this.free(t)) { i++; continue }
+      this.waiting.splice(i, 1)
+      this.track(this.exec(t, run))
     }
+  }
+
+  // --- scripts ------------------------------------------------------------------
+
+  private async execScript(t: Task, run: Run): Promise<void> {
+    this.scriptActive++
+    run = this.store.updateRun(run.id, { state: 'running', startedAt: this.d.now().toISOString() })!
+    this.d.cardChanged(this.store.getTask(t.id) ?? t)
+    let o: ScriptOutcome
+    try {
+      o = this.d.runScript ? await this.d.runScript(t, run) : { code: null, out: '', err: 'scripts are not available here', timedOut: false, durationMs: 0 }
+    } catch (e) {
+      o = { code: null, out: '', err: String((e as Error)?.message ?? e), timedOut: false, durationMs: 0 }
+    } finally {
+      this.scriptActive--
+    }
+    try {
+      await this.settleScript(t.id, run.id, o)
+    } finally {
+      this.inFlight.delete(t.id)
+      this.startWaiting()
+      this.afterRun(t.id)
+    }
+  }
+
+  // Its exit status decides. What it printed is posted as says has it: result (and
+  // live) always, noteworthy when it printed something, problems only on failure.
+  private async settleScript(taskId: string, runId: string, o: ScriptOutcome): Promise<void> {
+    const t = this.store.getTask(taskId)!
+    let run = this.store.getRun(runId)!
+    const end = this.d.now().toISOString()
+    const usage = { durationMs: o.durationMs }
+    if (t.state === 'deleted') { this.store.updateRun(run.id, { state: 'canceled', reason: 'the task was deleted while it ran', endedAt: end, usage }); return }
+    const all = [o.out.trim(), o.err.trim() ? `--- stderr\n${o.err.trim()}` : ''].filter(Boolean).join('\n')
+    const resultPath = all ? this.writeResult(t, run, all) : undefined
+    const base: Partial<Run> = { endedAt: end, usage, ...(resultPath ? { resultPath } : {}) }
+    if (o.stopped) {
+      run = this.store.updateRun(run.id, { ...base, state: 'canceled', reason: 'stopped' })!
+      this.d.cardChanged(this.store.updateTask(t.id, { lastMark: 'interrupted', lastRunAt: run.startedAt })!)
+      return
+    }
+    if (o.code !== 0 || o.timedOut) {
+      const timeout = t.action.kind === 'script' ? t.action.timeoutMs ?? LIMITS.scriptTimeoutMs : LIMITS.scriptTimeoutMs
+      const what = o.timedOut ? `it ran past ${elapsedText(timeout)} and was stopped` : o.code === null ? 'it was stopped before it finished' : `it exited with status ${o.code}`
+      const said = lastLines(o.err || o.out)
+      const reason = said ? `${what}: ${said}` : what
+      run = this.store.updateRun(run.id, { ...base, state: o.timedOut ? 'timed_out' : 'failed', reason })!
+      await this.onFailure(this.store.getTask(t.id)!, run, reason)
+      return
+    }
+    const out = o.out.trim()
+    const post = t.says === 'live' || t.says === 'result' || (t.says === 'noteworthy' && out !== '')
+    let postedMsg: number | undefined
+    if (post) {
+      const text = out ? outputBlock(out) : `Done in ${elapsedText(o.durationMs)}, with nothing printed.`
+      postedMsg = await this.safePost(t, 'result', text, { loud: t.sound === 'loud', lateMs: run.lateMs, run })
+    }
+    run = this.store.updateRun(run.id, { ...base, state: 'succeeded', summary: out ? lastLines(out, 1, 200) : 'nothing printed', ...(postedMsg ? { postedMsg } : {}) })!
+    if (postedMsg) this.d.note(t, `The task "${t.name}" ran its command at ${new Date(run.startedAt ?? end).toISOString()} and posted: ${lastLines(out, 3, 280) || 'that it finished'}${resultPath ? ` (full output: ${resultPath})` : ''}`)
+    this.finishRun(t.id, run)
   }
 
   // --- reminders --------------------------------------------------------------
@@ -732,7 +819,8 @@ export class TaskRuntime {
       const id = await this.safePost(t, 'alert', `⚠️ ${t.name} failed ${streak} times in a row. Last error: ${reason}`, { loud: !t.alertMsg, edit: t.alertMsg, buttons: 'alert', run })
       t = this.store.updateTask(t.id, { alertMsg: id ?? t.alertMsg, alertAt: this.d.now().toISOString() })!
       this.d.activity(t, `⚠️ ${t.name} failed ${streak} times in a row`)
-    } else if (t.says === 'live') {
+    } else if (t.says === 'live' || t.says === 'problems') {
+      // Someone watching, or a task whose whole job is to say when something fails.
       await this.safePost(t, 'failure', `⚠️ ${t.name} failed: ${reason}`, { loud: true, run })
     } else {
       this.d.activity(t, `❌ ${t.name} failed: ${reason}`)

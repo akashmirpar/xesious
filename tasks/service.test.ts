@@ -343,3 +343,24 @@ describe('rules and the AI filter', () => {
     expect(r.ok && r.value.task.trigger.kind).toBe('cron')
   })
 })
+
+describe('scripts', () => {
+  test('a command on a schedule: says result by default, named after its command, silent in a group; checked', () => {
+    const t = create({ script: 'bash backup.sh', cron: '7 3 * * *' })
+    expect(t.action).toEqual({ kind: 'script', command: 'bash backup.sh' })
+    expect(t).toMatchObject({ says: 'result', name: 'bash backup.sh', sound: 'silent' })
+    const p = create({ script: { command: 'bash sync.sh', timeout_minutes: 90 }, cron: '7 4 * * *', says: 'problems' })
+    expect(p.action).toEqual({ kind: 'script', command: 'bash sync.sh', timeoutMs: 5_400_000 })
+    expect(p.sound).toBe('loud')
+    const e = (input: any) => { const r = svc.create(person, { tz: 'UTC', ...input }); return r.ok ? '' : r.error }
+    expect(e({ script: '', cron: '7 3 * * *' })).toContain('script needs command')
+    expect(e({ script: { command: 'x', timeout_minutes: 500 }, cron: '7 3 * * *' })).toContain('script.timeout_minutes is between 1 and 240')
+    expect(e({ script: 'x', prompt: 'y', cron: '7 3 * * *' })).toContain('give one of')
+    const v = svc.get(person, p.id)
+    expect(v.ok && v.value).toMatchObject({ script: { command: 'bash sync.sh', timeout_minutes: 90 }, says: 'problems' })
+  })
+
+  test("a watcher's events can run a script", () => {
+    expect(create({ watch: { command: 'python3 feed.py' }, script: 'bash on-event.sh' }).action.kind).toBe('script')
+  })
+})

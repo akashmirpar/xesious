@@ -97,9 +97,18 @@ const SAYS_TEXT: Record<Task['says'], string> = {
   never: 'posts nothing (history only)',
 }
 
+const SCRIPT_SAYS: Record<Task['says'], string> = {
+  live: 'posts what it prints',
+  result: 'posts what it prints',
+  noteworthy: 'posts only when it prints something',
+  problems: 'posts only when it fails',
+  never: 'posts nothing (history only)',
+}
+
 export function actionText(t: Task): string {
   const watch = t.trigger.kind === 'watch'
   if (t.action.kind === 'none') return 'keeps it running; says something only if it fails'
+  if (t.action.kind === 'script') return `runs a command${watch ? ' when it sees something' : ''} · ${SCRIPT_SAYS[t.says]}`
   if (t.action.kind === 'message') return watch ? 'sends a message when it sees something' : 'sends a message'
   const session = t.action.session === 'own' ? 'Claude, in its own session (remembers earlier runs)' : 'Claude, a fresh session each run'
   return `${watch ? `${session}, when it sees something` : session} · ${SAYS_TEXT[t.says]}`
@@ -172,6 +181,7 @@ export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchSt
   lines.push([sched, esc(actionText(t)), t.action.kind === 'none' ? '' : t.sound === 'loud' ? '🔔 loud' : '🔕 silent', freq ? esc(freq) : ''].filter(Boolean).join(' · '))
   if (t.trigger.kind === 'watch') lines.push(`<code>${esc(clip(t.trigger.command, 200))}</code>`)
   if (t.rule) lines.push(`Only ${esc(ruleText(t.rule))}`)
+  if (t.action.kind === 'script') lines.push(`${isWatch ? 'Then runs ' : ''}<code>${esc(clip(t.action.command, 200))}</code>`)
   if (t.ai) {
     const n = t.filterSeen ? ` · ${t.filterSeen.toLocaleString('en-US')} considered, ${(t.filterPassed ?? 0).toLocaleString('en-US')} let through` : ''
     lines.push(`AI filter every ${esc(durationText(t.ai.everyMs))}: “${esc(clip(t.ai.question, 160))}”${n}`)

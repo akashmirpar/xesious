@@ -5164,6 +5164,33 @@ describe('tasks: watchers (phase 2)', () => {
     expect(events.map(c => textOf(c))).toEqual(['👀 <a href="tg://user?id=1">Ada</a> 🚨 Major outage in one region stubPASS — the stub says so'])
   }, 20000)
 
+  test("a task's script: it can post in its own topic through the CLI while it runs, and what it printed is posted", async () => {
+    const before = calls.length
+    const seen = join(TMP, 'script-token')
+    const t = make({ name: 'Backup', script: `printf %s "$XESIOUS_API_TOKEN" > ${seen}; bun "$XESIOUS_CLI" notify --silent "halfway there"; echo "backup: 12 files"`, cron: '7 3 * * *' })
+    T().runtime.runNow(t.id)
+    await waitFor(() => T().store.runsFor(t.id).some((r: any) => r.state === 'succeeded'), 15000)
+    // The card shows the command, so the messages are told apart from it.
+    const mid = sent(before, 'halfway there').filter(c => textOf(c) === 'halfway there')
+    expect(mid.length).toBe(1)
+    expect(mid[0].payload).toMatchObject({ chat_id: C, message_thread_id: 701, disable_notification: true })
+    expect(sent(before, 'backup: 12 files').filter(c => !textOf(c).includes('<code>')).length).toBe(1)
+    // Its token died with the run.
+    const token = readFileSync(seen, 'utf8')
+    expect(token.length).toBeGreaterThan(20)
+    expect(T().tokens.lookup(token)).toBeUndefined()
+  }, 20000)
+
+  test('a script that says problems: quiet when it works, loud when it fails', async () => {
+    const before = calls.length
+    const t = make({ name: 'Nightly sync', script: 'echo "sync: connection refused" >&2; exit 4', cron: '7 4 * * *', says: 'problems' })
+    T().runtime.runNow(t.id)
+    await waitFor(() => sent(before, 'Nightly sync failed').length > 0, 15000)
+    const m = sent(before, 'Nightly sync failed')[0]
+    expect(textOf(m)).toContain('it exited with status 4: sync: connection refused')
+    expect(m.payload.disable_notification).toBe(false)
+  }, 20000)
+
   test('at its end it stops and says so; a tap gives it another week, and it starts again', async () => {
     const t = make({ name: 'Sync loop', watch: { command: 'sleep 30' }, keep_running: true })
     await waitFor(() => T().watchers.list().includes(t.id))
