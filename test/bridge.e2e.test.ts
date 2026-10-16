@@ -5308,6 +5308,14 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     expect(calls.slice(b3).some(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('⚠️'))).toBe(false)
   }, 30000)
 
+  test('one run hands off at most five times', async () => {
+    const tok = T().tokens.mint({ ...scopeOf(C, 501), runKind: 'scheduled', taskId: 'cap001', runId: 'cap001@1' })
+    for (let i = 1; i <= 5; i++) expect((await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', bot: 'postingbot', brief: `part ${i}` })).status).toBe(201)
+    const sixth = await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', bot: 'postingbot', brief: 'part 6' })
+    expect([sixth.status, sixth.body.error]).toEqual([409, 'one run hands off at most 5 times'])
+    T().tokens.revoke(tok)
+  })
+
   test('a flow: where a run\'s work went shows on its card and in /tasks flows; a hand-off can be waited for', async () => {
     const t = make({ name: 'Morning draft', prompt: 'Draft the post', cron: '7 9 * * *', then: { handoff_to: '502', brief: 'Publish this draft.' } }, scopeOf(C, 501))
     T().runtime.runNow(t.id)

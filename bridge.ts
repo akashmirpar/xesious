@@ -8435,6 +8435,15 @@ async function runHandoff(id: string): Promise<void> {
   }
 }
 
+// Hand-offs per run, for the cap: a run is over long before a day is.
+const handoffsByRun = new Map<string, { n: number; at: number }>()
+function countRunHandoff(run: string): void {
+  for (const [k, v] of handoffsByRun) if (Date.now() - v.at > 24 * 3600_000) handoffsByRun.delete(k)
+  const c = handoffsByRun.get(run) ?? { n: 0, at: Date.now() }
+  c.n++
+  handoffsByRun.set(run, c)
+}
+
 // A hand-off that ended: the card of the task that made it shows it.
 function handoffEnded(h: Handoff): void {
   const t = h.fromTask ? taskStore?.getTask(h.fromTask) : undefined
@@ -9135,9 +9144,12 @@ const taskBridge: BridgeHandlers = {
     if (peer && !PEER_BOTS.includes(peer) && !OTHER_BOTS.includes(peer)) return fail(403, `@${peer} isn't a bot this one hands off to (TG_PEER_BOTS, TG_OTHER_BOTS)`)
     const minutes = body?.wait_minutes === undefined || body.wait_minutes === null ? 0 : Number(body.wait_minutes)
     if (!(minutes >= 0 && minutes <= 10)) return fail(400, 'wait_minutes is between 1 and 10')
+    const runKey = s.runId ?? s.jobId
+    if (runKey && (handoffsByRun.get(runKey)?.n ?? 0) >= LIMITS.handoffsPerRun) return fail(409, `one run hands off at most ${LIMITS.handoffsPerRun} times`)
     const ask = { chat: s.chat, fromThread: s.thread, toThread, brief, files, by: s.person, byName: s.personName, fromTask: s.taskId, fromRun: s.runId, fromHandoff: s.handoffId, depth: (s.handoffDepth ?? 0) + 1 }
     const r = !peer ? await startHandoff(ask) : PEER_BOTS.includes(peer) ? await startPeerHandoff({ ...ask, peer }) : await startBotAsk({ ...ask, peer })
     if (r.error) return fail(409, r.error)
+    if (runKey) countRunHandoff(runKey)
     // Waited for: its result comes back to the run that asked, holding its watchdog.
     if (minutes > 0) {
       const release = holdJob(s.jobId)

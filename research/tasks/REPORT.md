@@ -1,6 +1,6 @@
 # Tasks: scheduled, watching and background work, with a local API and MCP
 
-*Proposal, branch `feat/jobs-mcp-api`. Phases 1 to 4 (§18) are built: schedules, reminders, Claude runs, scripts, watchers with rules and the AI filter, digests and watchdogs; questions, and Claude's own questions, plans and permission prompts as buttons; hand-offs, plans with a Codex step, after, child tasks, xesious ask/run/fire and webhooks. "Approve and re-run" for what auto mode blocked was left out (§8). Written 2026-10-15; the decisions from the 2026-10-16 review are folded in and listed in [§19](#19-decisions-2026-10-16). The research behind it is in [landscape.md](landscape.md).*
+*Proposal, branch `feat/jobs-mcp-api`. All five phases (§18) are built: schedules, reminders, Claude runs, scripts, watchers with rules and the AI filter, digests and watchdogs; questions, and Claude's own questions, plans and permission prompts as buttons; hand-offs (waited for, up to 10 minutes, when a run needs the result), plans with a Codex step, after, child tasks, flows on cards and in `/tasks flows`, xesious ask/run/fire and webhooks; hand-offs between xesious bots over Telegram, and to other bots best effort. "Approve and re-run" for what auto mode blocked was left out (§8), and so was the same-host shortcut between xesious bots (§9, "Later"). Written 2026-10-15; the decisions from the 2026-10-16 review are folded in and listed in [§19](#19-decisions-2026-10-16). The research behind it is in [landscape.md](landscape.md).*
 
 ## The short version
 
@@ -242,7 +242,7 @@ Some tasks need gates that must not depend on Claude following a prompt: "push o
 For a topic served by a different xesious bot: Content and Posting each have their own bot.
 - **Setup, once:**
   - Both bots are in the group, with Bot-to-Bot Communication Mode switched on in @BotFather (Bot API 10.0).
-  - Each bot lists the other as a **peer** (by bot id).
+  - Each bot lists the other as a **peer** (by username, which the mention needs: `TG_PEER_BOTS`).
   - The sending bot knows which topics the other serves.
   - xesious's group setup already turns privacy mode off (or makes the bot an admin). With bot-to-bot mode on, the bots then see each other's group messages.
 - **The hand-off is an ordinary message** in the target topic, readable by people and addressed with a mention:
