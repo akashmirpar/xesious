@@ -216,6 +216,7 @@ const HANDOFF_TOOL = {
       bot: { type: 'string', description: "Optional: another bot in this group that does it there, by its username (\"@PostingBot\"), one this bot knows. Another xesious bot gets it as a hand-off and answers when done. A bot of another kind gets the brief as a message, so start it with that bot's command (\"/forecast Paris\"); its reply is the answer, best effort, with no files." },
       brief: { type: 'string' },
       files: { type: 'array', items: { type: 'string' } },
+      wait_minutes: { type: 'number', description: "Optional, 1 to 10: wait this long for its result and get it back here (that topic's answer, the other bot's reply), to carry on with it. Past that it goes on there, and its result is posted there." },
     },
     required: ['topic', 'brief'],
   },

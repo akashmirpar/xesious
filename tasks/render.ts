@@ -180,7 +180,7 @@ export function usageText(u: Usage | undefined): string {
 export interface WatchStatus { running: boolean; since?: string }
 
 // The card: one message per task in its home topic, edited when its state changes.
-export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchStatus, related?: string[]): string {
+export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchStatus, related?: string[], flow?: string): string {
   const lines: string[] = []
   lines.push(`${kindLabel(t)}: <b>${esc(t.name)}</b>`)
   const isWatch = t.trigger.kind === 'watch'
@@ -231,6 +231,7 @@ export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchSt
       : ''
     lines.push([strip, lastText].filter(Boolean).join('  '))
   }
+  if (flow) lines.push(flow)
   return lines.join('\n')
 }
 

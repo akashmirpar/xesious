@@ -226,6 +226,9 @@ export interface Handoff {
   by: string                 // the person it runs as
   byName?: string
   fromTask?: string          // a task's run that handed it off
+  fromRun?: string           // …that run: a flow's link
+  fromHandoff?: string       // the hand-off whose run handed it on
+  fromHost?: boolean         // a script on the host (xesious run): no source topic
   depth: number              // 1 from a person or a task; one more each time it is handed on
   state: 'queued' | 'running' | 'sent' | 'done' | 'failed'
   // Between xesious bots: the other bot, which way it goes, the message that carried it

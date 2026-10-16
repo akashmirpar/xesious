@@ -68,6 +68,7 @@ import { Watchers } from './tasks/watchers'
 import { TaskService, type Action as TaskAction } from './tasks/service'
 import { taskRoutes, type BridgeHandlers } from './tasks/routes'
 import { TokenRegistry, startApi, loadOperatorToken, reply, fail, type Scope, type ApiServer, type ApiReply } from './tasks/api'
+import { runNode, recentFlows, flowLine, flowsHtml, type FlowSource } from './tasks/flows'
 import { whenText, elapsedText, cardHtml, historyHtml, scheduleText, watchedText, taskListHtml, kindLabel, actionText, type TaskSection } from './tasks/render'
 import { LIMITS, type Handoff, type Task, type Run, type Wait } from './tasks/model'
 import type { RunUsage } from './lib'
@@ -3055,7 +3056,7 @@ function tasksMcpFor(ctx: Context, key: string, threadId: number | undefined, ro
     runKind: ro.task ? 'scheduled' : 'interactive', ...(ro.task ? { taskId: ro.task.taskId, runId: ro.task.runId } : {}),
     ...(!ro.task && isTasksHub(ctx.chat.id, threadId) ? { hub: true } : {}),
     ...(jobId ? { jobId } : {}),
-    ...(ro.handoff ? { handoffDepth: ro.handoff.depth } : {}),
+    ...(ro.handoff ? { handoffDepth: ro.handoff.depth, handoffId: ro.handoff.id } : {}),
   }
   const token = apiTokens.mint(scope)
   const env = { XESIOUS_API_SOCK: taskApi.socket, XESIOUS_API_TOKEN: token, XESIOUS_RUN_KIND: scope.runKind! }
@@ -7045,6 +7046,14 @@ bot.on('message', async ctx => {
     const group = ctx.chat.type !== 'private'
     const wide = group && (threadId === undefined || isTasksHub(chatId, threadId))
     const where = wide ? 'in this group' : group ? 'in this topic' : 'here'
+    // /tasks flows: what the runs set going, the last week.
+    if (words[0] === 'flows') {
+      const since = new Date(taskNow().getTime() - 7 * 86400_000).toISOString()
+      const html = flowsHtml(`<b>🔀 Flows ${where}, the last 7 days</b>`, recentFlows(flowSource(String(chatId)), since, wide ? 'all' : threadId))
+      if (ctx.chat.type === 'private') await ctx.api.sendMessage(chatId, html, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }).catch(e => console.error(`[tasks] /tasks flows: ${e}`))
+      else await replyOnlyTo(ctx, threadId, html, undefined, msg.message_id || undefined, ephemeralId, true, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
+      return
+    }
     const view = tasksListView(chatId, wide ? 'all' : threadId, `<b>Tasks ${where}</b>`)
     if (!view.count) {
       await answer(`No tasks ${where} yet. Ask for one in plain words: "remind me in two hours to…", "every weekday at 9, summarize…", "tell me when…".`)
@@ -8153,7 +8162,7 @@ async function runStepHandoff(t: Task, run: Run, step: StepCall): Promise<{ ok: 
   const outbox = join(resolveCwd(taskContext(t), t.thread), OUTBOX_DIR)
   const files = existsSync(outbox) ? readdirSync(outbox).map(n => join(outbox, n)).filter(p => statSync(p).isFile()) : []
   const brief = `${step.step.brief?.trim() || `Carry on from the plan "${t.name}".`}\n\nFrom step ${step.n} of the plan "${t.name}". What the steps before it gave:\n${gave || '(nothing)'}`
-  const r = await startHandoff({ chat: t.chat, fromThread: t.thread, toThread: step.step.thread, brief: brief.slice(0, 20_000), files, by: t.owner, byName: t.ownerName, fromTask: t.id, depth: 1 })
+  const r = await startHandoff({ chat: t.chat, fromThread: t.thread, toThread: step.step.thread, brief: brief.slice(0, 20_000), files, by: t.owner, byName: t.ownerName, fromTask: t.id, fromRun: run.id, depth: 1 })
   return r.error ? { ok: false, error: r.error } : { ok: true }
 }
 
@@ -8290,6 +8299,8 @@ interface HandoffAsk {
   by: string
   byName?: string
   fromTask?: string
+  fromRun?: string           // the task's run that hands it off
+  fromHandoff?: string       // the hand-off whose run hands it on
   depth: number
   fromHost?: boolean         // asked by a script on the host (xesious run): no source topic
 }
@@ -8324,7 +8335,7 @@ async function startHandoff(a: HandoffAsk): Promise<{ handoff?: Handoff; error?:
     landed.push(name)
   }
   let h = store.createHandoff({ chat: a.chat, fromThread: a.fromThread, toThread: a.toThread, brief: a.brief, files: landed, by: a.by, byName: a.byName,
-    fromTask: a.fromTask, depth: a.depth, state: 'queued', createdAt: new Date().toISOString(), ...(a.fromHost ? { fromHost: true } : {}) } as any)
+    fromTask: a.fromTask, fromRun: a.fromRun, fromHandoff: a.fromHandoff, depth: a.depth, state: 'queued', createdAt: new Date().toISOString(), ...(a.fromHost ? { fromHost: true } : {}) })
   const from = a.fromHost ? 'a script on the host' : topicNameOf(chatId, a.fromThread), to = topicNameOf(chatId, a.toThread)
   const first = handoffFirstLine(a.brief)
   const head = a.fromHost ? '⚙️ From a script on the host' : `⬅️ From <b>${escapeHtml(from)}</b> · ${escapeHtml(a.byName ?? 'someone')}`
@@ -8416,10 +8427,27 @@ async function runHandoff(id: string): Promise<void> {
     await bot.api.sendMessage(chatId, ok ? `✅ #handoff-${h.peerTag} done${there ? `: ${there}` : ''}` : `❌ #handoff-${h.peerTag} failed: ${error}`,
       { ...destOpts({ threadId: h.toThread, replyTo: h.peerMsg }), link_preview_options: { is_disabled: true } }).catch(e => console.error(`[handoff] answering @${h.peer}: ${e}`))
   }
+  handoffEnded(h)
   // A task's run that handed this off, failing: said loud, where the task lives.
   if (!ok && h.fromTask && !res.stopped) {
     const t = store.getTask(h.fromTask)
     if (t) await postTask(t, 'failure', `⚠️ ${t.name}: the work it handed to ${to} didn't finish: ${error}`, { loud: true }).catch(() => {})
+  }
+}
+
+// A hand-off that ended: the card of the task that made it shows it.
+function handoffEnded(h: Handoff): void {
+  const t = h.fromTask ? taskStore?.getTask(h.fromTask) : undefined
+  if (t) refreshTaskCard(t, 'run')
+}
+
+// A hand-off's end, waited for: a script on the host, or a run that wants its result.
+async function waitForHandoff(id: string, ms: number): Promise<Handoff | undefined> {
+  const end = Date.now() + ms
+  for (;;) {
+    const h = taskStore?.getHandoff(id)
+    if (!h || h.state === 'done' || h.state === 'failed' || Date.now() >= end) return h
+    await Bun.sleep(Math.min(500, Math.max(0, end - Date.now())))
   }
 }
 
@@ -8432,7 +8460,7 @@ async function handTaskOn(t: Task, run: Run, text: string): Promise<void> {
 
 What its run produced:
 ${text}`
-  const r = await startHandoff({ chat: t.chat, fromThread: t.thread, toThread: t.then.thread, brief: brief.slice(0, 20_000), files, by: t.owner, byName: t.ownerName, fromTask: t.id, depth: 1 })
+  const r = await startHandoff({ chat: t.chat, fromThread: t.thread, toThread: t.then.thread, brief: brief.slice(0, 20_000), files, by: t.owner, byName: t.ownerName, fromTask: t.id, fromRun: run.id, depth: 1 })
   if (r.error) await postTask(t, 'failure', `⚠️ ${t.name}: couldn't hand its result on: ${r.error}`, { loud: true }).catch(() => {})
 }
 
@@ -8515,7 +8543,7 @@ async function startPeerHandoff(a: HandoffAsk & { peer: string }): Promise<{ han
     brief = `${a.brief.slice(0, room).trimEnd()}…\n(The whole brief is in brief.md.)`
   }
   let h = store.createHandoff({ chat: a.chat, fromThread: a.fromThread, toThread: a.toThread, brief: a.brief, files: paths.map(p => basename(p)), by: a.by, byName: a.byName,
-    fromTask: a.fromTask, depth: a.depth, state: 'sent', createdAt: new Date().toISOString(), peer: a.peer, direction: 'out',
+    fromTask: a.fromTask, fromRun: a.fromRun, fromHandoff: a.fromHandoff, depth: a.depth, state: 'sent', createdAt: new Date().toISOString(), peer: a.peer, direction: 'out',
     deadline: new Date(taskNow().getTime() + LIMITS.peerAnswerMs).toISOString() })
   h = store.updateHandoff(h.id, { peerTag: h.id })!
   const text = `${head}${brief}${links.length ? `\n${links.join('\n')}` : ''}\n#handoff-${h.id}${a.depth > 1 ? ` #depth-${a.depth}` : ''}`
@@ -8544,7 +8572,7 @@ async function startBotAsk(a: HandoffAsk & { peer: string }): Promise<{ handoff?
   const cmd = brief.match(/^\/([a-z0-9_]{1,32})(?:@\w+)?(\s[\s\S]*)?$/i)
   const text = cmd ? `/${cmd[1]}@${a.peer}${cmd[2] ?? ''}` : `@${a.peer} ${brief}`
   let h = store.createHandoff({ chat: a.chat, fromThread: a.fromThread, toThread: a.toThread, brief, files: [], by: a.by, byName: a.byName,
-    fromTask: a.fromTask, depth: a.depth, state: 'sent', createdAt: new Date().toISOString(), peer: a.peer, direction: 'out', plain: true,
+    fromTask: a.fromTask, fromRun: a.fromRun, fromHandoff: a.fromHandoff, depth: a.depth, state: 'sent', createdAt: new Date().toISOString(), peer: a.peer, direction: 'out', plain: true,
     deadline: new Date(taskNow().getTime() + LIMITS.otherBotAnswerMs).toISOString() })
   const m = await bot.api.sendMessage(chatId, text, { ...destOpts({ threadId: a.toThread }), link_preview_options: { is_disabled: true } }).catch(e => { console.error(`[handoff] to @${a.peer}: ${e}`); return null })
   if (!m) { store.updateHandoff(h.id, { state: 'failed', error: "Telegram didn't take the message", endedAt: new Date().toISOString() }); return { error: "Telegram didn't take the message" } }
@@ -8577,6 +8605,7 @@ async function settlePeerHandoff(h: Handoff, ok: boolean, said: string, link?: s
   if (h.srcMsg) await bot.api.editMessageText(chatId, h.srcMsg, `${peerLineHead(h, there)}\n${ok ? okText : `❌ ${escapeHtml(said)}`}`,
     { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }).catch(() => {})
   console.log(`[handoff] ${h.chat}: @${h.peer} answered ${h.id}: ${ok ? 'done' : said}`)
+  handoffEnded(h)
   logHandoff(h, `${ok ? '✅' : '❌'} ${topicNameOf(chatId, h.fromThread)} → @${h.peer} in ${to}: ${ok ? 'done' : said}`)
   if (ok || late) return
   const t = h.fromTask ? store.getTask(h.fromTask) : undefined
@@ -9048,11 +9077,8 @@ const taskBridge: BridgeHandlers = {
     if (r.error) return fail(409, r.error)
     const id = r.handoff!.id
     if (body?.wait === false) return reply(202, { message: 'Started.', id })
-    for (;;) {
-      await Bun.sleep(1000)
-      const h = taskStore!.getHandoff(id) as any
-      if (!h || h.state === 'done' || h.state === 'failed') return reply(200, { id, state: h?.state ?? 'gone', result: h?.result, error: h?.error })
-    }
+    const h = await waitForHandoff(id, Infinity)
+    return reply(200, { id, state: h?.state ?? 'gone', result: h?.result, error: h?.error })
   },
   // A task's run asking someone something, and waiting for the answer: a few minutes
   // here, holding its watchdog; after that it is told to stop, and the answer carries
@@ -9107,9 +9133,20 @@ const taskBridge: BridgeHandlers = {
     const peer = body?.bot ? String(body.bot).trim().replace(/^@/, '').toLowerCase() : undefined
     if (peer !== undefined && !/^[a-z][a-z0-9_]{3,31}$/.test(peer)) return fail(400, 'bot is the other bot\'s username, like "@PostingBot"')
     if (peer && !PEER_BOTS.includes(peer) && !OTHER_BOTS.includes(peer)) return fail(403, `@${peer} isn't a bot this one hands off to (TG_PEER_BOTS, TG_OTHER_BOTS)`)
-    const ask = { chat: s.chat, fromThread: s.thread, toThread, brief, files, by: s.person, byName: s.personName, fromTask: s.taskId, depth: (s.handoffDepth ?? 0) + 1 }
+    const minutes = body?.wait_minutes === undefined || body.wait_minutes === null ? 0 : Number(body.wait_minutes)
+    if (!(minutes >= 0 && minutes <= 10)) return fail(400, 'wait_minutes is between 1 and 10')
+    const ask = { chat: s.chat, fromThread: s.thread, toThread, brief, files, by: s.person, byName: s.personName, fromTask: s.taskId, fromRun: s.runId, fromHandoff: s.handoffId, depth: (s.handoffDepth ?? 0) + 1 }
     const r = !peer ? await startHandoff(ask) : PEER_BOTS.includes(peer) ? await startPeerHandoff({ ...ask, peer }) : await startBotAsk({ ...ask, peer })
     if (r.error) return fail(409, r.error)
+    // Waited for: its result comes back to the run that asked, holding its watchdog.
+    if (minutes > 0) {
+      const release = holdJob(s.jobId)
+      let h: Handoff | undefined
+      try { h = await waitForHandoff(r.handoff!.id, minutes * 60_000) } finally { release() }
+      if (h?.state === 'done') return reply(200, { id: h.id, state: 'done', result: (h.result ?? '').slice(0, 8000), message: 'Done; its result is in result.' })
+      if (h?.state === 'failed') return reply(200, { id: h.id, state: 'failed', error: h.error, message: "It didn't get done; error says why." })
+      return reply(201, { id: r.handoff!.id, state: h?.state ?? 'gone', message: `Not done within ${minutes} min: it goes on there, and its result is posted there.` })
+    }
     if (peer && !PEER_BOTS.includes(peer)) return reply(201, { message: `Asked @${peer} in ${topicNameOf(Number(s.chat), toThread)}. Its reply there, if it replies to that message within ${elapsedText(LIMITS.otherBotAnswerMs)}, is its answer; this topic's line shows it.`, id: r.handoff!.id })
     if (peer) return reply(201, { message: `Handed to @${peer} in ${topicNameOf(Number(s.chat), toThread)}: it does it there and answers; this topic gets a line when it does.`, id: r.handoff!.id })
     return reply(201, { message: `Handed to ${topicNameOf(Number(s.chat), toThread)}: it runs there now and posts its result there, and this topic gets a line when it is done.`, id: r.handoff!.id })
@@ -9163,11 +9200,32 @@ function cardKeyboard(t: Task): { inline_keyboard: any[][] } {
   return { inline_keyboard: [row] }
 }
 
+// A group's tasks, runs and hand-offs, for its flows.
+function flowSource(chat: string): FlowSource {
+  const store = taskStore!
+  const runs = new Map<string, Run[]>()
+  return {
+    tasks: store.listTasks({ chat }),
+    runsOf: id => { let r = runs.get(id); if (!r) runs.set(id, r = store.runsFor(id, 30)); return r },
+    handoffs: store.handoffsSince(chat, new Date(taskNow().getTime() - 8 * 86400_000).toISOString()),
+    topicName: th => topicNameOf(Number(chat), th),
+    link: (th, msg) => messageLink(Number(chat), th, msg),
+  }
+}
+
+function taskCardHtml(t: Task): string {
+  const store = taskStore!
+  const runs = store.runsFor(t.id, 8)
+  const ids = t.action.kind === 'claude' ? t.action.watch : t.action.kind === 'digest' ? t.action.of : undefined
+  const last = runs.find(r => r.state !== 'queued')
+  const flow = last && t.where !== 'dm' ? flowLine(runNode(last, flowSource(t.chat))) : undefined
+  return cardHtml(t, runs, taskNow(), taskWatchers?.status(t.id), ids?.map(id => store.getTask(id)?.name ?? id), flow)
+}
+
 async function showTaskCard(id: string): Promise<void> {
   const t = taskStore?.getTask(id)
   if (!t || !taskStore) return
-  const ids = t.action.kind === 'claude' ? t.action.watch : t.action.kind === 'digest' ? t.action.of : undefined
-  const html = cardHtml(t, taskStore.runsFor(t.id, 8), taskNow(), taskWatchers?.status(t.id), ids?.map(id => taskStore!.getTask(id)?.name ?? id))
+  const html = taskCardHtml(t)
   const kb = cardKeyboard(t)
   const shown = html + JSON.stringify(kb)
   const c = cards.get(t.id) ?? { at: 0 }
@@ -9444,7 +9502,7 @@ async function handleTaskCallback(ctx: Context, data: string): Promise<void> {
     }
     // Its card, privately: from a number in /tasks or the board.
     case 'card':
-      await privatelyFromTap(ctx, cardHtml(t, taskStore.runsFor(t.id, 8), taskNow(), taskWatchers?.status(t.id)), cardKeyboard(t))
+      await privatelyFromTap(ctx, taskCardHtml(t), cardKeyboard(t))
       await answer()
       return
     case 'delok': {

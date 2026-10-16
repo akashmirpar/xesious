@@ -5308,6 +5308,31 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     expect(calls.slice(b3).some(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('⚠️'))).toBe(false)
   }, 30000)
 
+  test('a flow: where a run\'s work went shows on its card and in /tasks flows; a hand-off can be waited for', async () => {
+    const t = make({ name: 'Morning draft', prompt: 'Draft the post', cron: '7 9 * * *', then: { handoff_to: '502', brief: 'Publish this draft.' } }, scopeOf(C, 501))
+    T().runtime.runNow(t.id)
+    const mine = () => T().store.handoffsSince(String(C), '2000-01-01T00:00:00Z').find((x: any) => x.fromTask === t.id)
+    await waitFor(() => mine()?.state === 'done', 15000)
+    expect(mine().fromRun).toBe(T().store.runsFor(t.id)[0].id)
+    // Its card: where its last run's work went.
+    const cs = await press(`tk:card:${t.id}`, C, 501)
+    const card = String(cs.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('Morning draft'))!.payload.text)
+    expect(card).toMatch(/🔀 Its last run → <a href="[^"]+">➡️ topic 502 ✅<\/a>$/)
+    // /tasks flows in the 🗂 Tasks topic: the group's.
+    const hub = Number(T().store.getMeta(`activity:${C}`))
+    const fl = await say('/tasks flows', hub)
+    const view = String(fl.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('🔀 Flows in this group, the last 7 days'))!.payload.text)
+    expect(view).toMatch(/<b>Morning draft<\/b> · [^<]+ ✅(<\/a>)? → <a href="[^"]+">➡️ topic 502 ✅<\/a>/)
+    // A hand-off waited for: its result comes back to the run that asked.
+    await say('MCPTASK handoff {"topic":"502","brief":"Count to three.","wait_minutes":1}', 501)
+    const w = lastMcp()
+    expect(w).toMatchObject({ tool: 'handoff', isError: false })
+    expect(w.text).toContain('"state":"done"')
+    expect(w.text).toContain('okReply')
+    await say('MCPTASK handoff {"topic":"502","brief":"x","wait_minutes":11}', 501)
+    expect(lastMcp()).toMatchObject({ isError: true, text: 'Error: wait_minutes is between 1 and 10' })
+  }, 30000)
+
   test('a plan: its steps one after another, each given what came before; one progress line, edited; the last word posted', async () => {
     const before = calls.length
     const t = make({ name: 'Weekend fix', cron: '7 10 * * 6', steps: [
