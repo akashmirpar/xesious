@@ -3,8 +3,9 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TaskStore } from './store'
-import { TaskRuntime, type ClaudeOutcome, type RuntimeDeps } from './runtime'
-import type { Run, Task } from './model'
+import { TaskRuntime, eventText, type ClaudeOutcome, type RuntimeDeps, type WatcherControl } from './runtime'
+import type { Run, Task, WatchEvent } from './model'
+import type { PollResult } from './watchers'
 
 let dir: string
 let store: TaskStore
@@ -308,4 +309,184 @@ test('after a restart, runs left open are interrupted and the topic is told, wit
   expect(store.getRun(`${t.id}@x`)!.state).toBe('interrupted')
   expect(posts).toMatchObject([{ kind: 'notice', opts: { buttons: 'rerun' } }])
   expect(posts[0].text).toContain('the bot restarted while this was running')
+})
+
+describe('watchers', () => {
+  let running: Set<string>
+  let starts: string[]
+  let canStart: boolean
+  let looks: Map<string, PollResult>
+  const fake: WatcherControl = {
+    list: () => [...running],
+    ensure: t => { if (!canStart) return false; if (!running.has(t.id)) starts.push(t.id); running.add(t.id); return true },
+    stop: id => { running.delete(id) },
+    poll: async t => looks.get(t.id) ?? { events: [], code: 0, err: '', upMs: 5 },
+  }
+  beforeEach(() => {
+    running = new Set(); starts = []; canStart = true; looks = new Map()
+    rt.stop()
+    rt = new TaskRuntime(deps({ watchers: fake }))
+  })
+  const stream = (over: Partial<Task> = {}) => mk({
+    name: 'Price watch', trigger: { kind: 'watch', command: 'python3 price.py' }, action: { kind: 'message', text: 'Below 300: {event}' },
+    nextDue: undefined, until: '2026-10-23T19:07:00.000Z', ...over,
+  })
+  const ev = (text: string, at = now): WatchEvent => ({ at: at.toISOString(), text })
+  const later = (ms: number) => { now = new Date(now.getTime() + ms) }
+
+  test('an active streaming watcher is kept running; paused or deleted, it is stopped', async () => {
+    const t = stream()
+    rt.sync()
+    expect([...running]).toEqual([t.id])
+    rt.sync()
+    expect(starts).toEqual([t.id])
+    store.updateTask(t.id, { state: 'paused' }); rt.sync()
+    expect(running.size).toBe(0)
+    store.updateTask(t.id, { state: 'active' }); rt.sync()
+    store.updateTask(t.id, { state: 'deleted' }); rt.sync()
+    expect(running.size).toBe(0)
+  })
+
+  test('an event sends the message, with {event} filled in, loud, with a Pause button', async () => {
+    const t = stream()
+    rt.onEvents(t.id, [ev('{"price": 298}')])
+    await rt.idle()
+    expect(posts).toMatchObject([{ kind: 'reminder', text: 'Below 300: {"price": 298}', opts: { loud: true, buttons: 'pause' } }])
+    expect(store.runsFor(t.id)[0]).toMatchObject({ trigger: 'event', state: 'succeeded', folded: 1 })
+    expect(store.getTask(t.id)).toMatchObject({ state: 'active', eventsSeen: 1, runsDone: 1 })
+  })
+
+  test('within the cooldown, events wait and are folded into one run when it ends', async () => {
+    const t = stream({ limits: { cooldownMs: 10 * 60_000 } })
+    rt.onEvents(t.id, [ev('first')]); await rt.idle()
+    later(60_000); rt.onEvents(t.id, [ev('second')])
+    later(60_000); rt.onEvents(t.id, [ev('third')])
+    await rt.idle()
+    expect(posts.length).toBe(1)
+    later(8 * 60_000 + 1); await tick()
+    expect(posts.length).toBe(2)
+    expect(posts[1].text).toBe('Below 300: third\n(+1 more since)')
+    expect(store.runsFor(t.id)[0].folded).toBe(2)
+  })
+
+  test('at most so many runs an hour; past that, events wait for the hour to turn (if they keep that long)', async () => {
+    const t = stream({ limits: { cooldownMs: 0, maxPerHour: 2, staleMs: 2 * 3600_000 } })
+    for (const x of ['a', 'b', 'c']) { rt.onEvents(t.id, [ev(x)]); await rt.idle(); later(1000) }
+    expect(posts.map(p => p.text)).toEqual(['Below 300: a', 'Below 300: b'])
+    later(3600_000); await tick()
+    expect(posts.map(p => p.text)).toEqual(['Below 300: a', 'Below 300: b', 'Below 300: c'])
+  })
+
+  test('stale events are dropped; a watcher kept running for its own sake only counts them', async () => {
+    const t = stream()
+    rt.onEvents(t.id, [ev('old news', new Date(now.getTime() - 11 * 60_000))])
+    await rt.idle()
+    expect(posts).toEqual([])
+    expect(store.getTask(t.id)!.eventsSeen).toBe(1)
+    const k = stream({ name: 'Sync', action: { kind: 'none' }, says: 'problems' })
+    rt.onEvents(k.id, [ev('synced 12 files')])
+    await rt.idle()
+    expect(posts).toEqual([])
+    expect(store.getTask(k.id)!.eventsSeen).toBe(1)
+  })
+
+  test("a Claude run gets the events; those that come during it start the next run after it", async () => {
+    let release!: () => void
+    const seen: Run[] = []
+    claude = async (_t, r) => { seen.push(r); if (seen.length === 1) await new Promise<void>(res => { release = res }); return OK('Found why.') }
+    const t = stream({ action: { kind: 'claude', prompt: 'Find out why it moved', session: 'fresh' }, limits: { cooldownMs: 0 } })
+    rt.onEvents(t.id, [ev('moved -1.3% in 3 min')])
+    await new Promise(res => setTimeout(res, 0))
+    expect(seen[0].events!.map(e => e.text)).toEqual(['moved -1.3% in 3 min'])
+    rt.onEvents(t.id, [ev('moved again'), ev('and again')])
+    release()
+    await rt.idle()
+    expect(seen.length).toBe(2)
+    expect(seen[1]).toMatchObject({ trigger: 'event', folded: 2 })
+    expect(posts.filter(p => p.kind === 'result').length).toBe(2)
+  })
+
+  test('a watcher that dies is started again after a backoff; two in a row alert, five pause the task', async () => {
+    const t = stream()
+    rt.sync()
+    const die = () => { running.delete(t.id); rt.onWatcherExit(t.id, { code: 1, err: 'Traceback…\nConnectionError: refused', upMs: 2000 }) }
+    die()
+    expect(acts.at(-1)).toContain('its watcher it ended with status 1: ConnectionError: refused')
+    expect(store.getTask(t.id)!.watchRetryAt).toBe(new Date(now.getTime() + 5000).toISOString())
+    rt.sync()
+    expect(running.size).toBe(0)
+    later(5000); rt.sync()
+    expect(running.size).toBe(1)
+    die(); await rt.idle()
+    expect(posts).toMatchObject([{ kind: 'alert', opts: { loud: true, buttons: 'alert' } }])
+    expect(posts[0].text).toContain('failed 2 times in a row')
+    for (let i = 0; i < 3; i++) { later(20 * 60_000); rt.sync(); die(); await rt.idle() }
+    expect(store.getTask(t.id)).toMatchObject({ state: 'paused', pauseReason: 'failures' })
+    expect(running.size).toBe(0)
+    expect(posts.at(-1)).toMatchObject({ kind: 'alert', opts: { buttons: 'paused' } })
+  })
+
+  test('one that ran a good while before it died starts its count afresh', () => {
+    const t = stream({ watchFails: 3 })
+    rt.onWatcherExit(t.id, { code: 0, err: '', upMs: 11 * 60_000 })
+    expect(store.getTask(t.id)!.watchFails).toBe(1)
+  })
+
+  test("polled: at its slot it looks; what a failed look printed isn't news, and a good look clears the alert", async () => {
+    const t = stream({ trigger: { kind: 'watch', command: 'python3 page.py', everyMs: 10 * 60_000, anchor: now.toISOString() }, nextDue: now.toISOString() })
+    looks.set(t.id, { events: [{ at: now.toISOString(), text: 'Error: page not found' }], code: 1, err: '', upMs: 50 })
+    await tick()
+    later(10 * 60_000); await tick()
+    expect(posts).toMatchObject([{ kind: 'alert' }])
+    expect(posts[0].text).toContain('Error: page not found')
+    expect(store.getTask(t.id)!.nextDue).toBe(new Date(now.getTime() + 10 * 60_000).toISOString())
+    looks.set(t.id, { events: [{ at: now.toISOString(), text: 'price 289' }], code: 0, err: '', upMs: 50 })
+    later(10 * 60_000); await tick()
+    expect(posts.map(p => p.text)).toEqual([posts[0].text, '✅ Price watch is working again.', 'Below 300: price 289'])
+    expect(store.getTask(t.id)!.watchFails).toBe(0)
+  })
+
+  test('times: 1 — done after the first event run, and its watcher stopped', async () => {
+    const t = stream({ times: 1 })
+    rt.sync()
+    rt.onEvents(t.id, [ev('298')]); await rt.idle()
+    expect(store.getTask(t.id)!.state).toBe('done')
+    rt.sync()
+    expect(running.size).toBe(0)
+  })
+
+  test('at its end date it ends, stops, and says so with a tap for another week', async () => {
+    const t = stream()
+    rt.sync()
+    now = new Date('2026-10-23T19:07:00Z'); rt.sync(); await rt.idle()
+    expect(store.getTask(t.id)!.state).toBe('expired')
+    expect(running.size).toBe(0)
+    expect(posts).toMatchObject([{ kind: 'notice', opts: { loud: false, buttons: 'renew' } }])
+    expect(posts[0].text).toContain('has ended')
+  })
+
+  test("its owner can no longer use the chat: it pauses", () => {
+    const t = stream()
+    owner = false
+    rt.sync()
+    expect(store.getTask(t.id)).toMatchObject({ state: 'paused', pauseReason: 'owner' })
+    expect(running.size).toBe(0)
+  })
+
+  test('run now: a polled one looks at once; a streaming one waiting out a backoff starts', async () => {
+    const p = stream({ trigger: { kind: 'watch', command: 'python3 page.py', everyMs: 3600_000, anchor: now.toISOString() }, nextDue: '2026-10-17T00:00:00.000Z' })
+    looks.set(p.id, { events: [{ at: now.toISOString(), text: 'x' }], code: 0, err: '', upMs: 5 })
+    expect(rt.runNow(p.id)).toEqual({ runId: 'poll' })
+    await rt.idle()
+    expect(posts.map(x => x.text)).toEqual(['Below 300: x'])
+    const s = stream({ watchRetryAt: new Date(now.getTime() + 60_000).toISOString() })
+    expect(rt.runNow(s.id)).toEqual({ runId: 'watcher' })
+    expect(running.has(s.id)).toBe(true)
+  })
+})
+
+test('a watcher message: {event} is the newest line, and folded ones are counted', () => {
+  const run = { id: 'x', task: 'x', trigger: 'event', state: 'queued', events: [{ at: '', text: 'a' }, { at: '', text: 'b' }], folded: 5 } as Run
+  expect(eventText('Saw {event}!', run)).toBe('Saw b!\n(+4 more since)')
+  expect(eventText('Something happened', { ...run, folded: 1, events: [{ at: '', text: 'c' }] })).toBe('Something happened\nc')
 })

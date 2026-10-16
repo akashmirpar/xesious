@@ -33,17 +33,37 @@ const WHEN_PROPS = {
   cron: { type: 'string', description: 'A five-field cron expression, read in tz: "7 21 * * *" every day at 21:07, "7 9 * * 1-5" weekdays at 09:07, "0 10 * * 6" Saturdays at 10:00.' },
 }
 
+const WATCH_PROPS = {
+  watch: {
+    type: 'object',
+    description: "Instead of a time: watch something, with a small program in this topic's folder that the bot runs for you. Write the program first and run it once yourself to show it works and what it prints; then give its command here. " +
+      "Every line it prints is an event, so print one line per thing worth knowing and nothing else (JSON or text; flush each line: python print(..., flush=True)). Errors go to stderr. " +
+      "With every_minutes the bot runs it that often and it should print what it finds and exit (a page, an API). Without, the bot keeps it running (a websocket, a stream): it should reconnect by itself. " +
+      "The bot restarts it if it dies, and tells the topic if it keeps failing. Keep it light: heavy work belongs in the prompt.",
+    properties: {
+      command: { type: 'string', description: 'Run with bash in this topic\'s folder, e.g. "python3 watchers/price.py".' },
+      every_minutes: { type: 'number', description: 'Run it this often (at least 1), instead of keeping it running.' },
+    },
+    required: ['command'],
+  },
+  keep_running: { type: 'boolean', description: 'With watch, and neither message nor prompt: just keep the program running ("keep the sync loop running"); only its failures are reported.' },
+  cooldown_minutes: { type: 'number', description: "For a watcher: at least this long between runs (default 5 for a prompt, 1 for a message). Events that come meanwhile are folded into the next run." },
+  max_per_hour: { type: 'number', description: 'For a watcher: at most this many runs an hour (default 6 for a prompt, 20 for a message).' },
+  stale_minutes: { type: 'number', description: 'For a watcher: events older than this are dropped, e.g. after a restart (default 10).' },
+}
+
 const TASK_FIELDS = {
   name: { type: 'string', description: "A short name for the task's card, e.g. 'Nightly news'." },
-  message: { type: 'string', description: 'For a reminder: the exact text the bot sends at the time.' },
-  prompt: { type: 'string', description: "For work Claude does when the task runs: a complete, self-contained instruction. The run starts without this conversation, in this topic's folder and with its instructions." },
+  message: { type: 'string', description: 'For a reminder: the exact text the bot sends at the time. For a watcher: the text sent for each event, where {event} is the line the watcher printed.' },
+  prompt: { type: 'string', description: "For work Claude does when the task runs: a complete, self-contained instruction. The run starts without this conversation, in this topic's folder and with its instructions. For a watcher, the events that set it off come with the run." },
   ...WHEN_PROPS,
+  ...WATCH_PROPS,
   tz: { type: 'string', description: "The person's IANA time zone, e.g. Europe/Berlin. Work it out from what you know of them and this conversation; if you can't tell, ask them before creating the task." },
   session: { type: 'string', enum: ['fresh', 'own'], description: "For a Claude run. fresh (the default): each run starts without memory of earlier runs. own: the task keeps one session across its runs, for tasks that must remember what they did before (\"don't repeat yesterday's topics\")." },
   says: { type: 'string', enum: ['live', 'result', 'noteworthy', 'problems', 'never'], description: 'For a Claude run, how much it posts. live: its progress and the answer. result (the default): the answer. noteworthy: only when the run reports something worth telling (for checks and monitors). problems: only failures. never: nothing, only history.' },
   sound: { type: 'string', enum: ['loud', 'silent'], description: 'loud notifies; silent posts without a sound. Default: loud for reminders and for noteworthy or problems; for results, silent in groups and loud in a private chat.' },
   deliver_to: { type: 'string', enum: ['topic', 'dm'], description: "Where it posts: this topic (the default) or the person's private chat with the bot." },
-  until: { type: 'string', description: 'Optional: no runs after this local time, "YYYY-MM-DD HH:MM" in tz.' },
+  until: { type: 'string', description: 'Optional: no runs after this local time, "YYYY-MM-DD HH:MM" in tz. A task that runs more often than hourly (a watcher, a short interval) ends after 7 days unless given one; give a later until when the person wants it to last.' },
   times: { type: 'number', description: 'Optional: stop after this many runs.' },
 }
 
@@ -53,9 +73,10 @@ const topicRef = { type: 'string', description: "A topic's id or name, from topi
 const INTERACTIVE_TOOLS = [
   {
     name: 'task_create',
-    description: "Create a task: something this bot does on its own later, or again and again, and reports here in Telegram. Use it whenever the person wants something to happen later or on a schedule: \"remind me in two hours to…\", \"every night at 9, summarize the news\", \"every weekday morning, check…\". This is the bot's scheduler. It is NOT TaskCreate or TodoWrite, which are your private to-do list for this turn and do nothing later; and don't use CronCreate or /loop for this either. " +
+    description: "Create a task: something this bot does on its own later, again and again, or when something happens, and reports here in Telegram. Use it whenever the person wants something to happen later, on a schedule or on a change: \"remind me in two hours to…\", \"every night at 9, summarize the news\", \"tell me when the price drops below 300\", \"keep the sync running\". This is the bot's scheduler. It is NOT TaskCreate or TodoWrite, which are your private to-do list for this turn and do nothing later; and don't use CronCreate or /loop for this either. " +
       'Give message for a reminder (the bot sends exactly that text), or prompt for work Claude should do each time it runs. ' +
       "For the time give exactly one of in_minutes, at, every_minutes or cron, and let the bot do the date arithmetic. When the person gives an approximate time (\"around 9\", \"every morning\"), choose an off-minute such as 09:07 rather than 09:00. " +
+      'To act when something happens, give watch instead of a time: a program you write that prints a line for each thing worth knowing. ' +
       "Afterwards the bot posts the task's card with its details and buttons, so keep your own reply to one short line.",
     inputSchema: { type: 'object', properties: TASK_FIELDS, required: ['tz'] },
   },

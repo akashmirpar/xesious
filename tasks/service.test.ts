@@ -74,7 +74,7 @@ describe('creating', () => {
     const r2 = svc.create(person, { tz: 'Mars/Olympus', message: 'x', in_minutes: 5 })
     expect(r2.ok ? '' : r2.error).toContain('unknown time zone')
     const r3 = svc.create(person, { tz: 'UTC', message: 'x', prompt: 'y', in_minutes: 5 })
-    expect(r3.ok ? '' : r3.error).toContain('not both')
+    expect(r3.ok ? '' : r3.error).toContain('give one of message')
     const r4 = svc.create(person, { tz: 'UTC', in_minutes: 5 })
     expect(r4.ok ? '' : r4.error).toContain('give message')
   })
@@ -225,4 +225,89 @@ test('lists: this topic by default from a topic, the chat on request; the operat
   expect(ids(svc.list(operator, undefined, '1'))).toEqual([c.id])
   const v = (svc.list(person, undefined) as any).value[0]
   expect(v).toMatchObject({ kind: 'reminder', message: 'a', schedule: 'once, Fri 16 Oct, 16:45', next_run: 'Fri 16 Oct, 16:45 (Europe/Berlin)', state: 'active' })
+})
+
+describe('watchers', () => {
+  const WEEK = 7 * 24 * 3600_000
+
+  test('a streaming watcher: no slots, loud, a week until it ends; its name from its message', () => {
+    const t = create({ watch: { command: 'python3 watchers/price.py' }, message: 'Below 300: {event}' })
+    expect(t.trigger).toEqual({ kind: 'watch', command: 'python3 watchers/price.py' })
+    expect(t.nextDue).toBeUndefined()
+    expect(t.sound).toBe('loud')
+    expect(t.until).toBe(new Date(now.getTime() + WEEK).toISOString())
+    expect(t.name).toBe('Below 300: {event}')
+  })
+
+  test('a polled watcher looks at once, then every so often; the same command at the same pace is the same task', () => {
+    const t = create({ watch: { command: 'python3 page.py', every_minutes: 10 }, prompt: 'Say what changed on the page' })
+    expect(t.trigger).toEqual({ kind: 'watch', command: 'python3 page.py', everyMs: 600_000, anchor: now.toISOString() })
+    expect(t.nextDue).toBe(now.toISOString())
+    const again = svc.create(person, { tz: 'Europe/Berlin', watch: { command: 'python3 page.py', every_minutes: 10 }, prompt: 'Say what changed on the page' })
+    expect(again.ok && again.value.duplicate).toBe(true)
+    // An edit that leaves the command and pace alone keeps the checks where they were.
+    now = new Date(now.getTime() + 25 * 60_000)
+    const r = svc.update(person, t.id, { watch: { command: 'python3 page.py', every_minutes: 10 }, name: 'Page' })
+    expect(r.ok && r.value.task.trigger).toEqual(t.trigger)
+  })
+
+  test('what a watcher needs: a command, and something to do with what it sees, or keep_running', () => {
+    const e = (input: any) => { const r = svc.create(person, { tz: 'UTC', ...input }); return r.ok ? '' : r.error }
+    expect(e({ watch: {}, message: 'x' })).toContain('watch needs command')
+    expect(e({ watch: { command: 'x' } })).toContain('a watcher needs message')
+    expect(e({ watch: { command: 'x', every_minutes: 0.5 }, message: 'x' })).toContain('at least 1')
+    expect(e({ watch: { command: 'x' }, in_minutes: 5, message: 'x' })).toContain('not both')
+    expect(e({ keep_running: true, in_minutes: 5 })).toContain('keep_running is for a watcher')
+    expect(e({ watch: { command: 'x' }, message: 'x', cooldown_minutes: -1 })).toContain('cooldown_minutes is between')
+    expect(e({ watch: { command: 'x' }, message: 'x', max_per_hour: 500 })).toContain('max_per_hour')
+    const k = create({ watch: 'bash sync.sh', keep_running: true })
+    expect(k).toMatchObject({ action: { kind: 'none' }, says: 'problems' })
+  })
+
+  test("its limits are its own; the view shows them, with what it saw", () => {
+    const t = create({ watch: { command: 'python3 price.py' }, prompt: 'Find out why', cooldown_minutes: 15, max_per_hour: 4, stale_minutes: 5 })
+    expect(t.limits).toEqual({ cooldownMs: 900_000, maxPerHour: 4, staleMs: 300_000 })
+    const v = svc.get(person, t.id)
+    expect(v.ok && v.value).toMatchObject({ kind: 'watch', watch: { command: 'python3 price.py', streaming: true }, cooldown_minutes: 15, max_per_hour: 4, stale_minutes: 5, events_seen: 0 })
+  })
+
+  test('anything more often than hourly gets a week unless given an end; an end can be further, not removed', () => {
+    const f = create({ prompt: 'Check the queue', every_minutes: 15 })
+    expect(f.until).toBe(new Date(now.getTime() + WEEK).toISOString())
+    const g = create({ prompt: 'Check the queue again', every_minutes: 15, until: '2027-01-31 12:00' })
+    expect(g.until).toBe('2027-01-31T11:00:00.000Z')
+    const r = svc.update(person, g.id, { until: '' })
+    expect(r.ok ? '' : r.error).toContain('needs an end')
+    expect(create({ prompt: 'Daily', cron: '7 9 * * *' }).until).toBeUndefined()
+  })
+
+  test('another week: an ended one starts again; a running one ends a week later', () => {
+    const t = create({ watch: { command: 'python3 price.py' }, message: '{event}' })
+    store.updateTask(t.id, { state: 'expired' })
+    now = new Date(now.getTime() + WEEK + 3600_000)
+    const r = svc.extend(person, t.id)
+    expect(r.ok && r.value.task).toMatchObject({ state: 'active', until: new Date(now.getTime() + WEEK).toISOString() })
+    const r2 = svc.extend(person, t.id)
+    expect(r2.ok && r2.value.task.until).toBe(new Date(now.getTime() + 2 * WEEK).toISOString())
+    expect(changes.slice(-2).map(c => c[1])).toEqual(['resumed', 'updated'])
+  })
+
+  test('a paused streaming watcher resumes, its failures forgotten', () => {
+    const t = create({ watch: { command: 'python3 price.py' }, message: '{event}' })
+    store.updateTask(t.id, { state: 'paused', pauseReason: 'failures', watchFails: 5, watchError: 'it ended with status 1' })
+    const r = svc.resume(person, t.id)
+    expect(r.ok && r.value.task).toMatchObject({ state: 'active' })
+    expect(r.ok && r.value.task.watchFails).toBeUndefined()
+  })
+
+  test('the bot keeps only so many streaming watchers running', () => {
+    svc = new TaskService({
+      store, now: () => now, mayCreate: () => undefined, mayManage: () => undefined, isGroup: c => c.startsWith('-'),
+      changed: () => {}, runNow: () => ({ runId: 'x' }), maxWatchers: 1,
+    })
+    create({ watch: { command: 'a' }, message: '{event}' })
+    const r = svc.create(person, { tz: 'UTC', watch: { command: 'b' }, message: '{event}' })
+    expect(r.ok ? '' : r.error).toContain('already keeps 1 watchers running')
+    expect(svc.create(person, { tz: 'UTC', watch: { command: 'b', every_minutes: 5 }, message: '{event}' }).ok).toBe(true)
+  })
 })

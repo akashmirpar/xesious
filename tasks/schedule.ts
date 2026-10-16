@@ -31,9 +31,18 @@ export function cronError(expr: string, tz: string): string | undefined {
   return undefined
 }
 
+// A polled watcher's slots step like an interval's; a streaming one has none (the
+// bridge keeps it running instead).
+const pollOf = (t: Extract<Trigger, { kind: 'watch' }>): Trigger | undefined =>
+  t.everyMs && t.anchor ? { kind: 'every', everyMs: t.everyMs, anchor: t.anchor } : undefined
+
 // The first slot strictly after `after`.
 export function nextAfter(t: Trigger, tz: string, after: Date): Date | undefined {
   switch (t.kind) {
+    case 'watch': {
+      const p = pollOf(t)
+      return p ? nextAfter(p, tz, after) : undefined
+    }
     case 'at': {
       const at = new Date(t.at)
       return at.getTime() > after.getTime() ? at : undefined
@@ -52,6 +61,10 @@ export function nextAfter(t: Trigger, tz: string, after: Date): Date | undefined
 // The latest slot at or before `at`, if any.
 export function latestAtOrBefore(t: Trigger, tz: string, at: Date): Date | undefined {
   switch (t.kind) {
+    case 'watch': {
+      const p = pollOf(t)
+      return p ? latestAtOrBefore(p, tz, at) : undefined
+    }
     case 'at': {
       const d = new Date(t.at)
       return d.getTime() <= at.getTime() ? d : undefined
@@ -79,10 +92,19 @@ export const firstDue = (t: Trigger, tz: string, now: Date) => nextAfter(t, tz, 
 export function periodMs(t: Trigger, tz: string, now = new Date()): number | undefined {
   if (t.kind === 'at') return undefined
   if (t.kind === 'every') return t.everyMs
+  if (t.kind === 'watch') return t.everyMs
   const runs = cronOf(t.expr, tz).nextRuns(6, now)
   let min = Infinity
   for (let i = 1; i < runs.length; i++) min = Math.min(min, runs[i].getTime() - runs[i - 1].getTime())
   return Number.isFinite(min) ? min : undefined
+}
+
+// More often than hourly: a watcher, a short interval, a cron every few minutes. Such
+// a task ends after a week unless it was given an end (LIMITS.frequentEndMs).
+export function runsOften(t: Trigger, tz: string, now = new Date()): boolean {
+  if (t.kind === 'watch') return true
+  const p = periodMs(t, tz, now)
+  return p !== undefined && p < HOUR
 }
 
 // How late a slot may still start. A reminder two hours late is still worth sending;
@@ -133,7 +155,7 @@ export const manualRunId = (taskId: string, now: Date) => `${taskId}@manual-${no
 
 // About how often a task runs, for the card ("Claude, about 5 runs a week").
 export function runsPerDay(t: Trigger, tz: string, now = new Date()): number | undefined {
-  if (t.kind === 'at') return undefined
+  if (t.kind === 'at' || t.kind === 'watch') return undefined
   if (t.kind === 'every') return DAY / t.everyMs
   const runs = cronOf(t.expr, tz).nextRuns(60, now)
   if (runs.length < 2) return undefined

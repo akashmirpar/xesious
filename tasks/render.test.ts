@@ -117,3 +117,43 @@ describe('runs', () => {
     expect(listLine(task({ state: 'paused' }), [])).toContain('⏸ ⏰')
   })
 })
+
+describe('watchers on the card', () => {
+  const w = (over: Partial<Task> = {}) => task({
+    name: 'Price watch', trigger: { kind: 'watch', command: 'python3 watchers/price.py' },
+    action: { kind: 'message', text: 'Below 300: {event}' }, nextDue: undefined, until: '2026-10-23T14:40:00.000Z', ...over,
+  })
+  const now = new Date('2026-10-16T12:00:00Z')
+
+  test('label, what it does, its command, and that it is running', () => {
+    const html = cardHtml(w({ eventsSeen: 1234, lastEventAt: '2026-10-16T11:59:00.000Z' }), [], now, { running: true, since: '2026-10-16T10:00:00.000Z' })
+    expect(html).toContain('👀 Watch: <b>Price watch</b>')
+    expect(html).toContain('watches continuously · sends a message when it sees something · 🔔 loud')
+    expect(html).not.toContain('(Europe/Berlin)')
+    expect(html).toContain('<code>python3 watchers/price.py</code>')
+    expect(html).toContain('👀 running since Fri 16 Oct, 12:00 · 1,234 lines, the last Fri 16 Oct, 13:59')
+    expect(html).toContain('Ends <tg-time')
+  })
+
+  test('failing: what went wrong, and when it starts again', () => {
+    const html = cardHtml(w({ watchError: 'it ended with status 1: refused', watchRetryAt: '2026-10-16T12:05:00.000Z' }), [], now, { running: false })
+    expect(html).toContain('⚠️ it ended with status 1: refused · starts again <tg-time')
+  })
+
+  test('polled, with a Claude run: when it looks next, and the cap on runs', () => {
+    const html = cardHtml(w({
+      trigger: { kind: 'watch', command: 'python3 page.py', everyMs: 600_000, anchor: '2026-10-16T11:50:00.000Z' }, nextDue: '2026-10-16T12:10:00.000Z',
+      action: { kind: 'claude', prompt: 'Say what changed', session: 'fresh' }, says: 'noteworthy',
+    }), [], now)
+    expect(html).toContain('checks every 10 minutes · Claude, a fresh session each run, when it sees something · posts only when something is worth telling')
+    expect(html).toContain('at most 6 runs an hour, 5 min apart')
+    expect(html).toContain('Next check: <tg-time')
+  })
+
+  test('kept running for its own sake; in /tasks; event runs in history', () => {
+    expect(cardHtml(w({ action: { kind: 'none' }, says: 'problems' }), [], now, { running: true })).toContain('keeps it running; says something only if it fails')
+    expect(listLine(w(), [])).toContain('· 👀 <b>Price watch</b> — watches continuously')
+    const r = { id: 'x@e', task: 'x', trigger: 'event', state: 'succeeded', startedAt: '2026-10-16T12:00:00.000Z', postedMsg: 9, folded: 3 } as Run
+    expect(runLine(r, 'UTC')).toContain('3 events')
+  })
+})

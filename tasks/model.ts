@@ -3,9 +3,11 @@
  * the MCP server and the bridge share. The design is research/tasks/REPORT.md.
  *
  * A task is something the bot does on its own: trigger → (optional) filter → action.
- * Phase 1 has schedule triggers and two actions, a fixed message (a reminder) and a
- * Claude run. Watchers, filters, steps and hand-offs come later; the shapes leave room
- * for them without pretending they exist.
+ * The triggers are a schedule, or a watcher: a program the bridge runs and reads, each
+ * line it prints an event. The actions are a fixed message (a reminder, or a line for
+ * each event), a Claude run, or, for a watcher kept running for its own sake, nothing.
+ * Filters, steps and hand-offs come later; the shapes leave room for them without
+ * pretending they exist.
  *
  * A task is the standing definition; a run is one execution of it. Nothing that shows
  * a run calls it a task.
@@ -17,12 +19,29 @@ export type Trigger =
   | { kind: 'at'; at: string }                          // once
   | { kind: 'every'; everyMs: number; anchor: string }  // anchor + k·everyMs
   | { kind: 'cron'; expr: string }                      // five fields
+  // A program in the home topic's folder (bash -c command). With everyMs it is polled:
+  // run at anchor + k·everyMs, its output read when it exits. Without, it streams: kept
+  // running, read as it prints. Every line it prints is an event.
+  | { kind: 'watch'; command: string; everyMs?: number; anchor?: string }
 
 export type Action =
+  // For a watcher, {event} in the text is the line that set it off.
   | { kind: 'message'; text: string }
   // fresh: a new session each run, in the topic's folder. own: one session the task
-  // keeps across its runs, so it remembers what earlier runs did.
+  // keeps across its runs, so it remembers what earlier runs did. A watcher's events
+  // come with its run.
   | { kind: 'claude'; prompt: string; session: 'fresh' | 'own' }
+  // A watcher kept running for its own sake ("keep the sync loop running"): its output
+  // goes nowhere, and only its failures are said.
+  | { kind: 'none' }
+
+// One line a watcher printed, and when.
+export interface WatchEvent { at: string; text: string }
+
+// How a watcher's events may start runs: at most one run per cooldown and so many an
+// hour, events that come meanwhile folded into the next run, and none older than the
+// stale limit (a price move from an hour ago isn't news).
+export interface EventLimits { cooldownMs: number; maxPerHour: number; staleMs: number }
 
 // How much a Claude run says. A message task always posts its message.
 export type Says = 'live' | 'result' | 'noteworthy' | 'problems' | 'never'
@@ -61,6 +80,14 @@ export interface Task {
   alertAt?: string
   lastRunAt?: string
   lastMark?: RunMark      // the last run's mark, for lists
+  // Watchers:
+  limits?: Partial<EventLimits>   // the task's own; the defaults otherwise (eventLimits)
+  eventsSeen?: number
+  lastEventAt?: string
+  lastEventRunAt?: string
+  watchFails?: number     // the watcher's failures in a row
+  watchError?: string     // the last of them, in words
+  watchRetryAt?: string   // a streaming watcher that died starts again from here
 }
 
 export type RunState =
@@ -70,7 +97,7 @@ export type RunState =
   | 'interrupted'    // the bridge stopped mid-run; never replayed on its own
   | 'deferred'       // a usage limit stopped it; not a failure
 
-export type RunTrigger = 'schedule' | 'catchup' | 'manual'
+export type RunTrigger = 'schedule' | 'catchup' | 'manual' | 'event'
 
 // What a run says about itself through the report tool.
 export type ReportOutcome = 'nothing_new' | 'done' | 'progress' | 'blocked' | 'needs_attention'
@@ -105,6 +132,8 @@ export interface Run {
   usage?: Usage
   denials?: string[]      // actions the permission mode blocked
   lateMs?: number         // how late it started, for a catch-up
+  events?: WatchEvent[]   // what set off an event run (the newest, at most eventsPerRun)
+  folded?: number         // how many events it covers in all
 }
 
 // One glyph per run, for lists and the strip on a card.
@@ -120,4 +149,29 @@ export const LIMITS = {
   graceMinMs: 2 * 60_000,            // a recurring slot may start this late, at least…
   graceMaxMs: 2 * 60 * 60_000,       // …and at most; half its period in between
   historyKept: 200,                  // runs kept per task
+  // Anything that runs more often than hourly (a watcher, a short interval) ends after
+  // a week unless it was given an end: a forgotten task is bounded, and one tap renews.
+  frequentEndMs: 7 * 24 * 60 * 60_000,
+  // Watchers:
+  watchCommandMax: 2000,
+  eventTextMax: 2000,                // characters kept of one line
+  pendingEventsKept: 100,            // events waiting for a run, per task
+  eventsPerRun: 50,                  // events a run is given
+  pollTimeoutMs: 5 * 60_000,         // a polled watcher must print and exit within this
+  watchUpResetMs: 10 * 60_000,       // a streaming watcher up this long starts its failure count afresh
+  watchBackoffMs: [5_000, 15_000, 60_000, 5 * 60_000, 15 * 60_000],
 }
+
+// What a watcher's events may start, unless the task says otherwise: a Claude run at
+// most every 5 minutes and 6 times an hour, a message every minute and 20 an hour.
+export function eventLimits(t: Pick<Task, 'action' | 'limits'>): EventLimits {
+  const claude = t.action.kind === 'claude'
+  return {
+    cooldownMs: t.limits?.cooldownMs ?? (claude ? 5 * 60_000 : 60_000),
+    maxPerHour: t.limits?.maxPerHour ?? (claude ? 6 : 20),
+    staleMs: t.limits?.staleMs ?? 10 * 60_000,
+  }
+}
+
+export const isWatch = (t: Pick<Task, 'trigger'>): t is Pick<Task, 'trigger'> & { trigger: Extract<Trigger, { kind: 'watch' }> } => t.trigger.kind === 'watch'
+export const isStreaming = (t: Pick<Task, 'trigger'>) => t.trigger.kind === 'watch' && !t.trigger.everyMs

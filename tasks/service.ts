@@ -10,9 +10,9 @@
  *     cannot create tasks yet (child tasks come with hand-offs, in phase 4);
  *   - the operator token (scripts on the host) can read and pause anything.
  */
-import { LIMITS, type ReportOutcome, type Run, type Says, type Sound, type Task } from './model'
+import { LIMITS, eventLimits, isStreaming, type EventLimits, type ReportOutcome, type Run, type Says, type Sound, type Task, type Trigger } from './model'
 import type { TaskStore } from './store'
-import { firstDue, isValidTz, parseLocalTime, parseWhen, type WhenInput } from './schedule'
+import { firstDue, isValidTz, parseLocalTime, parseWhen, runsOften, type WhenInput } from './schedule'
 import type { Scope } from './api'
 import { markOf, scheduleText, whenText } from './render'
 
@@ -27,6 +27,12 @@ export interface TaskInput extends WhenInput {
   deliver_to?: 'topic' | 'dm'
   until?: string          // local time in tz
   times?: number
+  // A watcher instead of a time: a program the bot runs (every_minutes) or keeps running.
+  watch?: { command?: string; every_minutes?: number } | string
+  keep_running?: boolean  // a watcher with no action, kept running for its own sake
+  cooldown_minutes?: number
+  max_per_hour?: number
+  stale_minutes?: number
 }
 
 export type Change = 'created' | 'updated' | 'paused' | 'resumed' | 'deleted' | 'done'
@@ -42,6 +48,7 @@ export interface ServiceDeps {
   changed(task: Task, what: Change): void
   // Start a run of the task now; its id, or why it can't.
   runNow(task: Task): Promise<{ runId?: string; error?: string }> | { runId?: string; error?: string }
+  maxWatchers?: number    // streaming watchers the bot keeps running at once
 }
 
 // Both branches name both fields, so reading .error after checking .ok type-checks
@@ -59,17 +66,46 @@ const MAX = { name: 80, message: 3500, prompt: 20_000, summary: 300, text: 30_00
 // The task, as the model sees it.
 export function taskView(t: Task, runs: Run[] = []) {
   const last = runs.find(r => r.state !== 'queued')
+  const lim = eventLimits(t)
   return {
     id: t.id, name: t.name,
-    kind: t.action.kind === 'message' ? 'reminder' : 'claude',
+    kind: t.trigger.kind === 'watch' ? 'watch' : t.action.kind === 'message' ? 'reminder' : 'claude',
     schedule: scheduleText(t.trigger, t.tz), tz: t.tz,
     next_run: t.state === 'active' && t.nextDue ? `${whenText(new Date(t.nextDue), t.tz)} (${t.tz})` : undefined,
+    ends: t.until ? `${whenText(new Date(t.until), t.tz)} (${t.tz})` : undefined,
     state: t.state, pause_reason: t.pauseReason,
-    ...(t.action.kind === 'message' ? { message: t.action.text } : { prompt: t.action.prompt, session: t.action.session, says: t.says }),
+    ...(t.trigger.kind === 'watch' ? {
+      watch: { command: t.trigger.command, ...(t.trigger.everyMs ? { every_minutes: t.trigger.everyMs / 60_000 } : { streaming: true }) },
+      ...(t.action.kind !== 'none' ? { cooldown_minutes: lim.cooldownMs / 60_000, max_per_hour: lim.maxPerHour, stale_minutes: lim.staleMs / 60_000 } : {}),
+      events_seen: t.eventsSeen ?? 0, watcher_error: t.watchError,
+    } : {}),
+    ...(t.action.kind === 'message' ? { message: t.action.text }
+      : t.action.kind === 'claude' ? { prompt: t.action.prompt, session: t.action.session, says: t.says }
+      : { keep_running: true }),
     sound: t.sound, deliver_to: t.where === 'dm' ? 'dm' : 'topic',
     topic: t.thread, runs_done: t.runsDone,
     last_run: last ? { when: whenText(new Date(last.startedAt ?? last.slot ?? Date.now()), t.tz), result: markOf(last), summary: last.summary, error: last.state === 'failed' ? last.reason : undefined } : undefined,
   }
+}
+
+// What watch: gives, as a trigger. A polled watcher is first run at once, so the
+// person sees it work.
+function parseWatch(w: TaskInput['watch'], now: Date): { trigger?: Trigger; error?: string } {
+  const o: any = typeof w === 'string' ? { command: w } : (w ?? {})
+  const command = String(o.command ?? '').trim()
+  if (!command) return { error: 'watch needs command: the program to run in this topic\'s folder, e.g. "python3 watchers/price.py"' }
+  if (command.length > LIMITS.watchCommandMax) return { error: `watch.command is too long (at most ${LIMITS.watchCommandMax} characters)` }
+  if (o.every_minutes === undefined || o.every_minutes === null || o.every_minutes === '') return { trigger: { kind: 'watch', command } }
+  const m = Number(o.every_minutes)
+  if (!(m * 60_000 >= LIMITS.minEveryMs)) return { error: 'watch.every_minutes must be at least 1' }
+  return { trigger: { kind: 'watch', command, everyMs: Math.round(m * 60_000), anchor: now.toISOString() } }
+}
+
+// A number of minutes within bounds, or why not.
+function minutesIn(v: unknown, name: string, lo: number, hi: number): { ms?: number; error?: string } {
+  const m = Number(v)
+  if (!Number.isFinite(m) || m < lo || m > hi) return { error: `${name} is between ${lo} and ${hi}` }
+  return { ms: Math.round(m * 60_000) }
 }
 
 export class TaskService {
@@ -99,17 +135,28 @@ export class TaskService {
     if (!isValidTz(tz)) return err(400, `unknown time zone "${tz}"; use an IANA name such as Europe/Berlin`)
 
     const timeGiven = ['at', 'in_minutes', 'every_minutes', 'cron'].some(k => (input as any)[k] !== undefined && (input as any)[k] !== null && (input as any)[k] !== '')
+    const watchGiven = input.watch !== undefined && input.watch !== null && (input.watch as any) !== ''
+    if (watchGiven && timeGiven) return err(400, 'give watch or a time (at, in_minutes, every_minutes, cron), not both')
     let trigger = base?.trigger
-    if (timeGiven || !base) {
+    if (watchGiven) {
+      const w = parseWatch(input.watch, now)
+      if (w.error) return err(400, w.error)
+      // The same command at the same pace keeps its anchor, so an edit doesn't move its checks.
+      const b = base?.trigger
+      trigger = b?.kind === 'watch' && w.trigger!.kind === 'watch' && b.command === w.trigger!.command && b.everyMs === w.trigger!.everyMs ? b : w.trigger
+    } else if (timeGiven || !base) {
       const w = parseWhen(input, tz, now)
       if (w.error) return err(400, w.error)
       trigger = w.trigger
     }
+    const watching = trigger!.kind === 'watch'
 
     let action = base?.action
     const hasMsg = typeof input.message === 'string' && input.message.trim() !== ''
     const hasPrompt = typeof input.prompt === 'string' && input.prompt.trim() !== ''
-    if (hasMsg && hasPrompt) return err(400, 'give message (a reminder) or prompt (a Claude run), not both')
+    const keep = input.keep_running === true
+    if ([hasMsg, hasPrompt, keep].filter(Boolean).length > 1) return err(400, 'give one of message (a reminder, or a line for each event), prompt (a Claude run) or keep_running')
+    if (keep && !watching) return err(400, 'keep_running is for a watcher: give watch too')
     if (hasMsg) {
       if (input.message!.length > MAX.message) return err(400, `message is too long (at most ${MAX.message} characters)`)
       action = { kind: 'message', text: input.message!.trim() }
@@ -117,28 +164,51 @@ export class TaskService {
       if (input.prompt!.length > MAX.prompt) return err(400, `prompt is too long (at most ${MAX.prompt} characters)`)
       const session = input.session ?? (base?.action.kind === 'claude' ? base.action.session : 'fresh')
       action = { kind: 'claude', prompt: input.prompt!.trim(), session }
+    } else if (keep) {
+      action = { kind: 'none' }
     } else if (!base) {
-      return err(400, 'give message (what to send, for a reminder) or prompt (what Claude should do when it runs)')
+      return err(400, watching
+        ? 'a watcher needs message (sent for each event; {event} is the line it printed), prompt (what Claude does with the events) or keep_running: true'
+        : 'give message (what to send, for a reminder) or prompt (what Claude should do when it runs)')
     } else if (input.session && base.action.kind === 'claude') {
       action = { ...base.action, session: input.session }
     }
     if (input.session && input.session !== 'fresh' && input.session !== 'own') return err(400, 'session is fresh or own')
+    if (action!.kind === 'none' && !watching) return err(400, 'only a watcher can be kept running with nothing to do: give message or prompt')
 
     if (input.says !== undefined && !SAYS.includes(input.says)) return err(400, `says is one of ${SAYS.join(', ')}`)
     if (input.sound !== undefined && input.sound !== 'loud' && input.sound !== 'silent') return err(400, 'sound is loud or silent')
     if (input.deliver_to !== undefined && input.deliver_to !== 'topic' && input.deliver_to !== 'dm') return err(400, 'deliver_to is topic or dm')
 
-    const says: Says = action!.kind === 'message' ? 'result' : (input.says ?? base?.says ?? 'result')
+    const says: Says = action!.kind === 'message' ? 'result' : action!.kind === 'none' ? 'problems' : (input.says ?? base?.says ?? 'result')
     // Loud for what the person asked to receive and for what speaks only when it
-    // matters; a result in a group is silent unless asked otherwise.
-    const defaultSound: Sound = action!.kind === 'message' || says === 'noteworthy' || says === 'problems' ? 'loud'
+    // matters (a watcher that saw something does); a result in a group is silent
+    // unless asked otherwise.
+    const defaultSound: Sound = action!.kind === 'message' || says === 'noteworthy' || says === 'problems' || watching ? 'loud'
       : this.deps.isGroup(chat) ? 'silent' : 'loud'
     const sound = input.sound ?? base?.sound ?? defaultSound
 
     let name = (input.name ?? base?.name ?? '').trim()
     if (!name) {
-      const src = action!.kind === 'message' ? action!.text : action!.prompt
+      const src = action!.kind === 'message' ? action!.text : action!.kind === 'claude' ? action!.prompt : trigger!.kind === 'watch' ? trigger!.command : 'task'
       name = src.replace(/\s+/g, ' ').slice(0, 40).trim() + (src.length > 40 ? '…' : '')
+    }
+
+    const limits: Partial<EventLimits> = { ...base?.limits }
+    const lims: [keyof EventLimits, unknown, string, number, number][] = [
+      ['cooldownMs', input.cooldown_minutes, 'cooldown_minutes', 0, 24 * 60],
+      ['staleMs', input.stale_minutes, 'stale_minutes', 1, 24 * 60],
+    ]
+    for (const [k, v, label, lo, hi] of lims) {
+      if (v === undefined || v === null) continue
+      const m = minutesIn(v, label, lo, hi)
+      if (m.error) return err(400, m.error)
+      limits[k] = m.ms
+    }
+    if (input.max_per_hour !== undefined && input.max_per_hour !== null) {
+      const n = Number(input.max_per_hour)
+      if (!Number.isInteger(n) || n < 1 || n > 120) return err(400, 'max_per_hour is a whole number between 1 and 120')
+      limits.maxPerHour = n
     }
     if (name.length > MAX.name) return err(400, `name is too long (at most ${MAX.name} characters)`)
 
@@ -158,14 +228,22 @@ export class TaskService {
       if (!Number.isInteger(n) || n < 1) return err(400, 'times is a whole number, at least 1')
       times = n
     }
+    // Anything that runs more often than hourly ends after a week unless it was given
+    // an end, so a forgotten one is bounded; one tap on its last notice renews it.
+    if (runsOften(trigger!, tz, now) && until === undefined && times === undefined) {
+      if (input.until === '' || input.until === null as any) return err(400, 'a task that runs more often than hourly needs an end: give until, as far ahead as wanted')
+      until = new Date(now.getTime() + LIMITS.frequentEndMs).toISOString()
+    }
 
     // Undefined for a one-off whose time has passed: fine for renaming a reminder that
     // went out, not for creating one or giving it a new schedule (the callers check).
+    // A streaming watcher has no slots at all.
     const nextDue = firstDue(trigger!, tz, now)
     return ok({
       name, trigger: trigger!, tz, action: action!, says, sound,
       where: input.deliver_to ? (input.deliver_to === 'dm' ? 'dm' : 'home') : (base?.where ?? 'home'),
       until, times, nextDue: nextDue?.toISOString(),
+      limits: Object.keys(limits).length ? limits : undefined,
     } as any)
   }
 
@@ -176,11 +254,15 @@ export class TaskService {
     if (why) return err(403, why)
     const b = this.build(input, undefined, scope.chat)
     if (!b.ok) return err(b.status, b.error)
-    if (!b.value.nextDue) return err(400, 'that time has already passed')
+    if (!b.value.nextDue && !isStreaming(b.value)) return err(400, 'that time has already passed')
     const dup = this.store.findDuplicate(scope.chat, scope.thread, b.value)
     if (dup) return ok({ task: dup, duplicate: true })
     if (this.store.countInTopic(scope.chat, scope.thread) >= LIMITS.tasksPerTopic) {
       return err(409, `this topic already has ${LIMITS.tasksPerTopic} tasks; delete one first`)
+    }
+    const max = this.deps.maxWatchers
+    if (max !== undefined && isStreaming(b.value) && this.store.listTasks({ states: ['active'] }).filter(isStreaming).length >= max) {
+      return err(409, `the bot already keeps ${max} watchers running; pause or delete one first, or make this one check every few minutes (watch.every_minutes)`)
     }
     const task = this.store.createTask({
       ...b.value, chat: scope.chat, thread: scope.thread, owner: scope.person, ownerName: scope.personName,
@@ -200,7 +282,7 @@ export class TaskService {
     if (!b.ok) return err(b.status, b.error)
     const t = v.value
     const retimed = JSON.stringify(b.value.trigger) !== JSON.stringify(t.trigger) || b.value.tz !== t.tz
-    if (retimed && !b.value.nextDue) return err(400, 'that time has already passed')
+    if (retimed && !b.value.nextDue && !isStreaming(b.value)) return err(400, 'that time has already passed')
     const patch: Partial<Task> = { ...b.value }
     // A changed schedule replaces the old one; an unchanged one keeps its next slot.
     if (!retimed) patch.nextDue = t.nextDue
@@ -232,9 +314,34 @@ export class TaskService {
     const t = v.value
     if (t.state !== 'paused') return err(409, `it is ${t.state}, not paused`)
     const next = firstDue(t.trigger, t.tz, this.deps.now())
-    if (!next) return err(409, 'its time has passed while it was paused; give it a new time with task_update')
-    const task = this.store.updateTask(t.id, { state: 'active', pauseReason: undefined, failStreak: 0, nextDue: next.toISOString() }, this.deps.now())!
+    if (!next && !isStreaming(t)) return err(409, 'its time has passed while it was paused; give it a new time with task_update')
+    const task = this.store.updateTask(t.id, {
+      state: 'active', pauseReason: undefined, failStreak: 0, nextDue: next?.toISOString(),
+      watchFails: undefined, watchError: undefined, watchRetryAt: undefined,
+    }, this.deps.now())!
     this.deps.changed(task, 'resumed')
+    return ok({ task })
+  }
+
+  // Another week for a task that ends: an ended one starts again, a running one ends a
+  // week later.
+  extend(scope: Scope, id: string): Result<{ task: Task }> {
+    const v = this.visible(scope, id)
+    if (!v.ok) return err(v.status, v.error)
+    if (scope.runKind === 'scheduled') return err(403, "a scheduled run can't extend its task")
+    const why = this.deps.mayManage(scope, v.value, 'resume')
+    if (why) return err(403, why)
+    const t = v.value
+    if (t.state !== 'expired' && t.state !== 'active') return err(409, `it is ${t.state}`)
+    const now = this.deps.now()
+    const from = t.state === 'active' && t.until ? Math.max(Date.parse(t.until), now.getTime()) : now.getTime()
+    const until = new Date(from + LIMITS.frequentEndMs).toISOString()
+    const next = t.state === 'expired' ? firstDue(t.trigger, t.tz, now) : undefined
+    if (t.state === 'expired' && !next && !isStreaming(t)) return err(409, 'it has nothing left to run; give it a new time with task_update')
+    const task = this.store.updateTask(t.id, {
+      until, ...(t.state === 'expired' ? { state: 'active', nextDue: next?.toISOString(), watchFails: undefined, watchError: undefined, watchRetryAt: undefined } : {}),
+    }, now)!
+    this.deps.changed(task, t.state === 'expired' ? 'resumed' : 'updated')
     return ok({ task })
   }
 

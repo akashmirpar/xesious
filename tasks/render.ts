@@ -6,7 +6,7 @@
  * Times are written in the task's zone and wrapped in <tg-time>, which Telegram shows
  * in each reader's own zone and language; the written text is what older apps show.
  */
-import type { Run, RunMark, Task, Trigger, Usage } from './model'
+import { eventLimits, type Run, type RunMark, type Task, type Trigger, type Usage } from './model'
 import { runsPerDay } from './schedule'
 
 export const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -41,6 +41,7 @@ export function scheduleText(t: Trigger, tz: string): string {
     case 'at': return `once, ${whenText(new Date(t.at), tz)}`
     case 'every': return `every ${durationText(t.everyMs)}`
     case 'cron': return cronText(t.expr)
+    case 'watch': return t.everyMs ? `checks every ${durationText(t.everyMs)}` : 'watches continuously'
   }
 }
 
@@ -81,8 +82,9 @@ export function elapsedText(ms: number): string {
   return m % 60 ? `${h} h ${m % 60} min` : `${h} h`
 }
 
-// ⏰ Scheduled · 🔔 Reminder — the kinds phase 1 has.
+// ⏰ Scheduled · 🔔 Reminder · 👀 Watch
 export function kindLabel(t: Task): string {
+  if (t.trigger.kind === 'watch') return '👀 Watch'
   return t.action.kind === 'message' ? '🔔 Reminder' : '⏰ Scheduled'
 }
 
@@ -95,13 +97,21 @@ const SAYS_TEXT: Record<Task['says'], string> = {
 }
 
 export function actionText(t: Task): string {
-  if (t.action.kind === 'message') return 'sends a message'
+  const watch = t.trigger.kind === 'watch'
+  if (t.action.kind === 'none') return 'keeps it running; says something only if it fails'
+  if (t.action.kind === 'message') return watch ? 'sends a message when it sees something' : 'sends a message'
   const session = t.action.session === 'own' ? 'Claude, in its own session (remembers earlier runs)' : 'Claude, a fresh session each run'
-  return `${session} · ${SAYS_TEXT[t.says]}`
+  return `${watch ? `${session}, when it sees something` : session} · ${SAYS_TEXT[t.says]}`
 }
 
-// "about 5 runs a week" — so the cost of a frequent task is in plain sight.
+// "about 5 runs a week" — so the cost of a frequent task is in plain sight. A
+// watcher's runs depend on what it sees: its cap is what can be said.
 export function frequencyText(t: Task, now = new Date()): string | undefined {
+  if (t.trigger.kind === 'watch') {
+    if (t.action.kind !== 'claude') return undefined
+    const lim = eventLimits(t)
+    return `at most ${lim.maxPerHour} run${lim.maxPerHour === 1 ? '' : 's'} an hour, ${elapsedText(lim.cooldownMs)} apart`
+  }
   const perDay = runsPerDay(t.trigger, t.tz, now)
   if (perDay === undefined) return undefined
   const runs = (n: number) => `${n} run${n === 1 ? '' : 's'}`
@@ -147,19 +157,38 @@ export function usageText(u: Usage | undefined): string {
   return bits.join(' · ')
 }
 
+// How a streaming watcher is doing, from the supervisor: for the card.
+export interface WatchStatus { running: boolean; since?: string }
+
 // The card: one message per task in its home topic, edited when its state changes.
-export function cardHtml(t: Task, runs: Run[], now = new Date()): string {
+export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchStatus): string {
   const lines: string[] = []
   lines.push(`${kindLabel(t)}: <b>${esc(t.name)}</b>`)
-  const sched = `${esc(scheduleText(t.trigger, t.tz))} <i>(${esc(t.tz)})</i>`
+  const isWatch = t.trigger.kind === 'watch'
+  // A watcher's times are its own; a zone means nothing for it.
+  const sched = isWatch ? esc(scheduleText(t.trigger, t.tz)) : `${esc(scheduleText(t.trigger, t.tz))} <i>(${esc(t.tz)})</i>`
   const freq = t.action.kind === 'claude' ? frequencyText(t, now) : undefined
-  lines.push([sched, esc(actionText(t)), t.sound === 'loud' ? '🔔 loud' : '🔕 silent', freq ? esc(freq) : ''].filter(Boolean).join(' · '))
+  lines.push([sched, esc(actionText(t)), t.action.kind === 'none' ? '' : t.sound === 'loud' ? '🔔 loud' : '🔕 silent', freq ? esc(freq) : ''].filter(Boolean).join(' · '))
+  if (t.trigger.kind === 'watch') lines.push(`<code>${esc(clip(t.trigger.command, 200))}</code>`)
   if (t.action.kind === 'message') lines.push(`“${esc(t.action.text)}”`)
   if (t.state === 'paused') lines.push(`⏸ ${esc(pauseText(t))}`)
   else if (t.state === 'done') lines.push('✔️ done')
   else if (t.state === 'expired') lines.push('⌛ ended')
   else if (t.state === 'deleted') lines.push('🗑 deleted')
-  else if (t.nextDue) lines.push(`Next: ${tgTime(new Date(t.nextDue), t.tz)} (${tgTime(new Date(t.nextDue), t.tz, 'r')})`)
+  else if (isWatch) {
+    const seen = t.eventsSeen ? ` · ${t.eventsSeen.toLocaleString('en-US')} line${t.eventsSeen === 1 ? '' : 's'}, the last ${esc(whenText(new Date(t.lastEventAt ?? now.toISOString()), t.tz))}` : ''
+    if (t.watchError) {
+      const again = t.watchRetryAt && Date.parse(t.watchRetryAt) > now.getTime() ? ` · starts again ${tgTime(new Date(t.watchRetryAt), t.tz, 'r')}` : ''
+      lines.push(`⚠️ ${esc(clip(t.watchError, 200))}${again}`)
+    } else if (t.trigger.kind === 'watch' && t.trigger.everyMs) {
+      if (t.nextDue) lines.push(`Next check: ${tgTime(new Date(t.nextDue), t.tz, 'r')}${seen}`)
+    } else if (watch?.running) {
+      lines.push(`👀 running since ${esc(whenText(new Date(watch.since ?? now.toISOString()), t.tz))}${seen}`)
+    } else {
+      lines.push('👀 starting')
+    }
+  } else if (t.nextDue) lines.push(`Next: ${tgTime(new Date(t.nextDue), t.tz)} (${tgTime(new Date(t.nextDue), t.tz, 'r')})`)
+  if (t.until && (t.state === 'active' || t.state === 'paused')) lines.push(`Ends ${tgTime(new Date(t.until), t.tz)}`)
   const running = runs.find(r => r.state === 'running')
   if (running) lines.push(`⏳ running since ${esc(whenText(new Date(running.startedAt ?? now.toISOString()), t.tz))}`)
   const last = runs.find(r => r.state !== 'queued' && r.state !== 'running')
@@ -177,8 +206,9 @@ export function cardHtml(t: Task, runs: Run[], now = new Date()): string {
 export function listLine(t: Task, runs: Run[]): string {
   const last = runs.find(r => r.state !== 'queued')
   const mark = t.state === 'paused' ? '⏸' : last ? MARK[markOf(last)] : '·'
-  const when = t.state === 'active' && t.nextDue ? ` · next ${tgTime(new Date(t.nextDue), t.tz)}` : t.state === 'paused' ? ' · paused' : ''
-  return `${mark} ${t.action.kind === 'message' ? '🔔' : '⏰'} <b>${esc(t.name)}</b> — ${esc(scheduleText(t.trigger, t.tz))}${when}`
+  const when = t.state === 'active' && t.nextDue && t.trigger.kind !== 'watch' ? ` · next ${tgTime(new Date(t.nextDue), t.tz)}` : t.state === 'paused' ? ' · paused' : ''
+  const kind = t.trigger.kind === 'watch' ? '👀' : t.action.kind === 'message' ? '🔔' : '⏰'
+  return `${mark} ${kind} <b>${esc(t.name)}</b> — ${esc(scheduleText(t.trigger, t.tz))}${when}`
 }
 
 export function runLine(r: Run, tz: string): string {
@@ -186,6 +216,7 @@ export function runLine(r: Run, tz: string): string {
   const bits: string[] = [MARK[markOf(r)], at ? esc(whenText(new Date(at), tz)) : '']
   if (r.trigger === 'manual') bits.push('run now')
   if (r.trigger === 'catchup') bits.push('caught up')
+  if (r.trigger === 'event') bits.push((r.folded ?? 1) > 1 ? `${r.folded} events` : 'an event')
   if (r.startedAt && r.endedAt) bits.push(elapsedText(new Date(r.endedAt).getTime() - new Date(r.startedAt).getTime()))
   const u = usageText(r.usage)
   if (u) bits.push(esc(u))

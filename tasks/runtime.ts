@@ -12,13 +12,21 @@
  * each overdue task runs its latest slot once if still within its grace window
  * (schedule.resolveDue); Claude runs wait two minutes after start, and catch-ups are
  * started five at a time, so a restart is not a stampede.
+ *
+ * Watchers: sync() keeps every active streaming watcher running and stops the rest; a
+ * polled one is run at its slots. What they print comes to onEvents: stale lines are
+ * dropped, and the rest wait for a run, at most one per cooldown and so many an hour,
+ * events that come meanwhile folded into the next. A watcher that dies is a failure
+ * of its own (onWatcherExit): started again with backoff, alerting at two in a row and
+ * pausing the task at five.
  */
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { LIMITS, type Run, type RunMark, type Task, type Usage } from './model'
+import { LIMITS, eventLimits, isStreaming, isWatch, type Run, type RunMark, type Task, type Usage, type WatchEvent } from './model'
 import type { TaskStore } from './store'
-import { manualRunId, resolveDue, slotRunId } from './schedule'
-import { markOf } from './render'
+import { manualRunId, nextAfter, resolveDue, slotRunId } from './schedule'
+import { elapsedText, markOf, whenText } from './render'
+import type { PollResult, WatcherExit } from './watchers'
 
 export interface ClaudeOutcome {
   ok: boolean              // the run finished and produced an answer
@@ -39,8 +47,16 @@ export interface PostOpts {
   loud: boolean
   lateMs?: number          // a reminder or catch-up that runs late
   edit?: number            // edit this message instead of sending a new one
-  buttons?: 'reminder' | 'alert' | 'paused' | 'rerun'
+  buttons?: 'reminder' | 'alert' | 'paused' | 'rerun' | 'renew' | 'pause'
   run?: Run
+}
+
+// What the runtime needs of the watcher supervisor (watchers.ts).
+export interface WatcherControl {
+  list(): string[]                  // the tasks whose streaming watcher is running
+  ensure(task: Task): boolean       // running with its current command; false if it can't start
+  stop(taskId: string): void
+  poll(task: Task): Promise<PollResult>
 }
 
 export interface RuntimeDeps {
@@ -61,6 +77,9 @@ export interface RuntimeDeps {
   activity(task: Task, text: string): void
   setTimer?: (fn: () => void, ms: number) => unknown
   clearTimer?: (t: unknown) => void
+  // Without it, watcher tasks are never started.
+  watchers?: WatcherControl
+  maxWatchers?: number     // streaming watchers at once, across every task (8)
 }
 
 const WARMUP_MS = 2 * 60_000
@@ -77,6 +96,9 @@ export class TaskRuntime {
   private timer: unknown
   private stopped = false
   private pending = new Set<Promise<void>>()
+  private polling = new Set<string>()
+  private eventSeq = 0
+  private later = new Map<string, unknown>()     // per task: a cooldown's end, a watcher's restart
 
   constructor(private d: RuntimeDeps) {}
 
@@ -94,10 +116,20 @@ export class TaskRuntime {
   stop(): void {
     this.stopped = true
     if (this.timer) this.clearTimer(this.timer)
+    for (const t of this.later.values()) this.clearTimer(t)
+    this.later.clear()
   }
 
   // Something changed (a task created, moved, resumed): look again now.
-  wake(): void { this.arm(0) }
+  wake(): void { this.sync(); this.arm(0) }
+
+  // Do this for the task in ms, unless something is due for it sooner already.
+  private soon(taskId: string, ms: number, fn: () => void): void {
+    if (this.stopped) return
+    const cur = this.later.get(taskId)
+    if (cur) this.clearTimer(cur)
+    this.later.set(taskId, this.setTimer(() => { this.later.delete(taskId); fn() }, Math.max(0, ms)))
+  }
 
   // Runs open now, for the drain on shutdown.
   get busy(): number { return this.inFlight.size }
@@ -135,17 +167,20 @@ export class TaskRuntime {
     return open
   }
 
-  // One pass over the due tasks.
+  // One pass over the due tasks, the watchers, and the events waiting for a run.
   async tick(): Promise<void> {
     if (this.stopped) return
+    try { this.sync() } catch (e) { this.d.log(`[tasks] watchers: ${e}`) }
+    for (const id of this.store.tasksWithEvents()) this.fireEvents(id)
     const now = this.d.now()
     const warm = now.getTime() - this.d.startedAt.getTime() < WARMUP_MS
     let started = 0
     let deferUntil: number | undefined
     try {
       for (const t of this.store.dueTasks(now)) {
-        // Claude runs wait out the first two minutes after a start; reminders don't.
-        if (warm && t.action.kind === 'claude') {
+        // Claude runs wait out the first two minutes after a start; reminders and a
+        // watcher's looks don't.
+        if (warm && t.action.kind === 'claude' && !isWatch(t)) {
           deferUntil = Math.min(deferUntil ?? Infinity, this.d.startedAt.getTime() + WARMUP_MS)
           continue
         }
@@ -166,6 +201,7 @@ export class TaskRuntime {
 
   // Claim the task's due slot and start (or skip) it. true when a run started.
   private async fire(t: Task, now: Date): Promise<boolean> {
+    if (isWatch(t)) return this.firePoll(t, now)
     const due = new Date(t.nextDue!)
     const r = resolveDue(t.trigger, t.tz, due, now)
     let next = r.next
@@ -210,10 +246,22 @@ export class TaskRuntime {
     return true
   }
 
-  // A run now, outside the schedule. Its id, or why not.
+  // A run now, outside the schedule. Its id, or why not. For a watcher: look now (a
+  // polled one is run, a streaming one that is down is started without waiting).
   runNow(taskId: string): { runId?: string; error?: string } {
     const t = this.store.getTask(taskId)
     if (!t || t.state === 'deleted') return { error: 'no such task' }
+    if (isWatch(t)) {
+      if (t.state !== 'active') return { error: `it is ${t.state}` }
+      if (isStreaming(t)) {
+        this.store.updateTask(t.id, { watchRetryAt: undefined })
+        this.sync()
+        return this.d.watchers?.list().includes(t.id) ? { runId: 'watcher' } : { error: "its watcher couldn't be started" }
+      }
+      if (this.polling.has(t.id)) return { error: 'it is looking already' }
+      this.track(this.pollOnce(t.id))
+      return { runId: 'poll' }
+    }
     if (this.inFlight.has(t.id)) return { error: 'it is already running' }
     const run: Run = { id: manualRunId(t.id, this.d.now()), task: t.id, trigger: 'manual', state: 'queued' }
     if (!this.store.insertRun(run)) return { error: 'it was started a moment ago' }
@@ -253,8 +301,10 @@ export class TaskRuntime {
     run = this.store.updateRun(run.id, { state: 'running', startedAt: run.startedAt ?? startedAt })!
     let msgId: number | undefined
     let error: string | undefined
+    const event = run.trigger === 'event'
     try {
-      msgId = await this.d.post(t, 'reminder', t.action.text, { loud: t.sound === 'loud', lateMs: run.lateMs, buttons: 'reminder', run })
+      msgId = await this.d.post(t, 'reminder', event ? eventText(t.action.text, run) : t.action.text,
+        { loud: t.sound === 'loud', lateMs: run.lateMs, buttons: event ? 'pause' : 'reminder', run })
       if (msgId === undefined) error = 'Telegram did not accept the message'
     } catch (e) {
       error = String((e as Error)?.message ?? e)
@@ -269,11 +319,13 @@ export class TaskRuntime {
       run = this.store.updateRun(run.id, { state: 'failed', reason: error, endedAt: end })!
       this.inFlight.delete(t.id)
       await this.onFailure(this.store.getTask(t.id)!, run, error)
+      this.afterRun(t.id)
       return
     }
     run = this.store.updateRun(run.id, { state: 'succeeded', postedMsg: msgId, endedAt: end })!
     this.inFlight.delete(t.id)
     this.finishRun(t.id, run)
+    this.afterRun(t.id)
   }
 
   // --- Claude runs ------------------------------------------------------------
@@ -296,7 +348,13 @@ export class TaskRuntime {
     } finally {
       this.inFlight.delete(t.id)
       this.startWaiting()
+      this.afterRun(t.id)
     }
+  }
+
+  // A watcher's events that came during the run go into the next one.
+  private afterRun(taskId: string): void {
+    if (this.store.countEvents(taskId)) this.fireEvents(taskId)
   }
 
   private async settleClaude(taskId: string, runId: string, o: ClaudeOutcome): Promise<void> {
@@ -392,15 +450,190 @@ export class TaskRuntime {
   }
 
   // A task with nothing left to run is done (one-off, or out of runs) or expired
-  // (past its end date).
+  // (past its end date). A watcher has no slots to run out of: only its end date or
+  // its number of runs ends it.
   private endIfFinished(t: Task, next: Date | undefined): Task {
     if (t.state !== 'active') return t
-    if (t.times !== undefined && t.runsDone >= t.times) return this.store.updateTask(t.id, { state: 'done', nextDue: undefined })!
+    if (t.times !== undefined && t.runsDone >= t.times) {
+      if (isWatch(t)) { this.d.watchers?.stop(t.id); this.store.dropEvents(t.id) }
+      return this.store.updateTask(t.id, { state: 'done', nextDue: undefined })!
+    }
+    if (isWatch(t)) return t.until && Date.parse(t.until) <= this.d.now().getTime() ? this.expire(t) : t
     if (t.nextDue) return t
     if (next) return t
     if (t.trigger.kind === 'at') return this.store.updateTask(t.id, { state: 'done' })!
-    if (t.until) return this.store.updateTask(t.id, { state: 'expired' })!
+    if (t.until) return this.expire(t)
     return t
+  }
+
+  // Past its end date: it stops, and its topic is told, with a tap for another week.
+  private expire(t: Task): Task {
+    const task = this.store.updateTask(t.id, { state: 'expired', nextDue: undefined, watchRetryAt: undefined })!
+    if (isWatch(task)) { this.d.watchers?.stop(task.id); this.store.dropEvents(task.id) }
+    const until = task.until ? `: it was set to run until ${whenText(new Date(task.until), task.tz)}` : ''
+    void this.safePost(task, 'notice', `⌛ ${task.name} has ended${until}.`, { loud: false, buttons: 'renew' })
+    this.d.activity(task, `⌛ ${task.name} ended`)
+    this.d.cardChanged(task)
+    return task
+  }
+
+  // --- watchers ------------------------------------------------------------------
+
+  // The streaming watchers, in line with their tasks: each active one running unless
+  // it is waiting out a restart backoff, every other one stopped. One whose end date
+  // has passed ends here, having no slots to end on.
+  sync(): void {
+    const now = this.d.now().getTime()
+    const want = new Map<string, Task>()
+    for (const t of this.store.listTasks({ states: ['active'] })) {
+      if (!isWatch(t)) continue
+      if (t.until && Date.parse(t.until) <= now) { this.expire(t); continue }
+      // A watcher acts for its owner too: one who can no longer use the chat stops it.
+      if (!this.d.ownerAllowed(t)) {
+        const p = this.store.updateTask(t.id, { state: 'paused', pauseReason: 'owner', nextDue: undefined })!
+        this.store.dropEvents(t.id)
+        this.d.activity(p, `⏸ ${p.name} paused: the person it runs as can no longer use this chat`)
+        this.d.cardChanged(p)
+        continue
+      }
+      if (isStreaming(t)) want.set(t.id, t)
+    }
+    const w = this.d.watchers
+    if (!w) return
+    for (const id of w.list()) if (!want.has(id)) w.stop(id)
+    const max = this.d.maxWatchers ?? 8
+    for (const t of want.values()) {
+      const running = w.list().includes(t.id)
+      if (!running && t.watchRetryAt && Date.parse(t.watchRetryAt) > now) continue
+      if (!running && w.list().length >= max) {
+        const why = `waiting: the bot already keeps ${max} watchers running`
+        if (t.watchError !== why) { this.store.updateTask(t.id, { watchError: why }); this.d.cardChanged(t) }
+        continue
+      }
+      if (w.ensure(t)) {
+        if (t.watchError?.startsWith('waiting')) { this.store.updateTask(t.id, { watchError: undefined }); this.d.cardChanged(t) }
+        if (!running) this.d.cardChanged(this.store.getTask(t.id) ?? t)
+      } else {
+        this.onWatcherExit(t.id, { code: null, err: "it couldn't be started", upMs: 0 })
+      }
+    }
+  }
+
+  // A polled watcher's slot: run it, and set the next.
+  private firePoll(t: Task, now: Date): boolean {
+    let next = nextAfter(t.trigger, t.tz, now)
+    if (next && t.until && next.getTime() > Date.parse(t.until)) next = undefined
+    if (!this.store.claim(t.id, t.nextDue!, next?.toISOString())) return false
+    if (!this.d.watchers || this.polling.has(t.id)) return false
+    this.track(this.pollOnce(t.id))
+    return true
+  }
+
+  private async pollOnce(taskId: string): Promise<void> {
+    const t = this.store.getTask(taskId)
+    if (!t || t.state !== 'active' || !this.d.watchers || this.polling.has(taskId)) return
+    this.polling.add(taskId)
+    let r: PollResult
+    try {
+      r = await this.d.watchers.poll(t)
+    } catch (e) {
+      r = { events: [], code: null, err: String((e as Error)?.message ?? e), upMs: 0 }
+    } finally {
+      this.polling.delete(taskId)
+    }
+    // A failed look's output is not news: it is the failure.
+    const ok = r.code === 0 && !r.timedOut
+    this.onWatcherExit(taskId, ok ? r : { ...r, err: r.err || r.events.map(e => e.text).join('\n') }, true)
+    if (ok && r.events.length) this.onEvents(taskId, r.events)
+  }
+
+  // What a watcher printed. Stale lines are dropped; the rest wait for a run.
+  onEvents(taskId: string, events: WatchEvent[]): void {
+    const t = this.store.getTask(taskId)
+    if (!t || t.state !== 'active' || !events.length) return
+    const lim = eventLimits(t)
+    const now = this.d.now().getTime()
+    this.store.updateTask(t.id, { eventsSeen: (t.eventsSeen ?? 0) + events.length, lastEventAt: events[events.length - 1].at })
+    if (t.action.kind === 'none') return
+    const fresh = events.filter(e => now - Date.parse(e.at) <= lim.staleMs)
+    if (fresh.length < events.length) this.d.log(`[tasks] ${t.id}: ${events.length - fresh.length} stale event(s) dropped`)
+    if (!fresh.length) return
+    this.store.addEvents(t.id, fresh)
+    this.fireEvents(t.id)
+  }
+
+  // A run for the events waiting, if the task may run now: not while one is going,
+  // nor within the cooldown, nor past the hourly cap. Otherwise they wait, folded into
+  // the run that comes when it may.
+  fireEvents(taskId: string): void {
+    const t = this.store.getTask(taskId)
+    if (!t || t.state !== 'active' || !isWatch(t) || t.action.kind === 'none') { this.store.dropEvents(taskId); return }
+    if (this.inFlight.has(t.id) || this.stopped) return
+    const lim = eventLimits(t)
+    const now = this.d.now().getTime()
+    const cooled = t.lastEventRunAt ? Date.parse(t.lastEventRunAt) + lim.cooldownMs : 0
+    if (cooled > now) { this.soon(t.id, cooled - now, () => this.fireEvents(t.id)); return }
+    const hour = this.store.runsFor(t.id, lim.maxPerHour + 5)
+      .filter(r => r.trigger === 'event' && r.startedAt && now - Date.parse(r.startedAt) < 3600_000)
+      .map(r => Date.parse(r.startedAt!)).sort((a, b) => a - b)
+    if (hour.length >= lim.maxPerHour) { this.soon(t.id, hour[0] + 3600_000 - now, () => this.fireEvents(t.id)); return }
+    const all = this.store.takeEvents(t.id).filter(e => now - Date.parse(e.at) <= lim.staleMs)
+    if (!all.length) return
+    const run: Run = {
+      id: `${t.id}@event-${now.toString(36)}.${(this.eventSeq++).toString(36)}`, task: t.id, trigger: 'event', state: 'queued',
+      events: all.slice(-LIMITS.eventsPerRun), folded: all.length,
+    }
+    // Never lose them: back they go if the run can't be recorded.
+    if (!this.store.insertRun(run)) { this.store.addEvents(t.id, all); return }
+    this.store.updateTask(t.id, { lastEventRunAt: new Date(now).toISOString() })
+    this.dispatch(this.store.getTask(t.id)!, run)
+  }
+
+  // How a watcher ended, or how a look went. A good look clears a failure streak; a
+  // failure counts, and a streaming watcher is started again after a backoff. Two in a
+  // row raise an alert (edited in place after that), five pause the task.
+  onWatcherExit(taskId: string, how: WatcherExit, poll = false): void {
+    let t = this.store.getTask(taskId)
+    if (!t || t.state === 'deleted' || !isWatch(t)) return
+    const now = this.d.now()
+    if (poll && how.code === 0 && !how.timedOut) {
+      if (t.watchFails || t.watchError) {
+        const alert = t.alertMsg
+        t = this.store.updateTask(t.id, { watchFails: 0, watchError: undefined, ...(alert !== undefined ? { alertMsg: undefined, alertAt: undefined } : {}) })!
+        if (alert !== undefined) void this.safePost(t, 'alert', `✅ ${t.name} is working again.`, { loud: false, edit: alert })
+        this.d.cardChanged(t)
+      }
+      return
+    }
+    const what = how.timedOut ? `it didn't finish within ${elapsedText(LIMITS.pollTimeoutMs)}`
+      : how.code === null ? 'it stopped without saying why'
+      : poll ? `it exited with status ${how.code}` : how.code === 0 ? 'it ended' : `it ended with status ${how.code}`
+    const said = how.err.trim().split('\n').filter(Boolean).pop()?.slice(0, 300)
+    const error = said ? `${what}: ${said}` : what
+    // A streaming watcher that ran a good while before it died starts a fresh count.
+    const fails = !poll && how.upMs >= LIMITS.watchUpResetMs ? 1 : (t.watchFails ?? 0) + 1
+    const backoff = LIMITS.watchBackoffMs[Math.min(fails, LIMITS.watchBackoffMs.length) - 1]
+    t = this.store.updateTask(t.id, { watchFails: fails, watchError: error, ...(poll ? {} : { watchRetryAt: new Date(now.getTime() + backoff).toISOString() }) })!
+    this.d.log(`[tasks] ${t.id}: watcher failed (${fails} in a row): ${error}`)
+    if (fails >= LIMITS.failPauseAt) {
+      t = this.store.updateTask(t.id, { state: 'paused', pauseReason: 'failures', nextDue: undefined, watchRetryAt: undefined })!
+      this.d.watchers?.stop(t.id)
+      this.store.dropEvents(t.id)
+      const t2 = t
+      void this.safePost(t2, 'alert', `⏸ ${t2.name}: its watcher failed ${fails} times in a row, so the task is paused. Last: ${error}`, { loud: true, edit: t2.alertMsg, buttons: 'paused' })
+        .then(id => { if (id !== undefined) this.store.updateTask(t2.id, { alertMsg: id, alertAt: this.d.now().toISOString() }) })
+      this.d.activity(t, `⏸ ${t.name} paused: its watcher kept failing`)
+    } else if (fails >= LIMITS.failAlertAt) {
+      const t2 = t
+      const next = poll ? 'It looks again at its next check.' : `It starts again in ${elapsedText(backoff)}.`
+      void this.safePost(t2, 'alert', `⚠️ ${t2.name}: its watcher failed ${fails} times in a row. Last: ${error}. ${next}`, { loud: !t2.alertMsg, edit: t2.alertMsg, buttons: 'alert' })
+        .then(id => { if (id !== undefined) this.store.updateTask(t2.id, { alertMsg: id, alertAt: this.d.now().toISOString() }) })
+      this.d.activity(t, `⚠️ ${t.name}: its watcher failed ${fails} times in a row`)
+    } else {
+      this.d.activity(t, `❌ ${t.name}: its watcher ${error}`)
+    }
+    this.d.cardChanged(t)
+    if (!poll && t.state === 'active') this.soon(t.id, backoff, () => this.sync())
   }
 
   // Failures: one is recorded quietly; two in a row raise an alert, edited in place
@@ -435,4 +668,14 @@ export class TaskRuntime {
       return undefined
     }
   }
+}
+
+// A watcher's message for its run: {event} is the newest line, and events folded into
+// the run are counted. Without {event}, the line follows the text.
+export function eventText(template: string, run: Run): string {
+  const evs = run.events ?? []
+  const last = evs[evs.length - 1]?.text ?? ''
+  const more = (run.folded ?? evs.length) - 1
+  const body = template.includes('{event}') ? template.split('{event}').join(last) : last ? `${template}\n${last}` : template
+  return more > 0 ? `${body}\n(+${more} more since)` : body
 }

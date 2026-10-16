@@ -1,6 +1,7 @@
 /**
- * store.ts — tasks, their runs, and the notes runs leave for a topic, in one SQLite
- * file (state/tasks.db). The bridge is its only writer.
+ * store.ts — tasks, their runs, the notes runs leave for a topic, the watchers the
+ * bridge keeps running and the events waiting for a run, in one SQLite file
+ * (state/tasks.db). The bridge is its only writer.
  *
  * Each row keeps the whole record as JSON beside the few columns that are queried
  * (chat, topic, state, next due time), so a field added later needs no migration.
@@ -9,9 +10,22 @@
  */
 import { Database } from 'bun:sqlite'
 import { randomBytes } from 'node:crypto'
-import { LIMITS, type Run, type Task, type TaskState } from './model'
+import { LIMITS, type Run, type Task, type TaskState, type WatchEvent } from './model'
 
-const SCHEMA = 1
+const SCHEMA = 2
+
+// A streaming watcher as the bridge started it: enough to find it again after a
+// restart (its pid, and the start time that proves the pid is still it) and to read on
+// from where the last bridge left off.
+export interface WatchProc {
+  pid: number
+  startTicks: string      // /proc/<pid>/stat start time
+  startedAt: string
+  command: string         // what it runs: a changed command restarts it
+  out: string             // its output, one timestamped line per line it printed
+  err: string             // its stderr
+  readPos: number         // how far out has been read
+}
 
 type NewTask = Omit<Task, 'id' | 'createdAt' | 'updatedAt' | 'runsDone' | 'failStreak' | 'state'> & { state?: TaskState }
 
@@ -48,6 +62,11 @@ export class TaskStore {
         created_at TEXT NOT NULL, taken_at TEXT
       );
       CREATE INDEX IF NOT EXISTS notes_key ON notes (key, taken_at);
+      CREATE TABLE IF NOT EXISTS watchers (task TEXT PRIMARY KEY, doc TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT NOT NULL, at TEXT NOT NULL, text TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS events_task ON events (task, id);
     `)
     this.db.query("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)").run(String(SCHEMA))
   }
@@ -216,6 +235,45 @@ export class TaskStore {
   peekNotes(key: string): string[] {
     return (this.db.query('SELECT text FROM notes WHERE key = ? AND taken_at IS NULL ORDER BY id').all(key) as any[]).map(r => r.text)
   }
+
+  // --- watchers the bridge keeps running ---------------------------------------
+
+  getWatcher(task: string): WatchProc | undefined {
+    const row = this.db.query('SELECT doc FROM watchers WHERE task = ?').get(task) as any
+    return row ? JSON.parse(row.doc) : undefined
+  }
+  setWatcher(task: string, p: WatchProc | undefined): void {
+    if (!p) this.db.query('DELETE FROM watchers WHERE task = ?').run(task)
+    else this.db.query('INSERT OR REPLACE INTO watchers (task, doc) VALUES (?, ?)').run(task, JSON.stringify(p))
+  }
+  listWatchers(): { task: string; proc: WatchProc }[] {
+    return (this.db.query('SELECT task, doc FROM watchers').all() as any[]).map(r => ({ task: r.task, proc: JSON.parse(r.doc) }))
+  }
+
+  // --- events waiting for a run ------------------------------------------------
+  // What a watcher printed that is to start a run, kept until the run takes it: a run
+  // already going, a cooldown or the hourly cap holds them, and they are folded into
+  // the next run. Only the newest are kept.
+
+  addEvents(task: string, events: WatchEvent[]): void {
+    const q = this.db.query('INSERT INTO events (task, at, text) VALUES (?, ?, ?)')
+    for (const e of events) q.run(task, e.at, e.text)
+    const old = this.db.query('SELECT id FROM events WHERE task = ? ORDER BY id DESC LIMIT -1 OFFSET ?').all(task, LIMITS.pendingEventsKept) as any[]
+    for (const r of old) this.db.query('DELETE FROM events WHERE id = ?').run(r.id)
+  }
+  // Oldest first, and gone from here.
+  takeEvents(task: string): WatchEvent[] {
+    const rows = this.db.query('SELECT id, at, text FROM events WHERE task = ? ORDER BY id').all(task) as any[]
+    this.db.query('DELETE FROM events WHERE task = ?').run(task)
+    return rows.map(r => ({ at: r.at, text: r.text }))
+  }
+  countEvents(task: string): number {
+    return Number((this.db.query('SELECT COUNT(*) AS n FROM events WHERE task = ?').get(task) as any)?.n ?? 0)
+  }
+  tasksWithEvents(): string[] {
+    return (this.db.query('SELECT DISTINCT task FROM events').all() as any[]).map(r => r.task)
+  }
+  dropEvents(task: string): void { this.db.query('DELETE FROM events WHERE task = ?').run(task) }
 }
 
 // The JSON part: everything except what the columns hold.
@@ -241,9 +299,12 @@ function runOf(row: any): Run {
 }
 
 function dupKey(t: Pick<Task, 'trigger' | 'action'>): string {
-  const a = t.action.kind === 'message' ? `m:${norm(t.action.text)}` : `c:${t.action.session}:${norm(t.action.prompt)}`
+  const a = t.action.kind === 'message' ? `m:${norm(t.action.text)}`
+    : t.action.kind === 'claude' ? `c:${t.action.session}:${norm(t.action.prompt)}`
+    : 'none'
   const tr = t.trigger.kind === 'cron' ? `cron:${t.trigger.expr.trim().replace(/\s+/g, ' ')}`
     : t.trigger.kind === 'every' ? `every:${t.trigger.everyMs}`
+    : t.trigger.kind === 'watch' ? `watch:${norm(t.trigger.command)}:${t.trigger.everyMs ?? 'stream'}`
     : `at:${t.trigger.at}`
   return `${tr}|${a}`
 }
