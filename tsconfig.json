@@ -17,5 +17,5 @@
     "noUnusedLocals": false,
     "allowImportingTsExtensions": true
   },
-  "include": ["*.ts", "test/*.ts"]
+  "include": ["*.ts", "test/*.ts", "tasks/*.ts"]
 }

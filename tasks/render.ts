@@ -1,0 +1,204 @@
+/**
+ * render.ts — what tasks look like in Telegram: schedules in words, the card, a line
+ * of /tasks, and run history. Pure functions returning Telegram HTML, so each
+ * wording is tested without a bot.
+ *
+ * Times are written in the task's zone and wrapped in <tg-time>, which Telegram shows
+ * in each reader's own zone and language; the written text is what older apps show.
+ */
+import type { Run, RunMark, Task, Trigger, Usage } from './model'
+import { runsPerDay } from './schedule'
+
+export const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+
+function parts(d: Date, tz: string) {
+  const p = new Intl.DateTimeFormat('en-GB', {
+    timeZone: tz, hourCycle: 'h23', weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit',
+  }).formatToParts(d)
+  const get = (t: string) => p.find(x => x.type === t)?.value ?? ''
+  return { wd: get('weekday'), day: get('day'), mon: get('month'), hm: `${get('hour')}:${get('minute')}` }
+}
+
+// "Fri 16 Oct, 21:07" in tz.
+export function whenText(d: Date, tz: string): string {
+  const p = parts(d, tz)
+  return `${p.wd} ${p.day} ${p.mon}, ${p.hm}`
+}
+
+// A time each reader sees in their own zone. format: Telegram's r|w?[dD]?[tT]? string.
+export function tgTime(d: Date, tz: string, format = 'wdt'): string {
+  return `<tg-time unix="${Math.floor(d.getTime() / 1000)}" format="${format}">${esc(whenText(d, tz))}</tg-time>`
+}
+
+const pad2 = (n: number) => String(n).padStart(2, '0')
+
+// The schedule in words, for the kinds people actually ask for; anything else shows
+// its cron expression rather than a paraphrase that might be wrong.
+export function scheduleText(t: Trigger, tz: string): string {
+  switch (t.kind) {
+    case 'at': return `once, ${whenText(new Date(t.at), tz)}`
+    case 'every': return `every ${durationText(t.everyMs)}`
+    case 'cron': return cronText(t.expr)
+  }
+}
+
+export function cronText(expr: string): string {
+  const f = expr.trim().split(/\s+/)
+  if (f.length !== 5) return `cron ${expr}`
+  const [mi, h, dom, mon, dow] = f
+  const fixed = /^\d+$/.test(mi) && /^\d+$/.test(h)
+  if (!fixed) {
+    if (/^\*\/\d+$/.test(mi) && h === '*' && dom === '*' && mon === '*' && dow === '*') return `every ${mi.slice(2)} minutes`
+    if (/^\d+$/.test(mi) && h === '*' && dom === '*' && mon === '*' && dow === '*') return `every hour at :${pad2(Number(mi))}`
+    return `cron ${expr}`
+  }
+  const at = `${pad2(Number(h))}:${pad2(Number(mi))}`
+  if (mon !== '*') return `cron ${expr}`
+  if (dom === '*' && dow === '*') return `every day at ${at}`
+  if (dom === '*' && (dow === '1-5' || dow === 'MON-FRI')) return `weekdays at ${at}`
+  if (dom === '*' && (dow === '0,6' || dow === '6,0' || dow === 'SAT,SUN')) return `weekends at ${at}`
+  if (dom === '*' && /^[0-7]$/.test(dow)) return `every ${DAY_NAMES[Number(dow) % 7]} at ${at}`
+  if (dow === '*' && /^\d+$/.test(dom)) return `on day ${Number(dom)} of each month at ${at}`
+  return `cron ${expr}`
+}
+
+export function durationText(ms: number): string {
+  const min = Math.round(ms / 60_000)
+  if (min % (24 * 60) === 0) return min === 24 * 60 ? 'day' : `${min / (24 * 60)} days`
+  if (min % 60 === 0) return min === 60 ? 'hour' : `${min / 60} hours`
+  return min === 1 ? 'minute' : `${min} minutes`
+}
+
+// "2 h 5 min", "48 s"
+export function elapsedText(ms: number): string {
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s} s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m} min`
+  const h = Math.floor(m / 60)
+  return m % 60 ? `${h} h ${m % 60} min` : `${h} h`
+}
+
+// ⏰ Scheduled · 🔔 Reminder — the kinds phase 1 has.
+export function kindLabel(t: Task): string {
+  return t.action.kind === 'message' ? '🔔 Reminder' : '⏰ Scheduled'
+}
+
+const SAYS_TEXT: Record<Task['says'], string> = {
+  live: 'shows its progress and posts the answer',
+  result: 'posts the result',
+  noteworthy: 'posts only when something is worth telling',
+  problems: 'posts only problems',
+  never: 'posts nothing (history only)',
+}
+
+export function actionText(t: Task): string {
+  if (t.action.kind === 'message') return 'sends a message'
+  const session = t.action.session === 'own' ? 'Claude, in its own session (remembers earlier runs)' : 'Claude, a fresh session each run'
+  return `${session} · ${SAYS_TEXT[t.says]}`
+}
+
+// "about 5 runs a week" — so the cost of a frequent task is in plain sight.
+export function frequencyText(t: Task, now = new Date()): string | undefined {
+  const perDay = runsPerDay(t.trigger, t.tz, now)
+  if (perDay === undefined) return undefined
+  const runs = (n: number) => `${n} run${n === 1 ? '' : 's'}`
+  if (perDay >= 0.95) return `about ${runs(Math.round(perDay))} a day`
+  const perWeek = perDay * 7
+  if (perWeek >= 0.95) return `about ${runs(Math.round(perWeek))} a week`
+  return `about ${runs(Math.max(1, Math.round(perDay * 30)))} a month`
+}
+
+export const MARK: Record<RunMark, string> = {
+  posted: '✅', quiet: '🔇', blocked: '⚠️', failed: '❌', skipped: '⏭', deferred: '⏳', interrupted: '✂️', running: '⏳',
+}
+
+export function markOf(r: Run): RunMark {
+  switch (r.state) {
+    case 'queued': case 'running': return 'running'
+    case 'failed': case 'timed_out': return 'failed'
+    case 'skipped': return 'skipped'
+    case 'deferred': return 'deferred'
+    case 'interrupted': case 'canceled': return 'interrupted'
+    case 'succeeded':
+      if (r.outcome === 'blocked' || (r.denials?.length && !r.postedMsg)) return 'blocked'
+      return r.postedMsg ? 'posted' : 'quiet'
+  }
+}
+
+export function pauseText(t: Task): string {
+  switch (t.pauseReason) {
+    case 'failures': return 'paused after failing several times in a row'
+    case 'owner': return 'paused: the person it runs as can no longer use this chat'
+    case 'review': return 'paused for review'
+    default: return 'paused'
+  }
+}
+
+export function usageText(u: Usage | undefined): string {
+  if (!u) return ''
+  const bits: string[] = []
+  if (u.model) bits.push(u.model.replace(/^claude-/, '').replace(/-\d{8}$/, ''))
+  const tokens = (u.inputTokens ?? 0) + (u.outputTokens ?? 0) + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0)
+  if (tokens) bits.push(tokens >= 1000 ? `${(tokens / 1000).toFixed(tokens >= 10_000 ? 0 : 1)}k tokens` : `${tokens} tokens`)
+  if (u.costUsd !== undefined) bits.push(`~$${u.costUsd < 0.01 ? u.costUsd.toFixed(3) : u.costUsd.toFixed(2)}`)
+  return bits.join(' · ')
+}
+
+// The card: one message per task in its home topic, edited when its state changes.
+export function cardHtml(t: Task, runs: Run[], now = new Date()): string {
+  const lines: string[] = []
+  lines.push(`${kindLabel(t)}: <b>${esc(t.name)}</b>`)
+  const sched = `${esc(scheduleText(t.trigger, t.tz))} <i>(${esc(t.tz)})</i>`
+  const freq = t.action.kind === 'claude' ? frequencyText(t, now) : undefined
+  lines.push([sched, esc(actionText(t)), t.sound === 'loud' ? '🔔 loud' : '🔕 silent', freq ? esc(freq) : ''].filter(Boolean).join(' · '))
+  if (t.action.kind === 'message') lines.push(`“${esc(t.action.text)}”`)
+  if (t.state === 'paused') lines.push(`⏸ ${esc(pauseText(t))}`)
+  else if (t.state === 'done') lines.push('✔️ done')
+  else if (t.state === 'expired') lines.push('⌛ ended')
+  else if (t.state === 'deleted') lines.push('🗑 deleted')
+  else if (t.nextDue) lines.push(`Next: ${tgTime(new Date(t.nextDue), t.tz)} (${tgTime(new Date(t.nextDue), t.tz, 'r')})`)
+  const last = runs.find(r => r.state !== 'queued')
+  if (runs.length) {
+    const strip = runs.slice(0, 8).reverse().map(r => MARK[markOf(r)]).join('')
+    const lastText = last
+      ? `last: ${MARK[markOf(last)]} ${esc(whenText(new Date(last.startedAt ?? last.slot ?? now.toISOString()), t.tz))}${markOf(last) === 'quiet' ? ' · nothing new' : ''}`
+      : ''
+    lines.push([strip, lastText].filter(Boolean).join('  '))
+  }
+  return lines.join('\n')
+}
+
+// One line of /tasks.
+export function listLine(t: Task, runs: Run[]): string {
+  const last = runs.find(r => r.state !== 'queued')
+  const mark = t.state === 'paused' ? '⏸' : last ? MARK[markOf(last)] : '·'
+  const when = t.state === 'active' && t.nextDue ? ` · next ${tgTime(new Date(t.nextDue), t.tz)}` : t.state === 'paused' ? ' · paused' : ''
+  return `${mark} ${t.action.kind === 'message' ? '🔔' : '⏰'} <b>${esc(t.name)}</b> — ${esc(scheduleText(t.trigger, t.tz))}${when}`
+}
+
+export function runLine(r: Run, tz: string): string {
+  const at = r.startedAt ?? r.slot
+  const bits: string[] = [MARK[markOf(r)], at ? esc(whenText(new Date(at), tz)) : '']
+  if (r.trigger === 'manual') bits.push('run now')
+  if (r.trigger === 'catchup') bits.push('caught up')
+  if (r.startedAt && r.endedAt) bits.push(elapsedText(new Date(r.endedAt).getTime() - new Date(r.startedAt).getTime()))
+  const u = usageText(r.usage)
+  if (u) bits.push(esc(u))
+  if (r.state === 'skipped') bits.push(esc(r.reason ?? 'skipped'))
+  else if (r.state === 'deferred') bits.push(esc(r.reason ?? 'usage limit'))
+  else if (r.state === 'failed' || r.state === 'timed_out' || r.state === 'interrupted') bits.push(esc(clip(r.reason ?? r.state, 120)))
+  else if (r.summary) bits.push(esc(clip(r.summary, 120)))
+  else if (markOf(r) === 'quiet') bits.push('nothing new')
+  if (r.denials?.length) bits.push(`blocked: ${esc(clip(r.denials.join(', '), 80))}`)
+  return bits.filter(Boolean).join(' · ')
+}
+
+export function historyHtml(t: Task, runs: Run[]): string {
+  if (!runs.length) return `<b>${esc(t.name)}</b>: no runs yet.`
+  return [`<b>${esc(t.name)}</b>: the last ${runs.length} run${runs.length === 1 ? '' : 's'}`, ...runs.map(r => runLine(r, t.tz))].join('\n')
+}
+
+const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + '…' : s)
