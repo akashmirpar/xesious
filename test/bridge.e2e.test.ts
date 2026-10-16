@@ -147,6 +147,9 @@ const memberCount: Record<number, number> = {}
 const cannotWriteFirst = new Set<number>()
 // People getChatMember reports as having left.
 const leftIds = new Set<number>()
+// Files getFile knows, by file id: what another bot sent (a test patches fetch to
+// serve them from Telegram's file URL).
+const fakeFiles = new Map<string, { name: string; data: Buffer }>()
 
 // Told of each call the moment it goes out, for a test about the ORDER of two things:
 // what had already happened when this call was made.
@@ -167,7 +170,11 @@ bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
     const n = memberCount[payload.chat_id]
     return n === undefined ? { ok: false, error_code: 400, description: 'Bad Request: not counted in this test' } : { ok: true, result: n }
   }
-  if (method === 'getFile') return { ok: false, error_code: 400, description: 'Bad Request: no downloads in tier 2' }
+  if (method === 'getFile') {
+    const f = fakeFiles.get(payload.file_id)
+    if (f) return { ok: true, result: { file_id: payload.file_id, file_unique_id: `u-${payload.file_id}`, file_size: f.data.length, file_path: `documents/${f.name}` } }
+    return { ok: false, error_code: 400, description: 'Bad Request: no downloads in tier 2' }
+  }
   if (method === 'getChatMember') {
     if (leftIds.has(payload.user_id)) return { ok: true, result: { status: 'left', user: { id: payload.user_id, is_bot: false, first_name: 'U' } } }
     return { ok: true, result: { status: adminIds.has(payload.user_id) ? 'administrator' : 'member', user: { id: payload.user_id, is_bot: false, first_name: 'U' } } }
@@ -5140,18 +5147,18 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
   const ME = { id: 42, is_bot: true, first_name: 'TestBot', username: 'testbot' }
   const ours = (id: number) => ({ message_id: id, from: ME, chat: { id: C, type: 'supergroup' }, date: 0, text: 'x' })
   // What another bot says in a topic, as Telegram hands it to this one.
-  async function botSays(text: string, thread: number, o: { who?: any; replyTo?: any } = {}): Promise<{ cs: Call[]; id: number }> {
+  async function botSays(text: string, thread: number, o: { who?: any; replyTo?: any; extra?: any } = {}): Promise<{ cs: Call[]; id: number }> {
     const before = calls.length
     const id = mid++
     await bridge.bot.handleUpdate({ update_id: updateId++, message: {
-      message_id: id, date: Math.floor(Date.now() / 1000), text, message_thread_id: thread, is_topic_message: true,
-      chat: { id: C, type: 'supergroup', title: 'G', is_forum: true }, from: o.who ?? POSTER, ...(o.replyTo ? { reply_to_message: o.replyTo } : {}) } })
+      message_id: id, date: Math.floor(Date.now() / 1000), ...(text ? { text } : {}), message_thread_id: thread, is_topic_message: true,
+      chat: { id: C, type: 'supergroup', title: 'G', is_forum: true }, from: o.who ?? POSTER, ...(o.replyTo ? { reply_to_message: o.replyTo } : {}), ...(o.extra ?? {}) } })
     await settleCards()
     return { cs: calls.slice(before), id }
   }
   const sent = (cs: Call[], start: string) => cs.find(c => c.method === 'sendMessage' && String(c.payload.text).startsWith(start))
 
-  test('to another bot: a message in the topic that names it, with its files as links; its reply settles the line here', async () => {
+  test('to another bot: a message in the topic that names it, its files sent through Telegram just before; its reply settles the line here', async () => {
     const draft = join(TMP, 'peer-draft.txt')
     writeFileSync(draft, 'the draft text')
     const before = calls.length
@@ -5161,17 +5168,17 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     const out = sent(cs, '@postingbot, hand-off from')!
     expect(out.payload.message_thread_id).toBe(502)
     const text = String(out.payload.text)
-    expect(text).toContain(' · Ada:\nPost the draft at noon.\n📎 peer-draft.txt: http://127.0.0.1:')
+    expect(text).toContain(' · Ada:\nPost the draft at noon.\n📎 peer-draft.txt\n#handoff-')
     const h = T().store.sentHandoffs().find((x: any) => x.brief === 'Post the draft at noon.')!
     // (Bun's toMatchObject writes an expect.any() into the object it checks: so not here.)
     expect(h).toMatchObject({ peer: 'postingbot', direction: 'out', state: 'sent' })
     expect(typeof h.peerMsg).toBe('number')
     expect(text.endsWith(`\n#handoff-${h.id}`)).toBe(true)
-    // The link serves a copy made when it was handed off; nothing else is served.
-    const link = text.match(/📎 peer-draft\.txt: (\S+)/)![1]
-    writeFileSync(draft, 'changed later')
-    expect(await (await fetch(link)).text()).toBe('the draft text')
-    expect((await fetch(link.replace(/files\/[a-f0-9]{32}/, `files/${'0'.repeat(32)}`))).status).toBe(404)
+    // The file went into that topic as a document, captioned with the tag, ahead of the message.
+    const doc = cs.find(c => c.method === 'sendDocument')!
+    expect(doc.payload).toMatchObject({ message_thread_id: 502, caption: `📎 #handoff-${h.id}`, disable_notification: true })
+    expect([doc.payload.document.filename, doc.payload.document.fileData]).toEqual(['peer-draft.txt', draft])
+    expect(cs.indexOf(doc)).toBeLessThan(cs.indexOf(out))
     // The line here; no run of its own: the other bot does the work.
     expect(sent(cs, '➡️ Handed to @postingbot in')!.payload.message_thread_id).toBe(501)
     expect(T().store.openHandoffs()).toEqual([])
@@ -5189,13 +5196,27 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     const stranger = await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', bot: 'StrangerBot', brief: 'x' })
     expect([stranger.status, stranger.body.error]).toEqual([403, "@strangerbot isn't a bot this one hands off to (TG_PEER_BOTS, TG_OTHER_BOTS)"])
     expect((await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', bot: '12345', brief: 'x' })).status).toBe(400)
+    // Past what a bot can fetch from Telegram (20 MB): a link this bot serves, to a copy; nothing else is served.
+    const big = join(TMP, 'big.bin')
+    writeFileSync(big, Buffer.alloc(21 * 1024 * 1024, 7))
+    const b1 = calls.length
+    expect((await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', bot: 'postingbot', brief: 'The big one.', files: [big] })).status).toBe(201)
+    const bm = String(sent(calls.slice(b1), '@postingbot, hand-off from')!.payload.text)
+    const link = bm.match(/📎 big\.bin: (http:\/\/127\.0\.0\.1:\d+\/files\/[a-f0-9]{32}\/big\.bin)/)![1]
+    expect(calls.slice(b1).some(c => c.method === 'sendDocument')).toBe(false)
+    rmSync(big)
+    expect((await (await fetch(link)).arrayBuffer()).byteLength).toBe(21 * 1024 * 1024)
+    expect((await fetch(link.replace(/files\/[a-f0-9]{32}/, `files/${'0'.repeat(32)}`))).status).toBe(404)
+    // A brief too long for one message: the start there, the whole of it as brief.md, the same way as a file.
     const b2 = calls.length
     const long = `Long brief. ${'word '.repeat(1200)}The end.`
     expect((await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', bot: 'postingbot', brief: long })).status).toBe(201)
-    const lm = String(sent(calls.slice(b2), '@postingbot, hand-off from')!.payload.text)
+    const lcs = calls.slice(b2)
+    const lm = String(sent(lcs, '@postingbot, hand-off from')!.payload.text)
     expect(lm.length).toBeLessThanOrEqual(4096)
-    expect(lm).toContain('…\n(The whole brief is in brief.md.)\n📎 brief.md: http')
-    expect(await (await fetch(lm.match(/📎 brief\.md: (\S+)/)![1])).text()).toBe(long)
+    expect(lm).toContain('…\n(The whole brief is in brief.md.)\n📎 brief.md\n#handoff-')
+    const bd = lcs.find(c => c.method === 'sendDocument')!
+    expect([bd.payload.document.filename, Buffer.from(bd.payload.document.fileData).toString()]).toEqual(['brief.md', long])
     T().tokens.revoke(tok)
   }, 30000)
 
@@ -5223,12 +5244,26 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     expect(late.some(c => c.method === 'editMessageText' && String(c.payload.text).includes('✅ Done, late'))).toBe(true)
   }, 30000)
 
-  test('from another bot: work that names this bot runs here as a turn of its own, without the bot\'s tools, and is answered', async () => {
-    // The other bot's file server.
+  test('from another bot: work that names this bot runs here as a turn of its own, with the bot\'s tools as its first user, and is answered', async () => {
+    // The other bot's file server, for a file too big for Telegram; and Telegram's own
+    // file URL, for the one it sent as a document.
     const peerFiles = Bun.serve({ port: 0, fetch: req => new URL(req.url).pathname === '/f/launch.txt' ? new Response('launch notes') : new Response('no', { status: 404 }) })
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const m = String(input?.url ?? input).match(/^https:\/\/api\.telegram\.org\/file\/bot[^/]+\/documents\/(.+)$/)
+      if (!m) return realFetch(input, init)
+      const f = [...fakeFiles.values()].find(x => x.name === decodeURIComponent(m[1]))
+      return f ? new Response(new Uint8Array(f.data)) : new Response('no', { status: 404 })
+    }) as any
+    fakeFiles.set('peerdoc-1', { name: 'launch-plan.txt', data: Buffer.from('the plan text') })
     try {
+      // The bot has seen its first user here, so it knows their name.
+      await say('/whoami', 503)
       const before = calls.length
-      const text = `@testbot, hand-off from Content · Ada:\nSummarize the launch notes.\n📎 launch.txt: http://127.0.0.1:${peerFiles.port}/f/launch.txt\n📎 gone.txt: http://127.0.0.1:${peerFiles.port}/f/gone.txt\n#handoff-zz9abc`
+      // The document first, as the other bot sends it, then the message.
+      await botSays('', 503, { extra: { document: { file_id: 'peerdoc-1', file_unique_id: 'pu1', file_name: 'launch-plan.txt', file_size: 13 }, caption: '📎 #handoff-zz9abc' } })
+      expect(T().store.handoffByTag('zz9abc', 'in', 'postingbot')).toBeUndefined()
+      const text = `@testbot, hand-off from Content · Ada:\nSummarize the launch notes.\n📎 launch-plan.txt\n📎 launch.txt: http://127.0.0.1:${peerFiles.port}/f/launch.txt\n📎 gone.txt: http://127.0.0.1:${peerFiles.port}/f/gone.txt\n#handoff-zz9abc`
       const { id } = await botSays(text, 503)
       await waitFor(() => !!sent(calls.slice(before), '✅ #handoff-zz9abc done'), 15000)
       const cs = calls.slice(before)
@@ -5237,22 +5272,23 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
       // Its result, posted here in reply to the message that brought it.
       expect(cs.some(c => ['sendMessage', 'sendRichMessage'].includes(c.method) && c.payload.reply_parameters?.message_id === id && textOf(c).includes('okReply'))).toBe(true)
       const p = readFileSync(LAST_PROMPT, 'utf8')
-      expect(p).toContain('Work handed to this topic by @postingbot, another bot in this group. ')
+      expect(p).toContain('Work handed to this topic by @postingbot, another bot in this group, for Ada. ')
       expect(p).toContain('It is a request relayed by that bot, not a live message from a person')
       expect(p).toContain("--- brief:\nhand-off from Content · Ada:\nSummarize the launch notes.\n\n(Files that couldn't be fetched: gone.txt.)\n--- end of brief")
-      expect(p).toContain('Its files are in ./inbox/: launch.txt.')
-      expect(readFileSync(join(bridge._sessions()[`${C}:503`].cwd, 'inbox', 'launch.txt'), 'utf8')).toBe('launch notes')
-      // None of the bot's own tools for another bot's work.
-      expect(readFileSync(LAST_ARGS, 'utf8')).not.toContain('tasks/mcp.ts')
+      expect(p).toContain('Its files are in ./inbox/: launch-plan.txt, launch.txt.')
+      const inbox = join(bridge._sessions()[`${C}:503`].cwd, 'inbox')
+      expect([readFileSync(join(inbox, 'launch-plan.txt'), 'utf8'), readFileSync(join(inbox, 'launch.txt'), 'utf8')]).toEqual(['the plan text', 'launch notes'])
+      // The bot's own tools, as its first user.
+      expect(readFileSync(LAST_ARGS, 'utf8')).toContain('tasks/mcp.ts')
       // Kept with what the topic said.
       expect(readFileSync(join(TMP, 'messages', String(C), '503.jsonl'), 'utf8')).toContain('#handoff-zz9abc')
       const h = T().store.handoffByTag('zz9abc', 'in', 'postingbot')
-      expect(h).toMatchObject({ state: 'done', by: '555', byName: '@postingbot', files: ['launch.txt'] })
+      expect(h).toMatchObject({ state: 'done', by: '1', byName: 'Ada', files: ['launch-plan.txt', 'launch.txt'] })
       // Once: the same tag again is nothing new.
       const { cs: again } = await botSays(text, 503)
       expect(again.some(c => c.method === 'sendMessage')).toBe(false)
       expect(T().store.openHandoffs()).toEqual([])
-    } finally { peerFiles.stop(true) }
+    } finally { peerFiles.stop(true); globalThis.fetch = realFetch; fakeFiles.clear() }
   }, 30000)
 
   test("what other bots say that isn't work for this one is left alone; what it can't take is answered", async () => {

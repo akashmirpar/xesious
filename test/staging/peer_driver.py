@@ -13,7 +13,8 @@ what the bots post:
   2. the other bot's "✅ #handoff-… done" reply to that message;
   3. the sending bot's ➡️ line in the first topic, edited to say ✅ Done.
 
-One case sends a file along and checks it reached the other bridge's inbox.
+One case sends a file along, through Telegram, and checks it reached the other
+bridge's inbox.
 
 Env (set by run-peers.sh from .env.staging):
     TG_API_ID, TG_API_HASH, TG_TEST_SESSION        the test account
@@ -160,17 +161,24 @@ async def main():
         path = os.path.join(BASE, "peer-file.txt")
         with open(path, "w") as fh:
             fh.write("MANGO42\n")
+        start = len(seen)
         ok, d = await hand_off(client, ids, A, B, x, y, "Read peer-file.txt and say what it holds.", files=[path])
         if ok:
-            if "📎 peer-file.txt: http" not in d.raw_text:
-                ok, d = False, f"the hand-off carried no link to the file: {d.raw_text[:200]!r}"
+            tag = re.search(r"#handoff-([a-z0-9]+)", d.raw_text).group(1)
+            # The file went through Telegram: a document in that topic, captioned with the tag.
+            doc = next((m for m in seen[start:] if m.sender_id == ids[A] and topic_of(m) == y and m.file
+                        and m.file.name == "peer-file.txt" and m.raw_text.startswith(f"📎 #handoff-{tag}")), None)
+            if "\n📎 peer-file.txt\n" not in d.raw_text:
+                ok, d = False, f"the hand-off didn't list the file: {d.raw_text[:200]!r}"
+            elif not doc:
+                ok, d = False, f"@{A} sent no document captioned #handoff-{tag} in topic {y}"
             else:
                 got = glob.glob(os.path.join(BASE, "b", "sessions", "**", "inbox", "peer-file*.txt"), recursive=True)
                 if not got:
                     ok, d = False, "the file never reached the other bridge's inbox"
                 elif open(got[0]).read() != "MANGO42\n":
                     ok, d = False, f"the other bridge's copy holds {open(got[0]).read()!r}"
-        results.append(("a file handed along lands in the other bridge's inbox", ok, d))
+        results.append(("a file handed along goes through Telegram and lands in the other bridge's inbox", ok, d))
     finally:
         if created and not KEEP:
             peer = await client.get_input_entity(GROUP)

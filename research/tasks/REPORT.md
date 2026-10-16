@@ -255,7 +255,7 @@ For a topic served by a different xesious bot: Content and Posting each have the
   - matches the reply (by reply-to and the tag), and marks the hand-off done or failed;
   - updates its own line in the source topic;
   - if no reply arrives by the deadline, posts a loud error there.
-- **Files go as links**, not uploads, so Telegram's 20 MB download limit for bots never applies. The link is a short-lived URL served by the sending bot, or a folder both bots can read.
+- **Files go through Telegram** (built so, 2026-10-16): documents in the topic just before the message, captioned with the tag, up to the 20 MB a bot can download. A bigger one goes as a short-lived link the sending bot serves.
 - **Loop guards** (Telegram requires them):
   - only messages that mention the bot and come from a peer are acted on;
   - replies to the bot's own hand-off messages are results, never new work;

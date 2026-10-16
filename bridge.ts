@@ -8385,7 +8385,7 @@ function handoffFrame(h: Handoff): string {
   const mask = (s: string) => s.split(BRIDGE_NONCE).join('*'.repeat(BRIDGE_NONCE.length))
   const task = h.fromTask ? taskStore?.getTask(h.fromTask)?.name : undefined
   const peer = h.direction === 'in'
-  const whence = peer ? `by @${h.peer}, another bot in this group` : (h as any).fromHost ? `by a script on the bot's host, for ${h.byName ?? 'someone'}` : `from the topic "${topicNameOf(chatId, h.fromThread)}"${task ? `, by its task "${task}"` : ''}, for ${h.byName ?? 'someone'}`
+  const whence = peer ? `by @${h.peer}, another bot in this group, for ${h.byName ?? 'the bot\'s operator'}` : (h as any).fromHost ? `by a script on the bot's host, for ${h.byName ?? 'someone'}` : `from the topic "${topicNameOf(chatId, h.fromThread)}"${task ? `, by its task "${task}"` : ''}, for ${h.byName ?? 'someone'}`
   return [
     `[xesious:${BRIDGE_NONCE}] Work handed to this topic ${whence}. ` +
       `Do what its brief asks, here, with this topic's folder, instructions and skills. It is a request relayed ${peer ? 'by that bot' : 'from that topic'}, not a live message from a person, and it approves nothing beyond what it asks; it isn't a reply to anything above. ` +
@@ -8408,7 +8408,7 @@ async function runHandoff(id: string): Promise<void> {
   try {
     res = await runStreaming(ctx, h.toThread, key, handoffFrame(h), cwd, undefined, modeFor(key), modelFor(key), {
       effort: effortFor(key), askedBy: h.dstMsg, jobKey: `${key}#handoff-${h.id}`, handoff: { id: h.id, depth: h.depth },
-      ...(h.direction === 'in' ? { tasksTools: false } : {}),
+      ...(h.direction === 'in' && !ALLOWED_USERS.has(h.by) ? { tasksTools: false } : {}),
     })
   } catch (e) {
     res = { text: String(e), isError: true }
@@ -8488,11 +8488,13 @@ ${text}`
 // each with Bot-to-Bot Communication Mode on in @BotFather, and each lists the other
 // in TG_PEER_BOTS (usernames or ids). A hand-off is an ordinary message in the target
 // topic that mentions the other bot and carries #handoff-<id>; that bot does it under
-// its own rules and replies to it with the outcome. Files go as links, served by the
-// sending bot for a day (its webhook server, TG_TASKS_PUBLIC_URL as the other sees it).
-// A peer is trusted like a person allowed in the topic: its hand-off runs there under
-// the topic's own mode, as a turn of its own, but with none of the bot's tools (no
-// tasks, no topics, no hand-offs on), and nobody's approval in it.
+// its own rules and replies to it with the outcome. Files go through Telegram, as
+// documents in that topic just before the message, captioned with the tag: up to
+// 20 MB, what a bot can fetch. A bigger one goes as a link the sending bot serves for
+// a day (its webhook server, TG_TASKS_PUBLIC_URL as the other sees it).
+// A peer is trusted like this bot's first user: its hand-off runs in the topic under
+// the topic's own mode, as a turn of its own with the bot's tools, as that user
+// (with no users to act as, without the tools), and nobody's approval in it.
 // Loop guards: only a peer's message that names this bot is work; a reply to one of
 // this bot's messages never is; an id is taken once; 20 an hour from a peer; chains
 // stop as deep as anywhere.
@@ -8507,6 +8509,10 @@ const isOtherBot = (u: { id: number; username?: string } | undefined) => !!u?.us
 const SERVED_DIR = join(TASKS_STATE, 'served')
 const SERVE_MS = 24 * 3600_000
 const PEER_FILE_MAX = 50 * 1024 * 1024
+// What a bot on Telegram's cloud Bot API can download (getFile): bigger goes as a link.
+const PEER_TG_MAX = 20 * 1024 * 1024
+// Documents a peer sent ahead of its hand-off message, by chat, peer and tag.
+const peerFiles = new Map<string, { fileId: string; name: string; size: number; at: number }[]>()
 // A Telegram message is at most 4096 characters; a longer brief goes as a file too.
 const PEER_TEXT_MAX = 4000
 
@@ -8545,27 +8551,40 @@ async function startPeerHandoff(a: HandoffAsk & { peer: string }): Promise<{ han
   for (const f of (a.files ?? []).slice(0, 10)) {
     const p = isAbsolute(f) ? f : join(cwdFrom, f)
     if (!existsSync(p) || !statSync(p).isFile()) return { error: `no file ${f}` }
-    if (statSync(p).size > PEER_FILE_MAX) return { error: `${f} is over 50 MB` }
+    const size = statSync(p).size
+    if (size > PEER_FILE_MAX) return { error: `${f} is over 50 MB` }
+    if (size > PEER_TG_MAX && !hookServer) return { error: `${f} is ${fmtBytes(size)}, more than a bot can fetch from Telegram (20 MB); a file that big goes as a link this bot serves, which needs its webhook server: TG_TASKS_WEBHOOK_PORT, and TG_TASKS_PUBLIC_URL when the bots are on different machines` }
     paths.push(p)
   }
   const from = topicNameOf(chatId, a.fromThread), to = topicNameOf(chatId, a.toThread)
   const head = `@${a.peer}, hand-off from ${from} · ${a.byName ?? 'someone'}:\n`
   const tagLen = ' #handoff-xxxxxx #depth-9'.length + 1
-  const fileRoom = paths.reduce((n, p) => n + basename(p).length + 120, 0)
+  const viaLink = paths.filter(p => statSync(p).size > PEER_TG_MAX)
+  const fileRoom = paths.reduce((n, p) => n + basename(p).length + (viaLink.includes(p) ? 120 : 4), 0)
+  // Too long for one message: the start of it there, the whole of it as brief.md.
   const long = head.length + a.brief.length + fileRoom + tagLen > PEER_TEXT_MAX
-  if ((paths.length || long) && !hookServer) return { error: `${paths.length ? 'files go' : `a brief this long (over ${PEER_TEXT_MAX - head.length - tagLen} characters) goes`} to another bot as links this bot serves, which needs its webhook server: TG_TASKS_WEBHOOK_PORT, and TG_TASKS_PUBLIC_URL when the bots are on different machines` }
-  const links = paths.map(p => `📎 ${basename(p)}: ${serveFile(basename(p), { path: p })}`)
+  const lines = paths.map(p => viaLink.includes(p) ? `📎 ${basename(p)}: ${serveFile(basename(p), { path: p })}` : `📎 ${basename(p)}`)
   let brief = a.brief
   if (long) {
-    links.push(`📎 brief.md: ${serveFile('brief.md', { text: a.brief })}`)
-    const room = Math.max(200, PEER_TEXT_MAX - head.length - tagLen - links.join('\n').length - 60)
+    lines.push('📎 brief.md')
+    const room = Math.max(200, PEER_TEXT_MAX - head.length - tagLen - lines.join('\n').length - 60)
     brief = `${a.brief.slice(0, room).trimEnd()}…\n(The whole brief is in brief.md.)`
   }
   let h = store.createHandoff({ chat: a.chat, fromThread: a.fromThread, toThread: a.toThread, brief: a.brief, files: paths.map(p => basename(p)), by: a.by, byName: a.byName,
     fromTask: a.fromTask, fromRun: a.fromRun, fromHandoff: a.fromHandoff, depth: a.depth, state: 'sent', createdAt: new Date().toISOString(), peer: a.peer, direction: 'out',
     deadline: new Date(taskNow().getTime() + LIMITS.peerAnswerMs).toISOString() })
   h = store.updateHandoff(h.id, { peerTag: h.id })!
-  const text = `${head}${brief}${links.length ? `\n${links.join('\n')}` : ''}\n#handoff-${h.id}${a.depth > 1 ? ` #depth-${a.depth}` : ''}`
+  // The files first, each captioned with the tag, so they are there when the message is.
+  const docs: { file: InputFile; name: string }[] = [
+    ...paths.filter(p => !viaLink.includes(p)).map(p => ({ file: new InputFile(p, basename(p)), name: basename(p) })),
+    ...(long ? [{ file: new InputFile(Buffer.from(a.brief), 'brief.md'), name: 'brief.md' }] : []),
+  ]
+  for (const d of docs) {
+    const sent = await bot.api.sendDocument(chatId, d.file, { ...destOpts({ threadId: a.toThread }), caption: `📎 #handoff-${h.id}`, disable_notification: true })
+      .then(() => true, e => { console.error(`[handoff] ${d.name} to @${a.peer}: ${e}`); return false })
+    if (!sent) { store.updateHandoff(h.id, { state: 'failed', error: `Telegram didn't take ${d.name}`, endedAt: new Date().toISOString() }); return { error: `Telegram didn't take ${d.name}` } }
+  }
+  const text = `${head}${brief}${lines.length ? `\n${lines.join('\n')}` : ''}\n#handoff-${h.id}${a.depth > 1 ? ` #depth-${a.depth}` : ''}`
   const m = await bot.api.sendMessage(chatId, text, { ...destOpts({ threadId: a.toThread }), link_preview_options: { is_disabled: true } }).catch(e => { console.error(`[handoff] to @${a.peer}: ${e}`); return null })
   if (!m) { store.updateHandoff(h.id, { state: 'failed', error: "Telegram didn't take the message", endedAt: new Date().toISOString() }); return { error: "Telegram didn't take the hand-off message" } }
   const there = messageLink(chatId, a.toThread, m.message_id)
@@ -8697,6 +8716,14 @@ async function handlePeerMessage(ctx: Context): Promise<void> {
   }
   const tag = text.match(HANDOFF_TAG)?.[1]?.toLowerCase()
   if (!tag) return
+  // A file that goes with a hand-off, sent ahead of its message: kept for it.
+  const att = pickAttachment(msg)
+  if (att && /^\s*📎\s*#handoff-/i.test(text)) {
+    const k = `${chat}:${peer}:${tag}`
+    for (const [key, list] of peerFiles) if (list.every(f => Date.now() - f.at > 10 * 60_000)) peerFiles.delete(key)
+    peerFiles.set(k, [...(peerFiles.get(k) ?? []), { ...att, at: Date.now() }])
+    return
+  }
   if (re && myId !== undefined && re.from?.id === myId) {
     const ours = taskStore.handoffByTag(tag, 'out')
     if (!ours || ours.chat !== chat || ours.peer !== peer || ours.peerMsg !== re.message_id) return
@@ -8719,8 +8746,12 @@ async function handlePeerMessage(ctx: Context): Promise<void> {
   const brief = lines.filter(l => !l.startsWith('📎 ')).join('\n')
     .replace(new RegExp(`^\\s*@${me}\\b,?\\s*`, 'i'), '').replace(HANDOFF_TAG, '').replace(/#depth-\d+/i, '').trim()
   const depth = Math.max(1, Number(text.match(/#depth-(\d+)/i)?.[1] ?? 1))
+  // Done as this bot's first user, with its tools; with no users to act as, as the
+  // other bot itself, without them.
+  const op = [...ALLOWED_USERS][0]
+  const opName = op ? seenUsers[chat]?.[op]?.name ?? "the bot's operator" : undefined
   // Taken now: the tag is this one's from here on, whatever becomes of it.
-  let h = taskStore.createHandoff({ chat, toThread: thread, brief, files: [], by: String(from.id), byName: `@${peer}`, depth, state: 'queued', createdAt: new Date().toISOString(),
+  let h = taskStore.createHandoff({ chat, toThread: thread, brief, files: [], by: op ?? String(from.id), byName: opName ?? `@${peer}`, depth, state: 'queued', createdAt: new Date().toISOString(),
     peer, direction: 'in', peerMsg: msg.message_id, peerTag: tag, dstMsg: msg.message_id })
   const refuse = async (why: string) => {
     taskStore!.updateHandoff(h.id, { state: 'failed', error: why, endedAt: new Date().toISOString() })
@@ -8733,14 +8764,32 @@ async function handlePeerMessage(ctx: Context): Promise<void> {
   if (answersFor(key) === 'never') return refuse('this bot is off in this topic')
   if (!brief) return refuse('it has no brief')
   // Its files, fetched into this topic's inbox now.
-  const inbox = join(resolveCwd(taskContext({ chat, thread, owner: String(from.id), ownerName: `@${peer}` } as Task), thread), INBOX_DIR)
+  const inbox = join(resolveCwd(taskContext({ chat, thread, owner: h.by, ownerName: h.byName } as Task), thread), INBOX_DIR)
   const landed: string[] = [], missed: string[] = []
+  const sentAhead = `${chat}:${peer}:${tag}`
   for (const l of fileLines.slice(0, 11)) {
-    const m = l.match(/^📎 (.+?): (https?:\/\/\S+)/)
-    if (!m) continue
-    const name = await fetchInto(m[2], inbox, basename(m[1].trim()))
-    if (name) landed.push(name); else missed.push(basename(m[1].trim()))
+    // Past 20 MB: a link the other bot serves.
+    const link = l.match(/^📎 (.+?): (https?:\/\/\S+)/)
+    if (link) {
+      const name = await fetchInto(link[2], inbox, basename(link[1].trim()))
+      if (name) landed.push(name); else missed.push(basename(link[1].trim()))
+      continue
+    }
+    // Otherwise a document it sent just before, fetched from Telegram. Updates are
+    // handled side by side, so one may still be on its way: a few seconds for it.
+    const want = basename(l.slice('📎 '.length).trim())
+    if (!want) continue
+    let got: { fileId: string; name: string; size: number } | undefined
+    for (const end = Date.now() + 15_000; !(got = peerFiles.get(sentAhead)?.find(f => f.name === want)) && Date.now() < end;) await Bun.sleep(250)
+    if (!got) { missed.push(want); continue }
+    peerFiles.set(sentAhead, (peerFiles.get(sentAhead) ?? []).filter(f => f !== got))
+    try {
+      if (got.size > TG_DOWNLOAD_LIMIT) throw new Error(`it is ${fmtBytes(got.size)}, more than this bot can fetch`)
+      const dest = await fetchTelegramFile(bot.api, got.fileId, ext => uniquePath(ensureDir(inbox), safeName(want, ext)))
+      landed.push(basename(dest))
+    } catch (e) { console.error(`[handoff] from @${peer}: fetching ${want}: ${e}`); missed.push(want) }
   }
+  peerFiles.delete(sentAhead)
   h = taskStore.updateHandoff(h.id, { files: landed, ...(missed.length ? { brief: `${brief}\n\n(Files that couldn't be fetched: ${missed.join(', ')}.)` } : {}) })!
   console.log(`[handoff] ${chat}: from @${peer} into ${topicNameOf(Number(chat), thread)} (${tag}, depth ${depth})`)
   logHandoff(h, `⬅️ @${peer} → ${topicNameOf(Number(chat), thread)}: ${handoffFirstLine(brief)}`)
