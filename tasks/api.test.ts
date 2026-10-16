@@ -24,6 +24,7 @@ beforeAll(() => {
       { method: 'POST', path: '/v1/send', operatorOnly: true, handler: () => reply(200, { sent: true }) },
       { method: 'GET', path: '/v1/boom', handler: () => { throw new Error('kaboom') } },
       { method: 'GET', path: '/v1/no', handler: () => fail(409, 'not now') },
+      { method: 'GET', path: '/v1/slow', handler: async () => { await Bun.sleep(11_000); return reply(200, { waited: true }) } },
     ],
   })
 })
@@ -77,3 +78,8 @@ describe('the local API', () => {
     expect(boom.body.error).toContain('kaboom')
   })
 })
+
+test('a call that waits on a person for minutes is not cut off (Bun closes idle connections after 10 s by default)', async () => {
+  const r = await callApi(sock, runToken, 'GET', '/v1/slow')
+  expect(r).toEqual({ status: 200, body: { waited: true } })
+}, 20_000)

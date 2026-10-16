@@ -94,6 +94,11 @@ export function startApi(opts: { socket: string; tokens: TokenRegistry; routes: 
   if (existsSync(opts.socket)) unlinkSync(opts.socket)
   const server = Bun.serve({
     unix: opts.socket,
+    // Some calls wait on a person (a question, an approval) for minutes; Bun's default
+    // closes a connection idle for 10 s, which would cut them off. Its types forbid
+    // idleTimeout with a Unix socket, but Bun honours it there (tried: a 12 s call),
+    // and the per-request server.timeout(req, 0) does not.
+    ...({ idleTimeout: 0 } as {}),
     async fetch(req) {
       const url = new URL(req.url, 'http://local')
       const auth = req.headers.get('authorization') ?? ''
