@@ -364,6 +364,7 @@ Things the bot does on its own, later, again and again, or when something happen
 - "tell me when this product's price drops below 300", "when the share price moves more than 1% in 3 minutes, find out why", "keep the sync loop running" — a 👀 **watcher**: see [Watchers](#watchers).
 - "every night, back up the database; only tell me if it fails" — a **script**: a command, with no AI. Its status decides; what it prints is posted as the task says (its output; only when it printed something; only when it fails, every failure, loud).
 - "every evening, list what my tasks did" — a 📋 **digest**, made without Claude; "each morning, check the backup and sync tasks and tell me only if something is off" — a **watchdog**, a Claude run handed what those tasks did since its last run.
+- "every morning make the short video; when it's ready the Posting topic publishes it" — a task whose result is **handed on** to another topic; "every weekend take the issue, have Codex implement it, push only if the tests pass, try to fix once" — a 🪜 **plan**, steps whose gates the bot keeps; "when the nightly report is done, translate it" — a task that runs **after** another. See [Hand-offs and plans](#hand-offs-and-plans).
 
 Claude makes them with the bot's own `task_create` tool, passing the time as it was said (at a time, in N minutes, every N minutes, or a cron expression) and the time zone; the bridge does the date arithmetic, daylight saving included. Claude Code's own schedulers are switched off in the bot's runs: a session cron dies with its run, and a cloud trigger would report to claude.ai instead of here.
 
@@ -389,16 +390,28 @@ Scripts on the server reach the bot through a Unix socket, `state/xesious.sock`,
 
 ```
 bun tasks/cli.ts send --chat -1001234567890 --topic Builds --silent "Nightly build finished"
+bun tasks/cli.ts ask --chat -1001234567890 --topic Deploys --options yes,no "Deploy to production?"   # exit 0 for yes, 1 for no
+bun tasks/cli.ts run --chat -1001234567890 --topic Research "Summarize today's papers"              # prints the result
+bun tasks/cli.ts fire <task id> "v1.2 is out"                                                      # runs that task now, given the payload
 bun tasks/cli.ts tasks list
 bun tasks/cli.ts tasks pause <task id>
 ```
 
-Each Claude run talks to it with a token of its own, scoped to its chat, topic and person, that dies with the run; so does a task's script, which can post in its topic with `bun "$XESIOUS_CLI" notify "…"`. `TG_TASKS=0` turns tasks off. Hand-offs between topics and bots, multi-step tasks and tasks that ask before they act are designed ([research/tasks/REPORT.md](research/tasks/REPORT.md)) but not built yet.
+A task can be one that runs only when fired (🔗): by `fire`, or, if the bot serves webhooks (`TG_TASKS_WEBHOOK_PORT`), by `POST /hook/<task id>/<secret>`, whose body is the payload; ask Claude for the path.
+
+Each Claude run talks to it with a token of its own, scoped to its chat, topic and person, that dies with the run; so does a task's script, which can post in its topic with `bun "$XESIOUS_CLI" notify "…"`. `TG_TASKS=0` turns tasks off. Hand-offs to other xesious bots are designed ([research/tasks/REPORT.md](research/tasks/REPORT.md)) but not built yet.
 
 ### Questions and approvals
 
 - **A task's run can ask** when it can't go on without someone: a choice, a missing detail, a go-ahead. The question goes into its topic, naming whoever set the task up, with its options as buttons; a reply in your own words counts too. The run waits a few minutes for the answer. If none comes it stops and waits (❔ on its card), and the answer, whenever it comes, carries the task on in the session that asked. After a day it takes its default answer, if it had one, or lets the question go.
 - **In a turn, Claude's own questions** (a choice between options, one or several) show as buttons, or take a reply in your own words; **a plan** (in plan mode, or from `/plan`) comes with ✅ Go ahead, which starts the turn that carries it out in the topic's own mode; **a prompt for permission** shows what Claude asks to do, with Allow and Deny. Only the person whose turn it is, or one of the bot's own users, answers; ten minutes without an answer is a no. A task that shows its work live gets the same; one nobody watches doesn't, and what its permission mode blocked is listed in its history.
+
+### Hand-offs and plans
+
+- **Hand-offs.** Work can be handed to another topic of the same group, where it's done as a turn of its own, fresh, in that topic's folder with its instructions and skills, as the person who handed it off. Claude does it when you ask ("hand this to the Posting topic"), and a task can say so (`then`): when its run works, its result and the files it made go to that topic. The topic gets a "⬅️ From …" header, the run's progress and its result; the topic it came from gets a "➡️ Handed to …" line that says ✅ Done or why not. Chains stop at 3 deep, at most 30 an hour per group. The brief is relayed material, never a message from a person.
+- **Plans** (🪜): a short list of steps for work whose gates mustn't depend on a model following a prompt. A step is a message, a command (it passes when it exits 0), a Claude run, a **Codex** run (`codex exec` in the topic's folder, on the owner's ChatGPT plan), a question, or a hand-off. Each says where to go when it passes or fails, and how many times to try again, told how it failed; Claude and Codex steps get what the steps before gave. One progress line is edited as the steps go by (✅ fetch · ✅ scope · ❌ tests ×2 · ⏳ fix), then the result is posted; a failure is loud and names the step. Each step's result is saved, so a restart carries on at the step it was at.
+- **After another task** (↪️): a task can run when another one's run works, posts something, or fails, given what that run gave ("when the backup fails, find out why").
+- **Child tasks.** A task's own run can set up tasks of its own ("look again in two hours"): at most 3 at a time, 2 levels deep, ending when it does or within a week. One meant to last is posted as a 💡 proposal, made only when someone taps Create.
 
 ### Watchers
 
@@ -431,7 +444,7 @@ defaults now — a group can override them with `/config` (see above). Highlight
   at that point. Neither photo is ever replaced automatically; `/logo bot|group` does
   that on purpose.
 - `TG_API_ROOT` — a local Bot API server, for files over 20 MB (see below).
-- `TG_TASKS` — [tasks](#tasks) (default on; `0` turns them off). `TG_TASKS_MAX_CLAUDE` caps the scheduled Claude runs at once (2), `TG_TASKS_MAX_WATCHERS` the streaming watchers kept running (8); `TG_TASK_CREATORS` (`everyone`|`admins`) and `TG_TASKS_ACTIVITY` (`1`|`0`) are the defaults for the two task settings in `/config`; `TG_API_SOCKET` moves the local API's socket.
+- `TG_TASKS` — [tasks](#tasks) (default on; `0` turns them off). `TG_TASKS_MAX_CLAUDE` caps the scheduled Claude runs at once (2), `TG_TASKS_MAX_WATCHERS` the streaming watchers kept running (8); `TG_TASK_CREATORS` (`everyone`|`admins`) and `TG_TASKS_ACTIVITY` (`1`|`0`) are the defaults for the two task settings in `/config`; `TG_API_SOCKET` moves the local API's socket; `TG_TASKS_WEBHOOK_PORT` (and `TG_TASKS_WEBHOOK_HOST`, default `127.0.0.1`) serves the tasks' webhooks; `TG_CODEX_BIN` names the Codex CLI for plans' Codex steps.
 
 ## Permission modes
 

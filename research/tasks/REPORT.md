@@ -1,6 +1,6 @@
 # Tasks: scheduled, watching and background work, with a local API and MCP
 
-*Proposal, branch `feat/jobs-mcp-api`. Phases 1 and 2 (§18) are built: schedules, reminders, Claude runs, scripts, watchers with rules and the AI filter, digests and watchdogs. Written 2026-10-15; the decisions from the 2026-10-16 review are folded in and listed in [§19](#19-decisions-2026-10-16). The research behind it is in [landscape.md](landscape.md).*
+*Proposal, branch `feat/jobs-mcp-api`. Phases 1 to 4 (§18) are built: schedules, reminders, Claude runs, scripts, watchers with rules and the AI filter, digests and watchdogs; questions, and Claude's own questions, plans and permission prompts as buttons; hand-offs, plans with a Codex step, after, child tasks, xesious ask/run/fire and webhooks. "Approve and re-run" for what auto mode blocked was left out (§8). Written 2026-10-15; the decisions from the 2026-10-16 review are folded in and listed in [§19](#19-decisions-2026-10-16). The research behind it is in [landscape.md](landscape.md).*
 
 ## The short version
 
