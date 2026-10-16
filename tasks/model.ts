@@ -176,9 +176,6 @@ export const LIMITS = {
   graceMinMs: 2 * 60_000,            // a recurring slot may start this late, at least…
   graceMaxMs: 2 * 60 * 60_000,       // …and at most; half its period in between
   historyKept: 200,                  // runs kept per task
-  // Anything that runs more often than hourly (a watcher, a short interval) ends after
-  // a week unless it was given an end: a forgotten task is bounded, and one tap renews.
-  frequentEndMs: 7 * 24 * 60 * 60_000,
   // Watchers:
   watchCommandMax: 2000,
   eventTextMax: 2000,                // characters kept of one line

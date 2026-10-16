@@ -12,7 +12,7 @@
  */
 import { LIMITS, eventLimits, isStreaming, type EventLimits, type ReportOutcome, type Run, type Says, type Sound, type Task, type Trigger } from './model'
 import type { TaskStore } from './store'
-import { firstDue, isValidTz, parseLocalTime, parseWhen, runsOften, type WhenInput } from './schedule'
+import { firstDue, isValidTz, parseLocalTime, parseWhen, type WhenInput } from './schedule'
 import type { Scope } from './api'
 import { markOf, scheduleText, whenText } from './render'
 import { ruleError, ruleText, toRule } from './filters'
@@ -36,6 +36,7 @@ export interface TaskInput extends WhenInput {
   stale_minutes?: number
   script?: string | { command?: string; timeout_minutes?: number }   // a command, no AI
   watch_tasks?: string[]  // with prompt: tasks (ids or names) whose recent runs come with each run
+  topic?: string | number // task_create: the topic it lives in, when not the caller's
   digest?: { of?: string[] } | boolean   // a list of what tasks did, no AI
   rule?: any              // filters.ruleError says what it may be; null removes it
   ai_filter?: { question?: string; every_minutes?: number } | null
@@ -55,6 +56,8 @@ export interface ServiceDeps {
   // Start a run of the task now; its id, or why it can't.
   runNow(task: Task): Promise<{ runId?: string; error?: string }> | { runId?: string; error?: string }
   maxWatchers?: number    // streaming watchers the bot keeps running at once
+  // A topic of a chat, by id or name ("General" too): its thread, or undefined if none.
+  topicOf?(chat: string, ref: string): { thread?: number } | undefined
 }
 
 // Both branches name both fields, so reading .error after checking .ok type-checks
@@ -319,13 +322,6 @@ export class TaskService {
       if (!Number.isInteger(n) || n < 1) return err(400, 'times is a whole number, at least 1')
       times = n
     }
-    // Anything that runs more often than hourly ends after a week unless it was given
-    // an end, so a forgotten one is bounded; one tap on its last notice renews it.
-    if (runsOften(trigger!, tz, now) && until === undefined && times === undefined) {
-      if (input.until === '' || input.until === null as any) return err(400, 'a task that runs more often than hourly needs an end: give until, as far ahead as wanted')
-      until = new Date(now.getTime() + LIMITS.frequentEndMs).toISOString()
-    }
-
     // Undefined for a one-off whose time has passed: fine for renaming a reminder that
     // went out, not for creating one or giving it a new schedule (the callers check).
     // A streaming watcher has no slots at all.
@@ -344,12 +340,19 @@ export class TaskService {
     if (scope.runKind === 'scheduled') return err(403, "a scheduled run can't create tasks")
     const why = this.deps.mayCreate(scope)
     if (why) return err(403, why)
+    // Its home: the caller's topic, or another of this chat it was asked to live in.
+    let thread = scope.thread
+    if (input.topic !== undefined && input.topic !== null && input.topic !== '') {
+      const to = this.deps.topicOf?.(scope.chat, String(input.topic))
+      if (!to) return err(404, `no topic "${input.topic}" here; topic_list lists them`)
+      thread = to.thread
+    }
     const b = this.build(input, undefined, scope.chat)
     if (!b.ok) return err(b.status, b.error)
     if (!b.value.nextDue && !isStreaming(b.value)) return err(400, 'that time has already passed')
-    const dup = this.store.findDuplicate(scope.chat, scope.thread, b.value)
+    const dup = this.store.findDuplicate(scope.chat, thread, b.value)
     if (dup) return ok({ task: dup, duplicate: true })
-    if (this.store.countInTopic(scope.chat, scope.thread) >= LIMITS.tasksPerTopic) {
+    if (this.store.countInTopic(scope.chat, thread) >= LIMITS.tasksPerTopic) {
       return err(409, `this topic already has ${LIMITS.tasksPerTopic} tasks; delete one first`)
     }
     const max = this.deps.maxWatchers
@@ -357,7 +360,7 @@ export class TaskService {
       return err(409, `the bot already keeps ${max} watchers running; pause or delete one first, or make this one check every few minutes (watch.every_minutes)`)
     }
     const task = this.store.createTask({
-      ...b.value, chat: scope.chat, thread: scope.thread, owner: scope.person, ownerName: scope.personName,
+      ...b.value, chat: scope.chat, thread, owner: scope.person, ownerName: scope.personName,
       createdBy: `person:${scope.person}`,
     }, this.deps.now())
     this.deps.changed(task, 'created')
@@ -415,23 +418,21 @@ export class TaskService {
     return ok({ task })
   }
 
-  // Another week for a task that ends: an ended one starts again, a running one ends a
-  // week later.
-  extend(scope: Scope, id: string): Result<{ task: Task }> {
+  // No end any more: a task that reached its end date runs on, from now; one that is
+  // running loses its end.
+  keepRunning(scope: Scope, id: string): Result<{ task: Task }> {
     const v = this.visible(scope, id)
     if (!v.ok) return err(v.status, v.error)
-    if (scope.runKind === 'scheduled') return err(403, "a scheduled run can't extend its task")
+    if (scope.runKind === 'scheduled') return err(403, "a scheduled run can't change its task's end")
     const why = this.deps.mayManage(scope, v.value, 'resume')
     if (why) return err(403, why)
     const t = v.value
     if (t.state !== 'expired' && t.state !== 'active') return err(409, `it is ${t.state}`)
     const now = this.deps.now()
-    const from = t.state === 'active' && t.until ? Math.max(Date.parse(t.until), now.getTime()) : now.getTime()
-    const until = new Date(from + LIMITS.frequentEndMs).toISOString()
     const next = t.state === 'expired' ? firstDue(t.trigger, t.tz, now) : undefined
     if (t.state === 'expired' && !next && !isStreaming(t)) return err(409, 'it has nothing left to run; give it a new time with task_update')
     const task = this.store.updateTask(t.id, {
-      until, ...(t.state === 'expired' ? { state: 'active', nextDue: next?.toISOString(), watchFails: undefined, watchError: undefined, watchRetryAt: undefined } : {}),
+      until: undefined, ...(t.state === 'expired' ? { state: 'active', nextDue: next?.toISOString(), watchFails: undefined, watchError: undefined, watchRetryAt: undefined } : {}),
     }, now)!
     this.deps.changed(task, t.state === 'expired' ? 'resumed' : 'updated')
     return ok({ task })
@@ -482,7 +483,8 @@ export class TaskService {
       const t = scope.taskId ? this.store.getTask(scope.taskId) : undefined
       tasks = t ? [t] : []
     } else {
-      const inTopic = (where ?? (scope.thread !== undefined ? 'topic' : 'chat')) === 'topic'
+      // The Tasks topic sees the whole group's.
+      const inTopic = (where ?? (scope.thread !== undefined && !scope.hub ? 'topic' : 'chat')) === 'topic'
       tasks = this.store.listTasks({ chat: scope.chat, ...(inTopic ? { thread: scope.thread ?? null } : {}) })
     }
     return ok(tasks.map(t => taskView(t, this.store.runsFor(t.id, 1))))

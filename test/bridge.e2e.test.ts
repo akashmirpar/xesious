@@ -4929,7 +4929,7 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     const reply = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('Tasks in this topic'))!
     expect(String(reply.payload.text)).toContain('Alpha')
     expect(String(reply.payload.text)).not.toContain('Beta')
-    expect(reply.payload.reply_markup.inline_keyboard[0][0].callback_data).toBe(`tk:run:${a.id}`)
+    expect(reply.payload.reply_markup.inline_keyboard[0][0]).toEqual({ text: '1', callback_data: `tk:card:${a.id}` })
     cs = await say('/tasks')
     const all = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('Tasks in this group'))!
     expect(String(all.payload.text)).toContain('Alpha')
@@ -4973,6 +4973,58 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     expect(mine.body.message).toContain('when this turn ends')
     expect((await callApi(T().socket, token, 'POST', '/v1/topics', { name: 'Bad', cwd: '/no/such/folder' })).status).toBe(400)
     T().tokens.revoke(token)
+  })
+
+  test('the 🗂 Tasks topic: a pinned board of every task in the group, under its topic, kept up to date', async () => {
+    const a = make({ name: 'Morning news', prompt: 'News', cron: '7 7 * * *' }, scopeOf(C, 501))
+    await settleCards()
+    const hub = Number(T().store.getMeta(`activity:${C}`))
+    const boardId = Number(T().store.getMeta(`board:${C}`))
+    expect(hub).toBeGreaterThan(0)
+    expect(boardId).toBeGreaterThan(0)
+    const before = calls.length
+    const b = make({ name: 'Weekly report', prompt: 'Report', cron: '7 9 * * 1' }, scopeOf(C, 502))
+    await settleCards()
+    const edit = calls.slice(before).filter(c => c.method === 'editMessageText' && c.payload.message_id === boardId).at(-1)!
+    const text = String(edit.payload.text)
+    expect(text).toContain('🗂 All tasks in this group')
+    expect(text.indexOf('Morning news')).toBeLessThan(text.indexOf('Weekly report'))
+    expect(text).toMatch(/<b><a href="[^"]+">[^<]+<\/a><\/b>\n\d+\. .*Morning news/)
+    const buttons = edit.payload.reply_markup.inline_keyboard.flat().map((x: any) => x.callback_data)
+    expect(buttons).toContain(`tk:card:${a.id}`)
+    expect(buttons).toContain(`tk:card:${b.id}`)
+    // A number, tapped there: that task's card, to the one who tapped, with its buttons.
+    const cs = await press(`tk:card:${b.id}`, C, hub)
+    const card = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('Weekly report'))!
+    expect(card.payload.ephemeral_message_parameters).toMatchObject({ receiver_user_id: 1 })
+    expect(card.payload.reply_markup.inline_keyboard[0].map((x: any) => x.callback_data)).toContain(`tk:pause:${b.id}`)
+    // A pause from there shows on the board at once.
+    const before2 = calls.length
+    await tap(`tk:pause:${b.id}`, C, hub)
+    expect(calls.slice(before2).some(c => c.method === 'editMessageText' && c.payload.message_id === boardId && String(c.payload.text).includes('⏸'))).toBe(true)
+  })
+
+  test('in the 🗂 Tasks topic, /tasks is the whole group; Claude there lists every topic\'s tasks and can set one up in another', async () => {
+    make({ name: 'Alpha one', prompt: 'A', cron: '7 6 * * *' }, scopeOf(C, 501))
+    make({ name: 'Beta two', prompt: 'B', cron: '7 5 * * *' }, scopeOf(C, 502))
+    await settleCards()
+    const hub = Number(T().store.getMeta(`activity:${C}`))
+    let cs = await say('/tasks', hub)
+    const list = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('Tasks in this group'))!
+    expect(String(list.payload.text)).toContain('Alpha one')
+    expect(String(list.payload.text)).toContain('Beta two')
+    const lastCall = () => JSON.parse(readFileSync(MCP_LOG, 'utf8').trim().split('\n').pop()!)
+    await say('MCPTASK task_list {}', hub)
+    expect(lastCall()).toMatchObject({ tool: 'task_list', isError: false })
+    expect(lastCall().text).toContain('Alpha one')
+    expect(lastCall().text).toContain('Beta two')
+    await say('MCPTASK task_create {"name":"Research digest","digest":{},"cron":"7 22 * * *","tz":"UTC","topic":"502"}', hub)
+    expect(lastCall()).toMatchObject({ tool: 'task_create', isError: false })
+    const made = T().store.listTasks({ chat: String(C) }).find((x: any) => x.name === 'Research digest')!
+    expect(made.thread).toBe(502)
+    // The profile tells Claude what this topic is.
+    const args: string[] = JSON.parse(readFileSync(LAST_ARGS, 'utf8'))
+    expect(args[args.indexOf('--append-system-prompt') + 1]).toContain("the group's 🗂 Tasks topic")
   })
 
   test('the activity topic can be turned off for a group', async () => {
@@ -5214,8 +5266,8 @@ describe('tasks: watchers (phase 2)', () => {
     expect(digest.payload.disable_notification).toBe(true)
   }, 30000)
 
-  test('at its end it stops and says so; a tap gives it another week, and it starts again', async () => {
-    const t = make({ name: 'Sync loop', watch: { command: 'sleep 30' }, keep_running: true })
+  test('at the end it was given it stops and says so; a tap keeps it running, with no end', async () => {
+    const t = make({ name: 'Sync loop', watch: { command: 'sleep 30' }, keep_running: true, until: new Date(Date.now() + 3600_000).toISOString() })
     await waitFor(() => T().watchers.list().includes(t.id))
     const before = calls.length
     const end = Date.parse(t.until)
@@ -5227,8 +5279,9 @@ describe('tasks: watchers (phase 2)', () => {
     const notice = sent(before, 'Sync loop has ended')[0]
     expect(notice.payload.reply_markup.inline_keyboard[0][0].callback_data).toBe(`tk:renew:${t.id}`)
     const cs = await press(`tk:renew:${t.id}`, 701)
-    expect(answers(cs)[0]).toContain('Running until')
-    expect(T().store.getTask(t.id)).toMatchObject({ state: 'active', until: new Date(end + 1000 + 7 * 24 * 3600_000).toISOString() })
+    expect(answers(cs)[0]).toBe('Running again, with no end.')
+    expect(T().store.getTask(t.id)).toMatchObject({ state: 'active' })
+    expect(T().store.getTask(t.id).until).toBeUndefined()
     await waitFor(() => T().watchers.list().includes(t.id))
   }, 20000)
 })

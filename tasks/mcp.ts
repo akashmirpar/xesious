@@ -108,7 +108,7 @@ const TASK_FIELDS = {
   says: { type: 'string', enum: ['live', 'result', 'noteworthy', 'problems', 'never'], description: 'For a Claude run, how much it posts. live: its progress and the answer. result (the default): the answer. noteworthy: only when the run reports something worth telling (for checks and monitors). problems: only failures. never: nothing, only history.' },
   sound: { type: 'string', enum: ['loud', 'silent'], description: 'loud notifies; silent posts without a sound. Default: loud for reminders and for noteworthy or problems; for results, silent in groups and loud in a private chat.' },
   deliver_to: { type: 'string', enum: ['topic', 'dm'], description: "Where it posts: this topic (the default) or the person's private chat with the bot." },
-  until: { type: 'string', description: 'Optional: no runs after this local time, "YYYY-MM-DD HH:MM" in tz. A task that runs more often than hourly (a watcher, a short interval) ends after 7 days unless given one; give a later until when the person wants it to last.' },
+  until: { type: 'string', description: 'Optional: no runs after this local time, "YYYY-MM-DD HH:MM" in tz. Only when the person wants it to end; give an empty string to remove an end.' },
   times: { type: 'number', description: 'Optional: stop after this many runs.' },
 }
 
@@ -123,7 +123,7 @@ const INTERACTIVE_TOOLS = [
       "For the time give exactly one of in_minutes, at, every_minutes or cron, and let the bot do the date arithmetic. When the person gives an approximate time (\"around 9\", \"every morning\"), choose an off-minute such as 09:07 rather than 09:00. " +
       'To act when something happens, give watch instead of a time: a program you write that prints a line for each thing worth knowing. ' +
       "Afterwards the bot posts the task's card with its details and buttons, so keep your own reply to one short line.",
-    inputSchema: { type: 'object', properties: TASK_FIELDS, required: ['tz'] },
+    inputSchema: { type: 'object', properties: { ...TASK_FIELDS, topic: { type: 'string', description: "Optional: the topic it lives in (id or name, from topic_list; \"General\" too), when not this one. It posts there and runs in that topic's folder." } }, required: ['tz'] },
   },
   {
     name: 'task_list',

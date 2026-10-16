@@ -68,7 +68,7 @@ import { Watchers } from './tasks/watchers'
 import { TaskService, type Action as TaskAction } from './tasks/service'
 import { taskRoutes, type BridgeHandlers } from './tasks/routes'
 import { TokenRegistry, startApi, loadOperatorToken, reply, fail, type Scope, type ApiServer } from './tasks/api'
-import { whenText, elapsedText, cardHtml, historyHtml, listLine, scheduleText, watchedText } from './tasks/render'
+import { whenText, elapsedText, cardHtml, historyHtml, scheduleText, watchedText, taskListHtml, type TaskSection } from './tasks/render'
 import { LIMITS, type Task, type Run } from './tasks/model'
 import type { RunUsage } from './lib'
 
@@ -215,6 +215,7 @@ function baseProfile(cwd: string, key: string): string {
     '- Assume no editor or file selection is open. Ignore any IDE/editor framing from earlier in this conversation; the user is in a chat.',
     `- Files the user sends are saved in ./${inb}/. To send a file back, put it in ./${out}/ and it is delivered then cleared.`,
     ...(TASKS ? ["- This bot can do things later, on a schedule or when something happens, and report here: reminders, Claude runs, commands, digests, and watchers (a small program you write that the bot keeps an eye on). When the person asks for that, use the xesious task_create tool, not TaskCreate (your private to-do list) or CronCreate. It can also create topics and set a topic's folder (topic_create, topic_set_cwd)."] : []),
+    ...(TASKS && isTasksHubKey(key) ? ["- This topic is the group's 🗂 Tasks topic: the bot's tasks of every topic are seen and managed here. task_list lists them all; task_get, task_update, task_pause, task_resume, task_delete and task_run_now take any task's id; task_create takes topic to set one up in another topic (it lives, posts and runs there)."] : []),
     ...attributionProfileLines(BRIDGE_NONCE),
   ].join('\n')
 }
@@ -3034,6 +3035,7 @@ function tasksMcpFor(ctx: Context, key: string, threadId: number | undefined, ro
   const scope: Scope = {
     kind: 'run', chat: String(ctx.chat.id), thread: threadId, person: String(person.id), personName: userName(person),
     runKind: ro.task ? 'scheduled' : 'interactive', ...(ro.task ? { taskId: ro.task.taskId, runId: ro.task.runId } : {}),
+    ...(!ro.task && isTasksHub(ctx.chat.id, threadId) ? { hub: true } : {}),
   }
   const token = apiTokens.mint(scope)
   const env = { XESIOUS_API_SOCK: taskApi.socket, XESIOUS_API_TOKEN: token, XESIOUS_RUN_KIND: scope.runKind! }
@@ -6991,22 +6993,18 @@ bot.on('message', async ctx => {
       await answer(active.length ? `Paused ${active.length} task${active.length === 1 ? '' : 's'}. Each one resumes from its card, or from /tasks.` : 'No active tasks to pause here.')
       return
     }
-    // In a topic, that topic's; in General, the whole group's; in a DM, the person's.
-    const inTopic = ctx.chat.type !== 'private' && threadId !== undefined
-    const list = taskStore.listTasks({ chat: String(chatId), ...(inTopic ? { thread: threadId } : {}), states: ['active', 'paused'] })
-    if (!list.length) {
-      await answer(`No tasks ${inTopic ? 'in this topic' : 'here'} yet. Ask for one in plain words: "remind me in two hours to…", "every weekday at 9, summarize…".`)
+    // In a topic, that topic's; in General and the 🗂 Tasks topic, the whole group's,
+    // under their topics; in a DM, the person's.
+    const group = ctx.chat.type !== 'private'
+    const wide = group && (threadId === undefined || isTasksHub(chatId, threadId))
+    const where = wide ? 'in this group' : group ? 'in this topic' : 'here'
+    const view = tasksListView(chatId, wide ? 'all' : threadId, `<b>Tasks ${where}</b>`)
+    if (!view.count) {
+      await answer(`No tasks ${where} yet. Ask for one in plain words: "remind me in two hours to…", "every weekday at 9, summarize…", "tell me when…".`)
       return
     }
-    const shown = list.slice(0, 12)
-    const where = inTopic ? 'in this topic' : ctx.chat.type === 'private' ? 'here' : 'in this group'
-    const html = [`<b>Tasks ${where}</b>`, ...shown.map((t, i) => `${i + 1}. ${listLine(t, taskStore!.runsFor(t.id, 1))}`),
-      ...(list.length > shown.length ? [`…and ${list.length - shown.length} more`] : [])].join('\n')
-    const kb = { inline_keyboard: shown.slice(0, 8).map((t, i) => [
-      { text: `${i + 1}. ▶️ Run now`, callback_data: `tk:run:${t.id}` },
-      t.state === 'active' ? { text: '⏸ Pause', callback_data: `tk:pause:${t.id}` } : { text: '▶️ Resume', callback_data: `tk:resume:${t.id}` },
-      { text: '📜', callback_data: `tk:hist:${t.id}` },
-    ]) }
+    const html = `${view.html}\n\n<i>Tap a number for its card.</i>`
+    const kb = view.kb
     if (ctx.chat.type === 'private') {
       await ctx.api.sendMessage(chatId, html, { parse_mode: 'HTML', reply_markup: kb, link_preview_options: { is_disabled: true } }).catch(e => console.error(`[tasks] /tasks: ${e}`))
     } else {
@@ -7971,7 +7969,7 @@ const TASK_BUTTONS: Record<NonNullable<PostOpts['buttons']>, (t: Task) => any[][
   alert: t => [[{ text: t.trigger.kind === 'watch' ? '🔄 Try again' : '▶️ Run now', callback_data: `tk:run:${t.id}` }, { text: '⏸ Pause', callback_data: `tk:pause:${t.id}` }]],
   paused: t => [[{ text: '▶️ Resume', callback_data: `tk:resume:${t.id}` }]],
   rerun: t => [[{ text: '▶️ Run again', callback_data: `tk:run:${t.id}` }]],
-  renew: t => [[{ text: '▶️ Keep it 7 more days', callback_data: `tk:renew:${t.id}` }]],
+  renew: t => [[{ text: '▶️ Keep it running', callback_data: `tk:renew:${t.id}` }]],
   pause: t => [[{ text: '⏸ Pause', callback_data: `tk:pause:${t.id}` }]],
 }
 
@@ -8230,6 +8228,7 @@ function refreshTaskCard(t: Task, what?: string): void {
   if (c.timer) return            // one is due already; it shows the latest state
   const wait = asked ? 0 : Math.max(0, c.at + CARD_GAP_MS - Date.now())
   c.timer = setTimeout(() => { c.timer = undefined; void showTaskCard(t.id) }, wait)
+  refreshBoard(t.chat, asked)
 }
 
 // The activity topic: in a forum group, "🗂 Tasks", where every task created,
@@ -8253,8 +8252,9 @@ function activityThread(t: Task): Promise<number | undefined> {
       taskStore!.setMeta(`activity:${t.chat}`, String(th))
       names[keyFor(Number(t.chat), th)] = '🗂 Tasks'
       saveState()
-      await bot.api.sendMessage(Number(t.chat), "This topic logs what the bot's tasks do in this group: created, changed, paused, failing. Mute it if you like. /tasks lists them, and /config can turn this topic off.",
+      await bot.api.sendMessage(Number(t.chat), "This topic is where the bot's tasks of every topic in this group are seen and managed: the board pinned above lists them all, and what they do is logged below (created, changed, paused, failing). Ask here to change any of them. Mute it if you like; /config can turn it off.",
         { message_thread_id: th, disable_notification: true }).catch(() => {})
+      await showBoard(t.chat)
       return th
     } catch (e) {
       taskStore!.setMeta(`activity:${t.chat}`, 'none')
@@ -8281,6 +8281,8 @@ const CHANGE_TEXT: Record<string, (t: Task) => string> = {
 function taskActivity(t: Task, text: string): void {
   const line = CHANGE_TEXT[text]?.(t) ?? text
   console.log(`[tasks] ${taskKey(t)} ${t.id}: ${line}`)
+  // A change a person made shows on the board at once.
+  refreshBoard(t.chat, text in CHANGE_TEXT)
   void activityThread(t).then(th => {
     if (th === undefined || th === t.thread) return
     const link = t.thread !== undefined ? topicLink(Number(t.chat), t.thread) : undefined
@@ -8294,17 +8296,93 @@ function taskActivity(t: Task, text: string): void {
 // even a bot that isn't an admin send that person one private message, within 15 s,
 // so it is sent before the tap is answered; a visible, silent one if that fails.
 async function showTaskHistory(ctx: Context, t: Task): Promise<void> {
-  const html = historyHtml(t, taskStore?.runsFor(t.id, 20) ?? [])
+  await privatelyFromTap(ctx, historyHtml(t, taskStore?.runsFor(t.id, 20) ?? []))
+}
+
+// To the person who tapped, alone: through the tap itself, which lets even a bot that
+// isn't an admin do it within 15 s; a visible, silent message if Telegram refuses. In
+// a private chat, just a message.
+async function privatelyFromTap(ctx: Context, html: string, kb?: { inline_keyboard: any[][] }): Promise<void> {
   const threadId = ctx.callbackQuery?.message?.message_thread_id
-  const opts = { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true } }
+  const opts = { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true }, ...(kb ? { reply_markup: kb } : {}) }
   if (ctx.chat?.type === 'private') {
-    await ctx.api.sendMessage(ctx.chat.id, html, opts).catch(e => console.error(`[tasks] history: ${e}`))
+    await ctx.api.sendMessage(ctx.chat.id, html, opts).catch(e => console.error(`[tasks] to ${ctx.chat?.id}: ${e}`))
     return
   }
   const sent = await ctx.api.sendMessage(ctx.chat!.id, html, { ...destOpts({ threadId }), ...opts,
     ephemeral_message_parameters: { receiver_user_id: ctx.from!.id, callback_query_id: ctx.callbackQuery!.id } } as any)
-    .catch(e => { console.error(`[tasks] history, privately: ${e}`); return null })
-  if (!sent) await ctx.api.sendMessage(ctx.chat!.id, html, { ...destOpts({ threadId }), ...opts, disable_notification: true }).catch(e => console.error(`[tasks] history: ${e}`))
+    .catch(e => { console.error(`[tasks] privately to ${ctx.from?.id}: ${e}`); return null })
+  if (!sent) await ctx.api.sendMessage(ctx.chat!.id, html, { ...destOpts({ threadId }), ...opts, disable_notification: true }).catch(e => console.error(`[tasks] to ${ctx.chat?.id}: ${e}`))
+}
+
+// The group's 🗂 Tasks topic, where every topic's tasks are seen and managed.
+const isTasksHub = (chat: number | string, thread: number | undefined) =>
+  thread !== undefined && !!taskStore && taskStore.getMeta(`activity:${chat}`) === String(thread)
+const isTasksHubKey = (key: string) => {
+  const i = key.indexOf(':')
+  const th = Number(key.slice(i + 1))
+  return Number.isInteger(th) && isTasksHub(key.slice(0, i), th)
+}
+
+// A chat's tasks as a numbered list: one topic's (or a DM's), or the whole group's
+// under their topics, with a button for each number that opens that task's card.
+function tasksListView(chat: number, where: number | undefined | 'all', head: string): { html: string; kb: { inline_keyboard: any[][] }; count: number } {
+  const store = taskStore!
+  const tasks = store.listTasks({ chat: String(chat), ...(where === 'all' ? {} : { thread: where ?? null }), states: ['active', 'paused'] })
+  const item = (task: Task) => ({ task, runs: store.runsFor(task.id, 1) })
+  const sections: TaskSection[] = []
+  if (where === 'all') {
+    const by = new Map<string, Task[]>()
+    for (const t of tasks) by.set(String(t.thread ?? 'main'), [...(by.get(String(t.thread ?? 'main')) ?? []), t])
+    for (const [k, ts] of by) {
+      const th = k === 'main' ? undefined : Number(k)
+      sections.push({ title: th === undefined ? 'General' : names[keyFor(chat, th)] ?? `topic ${th}`, link: th !== undefined ? topicLink(chat, th) : undefined, items: ts.map(item) })
+    }
+  } else sections.push({ items: tasks.map(item) })
+  const v = taskListHtml(head, sections)
+  const rows: any[][] = []
+  for (let i = 0; i < v.ids.length && i < 48; i += 6) rows.push(v.ids.slice(i, i + 6).map((id, j) => ({ text: String(i + j + 1), callback_data: `tk:card:${id}` })))
+  return { html: v.html, kb: { inline_keyboard: rows }, count: tasks.length }
+}
+
+// The 🗂 Tasks topic's board: every task in the group, pinned at its top and edited in
+// place as they change, at most once a minute for what runs change; at once for what
+// a person did.
+const boards = new Map<string, { timer?: ReturnType<typeof setTimeout>; shown?: string; at: number }>()
+const BOARD_HEAD = '<b>🗂 All tasks in this group</b>'
+async function showBoard(chat: string): Promise<void> {
+  if (!taskStore) return
+  const th = Number(taskStore.getMeta(`activity:${chat}`))
+  if (!th) return
+  const v = tasksListView(Number(chat), 'all', BOARD_HEAD)
+  const html = v.count ? `${v.html}\n\n<i>Tap a number for its card. Ask here to change any of them.</i>` : `${BOARD_HEAD}\nNone yet. Ask for one in any topic, or here.`
+  const shown = html + JSON.stringify(v.kb)
+  const b = boards.get(chat) ?? { at: 0 }
+  boards.set(chat, b)
+  if (b.shown === shown) return
+  const msgId = Number(taskStore.getMeta(`board:${chat}`)) || undefined
+  if (msgId) {
+    const edited = await bot.api.editMessageText(Number(chat), msgId, html, { parse_mode: 'HTML', reply_markup: v.kb, link_preview_options: { is_disabled: true } })
+      .then(() => true, e => String(e).includes('not modified'))
+    if (edited) { b.shown = shown; b.at = Date.now(); return }
+  }
+  // Gone, or never made: a new one, pinned.
+  const m = await bot.api.sendMessage(Number(chat), html, { message_thread_id: th, parse_mode: 'HTML', reply_markup: v.kb, disable_notification: true, link_preview_options: { is_disabled: true } })
+    .catch(e => { console.error(`[tasks] board in ${chat}: ${e}`); return null })
+  if (!m) return
+  noteBotMessage(keyFor(Number(chat), th))
+  taskStore.setMeta(`board:${chat}`, String(m.message_id))
+  await bot.api.pinChatMessage(Number(chat), m.message_id, { disable_notification: true }).catch(e => console.error(`[tasks] pinning the board in ${chat}: ${e}`))
+  b.shown = shown; b.at = Date.now()
+}
+function refreshBoard(chat: string, now = false): void {
+  if (!taskStore || !chat.startsWith('-') || !taskStore.getMeta(`activity:${chat}`)) return
+  const b = boards.get(chat) ?? { at: 0 }
+  boards.set(chat, b)
+  if (b.timer && now) { clearTimeout(b.timer); b.timer = undefined }
+  if (b.timer) return
+  const wait = now ? 0 : Math.max(0, b.at + CARD_GAP_MS - Date.now())
+  b.timer = setTimeout(() => { b.timer = undefined; void showBoard(chat) }, wait)
 }
 
 // A tap on a task's card, reminder, alert or /tasks list.
@@ -8324,10 +8402,10 @@ async function handleTaskCallback(ctx: Context, data: string): Promise<void> {
   const said = (r: { ok: boolean; error?: string }, okText: string) => answer(r.ok ? okText : r.error, !r.ok)
   switch (act) {
     case 'run': await said(await taskService.runNow(scope, t.id), t.trigger.kind === 'watch' ? 'Looking now.' : 'Started.'); return
-    // Another week, from an ended task's notice.
+    // Running on, with no end, from an ended task's notice.
     case 'renew': {
-      const r = taskService.extend(scope, t.id)
-      await said(r, r.ok ? `Running until ${whenText(new Date(r.value.task.until!), t.tz)}.` : '')
+      const r = taskService.keepRunning(scope, t.id)
+      await said(r, 'Running again, with no end.')
       if (r.ok && msg) await ctx.api.editMessageReplyMarkup(msg.chat.id, msg.message_id, { reply_markup: { inline_keyboard: [] } }).catch(() => {})
       return
     }
@@ -8351,11 +8429,21 @@ async function handleTaskCallback(ctx: Context, data: string): Promise<void> {
       return
     }
     // Delete asks first, on the card itself.
-    case 'del':
-      await answer()
-      if (msg) await ctx.api.editMessageReplyMarkup(msg.chat.id, msg.message_id, { reply_markup: { inline_keyboard: [[
+    case 'del': {
+      const confirm = { inline_keyboard: [[
         { text: '🗑 Yes, delete it', callback_data: `tk:delok:${t.id}`, style: 'danger' } as any, { text: 'No', callback_data: `tk:keep:${t.id}` },
-      ]] } }).catch(() => {})
+      ]] }
+      // On the card itself; on a card shown privately, which may not be editable, a
+      // private question.
+      const edited = msg ? await ctx.api.editMessageReplyMarkup(msg.chat.id, msg.message_id, { reply_markup: confirm }).then(() => true, () => false) : false
+      if (!edited) await privatelyFromTap(ctx, `Delete <b>${escapeHtml(t.name)}</b>?`, confirm)
+      await answer()
+      return
+    }
+    // Its card, privately: from a number in /tasks or the board.
+    case 'card':
+      await privatelyFromTap(ctx, cardHtml(t, taskStore.runsFor(t.id, 8), taskNow(), taskWatchers?.status(t.id)), cardKeyboard(t))
+      await answer()
       return
     case 'delok': {
       const r = taskService.remove(scope, t.id)
@@ -8424,6 +8512,12 @@ function startTasks(): void {
       // A person started it: the card shows it running, with Stop, at once.
       runNow: t => { const r = taskRuntime!.runNow(t.id); if (r.runId) refreshTaskCard(t, 'run'); return r },
       maxWatchers: TASKS_MAX_WATCHERS,
+      topicOf: (chat, ref) => {
+        if (!chat.startsWith('-')) return undefined
+        if (/^(general|main)$/i.test(ref.trim())) return { thread: undefined }
+        const th = resolveTopicRef(chat, ref)
+        return th === undefined ? undefined : { thread: th }
+      },
     })
     apiTokens.addOperator(loadOperatorToken(API_TOKEN_FILE))
     taskApi = startApi({ socket: API_SOCK, tokens: apiTokens, routes: taskRoutes(taskService, taskBridge), log: s => console.error(s) })
@@ -8432,6 +8526,8 @@ function startTasks(): void {
     taskWatchers.adopt()
     const adopted = taskWatchers.list().length
     taskRuntime.sync()
+    // Each group's board, made or brought up to date (one that has a Tasks topic).
+    for (const chat of new Set(store.listTasks().map(t => t.chat))) refreshBoard(chat, true)
     const active = store.listTasks({ states: ['active'] }).length
     console.log(`     tasks          : on — ${active} active${interrupted.length ? `, ${interrupted.length} run(s) interrupted by the restart` : ''}${adopted ? `, ${adopted} watcher(s) still running` : ''}; API at ${API_SOCK}`)
   } catch (e) {

@@ -230,12 +230,12 @@ test('lists: this topic by default from a topic, the chat on request; the operat
 describe('watchers', () => {
   const WEEK = 7 * 24 * 3600_000
 
-  test('a streaming watcher: no slots, loud, a week until it ends; its name from its message', () => {
+  test('a streaming watcher: no slots, loud, no end of its own; its name from its message', () => {
     const t = create({ watch: { command: 'python3 watchers/price.py' }, message: 'Below 300: {event}' })
     expect(t.trigger).toEqual({ kind: 'watch', command: 'python3 watchers/price.py' })
     expect(t.nextDue).toBeUndefined()
     expect(t.sound).toBe('loud')
-    expect(t.until).toBe(new Date(now.getTime() + WEEK).toISOString())
+    expect(t.until).toBeUndefined()
     expect(t.name).toBe('Below 300: {event}')
   })
 
@@ -271,25 +271,27 @@ describe('watchers', () => {
     expect(v.ok && v.value).toMatchObject({ kind: 'watch', watch: { command: 'python3 price.py', streaming: true }, cooldown_minutes: 15, max_per_hour: 4, stale_minutes: 5, events_seen: 0 })
   })
 
-  test('anything more often than hourly gets a week unless given an end; an end can be further, not removed', () => {
+  test('nothing ends on its own: an end only when given, and it can be taken away', () => {
     const f = create({ prompt: 'Check the queue', every_minutes: 15 })
-    expect(f.until).toBe(new Date(now.getTime() + WEEK).toISOString())
+    expect(f.until).toBeUndefined()
     const g = create({ prompt: 'Check the queue again', every_minutes: 15, until: '2027-01-31 12:00' })
     expect(g.until).toBe('2027-01-31T11:00:00.000Z')
     const r = svc.update(person, g.id, { until: '' })
-    expect(r.ok ? '' : r.error).toContain('needs an end')
-    expect(create({ prompt: 'Daily', cron: '7 9 * * *' }).until).toBeUndefined()
+    expect(r.ok && r.value.task.until).toBeUndefined()
   })
 
-  test('another week: an ended one starts again; a running one ends a week later', () => {
-    const t = create({ watch: { command: 'python3 price.py' }, message: '{event}' })
+  test('keep running: an ended one starts again with no end; a running one loses its end', () => {
+    const WEEK = 7 * 24 * 3600_000
+    const t = create({ watch: { command: 'python3 price.py' }, message: '{event}', until: '2026-10-20 12:00' })
     store.updateTask(t.id, { state: 'expired' })
-    now = new Date(now.getTime() + WEEK + 3600_000)
-    const r = svc.extend(person, t.id)
-    expect(r.ok && r.value.task).toMatchObject({ state: 'active', until: new Date(now.getTime() + WEEK).toISOString() })
-    const r2 = svc.extend(person, t.id)
-    expect(r2.ok && r2.value.task.until).toBe(new Date(now.getTime() + 2 * WEEK).toISOString())
-    expect(changes.slice(-2).map(c => c[1])).toEqual(['resumed', 'updated'])
+    now = new Date(now.getTime() + WEEK)
+    const r = svc.keepRunning(person, t.id)
+    expect(r.ok && r.value.task).toMatchObject({ state: 'active' })
+    expect(r.ok && r.value.task.until).toBeUndefined()
+    const p = create({ prompt: 'Poll', every_minutes: 5, until: '2026-12-01 12:00' })
+    const r2 = svc.keepRunning(person, p.id)
+    expect(r2.ok && r2.value.task.until).toBeUndefined()
+    expect(changes.slice(-2).map(c => c[1])).toEqual(['created', 'updated'])
   })
 
   test('a paused streaming watcher resumes, its failures forgotten', () => {

@@ -99,14 +99,6 @@ export function periodMs(t: Trigger, tz: string, now = new Date()): number | und
   return Number.isFinite(min) ? min : undefined
 }
 
-// More often than hourly: a watcher, a short interval, a cron every few minutes. Such
-// a task ends after a week unless it was given an end (LIMITS.frequentEndMs).
-export function runsOften(t: Trigger, tz: string, now = new Date()): boolean {
-  if (t.kind === 'watch') return true
-  const p = periodMs(t, tz, now)
-  return p !== undefined && p < HOUR
-}
-
 // How late a slot may still start. A reminder two hours late is still worth sending;
 // a check that runs every five minutes is not worth running for a slot from an hour ago.
 export function graceMs(t: Trigger, tz: string, now = new Date()): number {

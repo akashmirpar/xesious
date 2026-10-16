@@ -231,6 +231,31 @@ export function listLine(t: Task, runs: Run[]): string {
   return `${mark} ${kind} <b>${esc(t.name)}</b> — ${esc(scheduleText(t.trigger, t.tz))}${when}`
 }
 
+// A list of tasks, numbered: one topic's, or a whole group's under its topics. As
+// much as fits in one message; the numbers shown are the ones its buttons open.
+export interface TaskSection { title?: string; link?: string; items: { task: Task; runs: Run[] }[] }
+export function taskListHtml(head: string, sections: TaskSection[], maxChars = 3600): { html: string; ids: string[]; more: number } {
+  const out = [head]
+  const ids: string[] = []
+  let len = head.length
+  let more = 0
+  for (const s of sections) {
+    const title = s.title ? (s.link ? `<b><a href="${s.link}">${esc(s.title)}</a></b>` : `<b>${esc(s.title)}</b>`) : ''
+    let titled = !title
+    for (const it of s.items) {
+      const line = `${ids.length + 1}. ${listLine(it.task, it.runs)}`
+      const add = (titled ? 0 : title.length + 2) + line.length + 1
+      if (len + add > maxChars) { more++; continue }
+      if (!titled) { out.push('', title); titled = true }
+      out.push(line)
+      len += add
+      ids.push(it.task.id)
+    }
+  }
+  if (more) out.push('', `…and ${more} more`)
+  return { html: out.join('\n'), ids, more }
+}
+
 export function runLine(r: Run, tz: string): string {
   const at = r.startedAt ?? r.slot
   const bits: string[] = [MARK[markOf(r)], at ? esc(whenText(new Date(at), tz)) : '']

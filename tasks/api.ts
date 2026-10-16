@@ -26,6 +26,7 @@ export interface Scope {
   runKind?: 'interactive' | 'scheduled'
   taskId?: string        // a scheduled run: the task it belongs to
   runId?: string
+  hub?: boolean          // a turn in the group's 🗂 Tasks topic, where every topic's tasks are managed
 }
 
 export class TokenRegistry {

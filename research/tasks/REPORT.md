@@ -130,7 +130,7 @@ All examples are invented; §14 walks through six of them step by step.
   - `until` a time, or `times: N`;
   - "until done": a run calls `task_done`;
   - for watchers, `stop_when` a condition holds ("until the pull request is merged").
-  - Anything that fires more often than hourly asks for an end date (default 7 days, renewable with one tap). That bounds a forgotten task to a week.
+  - ~~Anything that fires more often than hourly asks for an end date (default 7 days, renewable with one tap).~~ Dropped after trying it (2026-10-16): a task runs until it's stopped, or until an end it was given.
 
 ## 4. Filters
 

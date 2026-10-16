@@ -100,7 +100,7 @@ In a group, the commands that only inform the person asking — `/status`, `/job
 | `/get <path>` | Send a file from this topic's directory back to you |
 | `/cwd <abs-path>` | Set this topic's working directory (resets its session) |
 | `/status` | Show this topic's session id, cwd and permission mode |
-| `/tasks` | What the bot does here on its own: this topic's reminders and scheduled runs (in General, the whole group's; in a DM, yours), to you alone, with Run now, Pause/Resume and History for each. `/tasks pause all` (admins) pauses every task in the group. See [Tasks](#tasks). |
+| `/tasks` | What the bot does here on its own: this topic's tasks (in General and the 🗂 Tasks topic, the whole group's, under their topics; in a DM, yours), numbered, to you alone; tap a number for that task's card. `/tasks pause all` (admins) pauses every task in the group. See [Tasks](#tasks). |
 | `/sessions <dir…>` | List the Claude sessions stored for one or more directories (what the IDE/CLI picker shows), as a **tappable picker** — tap one to bind this topic to it, page through with `‹ Prev` / `Next ›` |
 | `/import <dir…>` | Make a topic for each session in the given directories — bound + recent history backfilled |
 | `/history [N]` | Re-post the last N turns of this topic's bound session |
@@ -371,8 +371,8 @@ What you see:
 
 - **A card** in the topic, posted silently when the task is made and edited as it changes: what it does, when it runs next, how its last runs went, with ▶️ Run now, ⏸ Pause or ▶️ Resume, 📜 History (sent to you alone) and 🗑 (which asks first). While a run is going: ⏹ Stop.
 - **The results.** In a group a result is silent unless the task was asked to be loud; reminders, finds, problems and repeated failures notify. The topic's next turn is told what the task posted, so Claude knows.
-- **`/tasks`**, the list, with the same buttons.
-- **The 🗂 Tasks topic**, made with a group's first task: every task created, changed, paused, failing or finished, logged silently with a link to its topic. `/config` turns it off.
+- **`/tasks`**, the list, numbered: tap a number for that task's card, privately.
+- **The 🗂 Tasks topic**, made with a group's first task: where every topic's tasks are seen and managed. A board pinned at its top lists every task in the group under its topic, kept up to date, with a number to tap for each one's card; `/tasks` there lists the whole group; ask there to change any task, or to set one up in another topic. Below, every task created, changed, paused, failing or finished is logged silently, with a link to its topic. `/config` turns it off.
 
 The rules:
 
@@ -381,7 +381,7 @@ The rules:
 - After the bot was down, a task runs once for the slot it missed if that slot is still recent (half its period, between 2 minutes and 2 hours; 12 hours for a reminder), never a backlog. A run cut off by a restart isn't run again by itself; its topic gets a ▶️ Run again button. After a start, Claude runs wait two minutes, then go a few at a time.
 - Two failures in a row raise an alert, edited in place rather than repeated; five pause the task. A run the account's usage limit stopped waits for the reset and doesn't count as a failure.
 - At most `TG_TASKS_MAX_CLAUDE` (2) scheduled Claude runs at once, 2 scripts at once, 20 tasks per topic, at most one run a minute. Each run's model, tokens, cost and time are kept in its history.
-- Anything that runs more often than hourly (a watcher, a short interval) ends after 7 days unless it was given an end; its end says so in its topic, with ▶️ Keep it 7 more days. An end can be moved further, not removed.
+- A task runs until it's paused, deleted or finished, or until an end it was given ("for the next two weeks"); when it reaches that end it says so in its topic, with ▶️ Keep it running.
 
 In a forum group Claude can also make a topic for a new piece of work (with its own folder, or one you name, and another topic's settings), rename a topic, or move one to another folder: `topic_create`, `topic_rename`, `topic_set_cwd`. Moving the topic you're talking in happens when the turn ends.
 
