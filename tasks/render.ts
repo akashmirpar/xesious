@@ -235,18 +235,55 @@ export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchSt
   return lines.join('\n')
 }
 
+// What kind of task it is, at a glance.
+export const kindIcon = (t: Task) => t.action.kind === 'steps' ? '🪜' : t.action.kind === 'digest' ? '📋' : t.trigger.kind === 'after' ? '↪️' : t.trigger.kind === 'webhook' ? '🔗' : t.trigger.kind === 'watch' ? '👀' : t.action.kind === 'message' ? '🔔' : '⏰'
+
 // One line of /tasks.
 export function listLine(t: Task, runs: Run[]): string {
   const last = runs.find(r => r.state !== 'queued')
   const mark = t.state === 'paused' ? '⏸' : last ? MARK[markOf(last)] : '·'
   const when = t.state === 'active' && t.nextDue && t.trigger.kind !== 'watch' ? ` · next ${tgTime(new Date(t.nextDue), t.tz)}` : t.state === 'paused' ? ' · paused' : ''
-  const kind = t.action.kind === 'steps' ? '🪜' : t.trigger.kind === 'after' ? '↪️' : t.trigger.kind === 'webhook' ? '🔗' : t.trigger.kind === 'watch' ? '👀' : t.action.kind === 'message' ? '🔔' : '⏰'
+  const kind = kindIcon(t)
   // How it links to the rest: where it hands on, who made it.
   const flow = [
     t.then ? ` · then → ${esc(t.then.topicName ?? 'another topic')}` : '',
     t.parent ? ` · made by ${esc(t.parentName ?? t.parent)}` : '',
   ].join('')
   return `${mark} ${kind} <b>${esc(t.name)}</b> — ${esc(scheduleText(t.trigger, t.tz))}${when}${flow}`
+}
+
+// What the tasks used, from the 📊 Usage button: one line each, the most first, then
+// the hand-offs' runs and the total.
+export interface UsageLine { icon: string; name: string; runs: number; usage: Usage; note?: string }
+const tokensOf = (u: Usage) => (u.inputTokens ?? 0) + (u.outputTokens ?? 0) + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0)
+const amountText = (runs: number, u: Usage) => {
+  const n = tokensOf(u)
+  const tokens = n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M tokens` : n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k tokens` : `${n} tokens`
+  const cost = u.costUsd !== undefined ? ` · ~$${u.costUsd < 0.01 ? u.costUsd.toFixed(3) : u.costUsd.toFixed(2)}` : ''
+  return `${runs} run${runs === 1 ? '' : 's'} · ${tokens}${cost}`
+}
+export function usageListHtml(head: string, lines: UsageLine[], maxChars = 3600): string {
+  if (!lines.length) return `${head}
+
+Nothing here used Claude in that time.`
+  const sorted = [...lines].sort((a, b) => (b.usage.costUsd ?? 0) - (a.usage.costUsd ?? 0) || tokensOf(b.usage) - tokensOf(a.usage))
+  const out = [head, '']
+  let len = head.length
+  let shown = 0
+  for (const l of sorted) {
+    const line = `${l.icon} <b>${esc(l.name)}</b>${l.note ? ` <i>(${esc(l.note)})</i>` : ''} · ${amountText(l.runs, l.usage)}`
+    if (len + line.length > maxChars - 400) break
+    out.push(line)
+    len += line.length + 1
+    shown++
+  }
+  if (shown < sorted.length) out.push(`<i>…and ${sorted.length - shown} more.</i>`)
+  const runs = lines.reduce((n, l) => n + l.runs, 0)
+  const all = lines.reduce<Usage>((s, l) => ({ costUsd: l.usage.costUsd === undefined && s.costUsd === undefined ? undefined : (s.costUsd ?? 0) + (l.usage.costUsd ?? 0),
+    inputTokens: (s.inputTokens ?? 0) + tokensOf(l.usage) }), {})
+  out.push('', `<b>In all</b>: ${amountText(runs, all)}`,
+    "<i>~$ is Claude Code's own estimate at API prices; on a subscription, runs aren't billed one by one. Codex steps and AI filters aren't counted.</i>")
+  return out.join('\n')
 }
 
 // A list of tasks, numbered: one topic's, or a whole group's under its topics. As

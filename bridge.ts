@@ -69,8 +69,9 @@ import { TaskService, type Action as TaskAction } from './tasks/service'
 import { taskRoutes, type BridgeHandlers } from './tasks/routes'
 import { TokenRegistry, startApi, loadOperatorToken, reply, fail, type Scope, type ApiServer, type ApiReply } from './tasks/api'
 import { runNode, recentFlows, flowLine, flowsHtml, type FlowSource } from './tasks/flows'
+import { usageListHtml, kindIcon, type UsageLine } from './tasks/render'
 import { whenText, elapsedText, cardHtml, historyHtml, scheduleText, watchedText, taskListHtml, kindLabel, actionText, type TaskSection } from './tasks/render'
-import { LIMITS, type Handoff, type Task, type Run, type Wait } from './tasks/model'
+import { LIMITS, sumUsage, type Handoff, type Task, type Run, type Wait } from './tasks/model'
 import type { RunUsage } from './lib'
 
 // ---------------------------------------------------------------------------
@@ -7048,17 +7049,9 @@ bot.on('message', async ctx => {
     const group = ctx.chat.type !== 'private'
     const wide = group && (threadId === undefined || isTasksHub(chatId, threadId))
     const where = wide ? 'in this group' : group ? 'in this topic' : 'here'
-    // /tasks flows: what the runs set going, the last week.
-    if (words[0] === 'flows') {
-      const since = new Date(taskNow().getTime() - 7 * 86400_000).toISOString()
-      const html = flowsHtml(`<b>🔀 Flows ${where}, the last 7 days</b>`, recentFlows(flowSource(String(chatId)), since, wide ? 'all' : threadId))
-      if (ctx.chat.type === 'private') await ctx.api.sendMessage(chatId, html, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }).catch(e => console.error(`[tasks] /tasks flows: ${e}`))
-      else await replyOnlyTo(ctx, threadId, html, undefined, msg.message_id || undefined, ephemeralId, true, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
-      return
-    }
     const view = tasksListView(chatId, wide ? 'all' : threadId, `<b>Tasks ${where}</b>`)
     if (!view.count) {
-      await answer(`No tasks ${where} yet. Ask for one in plain words: "remind me in two hours to…", "every weekday at 9, summarize…", "tell me when…".`)
+      await answer(`No tasks ${where} yet. Ask for one in plain words: "remind me in two hours to…", "every weekday at 9, summarize…", "tell me when…".`, { inline_keyboard: [viewsRow(wide ? 'all' : threadId)] })
       return
     }
     const html = `${view.html}\n\n<i>Tap a number for its card.</i>`
@@ -8307,6 +8300,16 @@ interface HandoffAsk {
   fromHost?: boolean         // asked by a script on the host (xesious run): no source topic
 }
 
+// The whole brief, as people see it in the header: on its line when it is one short
+// line, else in a quote that opens with a tap. Past what a message holds, the start
+// of it here and the whole of it as a file.
+const BRIEF_SHOWN = 3500
+function briefHtml(brief: string): string {
+  const b = brief.trim()
+  const shown = b.length > BRIEF_SHOWN ? `${b.slice(0, BRIEF_SHOWN).trimEnd()}…` : b
+  return !shown.includes('\n') && shown.length <= 200 ? ` ${escapeHtml(shown)}` : `\n<blockquote expandable>${escapeHtml(shown)}</blockquote>`
+}
+
 const topicNameOf = (chat: number, thread: number | undefined) => thread === undefined ? 'General' : names[keyFor(chat, thread)] ?? `topic ${thread}`
 const handoffFirstLine = (brief: string) => { const l = brief.trim().split('\n')[0]; return l.length > 160 ? `${l.slice(0, 159)}…` : l }
 
@@ -8341,8 +8344,13 @@ async function startHandoff(a: HandoffAsk): Promise<{ handoff?: Handoff; error?:
   const from = a.fromHost ? 'a script on the host' : topicNameOf(chatId, a.fromThread), to = topicNameOf(chatId, a.toThread)
   const first = handoffFirstLine(a.brief)
   const head = a.fromHost ? '⚙️ From a script on the host' : `⬅️ From <b>${escapeHtml(from)}</b> · ${escapeHtml(a.byName ?? 'someone')}`
-  const header = await bot.api.sendMessage(chatId, `${head}: ${escapeHtml(first)}${landed.length ? `\n📎 ${landed.map(n => escapeHtml(n)).join(', ')}` : ''}`,
+  const header = await bot.api.sendMessage(chatId, `${head}:${briefHtml(a.brief)}${landed.length ? `\n📎 ${landed.map(n => escapeHtml(n)).join(', ')}` : ''}`,
     { ...destOpts({ threadId: a.toThread }), parse_mode: 'HTML', disable_notification: true }).catch(e => { console.error(`[handoff] header: ${e}`); return null })
+  // Longer than a message holds: the whole of it as a file, under the header.
+  if (header && a.brief.trim().length > BRIEF_SHOWN) {
+    await bot.api.sendDocument(chatId, new InputFile(Buffer.from(a.brief.trim()), 'brief.md'), { ...destOpts({ threadId: a.toThread, replyTo: header.message_id }), caption: 'The whole brief', disable_notification: true })
+      .catch(e => console.error(`[handoff] brief.md: ${e}`))
+  }
   const link = header ? messageLink(chatId, a.toThread, header.message_id) : undefined
   const line = a.fromHost ? null : await bot.api.sendMessage(chatId, `➡️ Handed to ${link ? `<a href="${link}">${escapeHtml(to)}</a>` : `<b>${escapeHtml(to)}</b>`}: ${escapeHtml(first)}`,
     { ...destOpts({ threadId: a.fromThread }), parse_mode: 'HTML', disable_notification: true, link_preview_options: { is_disabled: true } }).catch(e => { console.error(`[handoff] line: ${e}`); return null })
@@ -8415,7 +8423,7 @@ async function runHandoff(id: string): Promise<void> {
     await send(ctx, h.toThread, `❌ The work handed here didn't finish: ${res.noAnswer ? 'it ended without an answer' : res.text.slice(0, 300)}`, true)
   }
   const error = ok ? undefined : res.stopped ? 'stopped' : res.noAnswer ? 'it ended without an answer' : res.text.slice(0, 300)
-  h = store.updateHandoff(id, { state: ok ? 'done' : 'failed', endedAt: new Date().toISOString(), ...(error ? { error } : {}), ...(ok ? { result: res.text.slice(0, 20_000) } : {}) } as any)!
+  h = store.updateHandoff(id, { state: ok ? 'done' : 'failed', endedAt: new Date().toISOString(), ...(error ? { error } : {}), ...(ok ? { result: res.text.slice(0, 20_000) } : {}), ...(res.usage ? { usage: res.usage } : {}) })!
   const to = topicNameOf(chatId, h.toThread)
   const there = resultMsg ? messageLink(chatId, h.toThread, resultMsg) : h.dstMsg ? messageLink(chatId, h.toThread, h.dstMsg) : undefined
   if (h.srcMsg) {
@@ -9384,7 +9392,41 @@ function tasksListView(chat: number, where: number | undefined | 'all', head: st
   const v = taskListHtml(head, sections)
   const rows: any[][] = []
   for (let i = 0; i < v.ids.length && i < 48; i += 6) rows.push(v.ids.slice(i, i + 6).map((id, j) => ({ text: String(i + j + 1), callback_data: `tk:card:${id}` })))
+  rows.push(viewsRow(where))
   return { html: v.html, kb: { inline_keyboard: rows }, count: tasks.length }
+}
+
+// Under /tasks and the board: what the tasks set going, and what they used, each
+// shown to whoever taps it.
+const viewsRow = (where: number | undefined | 'all') => {
+  const scope = where === 'all' ? 'all' : String(where ?? 'main')
+  return [{ text: '🔀 Flows', callback_data: `tk:flows:${scope}` }, { text: '📊 Usage', callback_data: `tk:usage:${scope}` }]
+}
+const viewWhere = (scope: string): number | undefined | 'all' => scope === 'all' ? 'all' : scope === 'main' ? undefined : Number(scope)
+const viewLabel = (chat: number, where: number | undefined | 'all') => chat > 0 ? 'here' : where === 'all' ? 'in this group' : 'in this topic'
+
+function flowsView(chat: number, where: number | undefined | 'all'): string {
+  const since = new Date(taskNow().getTime() - 7 * 86400_000).toISOString()
+  return flowsHtml(`<b>🔀 Flows ${viewLabel(chat, where)}, the last 7 days</b>`, recentFlows(flowSource(String(chat)), since, where))
+}
+
+// What the tasks used, the last 7 days: each task's Claude runs (a plan's steps
+// included), and the hand-offs' runs.
+function usageView(chat: number, where: number | undefined | 'all'): string {
+  const store = taskStore!
+  const since = new Date(taskNow().getTime() - 7 * 86400_000).toISOString()
+  const here = (th: number | undefined) => where === 'all' || th === where
+  const lines: UsageLine[] = []
+  for (const t of store.listTasks({ chat: String(chat), states: ['active', 'paused', 'done', 'expired', 'deleted'] })) {
+    if (!here(t.thread)) continue
+    const runs = store.runsSince(t.id, since).filter(r => r.usage)
+    const usage = sumUsage(runs.map(r => r.usage))
+    if (usage) lines.push({ icon: kindIcon(t), name: t.name, runs: runs.length, usage, ...(t.state === 'deleted' ? { note: 'deleted' } : {}) })
+  }
+  const hs = store.handoffsSince(String(chat), since).filter(h => h.usage && h.direction !== 'out' && here(h.toThread))
+  const hu = sumUsage(hs.map(h => h.usage))
+  if (hu) lines.push({ icon: '➡️', name: 'Hand-offs', runs: hs.length, usage: hu })
+  return usageListHtml(`<b>📊 Usage ${viewLabel(chat, where)}, the last 7 days</b>`, lines)
 }
 
 // The 🗂 Tasks topic's board: every task in the group, pinned at its top and edited in
@@ -9451,6 +9493,14 @@ async function handleTaskCallback(ctx: Context, data: string): Promise<void> {
     taskStore.setMeta(`proposal:${id}`, undefined)
     if (msg) await ctx.api.editMessageText(msg.chat.id, msg.message_id, `${escapeHtml(String(msg.text ?? ''))}\n✅ Made by ${escapeHtml(who)}.`, { parse_mode: 'HTML' }).catch(() => {})
     await answer(r.value.duplicate ? 'It exists already.' : 'Made.')
+    return
+  }
+  // The views under /tasks and the board: tk:flows:<scope>, tk:usage:<scope>.
+  if (act === 'flows' || act === 'usage') {
+    const chat = ctx.chat!.id
+    const where = viewWhere(id ?? 'all')
+    await privatelyFromTap(ctx, act === 'flows' ? flowsView(chat, where) : usageView(chat, where))
+    await answer()
     return
   }
   // An answer to a task's question: tk:ans:<question>:<option>.

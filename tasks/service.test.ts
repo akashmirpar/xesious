@@ -275,7 +275,7 @@ describe('watchers', () => {
       { when: 'Thu 15 Oct, 03:00', trigger: 'schedule', result: 'failed', why: 'the disk was full' },
       { when: 'Wed 14 Oct, 03:00', trigger: 'schedule', result: 'quiet', summary: 'backed up 120 files' },
     ])
-    const l = svc.list(person, {})
+    const l = svc.list(person, 'topic')
     expect(l.ok && (l.value as any[]).find(x => x.id === t.id).recent_runs).toBeUndefined()
   })
 

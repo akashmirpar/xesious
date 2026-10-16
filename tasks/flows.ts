@@ -2,7 +2,7 @@
  * flows.ts — what one run set going, and what that set going in turn: a flow. The
  * links are the ones the bot made itself: hand-offs (to topics and to other bots,
  * each on to the next), the tasks that run after another, and the child tasks a run
- * made. A tree, shown on a task's card and in /tasks flows:
+ * made. A tree, shown on a task's card and under the 🔀 Flows button of /tasks:
  *
  *   Daily video · Fri 16 Oct, 09:00 ✅ → ➡️ Posting ✅ → ➡️ @statsbot in Stats ⏳
  *
@@ -132,10 +132,10 @@ export function flowLine(root: FlowNode): string | undefined {
   while (cur.children.length) { cur = cur.children[0]; path.push(cur.html) }
   const count = (n: FlowNode): number => n.children.reduce((k, c) => k + 1 + count(c), 0)
   const more = count(root) - path.length
-  return `🔀 Its last run → ${path.join(' → ')}${more ? ` <i>(+${more} more: /tasks flows)</i>` : ''}`
+  return `🔀 Its last run → ${path.join(' → ')}${more ? ` <i>(+${more} more: 🔀 Flows, under /tasks)</i>` : ''}`
 }
 
-// /tasks flows: as many as fit in one message.
+// The 🔀 Flows button's view: as many as fit in one message.
 export function flowsHtml(head: string, flows: FlowNode[], maxChars = 3800): string {
   if (!flows.length) return `${head}\n\nNothing yet: a flow starts when a task's run hands work on, sets off a task that runs after it, or makes a task.`
   const out = [head]

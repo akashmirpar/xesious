@@ -5105,7 +5105,7 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     const cs = calls.slice(before)
     const header = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('⬅️ From'))!
     expect(header.payload).toMatchObject({ chat_id: C, message_thread_id: 502, disable_notification: true })
-    expect(String(header.payload.text)).toContain('Ada: Write a summary of the notes.\n📎 handoff-notes.txt')
+    expect(String(header.payload.text)).toContain('Ada:\n<blockquote expandable>Write a summary of the notes.\nKeep it short.</blockquote>\n📎 handoff-notes.txt')
     const line = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('➡️ Handed to'))!
     expect(line.payload.message_thread_id).toBe(501)
     // The work ran in the other topic, told it is relayed, with its file in that topic's inbox.
@@ -5308,6 +5308,44 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     expect(calls.slice(b3).some(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('⚠️'))).toBe(false)
   }, 30000)
 
+  test("a hand-off's header shows the whole brief: a short one on its line, a longer one in a quote, past a message's room as a file too", async () => {
+    const tok = T().tokens.mint(scopeOf(C, 501))
+    const b = calls.length
+    expect((await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', brief: 'Publish the post.' })).status).toBe(201)
+    const short = calls.slice(b).find(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('⬅️ From'))!
+    expect(String(short.payload.text)).toMatch(/^⬅️ From <b>[^<]+<\/b> · Ada: Publish the post\.$/)
+    const long = `Step one.\n${'x'.repeat(4000)}\nThe end.`
+    const b2 = calls.length
+    expect((await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', brief: long })).status).toBe(201)
+    const cs = calls.slice(b2)
+    const header = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('⬅️ From'))!
+    expect(String(header.payload.text)).toMatch(/^⬅️ From <b>[^<]+<\/b> · Ada:\n<blockquote expandable>Step one\.\nx+…<\/blockquote>$/)
+    expect(cs.find(c => c.method === 'sendDocument')!.payload).toMatchObject({ caption: 'The whole brief', message_thread_id: 502, reply_parameters: { message_id: expect.any(Number) } })
+    await waitFor(() => T().store.openHandoffs().length === 0, 15000)
+    T().tokens.revoke(tok)
+  }, 30000)
+
+  test('under /tasks: 🔀 Flows and 📊 Usage, each shown to whoever taps it', async () => {
+    const t = make({ name: 'Usage probe', prompt: 'P', cron: '7 4 * * *' }, scopeOf(C, 504))
+    T().store.insertRun({ id: `${t.id}@u1`, task: t.id, trigger: 'schedule', state: 'succeeded', startedAt: '2026-10-15T04:07:00.000Z', usage: { model: 'sonnet', inputTokens: 12000, outputTokens: 3000, costUsd: 0.12 } })
+    T().store.insertRun({ id: `${t.id}@u2`, task: t.id, trigger: 'schedule', state: 'succeeded', startedAt: '2026-10-16T04:07:00.000Z', usage: { model: 'sonnet', inputTokens: 8000, outputTokens: 2000, costUsd: 0.08 } })
+    // Past the week: not counted.
+    T().store.insertRun({ id: `${t.id}@old`, task: t.id, trigger: 'schedule', state: 'succeeded', startedAt: '2026-10-01T04:07:00.000Z', usage: { costUsd: 9 } })
+    const cs = await say('/tasks', 504)
+    const list = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('Tasks in this topic'))!
+    expect(list.payload.reply_markup.inline_keyboard.at(-1)).toEqual([{ text: '🔀 Flows', callback_data: 'tk:flows:504' }, { text: '📊 Usage', callback_data: 'tk:usage:504' }])
+    const u = await press('tk:usage:504', C, 504)
+    const view = u.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('📊 Usage in this topic, the last 7 days'))!
+    expect(view.payload.ephemeral_message_parameters).toMatchObject({ receiver_user_id: 1 })
+    expect(String(view.payload.text)).toContain('⏰ <b>Usage probe</b> · 2 runs · 25k tokens · ~$0.20')
+    expect(String(view.payload.text)).toContain('<b>In all</b>: 2 runs · 25k tokens · ~$0.20')
+    const f = await press('tk:flows:504', C, 504)
+    expect(String(f.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('🔀 Flows in this topic, the last 7 days'))!.payload.text)).toContain('Nothing yet')
+    // A topic with no tasks has them too; the 🗂 Tasks topic's board, for the whole group.
+    const e = await say('/tasks', 509)
+    expect(e.find(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('No tasks in this topic yet'))!.payload.reply_markup.inline_keyboard[0].map((x: any) => x.callback_data)).toEqual(['tk:flows:509', 'tk:usage:509'])
+  })
+
   test('approve is only for a run that is the permission host', async () => {
     const tok = T().tokens.mint({ ...scopeOf(C, 501), runKind: 'scheduled', taskId: 'x', runId: 'x@1' })
     const r = await callApi(T().socket, tok, 'POST', '/v1/approve', { tool_name: 'Bash', input: { command: 'ls' } })
@@ -5333,9 +5371,9 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     const cs = await press(`tk:card:${t.id}`, C, 501)
     const card = String(cs.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('Morning draft'))!.payload.text)
     expect(card).toMatch(/🔀 Its last run → <a href="[^"]+">➡️ topic 502 ✅<\/a>$/)
-    // /tasks flows in the 🗂 Tasks topic: the group's.
+    // 🔀 Flows, under /tasks in the 🗂 Tasks topic: the group's.
     const hub = Number(T().store.getMeta(`activity:${C}`))
-    const fl = await say('/tasks flows', hub)
+    const fl = await press('tk:flows:all', C, hub)
     const view = String(fl.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('🔀 Flows in this group, the last 7 days'))!.payload.text)
     expect(view).toMatch(/<b>Morning draft<\/b> · [^<]+ ✅(<\/a>)? → <a href="[^"]+">➡️ topic 502 ✅<\/a>/)
     // A hand-off waited for: its result comes back to the run that asked.

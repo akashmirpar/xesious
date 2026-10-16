@@ -1,7 +1,7 @@
 import { test, expect, describe } from 'bun:test'
 import {
   cronText, scheduleText, durationText, frequencyText, cardHtml, listLine, runLine, markOf, usageText,
-  tgTime, esc, elapsedText, historyHtml, digestMarkdown, watchedText, stepLine, stepsStrip,
+  tgTime, esc, elapsedText, historyHtml, digestMarkdown, watchedText, stepLine, stepsStrip, usageListHtml,
 } from './render'
 import type { Run, Task } from './model'
 
@@ -215,4 +215,18 @@ test('a plan on its card, and how its run went', () => {
 test('how a task links to the rest, in a list line', () => {
   const t = task({ name: 'Translate', trigger: { kind: 'after', task: 'r1', name: 'Report', on: 'success' }, nextDue: undefined, then: { thread: 9, topicName: 'Posting' }, parent: 'p1', parentName: 'Research' })
   expect(listLine(t, [])).toBe('· ↪️ <b>Translate</b> — after “Report” works · then → Posting · made by Research')
+})
+
+test('what the tasks used: the most first, each with its runs, tokens and estimate; then the total', () => {
+  const html = usageListHtml('<b>Usage</b>', [
+    { icon: '⏰', name: 'Small', runs: 3, usage: { inputTokens: 900, outputTokens: 50, costUsd: 0.004 } },
+    { icon: '🪜', name: 'Big <one>', runs: 1, usage: { inputTokens: 1_500_000, outputTokens: 20_000, costUsd: 2.5 }, note: 'deleted' },
+  ])
+  expect(html.split('\n').slice(0, 6)).toEqual([
+    '<b>Usage</b>', '',
+    '🪜 <b>Big &lt;one&gt;</b> <i>(deleted)</i> · 1 run · 1.5M tokens · ~$2.50',
+    '⏰ <b>Small</b> · 3 runs · 950 tokens · ~$0.004',
+    '', '<b>In all</b>: 4 runs · 1.5M tokens · ~$2.50',
+  ])
+  expect(usageListHtml('<b>Usage</b>', [])).toBe('<b>Usage</b>\n\nNothing here used Claude in that time.')
 })

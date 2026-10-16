@@ -241,6 +241,7 @@ export interface Handoff {
   deadline?: string
   overdue?: boolean          // failed for want of an answer; a late one still settles it
   plain?: boolean            // to a bot that isn't xesious: the brief as a message, its reply the answer
+  usage?: Usage              // what its run here cost
   result?: string
   resultLink?: string
   createdAt: string
@@ -332,5 +333,17 @@ export function eventLimits(t: Pick<Task, 'action' | 'limits'>): EventLimits {
 
 export const isWatch = (t: Pick<Task, 'trigger'>): t is Pick<Task, 'trigger'> & { trigger: Extract<Trigger, { kind: 'watch' }> } => t.trigger.kind === 'watch'
 export const isStreaming = (t: Pick<Task, 'trigger'>) => t.trigger.kind === 'watch' && !t.trigger.everyMs
+// Usage, added up: several runs', or the steps of one.
+export function sumUsage(list: (Usage | undefined)[]): Usage | undefined {
+  const us = list.filter((u): u is Usage => !!u)
+  if (!us.length) return undefined
+  const add = (k: Exclude<keyof Usage, 'model'>) => us.some(u => u[k] !== undefined) ? us.reduce((n, u) => n + (u[k] ?? 0), 0) : undefined
+  return {
+    model: us.find(u => u.model)?.model, inputTokens: add('inputTokens'), outputTokens: add('outputTokens'),
+    cacheReadTokens: add('cacheReadTokens'), cacheWriteTokens: add('cacheWriteTokens'),
+    costUsd: add('costUsd'), turns: add('turns'), durationMs: add('durationMs'),
+  }
+}
+
 // No slots of its own: a streaming watcher, or a task that runs after another.
 export const hasNoSlots = (t: Pick<Task, 'trigger'>) => isStreaming(t) || t.trigger.kind === 'after' || t.trigger.kind === 'webhook'

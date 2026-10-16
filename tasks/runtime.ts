@@ -24,7 +24,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
-import { LIMITS, eventLimits, isStreaming, isWatch, type Run, type RunMark, type Step, type StepResult, type Task, type Usage, type Wait, type WatchEvent } from './model'
+import { LIMITS, eventLimits, isStreaming, isWatch, sumUsage, type Run, type RunMark, type Step, type StepResult, type Task, type Usage, type Wait, type WatchEvent } from './model'
 import type { TaskStore } from './store'
 import { manualRunId, nextAfter, resolveDue, slotRunId } from './schedule'
 import { digestMarkdown, elapsedText, markOf, stepsStrip, whenText, type Activity } from './render'
@@ -543,13 +543,7 @@ export class TaskRuntime {
     if (!u && !denials?.length) return
     const run = this.store.getRun(runId)
     if (!run) return
-    const add = (a?: number, b?: number) => a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0)
-    const c = run.usage ?? {}
-    const usage: Usage | undefined = u ? {
-      model: u.model ?? c.model, inputTokens: add(c.inputTokens, u.inputTokens), outputTokens: add(c.outputTokens, u.outputTokens),
-      cacheReadTokens: add(c.cacheReadTokens, u.cacheReadTokens), cacheWriteTokens: add(c.cacheWriteTokens, u.cacheWriteTokens),
-      costUsd: add(c.costUsd, u.costUsd), turns: add(c.turns, u.turns), durationMs: add(c.durationMs, u.durationMs),
-    } : undefined
+    const usage = u ? sumUsage([run.usage, u]) : undefined
     this.store.updateRun(runId, { ...(usage ? { usage } : {}), ...(denials?.length ? { denials: [...(run.denials ?? []), ...denials] } : {}) })
   }
 

@@ -201,6 +201,11 @@ export class TaskStore {
   }
 
   // Newest first. Runs that never started (skipped) sort by their slot.
+  // A task's runs that started since a time, for what they used.
+  runsSince(task: string, since: string): Run[] {
+    return (this.db.query('SELECT * FROM runs WHERE task = ? AND started_at >= ?').all(task, since) as any[]).map(runOf)
+  }
+
   runsFor(task: string, limit = 20): Run[] {
     const rows = this.db.query('SELECT * FROM runs WHERE task = ?').all(task) as any[]
     return rows.map(runOf)

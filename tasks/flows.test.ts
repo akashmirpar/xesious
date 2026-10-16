@@ -52,7 +52,7 @@ describe('a flow', () => {
     expect(html).toContain('<a href="https://t.me/c/777/6/50">➡️ Posting ✅</a>')
     expect(html).toContain('<a href="https://t.me/c/777/5/61">🌱 <b>Watch replies</b></a>')
     // On the card: the first path, and how many more.
-    expect(text(flowLine(root)!)).toBe('🔀 Its last run → ➡️ Posting ✅ → ➡️ @statsbot in Stats ⏳ (+2 more: /tasks flows)')
+    expect(text(flowLine(root)!)).toBe('🔀 Its last run → ➡️ Posting ✅ → ➡️ @statsbot in Stats ⏳ (+2 more: 🔀 Flows, under /tasks)')
     expect(flowLine(runNode(run({ id: 'vid001@0' }), src))).toBeUndefined()
   })
 
