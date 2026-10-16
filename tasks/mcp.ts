@@ -162,6 +162,14 @@ const INTERACTIVE_TOOLS = [
   },
 ]
 
+// Claude Code's own questions, plans and permission prompts, handed to the bot to
+// ask the person in Telegram (--permission-prompt-tool mcp__xesious__approve).
+const APPROVE_TOOL = {
+  name: 'approve',
+  description: "The bot's own: how Claude Code's questions, plans and permission prompts reach the person in the chat. Don't call it yourself.",
+  inputSchema: { type: 'object', properties: { tool_name: { type: 'string' }, input: { type: 'object' }, tool_use_id: { type: 'string' } }, required: ['tool_name', 'input'] },
+}
+
 const SCHEDULED_TOOLS = [
   {
     name: 'report',
@@ -202,7 +210,7 @@ const SCHEDULED_TOOLS = [
   { name: 'task_done', description: "Finish this task for good: its work is complete and it shouldn't run again.", inputSchema: { type: 'object', properties: {} } },
 ]
 
-export const toolsFor = (kind: 'interactive' | 'scheduled') => (kind === 'scheduled' ? SCHEDULED_TOOLS : INTERACTIVE_TOOLS)
+export const toolsFor = (kind: 'interactive' | 'scheduled') => [...(kind === 'scheduled' ? SCHEDULED_TOOLS : INTERACTIVE_TOOLS), APPROVE_TOOL]
 
 const enc = encodeURIComponent
 
@@ -224,6 +232,7 @@ export function routeOf(name: string, a: any, kind: 'interactive' | 'scheduled')
     case 'report': return { method: 'POST', path: '/v1/report', body: a }
     case 'notify': return { method: 'POST', path: '/v1/notify', body: a }
     case 'ask': return { method: 'POST', path: '/v1/ask', body: a }
+    case 'approve': return { method: 'POST', path: '/v1/approve', body: a }
     case 'topic_list': return { method: 'GET', path: '/v1/topics' }
     case 'topic_create': return { method: 'POST', path: '/v1/topics', body: a }
     case 'topic_rename': return { method: 'PATCH', path: `/v1/topics/${enc(String(a?.topic ?? 'this'))}`, body: { name: a?.name } }
@@ -236,6 +245,14 @@ async function call(name: string, args: any): Promise<{ text: string; isError: b
   if (!toolsFor(KIND).some(t => t.name === name)) throw new Error(`unknown tool ${name}`)
   if (!SOCK || !TOKEN) throw new Error('the tasks server was started without the bridge socket or a token')
   const r = routeOf(name, args ?? {}, KIND)
+  // The permission host's answer is the decision itself, as Claude Code reads it; one
+  // the bot couldn't get is a refusal, never an error the run stops on.
+  if (name === 'approve') {
+    const res = await callApi(SOCK, TOKEN, r.method, r.path, r.body).catch(e => ({ status: 500, body: { error: String(e) } }))
+    const decision = res.status < 400 && typeof res.body?.decision === 'string' ? res.body.decision
+      : JSON.stringify({ behavior: 'deny', message: `The bot couldn't ask the person (${res.body?.error ?? res.status}).` })
+    return { text: decision, isError: false }
+  }
   const res = await callApi(SOCK, TOKEN, r.method, r.path, r.body)
   if (res.status >= 400) return { text: `Error: ${res.body?.error ?? `HTTP ${res.status}`}`, isError: true }
   const { message, ...rest } = res.body ?? {}

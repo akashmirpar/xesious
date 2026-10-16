@@ -1254,6 +1254,8 @@ type RunOpts = {
   task?: { taskId: string; runId: string }
   // false: none of the bot's tools (tasks, topics) for this run.
   tasksTools?: boolean
+  // A task's run that shows its work (says live): it gets the permission host too.
+  host?: boolean
   // More CLI arguments, for the caller's own needs.
   extraArgs?: string[]
 }
@@ -1351,6 +1353,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose',
     ...permissionArgs(mode, [...(history?.tools ?? []), ...(own?.tools ?? [])]),
     ...(Object.keys(servers).length ? ['--mcp-config', JSON.stringify({ mcpServers: servers })] : []),
+    ...(own?.host ? ['--permission-prompt-tool', 'mcp__xesious__approve'] : []),
     ...taskGuardArgs(), ...(ro.extraArgs ?? [])]
   const profile = profileFor(cwd, key)
   if (profile.trim()) args.push('--append-system-prompt', profile)
@@ -3028,7 +3031,7 @@ function historyMcp(key: string): { servers: Record<string, unknown>; tools: str
 // for a private continuation or a private answer (private talk doesn't drive the
 // group), nor for runs that pass tasksTools: false (helpers, Auto turns, passthrough).
 // A task's own run gets the scheduled set, scoped to that task.
-function tasksMcpFor(ctx: Context, key: string, threadId: number | undefined, ro: RunOpts, jobId?: string): { servers: Record<string, unknown>; tools: string[]; revoke: () => void } | undefined {
+function tasksMcpFor(ctx: Context, key: string, threadId: number | undefined, ro: RunOpts, jobId?: string): { servers: Record<string, unknown>; tools: string[]; revoke: () => void; host: boolean } | undefined {
   if (!TASKS || !taskApi || ro.tasksTools === false) return undefined
   if (privateLinks[key] || askSource.has(key)) return undefined
   const person = ctx.from
@@ -3055,6 +3058,8 @@ function tasksMcpFor(ctx: Context, key: string, threadId: number | undefined, ro
     servers: { xesious: { command: process.execPath, args: [join(HERE, 'tasks', 'mcp.ts')], env } },
     tools: ['mcp__xesious'],
     revoke: () => apiTokens.revoke(token),
+    // Someone is there to answer: a person's turn, or a task that shows its work.
+    host: !ro.task || ro.host === true,
   }
 }
 
@@ -6575,6 +6580,13 @@ bot.on('message', async ctx => {
 
   if (!isAllowed(ctx)) { if (cmd) await send(ctx, threadId, `Not authorized. Send /whoami to get the id to allowlist.`); return }
 
+  // A reply to one of Claude's questions in a turn answers it, from whoever may.
+  const hostQ = msg.reply_to_message && text.trim() && !cmd ? hostQuestionByMessage(chatId, msg.reply_to_message.message_id) : undefined
+  if (hostQ && (String(ctx.from.id) === hostQ.w.person || ALLOWED_USERS.has(String(ctx.from.id)))) {
+    answerHostQuestion(hostQ.w, hostQ.qi, text.trim().slice(0, 2000))
+    await ctx.api.setMessageReaction(chatId, msg.message_id, [{ type: 'emoji', emoji: '👍' }]).catch(() => {})
+    return
+  }
   // A reply to a task's question is its answer, not a turn.
   const question = TASKS && taskStore && msg.reply_to_message && text.trim() && !cmd ? taskStore.waitByMessage(String(chatId), msg.reply_to_message.message_id) : undefined
   if (question) {
@@ -7460,6 +7472,11 @@ bot.on('callback_query:data', async ctx => {
     return
   }
   if (data.startsWith('pva:')) { await continueAskInDm(ctx, data.slice(4)); return }
+  if (data.startsWith('ap:')) {
+    console.log(`[cb] ${data} chat=${ctx.chat?.id} from=${ctx.from?.id}`)
+    await handleHostCallback(ctx, data)
+    return
+  }
   if (data.startsWith('tk:')) {
     console.log(`[cb] ${data} chat=${ctx.chat?.id} from=${ctx.from?.id}`)
     await handleTaskCallback(ctx, data)
@@ -7968,7 +7985,7 @@ async function runTaskClaude(t: Task, run: Run): Promise<ClaudeOutcome> {
   const wait = run.trigger === 'answer' && run.waitId ? taskStore?.getWait(run.waitId) : undefined
   const resumeId = wait?.sessionId ?? (t.action.session === 'own' ? t.sessionId : undefined)
   const res = await runStreaming(ctx, t.thread, key, wait ? answerFrame(t, wait) : taskFrame(t, run), cwd, resumeId, modeFor(key), modelFor(key), {
-    effort: effortFor(key), silent: t.says !== 'live', jobKey: `${key}#task-${t.id}`, task: { taskId: t.id, runId: run.id },
+    effort: effortFor(key), silent: t.says !== 'live', host: t.says === 'live', jobKey: `${key}#task-${t.id}`, task: { taskId: t.id, runId: run.id },
     // A changed topic instruction reaches a task that keeps its own session.
     ...(t.action.session === 'own' ? { extraArgs: ['--system-prompt-snapshot', 'off'] } : {}),
   })
@@ -8127,6 +8144,205 @@ function applyPendingCwd(ctx: Context, threadId: number | undefined, key: string
   void send(ctx, threadId, `📁 This topic now works in ${p}, with a fresh conversation.`, true)
 }
 
+// ---------------------------------------------------------------------------
+// Claude Code's own questions, plans and permission prompts, asked in Telegram. A live
+// run (a person's turn, or a task that shows its work) gets the bot as its permission
+// host (--permission-prompt-tool mcp__xesious__approve): the CLI hands it each
+// AskUserQuestion, ExitPlanMode and prompt for approval, and waits for the decision.
+// Only the person whose turn it is, or one of the bot's own users, answers; nobody
+// answering in time is a no.
+// ---------------------------------------------------------------------------
+
+type HostDecision = { behavior: 'allow'; updatedInput: any } | { behavior: 'deny'; message: string }
+interface HostQuestion { q: any; msgId?: number; picked: Set<number>; answer?: string }
+interface HostWait {
+  id: string
+  chat: number
+  thread?: number
+  person: string
+  personName?: string
+  kind: 'questions' | 'permission'
+  input: any
+  questions?: HostQuestion[]
+  msgIds: number[]
+  text?: string                   // a permission prompt's own text, to add the answer to
+  resolve: (d: HostDecision) => void
+}
+const hostWaits = new Map<string, HostWait>()
+// Plans shown with Go ahead: the tap starts a turn, for a day.
+const hostPlans = new Map<string, { chat: number; thread?: number; person: string; personName?: string; at: number }>()
+const hostDeny = (message: string): HostDecision => ({ behavior: 'deny', message })
+
+async function hostDecide(s: Scope, tool: string, input: any): Promise<HostDecision> {
+  if (!s.chat || !s.person) return hostDeny('There is nobody to ask.')
+  const release = holdJob(s.jobId)
+  try {
+    if (tool === 'AskUserQuestion') return await hostQuestions(s, input)
+    if (tool === 'ExitPlanMode') return await hostPlan(s, input)
+    return await hostPermission(s, tool, input)
+  } catch (e) {
+    console.error(`[host] ${tool}: ${e}`)
+    return hostDeny(`The bot couldn't ask the person (${e}).`)
+  } finally { release() }
+}
+
+function hostWait(w: Omit<HostWait, 'resolve'>, onTimeout: HostDecision): Promise<HostDecision> {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      const cur = hostWaits.get(w.id)
+      if (!cur) return
+      hostWaits.delete(w.id)
+      for (const m of cur.msgIds) bot.api.editMessageReplyMarkup(cur.chat, m, { reply_markup: { inline_keyboard: [] } }).catch(() => {})
+      if (cur.kind === 'permission' && cur.text) bot.api.editMessageText(cur.chat, cur.msgIds[0], `${cur.text}\n⌛ No answer in time, so not allowed.`, { parse_mode: 'HTML' }).catch(() => {})
+      resolve(onTimeout)
+    }, LIMITS.askWaitMaxMs)
+    hostWaits.set(w.id, { ...w, resolve: d => { clearTimeout(timer); resolve(d) } })
+  })
+}
+
+function hostQuestionHtml(hq: HostQuestion): string {
+  const q = hq.q
+  const head = q.header ? `<b>${escapeHtml(String(q.header))}</b> · ` : ''
+  const opts = (q.options ?? []).map((o: any) => `• <b>${escapeHtml(String(o.label))}</b>${o.description ? ` — ${escapeHtml(String(o.description))}` : ''}`)
+  const how = hq.answer !== undefined ? `✅ ${escapeHtml(hq.answer)}` : `<i>${q.multiSelect ? 'Tap the ones that fit, then Done' : 'Tap one'}, or reply to this message in your own words.</i>`
+  return [`❓ ${head}${escapeHtml(String(q.question ?? ''))}`, ...opts, how].join('\n')
+}
+function hostQuestionKb(id: string, qi: number, hq: HostQuestion): { inline_keyboard: any[][] } {
+  const opts: any[] = hq.q.options ?? []
+  const rows: any[][] = []
+  for (let i = 0; i < opts.length; i += 2) {
+    rows.push(opts.slice(i, i + 2).map((o, j) => ({ text: `${hq.q.multiSelect ? (hq.picked.has(i + j) ? '☑️ ' : '☐ ') : ''}${String(o.label).slice(0, 60)}`, callback_data: `ap:${id}:${qi}:${i + j}` })))
+  }
+  if (hq.q.multiSelect) rows.push([{ text: '✔️ Done', callback_data: `ap:${id}:${qi}:done` }])
+  return { inline_keyboard: rows }
+}
+
+async function hostQuestions(s: Scope, input: any): Promise<HostDecision> {
+  const qs: any[] = Array.isArray(input?.questions) ? input.questions.slice(0, 4) : []
+  if (!qs.length) return hostDeny('There were no questions to ask.')
+  const id = newJobId().slice(0, 6)
+  const chat = Number(s.chat)
+  const w: Omit<HostWait, 'resolve'> = { id, chat, thread: s.thread, person: s.person!, personName: s.personName, kind: 'questions', input, msgIds: [], questions: qs.map(q => ({ q, picked: new Set<number>() })) }
+  for (let qi = 0; qi < qs.length; qi++) {
+    const hq = w.questions![qi]
+    const m = await bot.api.sendMessage(chat, hostQuestionHtml(hq), { ...destOpts({ threadId: s.thread }), parse_mode: 'HTML', reply_markup: hostQuestionKb(id, qi, hq) })
+    hq.msgId = m.message_id
+    w.msgIds.push(m.message_id)
+  }
+  noteBotMessage(keyFor(chat, s.thread))
+  return hostWait(w, hostDeny('Nobody answered in time. If you still need to know, ask in your answer instead.'))
+}
+
+// One question answered: its message shows the answer; once all are, the run has them.
+function answerHostQuestion(w: HostWait, qi: number, answer: string): void {
+  const hq = w.questions![qi]
+  if (hq.answer !== undefined) return
+  hq.answer = answer
+  if (hq.msgId) bot.api.editMessageText(w.chat, hq.msgId, hostQuestionHtml(hq), { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } }).catch(() => {})
+  if (!w.questions!.every(x => x.answer !== undefined)) return
+  const answers: Record<string, string> = {}
+  for (const x of w.questions!) answers[String(x.q.question)] = x.answer!
+  hostWaits.delete(w.id)
+  w.resolve({ behavior: 'allow', updatedInput: { ...w.input, answers } })
+}
+
+// What a prompt asks to do, in words.
+function hostPermissionText(tool: string, input: any): string {
+  const clip = (v: string, n = 400) => (v.length > n ? `${v.slice(0, n - 1)}…` : v)
+  if (tool === 'Bash' && input?.command) return `run:\n<code>${escapeHtml(clip(String(input.command)))}</code>`
+  const path = input?.file_path ?? input?.notebook_path
+  if (/^(Write|Edit|MultiEdit|NotebookEdit)$/.test(tool) && path) return `change <code>${escapeHtml(String(path))}</code>`
+  if (tool === 'WebFetch' && input?.url) return `open ${escapeHtml(String(input.url))}`
+  const rest = input && Object.keys(input).length ? `:\n<code>${escapeHtml(clip(JSON.stringify(input)))}</code>` : ''
+  return `use <b>${escapeHtml(tool)}</b>${rest}`
+}
+
+async function hostPermission(s: Scope, tool: string, input: any): Promise<HostDecision> {
+  const id = newJobId().slice(0, 6)
+  const chat = Number(s.chat)
+  const text = `🔐 Claude asks to ${hostPermissionText(tool, input)}\n<i>${escapeHtml(s.personName ?? 'The person who asked')} can allow it.</i>`
+  const m = await bot.api.sendMessage(chat, text, { ...destOpts({ threadId: s.thread }), parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '✅ Allow', callback_data: `ap:${id}:allow` }, { text: '🚫 Deny', callback_data: `ap:${id}:deny` }]] } })
+  noteBotMessage(keyFor(chat, s.thread))
+  return hostWait({ id, chat, thread: s.thread, person: s.person!, personName: s.personName, kind: 'permission', input, msgIds: [m.message_id], text },
+    hostDeny('Nobody answered in time, so it was not allowed.'))
+}
+
+// A plan: shown with Go ahead, and the planning turn ends there. The tap starts a turn
+// that carries it out in the topic's own mode, so planning stays read-only.
+async function hostPlan(s: Scope, input: any): Promise<HostDecision> {
+  const chat = Number(s.chat)
+  const plan = String(input?.plan ?? '').trim()
+  const id = newJobId().slice(0, 6)
+  for (const [k, p] of hostPlans) if (Date.now() - p.at > 24 * 3600_000) hostPlans.delete(k)
+  hostPlans.set(id, { chat, thread: s.thread, person: s.person!, personName: s.personName, at: Date.now() })
+  const ctx = taskContext({ chat: s.chat!, thread: s.thread, owner: s.person!, ownerName: s.personName } as Task)
+  await deliver(ctx, s.thread, `**📋 The plan**\n\n${plan || '(it came without a plan)'}`, undefined, '', { inline_keyboard: [[{ text: '✅ Go ahead', callback_data: `ap:${id}:go` }]] }, false)
+  return hostDeny('The plan is shown to the person, with a button to start it. End your turn now with one short line; do not carry it out.')
+}
+
+// A tap on a question's option, a prompt's Allow or Deny, or a plan's Go ahead.
+async function handleHostCallback(ctx: Context, data: string): Promise<void> {
+  const [, id, a, b] = data.split(':')
+  const answer = (text = '', alert = false) => ctx.answerCallbackQuery(text ? { text, show_alert: alert } : {}).catch(() => {})
+  const who = String(ctx.from?.id)
+  if (a === 'go') {
+    const p = hostPlans.get(id)
+    if (!p) { await answer('That plan is gone; ask again.', true); return }
+    if (who !== p.person && !ALLOWED_USERS.has(who)) { await answer(`Only ${p.personName ?? 'the person who asked'} can start it.`, true); return }
+    hostPlans.delete(id)
+    const msg = ctx.callbackQuery?.message
+    if (msg) await ctx.api.editMessageReplyMarkup(msg.chat.id, msg.message_id, { reply_markup: { inline_keyboard: [] } }).catch(() => {})
+    await answer('Starting it.')
+    const key = keyFor(p.chat, p.thread)
+    void enqueue(key, () => handlePrompt(ctx, p.thread, key, 'Go ahead with the plan you proposed above.', undefined, msg?.message_id))
+      .catch(e => console.error(`[host] go ahead in ${key}: ${e}`))
+    return
+  }
+  const w = hostWaits.get(id)
+  if (!w) { await answer('That was answered already, or nobody answered in time.', true); return }
+  if (who !== w.person && !ALLOWED_USERS.has(who)) { await answer(`This is for ${w.personName ?? 'the person who asked'} to answer.`, true); return }
+  const by = userName(ctx.from!)
+  if (w.kind === 'permission') {
+    const allow = a === 'allow'
+    hostWaits.delete(w.id)
+    await ctx.api.editMessageText(w.chat, w.msgIds[0], `${w.text}\n${allow ? `✅ Allowed by ${escapeHtml(by)}` : `🚫 Not allowed, by ${escapeHtml(by)}`}`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } }).catch(() => {})
+    w.resolve(allow ? { behavior: 'allow', updatedInput: w.input } : hostDeny(`${by} said no.`))
+    await answer(allow ? 'Allowed.' : 'Not allowed.')
+    return
+  }
+  const qi = Number(a)
+  const hq = w.questions?.[qi]
+  if (!hq || hq.answer !== undefined) { await answer('That one is answered.'); return }
+  const opts: any[] = hq.q.options ?? []
+  if (b === 'done') {
+    if (!hq.picked.size) { await answer('Pick at least one first.', true); return }
+    answerHostQuestion(w, qi, [...hq.picked].sort((x, y) => x - y).map(i => String(opts[i].label)).join(', '))
+    await answer('Answered.')
+    return
+  }
+  const oi = Number(b)
+  if (!opts[oi]) { await answer(); return }
+  if (hq.q.multiSelect) {
+    if (hq.picked.has(oi)) hq.picked.delete(oi); else hq.picked.add(oi)
+    if (hq.msgId) await ctx.api.editMessageReplyMarkup(w.chat, hq.msgId, { reply_markup: hostQuestionKb(w.id, qi, hq) }).catch(() => {})
+    await answer()
+    return
+  }
+  answerHostQuestion(w, qi, String(opts[oi].label))
+  await answer(`Answered: ${opts[oi].label}`)
+}
+
+// A reply to one of Claude's questions, in one's own words.
+function hostQuestionByMessage(chat: number, msgId: number): { w: HostWait; qi: number } | undefined {
+  for (const w of hostWaits.values()) {
+    if (w.chat !== chat || w.kind !== 'questions') continue
+    const qi = w.questions!.findIndex(q => q.msgId === msgId && q.answer === undefined)
+    if (qi >= 0) return { w, qi }
+  }
+  return undefined
+}
+
 const taskBridge: BridgeHandlers = {
   // The chat's topics the bot knows, with their folders and settings.
   listTopics(s) {
@@ -8233,6 +8449,11 @@ const taskBridge: BridgeHandlers = {
       if (r.parked) return reply(200, { message: 'Nobody has answered yet. Stop here: call report with outcome blocked, saying what you are waiting for. When someone answers, the task carries on from where you stopped, with the answer.', answer: null })
       return reply(200, { message: `${r.by} answered: ${r.answer}`, answer: r.answer, by: r.by })
     } finally { release() }
+  },
+  // Claude Code's question, plan or permission prompt, for the person to decide.
+  async approve(s, body) {
+    const d = await hostDecide(s, String(body?.tool_name ?? ''), body?.input ?? {})
+    return reply(200, { decision: JSON.stringify(d) })
   },
   // A script on the host posting into a chat this bot serves: `xesious send`.
   async send(s, body) {

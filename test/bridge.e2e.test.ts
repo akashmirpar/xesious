@@ -4689,6 +4689,8 @@ describe('tasks: the bridge runs them (phase 1)', () => {
     // Claude Code's own schedulers are out of reach: they would die with the run, or
     // run in Anthropic's cloud and report to claude.ai.
     expect(args[args.indexOf('--disallowedTools') + 1]).toBe('RemoteTrigger,ScheduleWakeup')
+    // Nobody is there to answer questions or prompts for a run that doesn't show its work.
+    expect(args).not.toContain('--permission-prompt-tool')
     expect(JSON.parse(readFileSync(LAST_ENV, 'utf8')).disableCron).toBe('1')
     const p = readFileSync(LAST_PROMPT, 'utf8')
     expect(p).toContain('This is a run of the task "Nightly news"')
@@ -4853,6 +4855,14 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     return calls.slice(before)
   }
   const answers = (cs: Call[]) => cs.filter(c => c.method === 'answerCallbackQuery').map(c => String(c.payload.text ?? ''))
+  // A message whose turn will wait on someone: sent, and its turn awaited later.
+  function sayLater(text: string, thread?: number, who = ADA): Promise<unknown> {
+    const sent = bridge.bot.handleUpdate({ update_id: updateId++, message: {
+      message_id: mid++, date: Math.floor(Date.now() / 1000), text, ...(thread ? { message_thread_id: thread, is_topic_message: true } : {}),
+      chat: { id: C, type: 'supergroup', title: 'G', is_forum: true }, from: who } })
+    return sent.then(() => bridge._drainQueue(`${C}:${thread ?? 'main'}`))
+  }
+  const lastMcp = () => JSON.parse(readFileSync(MCP_LOG, 'utf8').trim().split('\n').pop()!)
   async function waitFor(pred: () => boolean, ms = 8000): Promise<void> {
     const end = Date.now() + ms
     while (!pred()) { if (Date.now() > end) throw new Error('timed out'); await new Promise(r => setTimeout(r, 25)) }
@@ -5026,6 +5036,55 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     const args: string[] = JSON.parse(readFileSync(LAST_ARGS, 'utf8'))
     expect(args[args.indexOf('--append-system-prompt') + 1]).toContain("the group's 🗂 Tasks topic")
   })
+
+  test("Claude's question in a person's turn: its options as buttons, and the tap is its answer", async () => {
+    const before = calls.length
+    const turn = sayLater('MCPTASK approve {"tool_name":"AskUserQuestion","input":{"questions":[{"question":"Tea or coffee?","header":"Drink","options":[{"label":"Tea","description":"hot"},{"label":"Coffee","description":"strong"}],"multiSelect":false}]}}', 501)
+    await waitFor(() => calls.slice(before).some(c => c.method === 'sendMessage' && String(c.payload.text).includes('Tea or coffee?')))
+    const q = calls.slice(before).find(c => c.method === 'sendMessage' && String(c.payload.text).includes('Tea or coffee?'))!
+    expect(String(q.payload.text)).toContain('❓ <b>Drink</b> · Tea or coffee?\n• <b>Tea</b> — hot\n• <b>Coffee</b> — strong')
+    const coffee = q.payload.reply_markup.inline_keyboard[0][1]
+    expect(coffee.text).toBe('Coffee')
+    const cs = await press(coffee.callback_data, C, 501)
+    expect(answers(cs)).toContain('Answered: Coffee')
+    await turn
+    expect(lastMcp().tool).toBe('approve')
+    expect(JSON.parse(lastMcp().text)).toMatchObject({ behavior: 'allow', updatedInput: { answers: { 'Tea or coffee?': 'Coffee' } } })
+    const args: string[] = JSON.parse(readFileSync(LAST_ARGS, 'utf8'))
+    expect(args[args.indexOf('--permission-prompt-tool') + 1]).toBe('mcp__xesious__approve')
+  }, 20000)
+
+  test('a permission prompt in a turn: only the person who asked can allow it', async () => {
+    bridge._setTrustChatMembers(true)
+    try {
+      const before = calls.length
+      const turn = sayLater('MCPTASK approve {"tool_name":"Bash","input":{"command":"ls -la"}}', 501)
+      await waitFor(() => calls.slice(before).some(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('🔐 Claude asks to run')))
+      const m = calls.slice(before).find(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('🔐 Claude asks to run'))!
+      expect(String(m.payload.text)).toContain('<code>ls -la</code>')
+      const [allow] = m.payload.reply_markup.inline_keyboard[0]
+      let cs = await press(allow.callback_data, C, 501, BEN)
+      expect(answers(cs)[0]).toContain('This is for Ada to answer')
+      cs = await press(allow.callback_data, C, 501)
+      expect(answers(cs)).toContain('Allowed.')
+      await turn
+      expect(JSON.parse(lastMcp().text)).toEqual({ behavior: 'allow', updatedInput: { command: 'ls -la' } })
+      expect(calls.some(c => c.method === 'editMessageText' && String(c.payload.text).includes('✅ Allowed by Ada'))).toBe(true)
+    } finally { bridge._setTrustChatMembers(false) }
+  }, 20000)
+
+  test('a plan: shown with Go ahead, the planning turn ends; the tap starts a turn that carries it out', async () => {
+    const before = calls.length
+    await say('MCPTASK approve {"tool_name":"ExitPlanMode","input":{"plan":"1. Write the file\\n2. Check it"}}', 501)
+    expect(JSON.parse(lastMcp().text)).toMatchObject({ behavior: 'deny' })
+    expect(JSON.parse(lastMcp().text).message).toContain('do not carry it out')
+    const plan = calls.slice(before).find(c => textOf(c).includes('The plan') && textOf(c).includes('Write the file'))!
+    const go = plan.payload.reply_markup.inline_keyboard[0][0]
+    expect(go.text).toBe('✅ Go ahead')
+    await press(go.callback_data, C, 501)
+    await bridge._drainQueue(`${C}:501`)
+    expect(readFileSync(LAST_PROMPT, 'utf8')).toContain('Go ahead with the plan you proposed above.')
+  }, 20000)
 
   test('the activity topic can be turned off for a group', async () => {
     const G = -100999

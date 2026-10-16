@@ -92,7 +92,7 @@ In a group, the commands that only inform the person asking — `/status`, `/job
 | `/voice [on\|off\|parts on\|off]` | Voice mode: transcribe voice notes and speak answers back (eyes-free). Default from `TG_VOICE`. `parts` decides whether the progressive notes are sent or only the full file. |
 | `/interrupt [on\|off]` | Toggle interrupt mode: a new message cancels the running task and starts immediately (its reply comes as a new message) instead of queueing. Default from `TG_INTERRUPT`. |
 | `/mode [plan\|acceptEdits\|auto\|bypass]` | Show or set this topic's permission mode. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_PERMISSION_MODE`. |
-| `/plan <task>` | One read-only turn: Claude researches and proposes without editing. Doesn't change the topic's mode, so "go ahead" carries the plan out. |
+| `/plan <task>` | One read-only turn: Claude researches and proposes without editing. Doesn't change the topic's mode, so "go ahead" carries the plan out; the plan comes with a ✅ Go ahead button that does just that. |
 | `/model [opus\|sonnet\|haiku\|fable]` | Show or set this topic's model — an alias, a full id, or `default` to clear. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_MODEL`. |
 | `/config` | This group's settings as a button menu: model, reasoning effort, voice, **topic mode**, and who may change settings. **More settings** holds the rest: instructions for Claude (the group's, plus any a topic adds), what topic mode presets (answers, records messages), how long recorded messages are kept, topics that differ from the group, default permission mode (never bypass), interrupt, voice parts, tool details and run records in the status, long-reply files, fan-out limits. In a group only you see the menu (an ephemeral message); each change is announced in the room with one line. Changes apply at once — no restart. See [Group settings](#group-settings). |
 | `/usage` `/cost` `/context` | Claude's own commands, forwarded to the CLI as-is. They report rather than prompt the model, so they're free and take no turn. Each answer carries a **🔄 Refresh** button that re-reads the numbers into the same message, so checking twice doesn't leave two. |
@@ -394,6 +394,11 @@ bun tasks/cli.ts tasks pause <task id>
 ```
 
 Each Claude run talks to it with a token of its own, scoped to its chat, topic and person, that dies with the run; so does a task's script, which can post in its topic with `bun "$XESIOUS_CLI" notify "…"`. `TG_TASKS=0` turns tasks off. Hand-offs between topics and bots, multi-step tasks and tasks that ask before they act are designed ([research/tasks/REPORT.md](research/tasks/REPORT.md)) but not built yet.
+
+### Questions and approvals
+
+- **A task's run can ask** when it can't go on without someone: a choice, a missing detail, a go-ahead. The question goes into its topic, naming whoever set the task up, with its options as buttons; a reply in your own words counts too. The run waits a few minutes for the answer. If none comes it stops and waits (❔ on its card), and the answer, whenever it comes, carries the task on in the session that asked. After a day it takes its default answer, if it had one, or lets the question go.
+- **In a turn, Claude's own questions** (a choice between options, one or several) show as buttons, or take a reply in your own words; **a plan** (in plan mode, or from `/plan`) comes with ✅ Go ahead, which starts the turn that carries it out in the topic's own mode; **a prompt for permission** shows what Claude asks to do, with Allow and Deny. Only the person whose turn it is, or one of the bot's own users, answers; ten minutes without an answer is a no. A task that shows its work live gets the same; one nobody watches doesn't, and what its permission mode blocked is listed in its history.
 
 ### Watchers
 
