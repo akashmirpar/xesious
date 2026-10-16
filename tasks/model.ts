@@ -98,6 +98,7 @@ export interface Run {
   outcome?: ReportOutcome
   notify?: boolean        // what the run asked for through report()
   summary?: string
+  reportText?: string     // what report() asked to post, when it gave more than a summary
   resultPath?: string
   postedMsg?: number
   sessionId?: string
