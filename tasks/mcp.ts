@@ -213,6 +213,7 @@ const HANDOFF_TOOL = {
     type: 'object',
     properties: {
       topic: { type: 'string', description: 'The topic it goes to: id or name, from topic_list.' },
+      bot: { type: 'string', description: "Optional: when that topic is another xesious bot's (\"@PostingBot\"), one this bot knows as a peer; the hand-off then goes to it as a message there, and its answer comes back." },
       brief: { type: 'string' },
       files: { type: 'array', items: { type: 'string' } },
     },

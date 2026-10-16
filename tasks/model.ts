@@ -227,7 +227,18 @@ export interface Handoff {
   byName?: string
   fromTask?: string          // a task's run that handed it off
   depth: number              // 1 from a person or a task; one more each time it is handed on
-  state: 'queued' | 'running' | 'done' | 'failed'
+  state: 'queued' | 'running' | 'sent' | 'done' | 'failed'
+  // Between xesious bots: the other bot, which way it goes, the message that carried it
+  // (sent: ours, which the other bot replies to; received: theirs, which we reply to),
+  // and when an answer is due.
+  peer?: string
+  direction?: 'out' | 'in'
+  peerMsg?: number
+  peerTag?: string
+  deadline?: string
+  overdue?: boolean          // failed for want of an answer; a late one still settles it
+  result?: string
+  resultLink?: string
   createdAt: string
   endedAt?: string
   srcMsg?: number            // the line in the source topic, edited when it ends
@@ -283,6 +294,8 @@ export const LIMITS = {
   handoffDepthMax: 3,
   handoffsPerHour: 30,               // per group
   handoffRunsAtOnce: 2,
+  peerHandoffsPerHour: 20,           // from one other bot
+  peerAnswerMs: 6 * 60 * 60_000,     // a hand-off to another bot not answered in this long is said to have failed
   // Child tasks, made by a task's own run:
   childrenPerParent: 3,
   childDepthMax: 2,

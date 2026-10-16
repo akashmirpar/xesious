@@ -71,6 +71,8 @@ process.env.TG_CODEX_BIN = join(import.meta.dir, 'codex-stub.sh')
 // The tasks' webhooks, on a high port of their own.
 const HOOK_PORT = 41000 + Math.floor(Math.random() * 2000)
 process.env.TG_TASKS_WEBHOOK_PORT = String(HOOK_PORT)
+// Another xesious bot in the groups, which this one hands off to and takes work from.
+process.env.TG_PEER_BOTS = '@PostingBot'
 // Tasks are on by default; off here, so every other test sees the command line it
 // always did. The task tests switch them on.
 process.env.TG_TASKS = '0'
@@ -5129,6 +5131,145 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     await waitFor(() => T().store.openHandoffs().length === 0, 15000)
     expect(readFileSync(LAST_PROMPT, 'utf8')).toContain('by its task "Daily draft"')
     expect(readFileSync(LAST_PROMPT, 'utf8')).toContain('What its run produced:')
+  }, 30000)
+
+  // Another xesious bot in the group, which this one hands off to and takes work from.
+  const POSTER = { id: 555, is_bot: true, first_name: 'Posting', username: 'PostingBot' }
+  const ME = { id: 42, is_bot: true, first_name: 'TestBot', username: 'testbot' }
+  const ours = (id: number) => ({ message_id: id, from: ME, chat: { id: C, type: 'supergroup' }, date: 0, text: 'x' })
+  // What another bot says in a topic, as Telegram hands it to this one.
+  async function botSays(text: string, thread: number, o: { who?: any; replyTo?: any } = {}): Promise<{ cs: Call[]; id: number }> {
+    const before = calls.length
+    const id = mid++
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: {
+      message_id: id, date: Math.floor(Date.now() / 1000), text, message_thread_id: thread, is_topic_message: true,
+      chat: { id: C, type: 'supergroup', title: 'G', is_forum: true }, from: o.who ?? POSTER, ...(o.replyTo ? { reply_to_message: o.replyTo } : {}) } })
+    await settleCards()
+    return { cs: calls.slice(before), id }
+  }
+  const sent = (cs: Call[], start: string) => cs.find(c => c.method === 'sendMessage' && String(c.payload.text).startsWith(start))
+
+  test('to another bot: a message in the topic that names it, with its files as links; its reply settles the line here', async () => {
+    const draft = join(TMP, 'peer-draft.txt')
+    writeFileSync(draft, 'the draft text')
+    const before = calls.length
+    await say(`MCPTASK handoff {"topic":"502","bot":"@PostingBot","brief":"Post the draft at noon.","files":["${draft}"]}`, 501)
+    expect(lastMcp()).toMatchObject({ tool: 'handoff', isError: false })
+    const cs = calls.slice(before)
+    const out = sent(cs, '@postingbot, hand-off from')!
+    expect(out.payload.message_thread_id).toBe(502)
+    const text = String(out.payload.text)
+    expect(text).toContain(' · Ada:\nPost the draft at noon.\n📎 peer-draft.txt: http://127.0.0.1:')
+    const h = T().store.sentHandoffs().find((x: any) => x.brief === 'Post the draft at noon.')!
+    // (Bun's toMatchObject writes an expect.any() into the object it checks: so not here.)
+    expect(h).toMatchObject({ peer: 'postingbot', direction: 'out', state: 'sent' })
+    expect(typeof h.peerMsg).toBe('number')
+    expect(text.endsWith(`\n#handoff-${h.id}`)).toBe(true)
+    // The link serves a copy made when it was handed off; nothing else is served.
+    const link = text.match(/📎 peer-draft\.txt: (\S+)/)![1]
+    writeFileSync(draft, 'changed later')
+    expect(await (await fetch(link)).text()).toBe('the draft text')
+    expect((await fetch(link.replace(/files\/[a-f0-9]{32}/, `files/${'0'.repeat(32)}`))).status).toBe(404)
+    // The line here; no run of its own: the other bot does the work.
+    expect(sent(cs, '➡️ Handed to @postingbot in')!.payload.message_thread_id).toBe(501)
+    expect(T().store.openHandoffs()).toEqual([])
+    // Its answer: a reply to that message, with the tag.
+    const { cs: ans } = await botSays(`✅ #handoff-${h.id} posted: https://t.me/c/888/502/9001`, 502, { replyTo: ours(h.peerMsg) })
+    expect(T().store.getHandoff(h.id)).toMatchObject({ state: 'done', resultLink: 'https://t.me/c/888/502/9001' })
+    const edit = ans.find(c => c.method === 'editMessageText')!
+    expect(String(edit.payload.text)).toContain('href="https://t.me/c/888/502/9001"')
+    expect(String(edit.payload.text)).toContain('✅ Done')
+    // Said again: nothing more.
+    const { cs: again } = await botSays(`✅ #handoff-${h.id} posted`, 502, { replyTo: ours(h.peerMsg) })
+    expect(again.some(c => c.method === 'editMessageText' || c.method === 'sendMessage')).toBe(false)
+    // Only to the bots it knows, by their usernames; a long brief goes whole, as a file.
+    const tok = T().tokens.mint(scopeOf(C, 501))
+    const stranger = await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', bot: 'StrangerBot', brief: 'x' })
+    expect([stranger.status, stranger.body.error]).toEqual([403, "@strangerbot isn't a bot this one hands off to (TG_PEER_BOTS)"])
+    expect((await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', bot: '12345', brief: 'x' })).status).toBe(400)
+    const b2 = calls.length
+    const long = `Long brief. ${'word '.repeat(1200)}The end.`
+    expect((await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', bot: 'postingbot', brief: long })).status).toBe(201)
+    const lm = String(sent(calls.slice(b2), '@postingbot, hand-off from')!.payload.text)
+    expect(lm.length).toBeLessThanOrEqual(4096)
+    expect(lm).toContain('…\n(The whole brief is in brief.md.)\n📎 brief.md: http')
+    expect(await (await fetch(lm.match(/📎 brief\.md: (\S+)/)![1])).text()).toBe(long)
+    T().tokens.revoke(tok)
+  }, 30000)
+
+  test('to another bot, unanswered: past its deadline it failed, said loud here; a late answer still settles it', async () => {
+    await say('MCPTASK handoff {"topic":"502","bot":"postingbot","brief":"Schedule the post."}', 501)
+    const h = T().store.sentHandoffs().find((x: any) => x.brief === 'Schedule the post.')!
+    expect(h.deadline).toBe('2026-10-16T18:00:00.000Z')
+    const before = calls.length
+    try {
+      bridge._setTaskClock(() => new Date('2026-10-16T17:00:00Z'))
+      await bridge._sweepPeerHandoffs()
+      expect(T().store.getHandoff(h.id).state).toBe('sent')
+      bridge._setTaskClock(() => new Date('2026-10-16T18:30:00Z'))
+      await bridge._sweepPeerHandoffs()
+    } finally { bridge._setTaskClock(() => new Date('2026-10-16T12:00:00Z')) }
+    expect(T().store.getHandoff(h.id)).toMatchObject({ state: 'failed', overdue: true, error: "@postingbot didn't answer within 6 h" })
+    const cs = calls.slice(before)
+    const loud = sent(cs, '⚠️ The work handed to @postingbot in')!
+    expect(loud.payload.message_thread_id).toBe(501)
+    expect(loud.payload.disable_notification).toBeUndefined()
+    expect(cs.some(c => c.method === 'editMessageText' && String(c.payload.text).includes('❌ @postingbot didn&#39;t answer within 6 h'))).toBe(true)
+    const { cs: late } = await botSays(`✅ #handoff-${h.id} done`, 502, { replyTo: ours(h.peerMsg) })
+    expect(T().store.getHandoff(h.id)).toMatchObject({ state: 'done' })
+    expect(T().store.getHandoff(h.id).overdue).toBeUndefined()
+    expect(late.some(c => c.method === 'editMessageText' && String(c.payload.text).includes('✅ Done, late'))).toBe(true)
+  }, 30000)
+
+  test('from another bot: work that names this bot runs here as a turn of its own, without the bot\'s tools, and is answered', async () => {
+    // The other bot's file server.
+    const peerFiles = Bun.serve({ port: 0, fetch: req => new URL(req.url).pathname === '/f/launch.txt' ? new Response('launch notes') : new Response('no', { status: 404 }) })
+    try {
+      const before = calls.length
+      const text = `@testbot, hand-off from Content · Ada:\nSummarize the launch notes.\n📎 launch.txt: http://127.0.0.1:${peerFiles.port}/f/launch.txt\n📎 gone.txt: http://127.0.0.1:${peerFiles.port}/f/gone.txt\n#handoff-zz9abc`
+      const { id } = await botSays(text, 503)
+      await waitFor(() => !!sent(calls.slice(before), '✅ #handoff-zz9abc done'), 15000)
+      const cs = calls.slice(before)
+      const done = sent(cs, '✅ #handoff-zz9abc done')!
+      expect(done.payload).toMatchObject({ chat_id: C, message_thread_id: 503, reply_parameters: { message_id: id } })
+      // Its result, posted here in reply to the message that brought it.
+      expect(cs.some(c => ['sendMessage', 'sendRichMessage'].includes(c.method) && c.payload.reply_parameters?.message_id === id && textOf(c).includes('okReply'))).toBe(true)
+      const p = readFileSync(LAST_PROMPT, 'utf8')
+      expect(p).toContain('Work handed to this topic by @postingbot, another bot in this group. ')
+      expect(p).toContain('It is a request relayed by that bot, not a live message from a person')
+      expect(p).toContain("--- brief:\nhand-off from Content · Ada:\nSummarize the launch notes.\n\n(Files that couldn't be fetched: gone.txt.)\n--- end of brief")
+      expect(p).toContain('Its files are in ./inbox/: launch.txt.')
+      expect(readFileSync(join(bridge._sessions()[`${C}:503`].cwd, 'inbox', 'launch.txt'), 'utf8')).toBe('launch notes')
+      // None of the bot's own tools for another bot's work.
+      expect(readFileSync(LAST_ARGS, 'utf8')).not.toContain('tasks/mcp.ts')
+      // Kept with what the topic said.
+      expect(readFileSync(join(TMP, 'messages', String(C), '503.jsonl'), 'utf8')).toContain('#handoff-zz9abc')
+      const h = T().store.handoffByTag('zz9abc', 'in', 'postingbot')
+      expect(h).toMatchObject({ state: 'done', by: '555', byName: '@postingbot', files: ['launch.txt'] })
+      // Once: the same tag again is nothing new.
+      const { cs: again } = await botSays(text, 503)
+      expect(again.some(c => c.method === 'sendMessage')).toBe(false)
+      expect(T().store.openHandoffs()).toEqual([])
+    } finally { peerFiles.stop(true) }
+  }, 30000)
+
+  test("what other bots say that isn't work for this one is left alone; what it can't take is answered", async () => {
+    const count = () => T().store.handoffsSince(String(C), '2000-01-01T00:00:00Z').length
+    const n = count()
+    const before = calls.length
+    // Not a bot it knows; one it knows, naming another; one it knows, in reply to this
+    // bot's own message; a mention of a longer name.
+    await botSays('@testbot, hand-off from X · Y:\nDo it.\n#handoff-aa1bbb', 503, { who: { id: 556, is_bot: true, first_name: 'Other', username: 'OtherBot' } })
+    await botSays('@someonebot, hand-off from X · Y:\nDo it.\n#handoff-aa2bbb', 503)
+    await botSays('@testbot see #handoff-aa3bbb', 503, { replyTo: ours(4242) })
+    await botSays('@testbot_two, hand-off from X · Y:\nDo it.\n#handoff-aa4bbb', 503)
+    await Bun.sleep(50)
+    expect(count()).toBe(n)
+    expect(calls.slice(before).some(c => c.method === 'sendMessage')).toBe(false)
+    // Too deep a chain: taken, and refused in a reply.
+    const { cs, id } = await botSays('@testbot, hand-off from X · Y:\nAnd on.\n#handoff-aa5bbb #depth-4', 503)
+    expect(sent(cs, '❌ #handoff-aa5bbb failed: it was handed on 3 times already')!.payload.reply_parameters).toMatchObject({ message_id: id })
+    expect(T().store.handoffByTag('aa5bbb', 'in', 'postingbot')).toMatchObject({ state: 'failed' })
   }, 30000)
 
   test('a plan: its steps one after another, each given what came before; one progress line, edited; the last word posted', async () => {

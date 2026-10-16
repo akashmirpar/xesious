@@ -351,6 +351,15 @@ export class TaskStore {
   openHandoffs(): Handoff[] {
     return (this.db.query("SELECT doc FROM handoffs WHERE state IN ('queued','running')").all() as any[]).map(r => JSON.parse(r.doc))
   }
+  // Those sent to another bot and not yet answered.
+  sentHandoffs(): Handoff[] {
+    return (this.db.query("SELECT doc FROM handoffs WHERE state = 'sent'").all() as any[]).map(r => JSON.parse(r.doc))
+  }
+  // A hand-off between bots, by its tag and the way it went.
+  handoffByTag(tag: string, direction: 'out' | 'in', peer?: string): Handoff | undefined {
+    return (this.db.query('SELECT doc FROM handoffs').all() as any[]).map(r => JSON.parse(r.doc))
+      .find((h: Handoff) => h.peerTag === tag && h.direction === direction && (peer === undefined || h.peer === peer))
+  }
 }
 
 export type EventStage = 'ready' | 'candidate'

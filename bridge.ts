@@ -2612,9 +2612,9 @@ const CONV_FILES_PER_TURN = 10
 
 const topicLogPath = (chatId: number | string, threadId?: number) => join(MSG_DIR, String(chatId), `${threadId ?? 'main'}.jsonl`)
 
-function recordOf(msg: any, toBot: boolean): ConvRecord | null {
+function recordOf(msg: any, toBot: boolean, peer = false): ConvRecord | null {
   const from = msg?.from
-  if (!from || from.is_bot) return null
+  if (!from || (from.is_bot && !peer)) return null
   const att = pickAttachment(msg)
   // Its words in whatever form they came: text, a photo's caption, a rich message.
   const text = incomingText(msg)
@@ -2641,8 +2641,8 @@ function appendRecord(chatId: number, threadId: number | undefined, r: ConvRecor
   } catch (e) { console.error(`[conv] could not record ${chatId}/${threadId ?? 'main'}#${r.id}: ${e}`) }
 }
 
-function recordMessage(msg: any, toBot: boolean, edited = false): void {
-  const r = recordOf(msg, toBot)
+function recordMessage(msg: any, toBot: boolean, edited = false, peer = false): void {
+  const r = recordOf(msg, toBot, peer)
   if (!r) return
   appendRecord(msg.chat.id, msg.message_thread_id, edited ? { ...r, edited: true } : r)
   contextAdd(msg.chat.id, msg.message_thread_id, [r])
@@ -6409,6 +6409,14 @@ bot.on('message', async ctx => {
     await dropPinNotice(ctx.chat.id, msg!.message_id, 'its own update')
     return
   }
+  // Another bot: a topic it made or renamed is still a topic here; what it says is a
+  // peer's hand-off or its answer to one of ours, or nothing to this bot.
+  if (msg && ctx.from?.is_bot) {
+    const named = (msg as any).forum_topic_created?.name ?? (msg as any).forum_topic_edited?.name
+    if (named && msg.message_thread_id !== undefined) { names[keyFor(ctx.chat.id, msg.message_thread_id)] = named; saveState(); return }
+    await handlePeerMessage(ctx).catch(e => console.error(`[handoff] from a bot: ${e}`))
+    return
+  }
   if (!msg || !ctx.from || ctx.from.is_bot) return
   const chatId = ctx.chat.id
   const threadId = msg.message_thread_id
@@ -8295,7 +8303,7 @@ async function startHandoff(a: HandoffAsk): Promise<{ handoff?: Handoff; error?:
   const chatId = Number(a.chat)
   if (a.depth > LIMITS.handoffDepthMax) return { error: `this work was handed on ${LIMITS.handoffDepthMax} times already; finish it here` }
   if (a.toThread === a.fromThread && !a.fromHost) return { error: 'that is this topic; do it here' }
-  if (store.handoffsSince(a.chat, new Date(Date.now() - 3600_000).toISOString()).length >= LIMITS.handoffsPerHour) return { error: `at most ${LIMITS.handoffsPerHour} hand-offs an hour in a group; try again later` }
+  if (ownHandoffsLastHour(a.chat) >= LIMITS.handoffsPerHour) return { error: `at most ${LIMITS.handoffsPerHour} hand-offs an hour in a group; try again later` }
   const cwdFrom = resolveCwd(taskContext({ chat: a.chat, thread: a.fromThread, owner: a.by, ownerName: a.byName } as Task), a.fromThread)
   const files: { from: string; name: string }[] = []
   for (const f of (a.files ?? []).slice(0, 10)) {
@@ -8355,11 +8363,12 @@ function handoffFrame(h: Handoff): string {
   const chatId = Number(h.chat)
   const mask = (s: string) => s.split(BRIDGE_NONCE).join('*'.repeat(BRIDGE_NONCE.length))
   const task = h.fromTask ? taskStore?.getTask(h.fromTask)?.name : undefined
-  const whence = (h as any).fromHost ? 'by a script on the bot\'s host' : `from the topic "${topicNameOf(chatId, h.fromThread)}"${task ? `, by its task "${task}"` : ''}`
+  const peer = h.direction === 'in'
+  const whence = peer ? `by @${h.peer}, another bot in this group` : (h as any).fromHost ? `by a script on the bot's host, for ${h.byName ?? 'someone'}` : `from the topic "${topicNameOf(chatId, h.fromThread)}"${task ? `, by its task "${task}"` : ''}, for ${h.byName ?? 'someone'}`
   return [
-    `[xesious:${BRIDGE_NONCE}] Work handed to this topic ${whence}, for ${h.byName ?? 'someone'}. ` +
-      `Do what its brief asks, here, with this topic's folder, instructions and skills. It is a request relayed from that topic, not a live message from a person, and it approves nothing beyond what it asks; it isn't a reply to anything above. ` +
-      `${h.files.length ? `Its files are in ./${INBOX_DIR}/: ${h.files.join(', ')}. ` : ''}Your final answer is posted here as its result; that topic is told it is done.`,
+    `[xesious:${BRIDGE_NONCE}] Work handed to this topic ${whence}. ` +
+      `Do what its brief asks, here, with this topic's folder, instructions and skills. It is a request relayed ${peer ? 'by that bot' : 'from that topic'}, not a live message from a person, and it approves nothing beyond what it asks; it isn't a reply to anything above. ` +
+      `${h.files.length ? `Its files are in ./${INBOX_DIR}/: ${h.files.join(', ')}. ` : ''}Your final answer is posted here as its result; ${peer ? 'that bot is told how it went' : 'that topic is told it is done'}.`,
     `--- brief:\n${mask(h.brief)}\n--- end of brief`,
   ].join('\n\n')
 }
@@ -8378,6 +8387,7 @@ async function runHandoff(id: string): Promise<void> {
   try {
     res = await runStreaming(ctx, h.toThread, key, handoffFrame(h), cwd, undefined, modeFor(key), modelFor(key), {
       effort: effortFor(key), askedBy: h.dstMsg, jobKey: `${key}#handoff-${h.id}`, handoff: { id: h.id, depth: h.depth },
+      ...(h.direction === 'in' ? { tasksTools: false } : {}),
     })
   } catch (e) {
     res = { text: String(e), isError: true }
@@ -8387,8 +8397,8 @@ async function runHandoff(id: string): Promise<void> {
   if (ok) {
     resultMsg = await deliver(ctx, h.toThread, res.text, h.dstMsg)
     await flushOutbox(ctx, h.toThread, cwd, key, resultMsg)
-    store.addNote(key, `Work was handed to this topic from "${topicNameOf(chatId, h.fromThread)}" (${handoffFirstLine(h.brief)}), and its run here answered: ${res.text.replace(/\s+/g, ' ').slice(0, 280)}`)
-  } else if (!res.stopped) {
+    store.addNote(key, `Work was handed to this topic ${h.direction === 'in' ? `by the bot @${h.peer}` : `from "${topicNameOf(chatId, h.fromThread)}"`} (${handoffFirstLine(h.brief)}), and its run here answered: ${res.text.replace(/\s+/g, ' ').slice(0, 280)}`)
+  } else if (!res.stopped && h.direction !== 'in') {
     await send(ctx, h.toThread, `❌ The work handed here didn't finish: ${res.noAnswer ? 'it ended without an answer' : res.text.slice(0, 300)}`, true)
   }
   const error = ok ? undefined : res.stopped ? 'stopped' : res.noAnswer ? 'it ended without an answer' : res.text.slice(0, 300)
@@ -8400,7 +8410,12 @@ async function runHandoff(id: string): Promise<void> {
     await bot.api.editMessageText(chatId, h.srcMsg, `${head}\n${ok ? '✅ Done' : `❌ ${escapeHtml(error ?? 'failed')}`}`, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
       .catch(e => console.error(`[handoff] ${id} line: ${e}`))
   }
-  logHandoff(h, `${ok ? '✅' : '❌'} ${topicNameOf(chatId, h.fromThread)} → ${to}: ${ok ? 'done' : error}`)
+  logHandoff(h, `${ok ? '✅' : '❌'} ${h.direction === 'in' ? `@${h.peer}` : topicNameOf(chatId, h.fromThread)} → ${to}: ${ok ? 'done' : error}`)
+  // From another bot: it hears how it went, in reply to the message that brought it.
+  if (h.direction === 'in' && h.peerMsg) {
+    await bot.api.sendMessage(chatId, ok ? `✅ #handoff-${h.peerTag} done${there ? `: ${there}` : ''}` : `❌ #handoff-${h.peerTag} failed: ${error}`,
+      { ...destOpts({ threadId: h.toThread, replyTo: h.peerMsg }), link_preview_options: { is_disabled: true } }).catch(e => console.error(`[handoff] answering @${h.peer}: ${e}`))
+  }
   // A task's run that handed this off, failing: said loud, where the task lives.
   if (!ok && h.fromTask && !res.stopped) {
     const t = store.getTask(h.fromTask)
@@ -8421,12 +8436,235 @@ ${text}`
   if (r.error) await postTask(t, 'failure', `⚠️ ${t.name}: couldn't hand its result on: ${r.error}`, { loud: true }).catch(() => {})
 }
 
+// ---------------------------------------------------------------------------
+// Hand-offs to and from other xesious bots, over Telegram. Both bots are in the group,
+// each with Bot-to-Bot Communication Mode on in @BotFather, and each lists the other
+// in TG_PEER_BOTS (usernames or ids). A hand-off is an ordinary message in the target
+// topic that mentions the other bot and carries #handoff-<id>; that bot does it under
+// its own rules and replies to it with the outcome. Files go as links, served by the
+// sending bot for a day (its webhook server, TG_TASKS_PUBLIC_URL as the other sees it).
+// A peer is trusted like a person allowed in the topic: its hand-off runs there under
+// the topic's own mode, as a turn of its own, but with none of the bot's tools (no
+// tasks, no topics, no hand-offs on), and nobody's approval in it.
+// Loop guards: only a peer's message that names this bot is work; a reply to one of
+// this bot's messages never is; an id is taken once; 20 an hour from a peer; chains
+// stop as deep as anywhere.
+// ---------------------------------------------------------------------------
+const PEER_BOTS = (process.env.TG_PEER_BOTS || '').split(',').map(s => s.trim().replace(/^@/, '').toLowerCase()).filter(Boolean)
+const isPeer = (u: { id: number; username?: string } | undefined) => !!u && (PEER_BOTS.includes(String(u.id)) || (!!u.username && PEER_BOTS.includes(u.username.toLowerCase())))
+const HANDOFF_TAG = /#handoff-([a-z0-9]{6,12})\b/i
+const SERVED_DIR = join(TASKS_STATE, 'served')
+const SERVE_MS = 24 * 3600_000
+const PEER_FILE_MAX = 50 * 1024 * 1024
+// A Telegram message is at most 4096 characters; a longer brief goes as a file too.
+const PEER_TEXT_MAX = 4000
+
+// A file handed to another bot: copied now, so later changes don't reach it, and
+// served for a day at a link that bot can reach. On disk, so a restart keeps it.
+function serveFile(name: string, from: { path: string } | { text: string }): string {
+  const base = (process.env.TG_TASKS_PUBLIC_URL || `http://127.0.0.1:${Number(process.env.TG_TASKS_WEBHOOK_PORT)}`).replace(/\/+$/, '')
+  const token = randomUUID().replace(/-/g, '')
+  const dir = join(SERVED_DIR, token)
+  mkdirSync(dir, { recursive: true })
+  if ('path' in from) copyFileSync(from.path, join(dir, name)); else writeFileSync(join(dir, name), from.text)
+  return `${base}/files/${token}/${encodeURIComponent(name)}`
+}
+function servedFile(token: string): string | undefined {
+  const dir = join(SERVED_DIR, token)
+  try {
+    if (Date.now() - statSync(dir).mtimeMs > SERVE_MS) return undefined
+    const name = readdirSync(dir)[0]
+    return name ? join(dir, name) : undefined
+  } catch { return undefined }
+}
+
+// This bot's own hand-offs in a group, the last hour: what another bot hands it
+// doesn't count against them.
+const ownHandoffsLastHour = (chat: string) => taskStore!.handoffsSince(chat, new Date(Date.now() - 3600_000).toISOString()).filter(h => h.direction !== 'in').length
+
+// Handed to another bot: a message in the topic that names it, a line here, and an
+// answer waited for.
+async function startPeerHandoff(a: HandoffAsk & { peer: string }): Promise<{ handoff?: Handoff; error?: string }> {
+  const store = taskStore!
+  const chatId = Number(a.chat)
+  if (a.depth > LIMITS.handoffDepthMax) return { error: `this work was handed on ${LIMITS.handoffDepthMax} times already; finish it here` }
+  if (ownHandoffsLastHour(a.chat) >= LIMITS.handoffsPerHour) return { error: `at most ${LIMITS.handoffsPerHour} hand-offs an hour in a group; try again later` }
+  const cwdFrom = resolveCwd(taskContext({ chat: a.chat, thread: a.fromThread, owner: a.by, ownerName: a.byName } as Task), a.fromThread)
+  const paths: string[] = []
+  for (const f of (a.files ?? []).slice(0, 10)) {
+    const p = isAbsolute(f) ? f : join(cwdFrom, f)
+    if (!existsSync(p) || !statSync(p).isFile()) return { error: `no file ${f}` }
+    if (statSync(p).size > PEER_FILE_MAX) return { error: `${f} is over 50 MB` }
+    paths.push(p)
+  }
+  const from = topicNameOf(chatId, a.fromThread), to = topicNameOf(chatId, a.toThread)
+  const head = `@${a.peer}, hand-off from ${from} · ${a.byName ?? 'someone'}:\n`
+  const tagLen = ' #handoff-xxxxxx #depth-9'.length + 1
+  const fileRoom = paths.reduce((n, p) => n + basename(p).length + 120, 0)
+  const long = head.length + a.brief.length + fileRoom + tagLen > PEER_TEXT_MAX
+  if ((paths.length || long) && !hookServer) return { error: `${paths.length ? 'files go' : `a brief this long (over ${PEER_TEXT_MAX - head.length - tagLen} characters) goes`} to another bot as links this bot serves, which needs its webhook server: TG_TASKS_WEBHOOK_PORT, and TG_TASKS_PUBLIC_URL when the bots are on different machines` }
+  const links = paths.map(p => `📎 ${basename(p)}: ${serveFile(basename(p), { path: p })}`)
+  let brief = a.brief
+  if (long) {
+    links.push(`📎 brief.md: ${serveFile('brief.md', { text: a.brief })}`)
+    const room = Math.max(200, PEER_TEXT_MAX - head.length - tagLen - links.join('\n').length - 60)
+    brief = `${a.brief.slice(0, room).trimEnd()}…\n(The whole brief is in brief.md.)`
+  }
+  let h = store.createHandoff({ chat: a.chat, fromThread: a.fromThread, toThread: a.toThread, brief: a.brief, files: paths.map(p => basename(p)), by: a.by, byName: a.byName,
+    fromTask: a.fromTask, depth: a.depth, state: 'sent', createdAt: new Date().toISOString(), peer: a.peer, direction: 'out',
+    deadline: new Date(taskNow().getTime() + LIMITS.peerAnswerMs).toISOString() })
+  h = store.updateHandoff(h.id, { peerTag: h.id })!
+  const text = `${head}${brief}${links.length ? `\n${links.join('\n')}` : ''}\n#handoff-${h.id}${a.depth > 1 ? ` #depth-${a.depth}` : ''}`
+  const m = await bot.api.sendMessage(chatId, text, { ...destOpts({ threadId: a.toThread }), link_preview_options: { is_disabled: true } }).catch(e => { console.error(`[handoff] to @${a.peer}: ${e}`); return null })
+  if (!m) { store.updateHandoff(h.id, { state: 'failed', error: "Telegram didn't take the message", endedAt: new Date().toISOString() }); return { error: "Telegram didn't take the hand-off message" } }
+  const there = messageLink(chatId, a.toThread, m.message_id)
+  const line = await bot.api.sendMessage(chatId, `${peerLineHead(h, there)}`,
+    { ...destOpts({ threadId: a.fromThread }), parse_mode: 'HTML', disable_notification: true, link_preview_options: { is_disabled: true } }).catch(() => null)
+  h = store.updateHandoff(h.id, { peerMsg: m.message_id, dstMsg: m.message_id, srcMsg: line?.message_id })!
+  console.log(`[handoff] ${a.chat}: ${from} → @${a.peer} in ${to} (${h.id}, depth ${a.depth})`)
+  logHandoff(h, `➡️ ${from} → @${a.peer} in ${to}: ${handoffFirstLine(a.brief)}`)
+  return { handoff: h }
+}
+
+const peerLineHead = (h: Handoff, there?: string) => {
+  const to = topicNameOf(Number(h.chat), h.toThread)
+  return `➡️ Handed to @${escapeHtml(h.peer ?? '?')} in ${there ? `<a href="${there}">${escapeHtml(to)}</a>` : `<b>${escapeHtml(to)}</b>`}: ${escapeHtml(handoffFirstLine(h.brief))}`
+}
+
+// One of this bot's hand-offs to another, answered or past its deadline: the line in
+// its source topic says how it went. A failure is said loud for a task that handed it
+// off, and when nobody answered.
+async function settlePeerHandoff(h: Handoff, ok: boolean, said: string, link?: string, timedOut = false): Promise<void> {
+  const store = taskStore!
+  const late = h.state === 'failed' && h.overdue === true
+  h = store.updateHandoff(h.id, { state: ok ? 'done' : 'failed', endedAt: new Date().toISOString(),
+    ...(ok ? { result: said, error: undefined } : { error: said }), ...(link ? { resultLink: link } : {}), overdue: timedOut || undefined })!
+  const chatId = Number(h.chat)
+  const to = topicNameOf(chatId, h.toThread)
+  const there = link ?? (h.peerMsg ? messageLink(chatId, h.toThread, h.peerMsg) : undefined)
+  if (h.srcMsg) await bot.api.editMessageText(chatId, h.srcMsg, `${peerLineHead(h, there)}\n${ok ? `✅ Done${late ? ', late' : ''}` : `❌ ${escapeHtml(said)}`}`,
+    { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }).catch(() => {})
+  console.log(`[handoff] ${h.chat}: @${h.peer} answered ${h.id}: ${ok ? 'done' : said}`)
+  logHandoff(h, `${ok ? '✅' : '❌'} ${topicNameOf(chatId, h.fromThread)} → @${h.peer} in ${to}: ${ok ? 'done' : said}`)
+  if (ok || late) return
+  const t = h.fromTask ? store.getTask(h.fromTask) : undefined
+  if (t) await postTask(t, 'failure', `⚠️ ${t.name}: what it handed to @${h.peer} didn't get done: ${said}`, { loud: true }).catch(() => {})
+  else if (timedOut) await bot.api.sendMessage(chatId, `⚠️ The work handed to @${h.peer} in ${to} didn't get done: ${said}`,
+    { ...destOpts({ threadId: h.fromThread }), link_preview_options: { is_disabled: true } }).catch(() => {})
+}
+
+// Hand-offs sent and never answered: failed, and said. Served files past their day: gone.
+async function sweepPeerHandoffs(): Promise<void> {
+  if (!taskStore) return
+  const now = taskNow().getTime()
+  const due = taskStore.sentHandoffs().filter(h => h.deadline && Date.parse(h.deadline) <= now)
+  await Promise.all(due.map(h => settlePeerHandoff(h, false, `@${h.peer} didn't answer within ${elapsedText(LIMITS.peerAnswerMs)}`, undefined, true).catch(() => {})))
+  try {
+    for (const d of readdirSync(SERVED_DIR)) {
+      const p = join(SERVED_DIR, d)
+      if (Date.now() - statSync(p).mtimeMs > SERVE_MS) rmSync(p, { recursive: true, force: true })
+    }
+  } catch {}
+}
+
+// A file another bot serves, into a topic's inbox: at most 50 MB and a minute.
+async function fetchInto(url: string, dir: string, name: string): Promise<string | undefined> {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(60_000) })
+    if (!r.ok || !r.body || Number(r.headers.get('content-length') ?? 0) > PEER_FILE_MAX) return undefined
+    const parts: Uint8Array[] = []
+    let size = 0
+    for await (const c of r.body as unknown as AsyncIterable<Uint8Array>) {
+      size += c.length
+      if (size > PEER_FILE_MAX) return undefined
+      parts.push(c)
+    }
+    mkdirSync(dir, { recursive: true })
+    const safe = name.replace(/[/\\]/g, '_').replace(/^\.+$/, 'file') || 'file'
+    let n = safe
+    for (let i = 2; existsSync(join(dir, n)); i++) n = `${basename(safe, extname(safe))}-${i}${extname(safe)}`
+    writeFileSync(join(dir, n), Buffer.concat(parts))
+    return n
+  } catch (e) { console.error(`[handoff] fetching ${url}: ${e}`); return undefined }
+}
+
+// A message from another bot. A peer's reply to one of this bot's messages is never
+// work: carrying the tag of a hand-off this bot sent, it is that one's answer. A
+// peer's message that names this bot and carries a tag is work for it, taken once.
+// Anything else a bot says is left alone.
+async function handlePeerMessage(ctx: Context): Promise<void> {
+  const msg = ctx.message as any
+  const from = ctx.from!
+  if (!TASKS || !taskStore || !msg || !isPeer(from)) return
+  const chat = String(ctx.chat!.id)
+  if (!ALLOWED_CHATS.has(chat)) return
+  const text = String(msg.text ?? msg.caption ?? '')
+  const tag = text.match(HANDOFF_TAG)?.[1]?.toLowerCase()
+  if (!tag) return
+  const peer = (from.username ?? String(from.id)).toLowerCase()
+  // In a forum every message "replies" to its topic's creation; that is not a reply.
+  const re = msg.reply_to_message && !msg.reply_to_message.forum_topic_created ? msg.reply_to_message : undefined
+  let myId: number | undefined
+  try { myId = bot.botInfo.id } catch {}
+  if (re && myId !== undefined && re.from?.id === myId) {
+    const ours = taskStore.handoffByTag(tag, 'out')
+    if (!ours || ours.chat !== chat || ours.peer !== peer || ours.peerMsg !== re.message_id) return
+    if (ours.state !== 'sent' && !(ours.state === 'failed' && ours.overdue)) return
+    const ok = /^\s*✅/.test(text)
+    const said = text.replace(HANDOFF_TAG, '').replace(/^\s*[✅❌]\s*/, '').replace(/^\s*(done|failed)\b\s*:?\s*/i, '').trim()
+    await settlePeerHandoff(ours, ok, said.slice(0, 500) || (ok ? 'done' : 'failed'), text.match(/https:\/\/t\.me\/\S+/)?.[0])
+    return
+  }
+  const me = botIdentity().username?.toLowerCase()
+  if (!me || !new RegExp(`@${me}\\b`, 'i').test(text)) return
+  if (taskStore.handoffByTag(tag, 'in', peer)) return
+  const thread = msg.message_thread_id as number | undefined
+  const key = keyFor(Number(chat), thread)
+  // Kept with what the topic said, as a person's message is.
+  if (recordsFor(key)) recordMessage(msg, true, false, true)
+  // What they wrote is the brief: without the address, the tag and the file lines.
+  const lines = text.split('\n')
+  const fileLines = lines.filter(l => l.startsWith('📎 '))
+  const brief = lines.filter(l => !l.startsWith('📎 ')).join('\n')
+    .replace(new RegExp(`^\\s*@${me}\\b,?\\s*`, 'i'), '').replace(HANDOFF_TAG, '').replace(/#depth-\d+/i, '').trim()
+  const depth = Math.max(1, Number(text.match(/#depth-(\d+)/i)?.[1] ?? 1))
+  // Taken now: the tag is this one's from here on, whatever becomes of it.
+  let h = taskStore.createHandoff({ chat, toThread: thread, brief, files: [], by: String(from.id), byName: `@${peer}`, depth, state: 'queued', createdAt: new Date().toISOString(),
+    peer, direction: 'in', peerMsg: msg.message_id, peerTag: tag, dstMsg: msg.message_id })
+  const refuse = async (why: string) => {
+    taskStore!.updateHandoff(h.id, { state: 'failed', error: why, endedAt: new Date().toISOString() })
+    console.log(`[handoff] ${chat}: from @${peer} (${tag}) refused: ${why}`)
+    await bot.api.sendMessage(Number(chat), `❌ #handoff-${tag} failed: ${why}`, { ...destOpts({ threadId: thread, replyTo: msg.message_id }), link_preview_options: { is_disabled: true } }).catch(() => {})
+  }
+  const fromPeer = taskStore.handoffsSince(chat, new Date(Date.now() - 3600_000).toISOString()).filter(x => x.direction === 'in' && x.peer === peer).length
+  if (fromPeer > LIMITS.peerHandoffsPerHour) return refuse(`more than ${LIMITS.peerHandoffsPerHour} hand-offs from @${peer} this hour`)
+  if (depth > LIMITS.handoffDepthMax) return refuse(`it was handed on ${LIMITS.handoffDepthMax} times already`)
+  if (answersFor(key) === 'never') return refuse('this bot is off in this topic')
+  if (!brief) return refuse('it has no brief')
+  // Its files, fetched into this topic's inbox now.
+  const inbox = join(resolveCwd(taskContext({ chat, thread, owner: String(from.id), ownerName: `@${peer}` } as Task), thread), INBOX_DIR)
+  const landed: string[] = [], missed: string[] = []
+  for (const l of fileLines.slice(0, 11)) {
+    const m = l.match(/^📎 (.+?): (https?:\/\/\S+)/)
+    if (!m) continue
+    const name = await fetchInto(m[2], inbox, basename(m[1].trim()))
+    if (name) landed.push(name); else missed.push(basename(m[1].trim()))
+  }
+  h = taskStore.updateHandoff(h.id, { files: landed, ...(missed.length ? { brief: `${brief}\n\n(Files that couldn't be fetched: ${missed.join(', ')}.)` } : {}) })!
+  console.log(`[handoff] ${chat}: from @${peer} into ${topicNameOf(Number(chat), thread)} (${tag}, depth ${depth})`)
+  logHandoff(h, `⬅️ @${peer} → ${topicNameOf(Number(chat), thread)}: ${handoffFirstLine(brief)}`)
+  handoffQueue.push(h.id)
+  pumpHandoffs()
+}
+
 // After a restart: what was queued runs; what was running was cut off, and says so.
 function recoverHandoffs(): void {
   if (!taskStore) return
   for (const h of taskStore.openHandoffs()) {
     if (h.state === 'queued') { handoffQueue.push(h.id); continue }
     taskStore.updateHandoff(h.id, { state: 'failed', error: 'the bot restarted while it ran', endedAt: new Date().toISOString() })
+    if (h.direction === 'in' && h.peerMsg) void bot.api.sendMessage(Number(h.chat), `❌ #handoff-${h.peerTag} failed: this bot restarted while it ran`,
+      { ...destOpts({ threadId: h.toThread, replyTo: h.peerMsg }), link_preview_options: { is_disabled: true } }).catch(() => {})
     if (h.srcMsg) void bot.api.editMessageText(Number(h.chat), h.srcMsg, `➡️ Handed to <b>${escapeHtml(topicNameOf(Number(h.chat), h.toThread))}</b>: ${escapeHtml(handoffFirstLine(h.brief))}\n✂️ Cut off by a restart`, { parse_mode: 'HTML' }).catch(() => {})
   }
   pumpHandoffs()
@@ -8823,8 +9061,13 @@ const taskBridge: BridgeHandlers = {
     const toThread = /^(general|main)$/i.test(ref) ? undefined : resolveTopicRef(s.chat, ref)
     if (toThread === undefined && !/^(general|main)$/i.test(ref)) return fail(404, `no topic "${ref}" here; topic_list lists them`)
     const files = Array.isArray(body?.files) ? body.files.map((f: any) => String(f)) : undefined
-    const r = await startHandoff({ chat: s.chat, fromThread: s.thread, toThread, brief, files, by: s.person, byName: s.personName, fromTask: s.taskId, depth: (s.handoffDepth ?? 0) + 1 })
+    const peer = body?.bot ? String(body.bot).trim().replace(/^@/, '').toLowerCase() : undefined
+    if (peer !== undefined && !/^[a-z][a-z0-9_]{3,31}$/.test(peer)) return fail(400, 'bot is the other bot\'s username, like "@PostingBot"')
+    if (peer && !PEER_BOTS.includes(peer)) return fail(403, `@${peer} isn't a bot this one hands off to (TG_PEER_BOTS)`)
+    const ask = { chat: s.chat, fromThread: s.thread, toThread, brief, files, by: s.person, byName: s.personName, fromTask: s.taskId, depth: (s.handoffDepth ?? 0) + 1 }
+    const r = peer ? await startPeerHandoff({ ...ask, peer }) : await startHandoff(ask)
     if (r.error) return fail(409, r.error)
+    if (peer) return reply(201, { message: `Handed to @${peer} in ${topicNameOf(Number(s.chat), toThread)}: it does it there and answers; this topic gets a line when it does.`, id: r.handoff!.id })
     return reply(201, { message: `Handed to ${topicNameOf(Number(s.chat), toThread)}: it runs there now and posts its result there, and this topic gets a line when it is done.`, id: r.handoff!.id })
   },
   // Claude Code's question, plan or permission prompt, for the person to decide.
@@ -9250,6 +9493,7 @@ function startTasks(): void {
     // Each group's board, made or brought up to date (one that has a Tasks topic).
     for (const chat of new Set(store.listTasks().map(t => t.chat))) refreshBoard(chat, true)
     const hooks = startWebhooks()
+    peerSweep = setInterval(() => void sweepPeerHandoffs(), 60_000)
     const active = store.listTasks({ states: ['active'] }).length
     console.log(`     tasks          : on — ${active} active${interrupted.length ? `, ${interrupted.length} run(s) interrupted by the restart` : ''}${adopted ? `, ${adopted} watcher(s) still running` : ''}; API at ${API_SOCK}${hooks ? `; webhooks at ${hooks}` : ''}`)
   } catch (e) {
@@ -9270,7 +9514,14 @@ function startWebhooks(): string | undefined {
   hookServer = Bun.serve({
     hostname, port,
     async fetch(req) {
-      const m = new URL(req.url).pathname.match(/^\/hook\/([a-z0-9]{6})\/([a-f0-9]{24})$/)
+      const path = new URL(req.url).pathname
+      // A file handed to another bot: for a day, at its token.
+      const f = path.match(/^\/files\/([a-f0-9]{32})\/[^/]+$/)
+      if (f && req.method === 'GET') {
+        const p = servedFile(f[1])
+        return p ? new Response(Bun.file(p)) : new Response('not found\n', { status: 404 })
+      }
+      const m = path.match(/^\/hook\/([a-z0-9]{6})\/([a-f0-9]{24})$/)
       const t = m && req.method === 'POST' ? taskStore?.getTask(m[1]) : undefined
       const right = t?.trigger.kind === 'webhook' && t.state !== 'deleted' && timingSafeEqual(Buffer.from(m![2]), Buffer.from(t.trigger.secret))
       if (!t || !right) return new Response('not found\n', { status: 404 })
@@ -9283,8 +9534,12 @@ function startWebhooks(): string | undefined {
   return `http://${hostname}:${port}/hook/<task>/<secret>`
 }
 
+let peerSweep: ReturnType<typeof setInterval> | undefined
+
 // Watchers are left running: the next start picks them up.
 function stopTasks(): void {
+  if (peerSweep) clearInterval(peerSweep)
+  peerSweep = undefined
   hookServer?.stop(true)
   hookServer = undefined
   taskRuntime?.stop()
@@ -9541,6 +9796,7 @@ export function _stopTasks(): void {
 }
 export const _tasks = () => ({ store: taskStore, runtime: taskRuntime, service: taskService, api: taskApi, tokens: apiTokens, socket: API_SOCK, dir: TASKS_DIR, watchers: taskWatchers })
 export function _setTaskClock(fn: () => Date): void { taskNow = fn }
+export const _sweepPeerHandoffs = sweepPeerHandoffs
 
 // Guarded so the module can be imported by a test without starting a poller.
 if (import.meta.main) main().catch(e => { console.error(`[fatal] ${e}`); process.exit(1) })
