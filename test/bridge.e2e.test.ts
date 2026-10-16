@@ -9,7 +9,7 @@
  * handler → handlePrompt → runStreaming → stream parser → Telegram-call pipeline runs.
  * We then assert on exactly what the user would have seen. Run with `bun test`.
  */
-import { test, expect, describe, beforeAll, afterAll } from 'bun:test'
+import { test, expect, describe, beforeAll, afterAll, afterEach } from 'bun:test'
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
@@ -4625,5 +4625,139 @@ describe('several messages sent at once are one turn', () => {
     await push({ text: 'just chatting now' }, { chat: C, thread: 9401 })
     await settle(`${C}:9401`)
     expect(turns(calls.slice(later))).toBe(0)
+  }, 20000)
+})
+
+describe('tasks: the bridge runs them (phase 1)', () => {
+  let clock = new Date('2026-10-16T19:00:00Z')
+  const T = () => bridge._tasks()
+  let callApi: any
+  beforeAll(async () => {
+    ;({ callApi } = await import('../tasks/api'))
+    bridge._enableTasks(true)
+    bridge._setTaskClock(() => clock)
+    bridge._startTasks()
+  })
+  afterAll(() => { bridge._stopTasks(); bridge._enableTasks(false) })
+  // Each case starts with no tasks of the others still scheduled.
+  afterEach(() => { for (const t of T().store.listTasks()) T().store.updateTask(t.id, { state: 'deleted', nextDue: undefined }) })
+
+  const person = (chat: string, thread?: number) => ({ kind: 'run', chat, thread, person: '1', personName: 'Ada', runKind: 'interactive' })
+  const make = (input: any, scope: any = person('5101')) => {
+    const r = T().service.create(scope, { tz: 'UTC', ...input })
+    if (!r.ok) throw new Error(r.error)
+    return r.value.task
+  }
+  const at = async (iso: string) => { clock = new Date(iso); await T().runtime.tick(); await T().runtime.idle() }
+  const posted = (from: number, needle: string) => calls.slice(from)
+    .filter(c => ['sendMessage', 'sendRichMessage', 'editMessageText'].includes(c.method) && textOf(c).includes(needle))
+
+  test('a reminder goes out at its time, loud, with its buttons, and only once', async () => {
+    const before = calls.length
+    const t = make({ message: 'Take your medicine', at: '2026-10-16 19:30' })
+    await at('2026-10-16T19:29:00Z')
+    expect(posted(before, 'Take your medicine')).toEqual([])
+    await at('2026-10-16T19:30:00Z')
+    const sent = posted(before, 'Take your medicine')
+    expect(sent.length).toBe(1)
+    expect(sent[0].payload.chat_id).toBe(5101)
+    expect(sent[0].payload.disable_notification).toBe(false)
+    expect(sent[0].payload.reply_markup.inline_keyboard[0].map((b: any) => b.callback_data)).toEqual([`tk:ok:${t.id}`, `tk:snz:${t.id}`])
+    await at('2026-10-16T19:31:00Z')
+    expect(posted(before, 'Take your medicine').length).toBe(1)
+    expect(T().store.getTask(t.id).state).toBe('done')
+  })
+
+  test('a Claude task runs at its time, as a scheduled run with the guard rails and its framing, and its result is posted', async () => {
+    const before = calls.length
+    const t = make({ name: 'Nightly news', prompt: 'Summarize the news', cron: '0 21 * * *' })
+    await at('2026-10-16T21:00:00Z')
+    const args: string[] = JSON.parse(readFileSync(LAST_ARGS, 'utf8'))
+    const mcp = JSON.parse(args[args.indexOf('--mcp-config') + 1])
+    expect(mcp.mcpServers.xesious.args[0]).toEndWith('tasks/mcp.ts')
+    expect(mcp.mcpServers.xesious.env.XESIOUS_RUN_KIND).toBe('scheduled')
+    expect(args[args.indexOf('--allowedTools') + 1]).toContain('mcp__xesious')
+    // Claude Code's own schedulers are out of reach: they would die with the run, or
+    // run in Anthropic's cloud and report to claude.ai.
+    expect(args[args.indexOf('--disallowedTools') + 1]).toBe('RemoteTrigger,ScheduleWakeup')
+    expect(JSON.parse(readFileSync(LAST_ENV, 'utf8')).disableCron).toBe('1')
+    const p = readFileSync(LAST_PROMPT, 'utf8')
+    expect(p).toContain('This is a run of the task "Nightly news"')
+    expect(p).toContain('call the report tool once')
+    expect(p).toMatch(/message from Ada, id 1:\nSummarize the news$/)
+    const out = posted(before, 'okReply')
+    expect(out.length).toBe(1)
+    expect(textOf(out[0])).toContain('⏰ Nightly news')
+    expect(T().store.runsFor(t.id)[0]).toMatchObject({ state: 'succeeded', trigger: 'schedule' })
+    // The run's token died with the run.
+    expect((await callApi(T().socket, mcp.mcpServers.xesious.env.XESIOUS_API_TOKEN, 'GET', '/v1/tasks/self')).status).toBe(401)
+  }, 20000)
+
+  test("the topic's next turn is told what the task posted, once", async () => {
+    make({ name: 'Morning digest', prompt: 'Digest', cron: '0 7 * * *' })
+    await at('2026-10-17T07:00:00Z')
+    await incoming(5101, 'what did the digest say?')
+    expect(readFileSync(LAST_PROMPT, 'utf8')).toContain('The task "Morning digest" ran at')
+    await incoming(5101, 'and now?')
+    expect(readFileSync(LAST_PROMPT, 'utf8')).not.toContain('The task "Morning digest" ran at')
+  }, 20000)
+
+  test('a noteworthy task that reports nothing worth telling stays silent', async () => {
+    const before = calls.length
+    const t = make({ name: 'Watch', prompt: 'Check the page', cron: '0 22 * * *', says: 'noteworthy' })
+    await at('2026-10-17T22:00:00Z')
+    expect(posted(before, 'okReply')).toEqual([])
+    expect(T().store.runsFor(t.id)[0].state).toBe('succeeded')
+    expect(T().store.getTask(t.id).lastMark).toBe('quiet')
+  }, 20000)
+
+  test('a task with its own session resumes it on its next run', async () => {
+    const before = calls.length
+    const t = make({ name: 'Diary', prompt: 'Write today', cron: '0 23 * * *', session: 'own' })
+    await at('2026-10-17T23:00:00Z')
+    expect(T().store.getTask(t.id).sessionId).toBeTruthy()
+    await at('2026-10-18T23:00:00Z')
+    const out = posted(before, '⏰ Diary')
+    expect(out.length).toBe(2)
+    expect(textOf(out[0])).toContain('noResume')
+    expect(textOf(out[1])).toContain('hadResume')
+    const args: string[] = JSON.parse(readFileSync(LAST_ARGS, 'utf8'))
+    expect(args[args.indexOf('--system-prompt-snapshot') + 1]).toBe('off')
+  }, 20000)
+
+  test('a task that fails twice in a row raises an alert, with a way to run it or pause it', async () => {
+    const before = calls.length
+    const t = make({ name: 'Flaky', prompt: 'ERROR boom', cron: '0 6 * * *' })
+    await at('2026-10-19T06:00:00Z')
+    expect(posted(before, 'Flaky failed')).toEqual([])
+    await at('2026-10-20T06:00:00Z')
+    const alert = posted(before, 'Flaky failed 2 times in a row')
+    expect(alert.length).toBe(1)
+    expect(alert[0].payload.disable_notification).toBe(false)
+    expect(alert[0].payload.reply_markup.inline_keyboard[0].map((b: any) => b.callback_data)).toEqual([`tk:run:${t.id}`, `tk:pause:${t.id}`])
+  }, 20000)
+
+  test('in a group, a result goes silently into its topic', async () => {
+    const before = calls.length
+    make({ name: 'Standup', prompt: 'Summarize yesterday', cron: '0 8 * * *' }, person('-100777', 77))
+    await at('2026-10-21T08:00:00Z')
+    const out = posted(before, '⏰ Standup')
+    expect(out.length).toBe(1)
+    expect(out[0].payload).toMatchObject({ chat_id: -100777, message_thread_id: 77, disable_notification: true })
+  }, 20000)
+
+  test('a script on the host can post with the operator token, only where the bot serves', async () => {
+    const op = readFileSync(join(TMP, 'xesious.token'), 'utf8').trim()
+    const before = calls.length
+    expect((await callApi(T().socket, op, 'POST', '/v1/send', { chat: '-100777', text: 'Build finished', silent: true })).status).toBe(200)
+    expect(posted(before, 'Build finished')[0].payload).toMatchObject({ chat_id: -100777, disable_notification: true })
+    expect((await callApi(T().socket, op, 'POST', '/v1/send', { chat: '-100555', text: 'x' })).status).toBe(403)
+  })
+
+  test("a person's turn gets the bot's tools, as that person", async () => {
+    await incoming(5102, 'hello')
+    const args: string[] = JSON.parse(readFileSync(LAST_ARGS, 'utf8'))
+    const mcp = JSON.parse(args[args.indexOf('--mcp-config') + 1])
+    expect(mcp.mcpServers.xesious.env.XESIOUS_RUN_KIND).toBe('interactive')
   }, 20000)
 })

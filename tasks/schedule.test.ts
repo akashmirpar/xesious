@@ -93,6 +93,16 @@ describe('resolveDue: what a slot that has come turns into', () => {
     expect(r.next!.toISOString()).toBe('2026-10-16T10:00:00.000Z')
   })
 
+  test('at the very second of the slot, it is that slot, not the one before', () => {
+    // croner drops milliseconds; a check exactly on the slot found yesterday's.
+    const daily: Trigger = { kind: 'cron', expr: '0 8 * * *' }
+    const r = resolveDue(daily, 'UTC', iso('2026-10-17T08:00:00Z'), iso('2026-10-21T08:00:00Z'))
+    expect(r.fire!.toISOString()).toBe('2026-10-21T08:00:00.000Z')
+    expect(r.missed).toBe(4)
+    expect(latestAtOrBefore(daily, 'UTC', iso('2026-10-21T08:00:00.000Z'))!.toISOString()).toBe('2026-10-21T08:00:00.000Z')
+    expect(latestAtOrBefore(daily, 'UTC', iso('2026-10-21T07:59:59.999Z'))!.toISOString()).toBe('2026-10-20T08:00:00.000Z')
+  })
+
   test('after an outage: the latest slot runs once if still in its window; the earlier ones are missed', () => {
     // Hourly: the window is half the period, 30 minutes.
     const r = resolveDue(hourly, 'UTC', iso('2026-10-16T09:00:00Z'), iso('2026-10-16T12:10:00Z'))

@@ -758,6 +758,36 @@ describe('parseStreamLine', () => {
     const line = JSON.stringify({ type: 'result', subtype: 'success', session_id: 's' })
     expect(parseStreamLine(line, on)[0]).toMatchObject({ text: '', isError: false })
   })
+
+  test('a result carries what the run cost and what the permission mode refused', () => {
+    // The shape of a real `claude -p --output-format stream-json` result (2.1.301).
+    const line = JSON.stringify({
+      type: 'result', subtype: 'success', session_id: 's', is_error: false, result: 'ok',
+      total_cost_usd: 0.0197, num_turns: 3, duration_ms: 14490,
+      usage: { input_tokens: 2, output_tokens: 400, cache_read_input_tokens: 14130, cache_creation_input_tokens: 9142 },
+      modelUsage: { 'claude-sonnet-5-5': { costUSD: 0.0197 } },
+      permission_denials: [{ tool_name: 'Bash', tool_use_id: 'x', tool_input: { command: 'git push origin main' } }, { tool_name: 'WebFetch' }],
+    })
+    expect(parseStreamLine(line, on)[0]).toEqual({
+      kind: 'result', text: 'ok', sessionId: 's', isError: false,
+      usage: { model: 'claude-sonnet-5-5', inputTokens: 2, outputTokens: 400, cacheReadTokens: 14130, cacheWriteTokens: 9142, costUsd: 0.0197, turns: 3, durationMs: 14490 },
+      denials: ['Bash: git push origin main', 'WebFetch'],
+    })
+  })
+
+  test('the usage limit: its own message with the reset time, and a result marked so', () => {
+    // The synthetic assistant message the CLI writes when the account is out of usage.
+    const msg = JSON.stringify({
+      type: 'assistant', error: 'rate_limit', isApiErrorMessage: true, apiErrorStatus: 429,
+      quotaLimits: { status: 'rejected', resetsAt: 1792090200, rateLimitType: 'five_hour' },
+      message: { model: '<synthetic>', content: [{ type: 'text', text: "You've hit your session limit · resets 1:40am (UTC)" }] },
+    })
+    expect(parseStreamLine(msg, on)).toContainEqual({ kind: 'limit', resetsAt: 1792090200, text: "You've hit your session limit · resets 1:40am (UTC)" })
+    const res = JSON.stringify({ type: 'result', subtype: 'success', is_error: true, result: "You've hit your session limit · resets 1:40am (UTC)", api_error_status: 429 })
+    expect(parseStreamLine(res, on)[0]).toMatchObject({ kind: 'result', isError: true, usageLimited: true })
+    const plain = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'The limit of the function is 2.' })
+    expect((parseStreamLine(plain, on)[0] as any).usageLimited).toBeUndefined()
+  })
 })
 
 // ---------------------------------------------------------------------------

@@ -1760,8 +1760,38 @@ export function buildSynthesisPreamble(
 export type StreamEvent =
   | { kind: 'step'; step: Step }
   | { kind: 'text'; text: string }
-  | { kind: 'result'; text: string; sessionId?: string; isError: boolean }
+  | { kind: 'result'; text: string; sessionId?: string; isError: boolean; usage?: RunUsage; denials?: string[]; usageLimited?: boolean }
   | { kind: 'init'; sessionId: string; model?: string; cliVersion?: string }
+  // The account's usage limit stopped the run. The CLI says so in a synthetic
+  // assistant message carrying when the limit resets.
+  | { kind: 'limit'; resetsAt?: number; text: string }
+
+// What a run cost, from its result event: tasks keep it per run so a person can see
+// what a schedule spends.
+export interface RunUsage {
+  model?: string
+  inputTokens?: number
+  outputTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  costUsd?: number
+  turns?: number
+  durationMs?: number
+}
+
+// "You've hit your session limit · resets 1:40am (UTC)" and its weekly kin.
+const LIMIT_TEXT = /^you'?ve hit your [a-z ]*limit\b/i
+
+// An action the permission mode refused, as a short line: "Bash: git push origin main".
+function denialLine(d: any): string {
+  const name = String(d?.tool_name ?? 'tool')
+  const i = d?.tool_input ?? {}
+  const what = i.command ?? i.file_path ?? i.url ?? i.path ?? i.pattern ?? ''
+  const s = String(what).replace(/\s+/g, ' ').trim()
+  return s ? `${name}: ${s.length > 120 ? s.slice(0, 119) + '…' : s}` : name
+}
+
+const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
 
 // Decode one NDJSON line into zero or more events. A blank or unparseable line
 // yields none (the CLI can emit partial/non-JSON lines; the caller skips them).
@@ -1789,12 +1819,30 @@ export function parseStreamLine(line: string, opts: { progressDetail: boolean })
         if (t) out.push({ kind: 'step', step: { label: '💭 Thinking', detail: t } })
       }
     }
+    // The usage limit, said in a message of its own before the result.
+    if (o.error === 'rate_limit' || o.isApiErrorMessage && o.apiErrorStatus === 429) {
+      const text = (o.message?.content ?? []).map((b: any) => String(b?.text ?? '')).join(' ').trim()
+      out.push({ kind: 'limit', resetsAt: Number(o.quotaLimits?.resetsAt) || undefined, text })
+    }
   } else if (o.type === 'result') {
+    const text = String(o.result ?? '').trim()
+    const u = o.usage ?? {}
+    const models = Object.keys(o.modelUsage ?? {})
+    const usage: RunUsage = {
+      model: models.length ? models[0] : undefined,
+      inputTokens: num(u.input_tokens), outputTokens: num(u.output_tokens),
+      cacheReadTokens: num(u.cache_read_input_tokens), cacheWriteTokens: num(u.cache_creation_input_tokens),
+      costUsd: num(o.total_cost_usd), turns: num(o.num_turns), durationMs: num(o.duration_ms),
+    }
+    const denials = Array.isArray(o.permission_denials) ? o.permission_denials.map(denialLine) : []
     out.push({
       kind: 'result',
-      text: String(o.result ?? '').trim(),
+      text,
       sessionId: o.session_id,
       isError: Boolean(o.is_error) || o.subtype !== 'success',
+      ...(Object.values(usage).some(v => v !== undefined) ? { usage } : {}),
+      ...(denials.length ? { denials } : {}),
+      ...(o.api_error_status === 429 || LIMIT_TEXT.test(text) ? { usageLimited: true } : {}),
     })
   } else if (o.type === 'system' && o.subtype === 'init' && o.session_id) {
     // The init event also states which model the CLI actually resolved to (e.g.

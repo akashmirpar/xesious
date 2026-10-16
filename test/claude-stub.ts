@@ -56,7 +56,10 @@ if (process.env.XESIOUS_STUB_LAST_ENV) {
   const dir = i >= 0 ? argv[i + 1] : undefined
   let claudeMd: string | undefined
   try { claudeMd = dir ? readFileSync(dir + '/CLAUDE.md', 'utf8') : undefined } catch {}
-  writeFileSync(process.env.XESIOUS_STUB_LAST_ENV, JSON.stringify({ addDirClaudeMd: process.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD ?? null, dir, claudeMd }))
+  writeFileSync(process.env.XESIOUS_STUB_LAST_ENV, JSON.stringify({
+    addDirClaudeMd: process.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD ?? null, dir, claudeMd,
+    disableCron: process.env.CLAUDE_CODE_DISABLE_CRON ?? null,
+  }))
 }
 // The bridge wraps a user message in an attribution frame whose first line carries
 // a per-process nonce. Strip it the way the real CLI's model would look past it,

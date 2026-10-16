@@ -60,6 +60,14 @@ import { DIGEST_BATCH_SYSTEM, digestBatchUser, splitDigests } from './context/di
 import { buildEngines, defaultEngineId, envEmbedding, historyChat, loadEnginesConfig, type Engine, type EnginesConfig } from './context/engines'
 import { readPhotos } from './context/ocr'
 import { recallBody, recallIntro, RECALL_CAVEAT, RECALL_CHARS, RECALL_MAX } from './context/recall'
+import { TaskStore } from './tasks/store'
+import { TaskRuntime, type ClaudeOutcome, type PostKind, type PostOpts } from './tasks/runtime'
+import { TaskService, type Action as TaskAction } from './tasks/service'
+import { taskRoutes, type BridgeHandlers } from './tasks/routes'
+import { TokenRegistry, startApi, loadOperatorToken, reply, fail, type Scope, type ApiServer } from './tasks/api'
+import { whenText, elapsedText } from './tasks/render'
+import type { Task, Run } from './tasks/model'
+import type { RunUsage } from './lib'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -913,6 +921,8 @@ type Job = {
 }
 const jobs = new Map<string, Job>()
 const jobsFor = (key: string) => [...jobs.values()].filter(j => j.key === key)
+// Every job of a topic, its detached ones (/bg, tasks) included: what /jobs lists.
+const jobsIn = (key: string) => [...jobs.values()].filter(j => j.key === key || j.key.startsWith(`${key}#`))
 // Short, because callback_data caps at 64 bytes and the id has to fit in a button.
 const newJobId = () => randomUUID().replace(/-/g, '').slice(0, 8)
 // Keyed by JOB id, never by topic (see the note in runStreaming's editStatus).
@@ -992,7 +1002,10 @@ const bgNotes: Record<string, string[]> = {}
 // would otherwise sit on disk unmentioned until the user typed its path themselves.
 const pendingFiles: Record<string, { abs: string; rel: string }[]> = {}
 const noteBgResult = (key: string, text: string) => {
-  (bgNotes[key] ??= []).push(text.length > 600 ? `${text.slice(0, 600)}…` : text)
+  const clipped = text.length > 600 ? `${text.slice(0, 600)}…` : text
+  // With tasks on, it waits in their store, which a restart doesn't empty.
+  if (taskStore) { taskStore.addNote(key, `A background task you started in this topic has finished. Its result:\n${clipped}`); return }
+  (bgNotes[key] ??= []).push(clipped)
   if (bgNotes[key].length > 3) bgNotes[key].shift()
 }
 
@@ -1094,7 +1107,12 @@ function enqueue<T>(key: string, task: () => Promise<T>): Promise<T> {
 // Run the Claude Code CLI for one prompt against a topic's session.
 // ---------------------------------------------------------------------------
 
-interface ClaudeResult { text: string; sessionId?: string; isError: boolean; noAnswer?: boolean; blocks?: string[] }
+interface ClaudeResult {
+  text: string; sessionId?: string; isError: boolean; noAnswer?: boolean; blocks?: string[]
+  // What the run cost, what the permission mode refused, and whether the account's
+  // usage limit stopped it (and when that resets): tasks record all of it per run.
+  usage?: RunUsage; denials?: string[]; usageLimited?: boolean; resetsAt?: number
+}
 
 // The permission postures the bridge offers, in ascending autonomy. `auto` routes
 // each tool call through Claude's classifier (blocks the irreversible/destructive
@@ -1117,6 +1135,9 @@ const permissionArgs = (mode: string, extraTools: string[] = []) =>
 function childEnv(): NodeJS.ProcessEnv {
   const e: NodeJS.ProcessEnv = { ...process.env }
   for (const k of Object.keys(e)) if (k.startsWith('TELEGRAM_') || k.startsWith('TG_')) delete e[k]
+  // With tasks on, Claude Code's session crons are off: one made in a `claude -p` run
+  // dies with it, so "every morning…" must become a task, not a cron that never fires.
+  if (TASKS) e.CLAUDE_CODE_DISABLE_CRON = '1'
   return e
 }
 
@@ -1191,10 +1212,40 @@ type RunOpts = {
   // do before its run could start (see handlePrompt). The run takes both over
   // instead of posting its own.
   early?: EarlyTurn
+  // Register the run's job under this key rather than the topic's, so /stop and
+  // interrupt mode in the topic leave it alone: a /bg run, a task's run. /jobs still
+  // lists it under the topic, and its own Interrupt button still ends it.
+  jobKey?: string
+  // A task's own run: it gets the scheduled set of the bot's tools, scoped to its task.
+  task?: { taskId: string; runId: string }
+  // false: none of the bot's tools (tasks, topics) for this run.
+  tasksTools?: boolean
+  // More CLI arguments, for the caller's own needs.
+  extraArgs?: string[]
 }
 // ---------------------------------------------------------------------------
 // Group memory — what the whole group keeps, across its topics (lib.ts explains how)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Tasks — things the bot does on its own, later or again and again, and reports in
+// Telegram (tasks/, research/tasks/REPORT.md). Off unless TG_TASKS=1.
+// ---------------------------------------------------------------------------
+let TASKS = /^(1|true|yes|on)$/i.test(process.env.TG_TASKS || '')
+const TASKS_STATE = dirname(STATE_FILE)
+const TASKS_DB = join(TASKS_STATE, 'tasks.db')
+const TASKS_DIR = join(TASKS_STATE, 'tasks')
+const API_SOCK = process.env.TG_API_SOCKET || join(TASKS_STATE, 'xesious.sock')
+const API_TOKEN_FILE = join(TASKS_STATE, 'xesious.token')
+// Scheduled Claude runs at once, across every task: below what people do live.
+const TASKS_MAX_CLAUDE = Math.max(1, Number(process.env.TG_TASKS_MAX_CLAUDE || 2))
+let taskStore: TaskStore | undefined
+let taskRuntime: TaskRuntime | undefined
+let taskService: TaskService | undefined
+let taskApi: ApiServer | undefined
+const apiTokens = new TokenRegistry()
+// The clock tasks run on: a test moves it.
+let taskNow = () => new Date()
+
 const GROUP_MEMORY = !/^(0|false|no)$/i.test(process.env.TG_GROUP_MEMORY || '')
 const GROUPS_BASE = process.env.TG_GROUPS_DIR || join(SESSIONS_BASE, '.groups')
 const groupMemoryDir = (chat: number | string) => join(GROUPS_BASE, String(chat))
@@ -1252,7 +1303,12 @@ function prepareGroupMemory(key: string, group: string): { dir: string; cleanup:
 async function runStreaming(ctx: Context, threadId: number | undefined, key: string, prompt: string, cwd: string, resumeId?: string, mode: string = PERMISSION_MODE, model: string = MODEL, ro: RunOpts = {}): Promise<ClaudeResult> {
   const { onInit, effort = EFFORT_TIER, askedBy, fork, silent, early } = ro
   const history = historyMcp(key)
-  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...permissionArgs(mode, history?.tools), ...(history?.args ?? [])]
+  const own = tasksMcpFor(ctx, key, threadId, ro)
+  const servers = { ...(history?.servers ?? {}), ...(own?.servers ?? {}) }
+  const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose',
+    ...permissionArgs(mode, [...(history?.tools ?? []), ...(own?.tools ?? [])]),
+    ...(Object.keys(servers).length ? ['--mcp-config', JSON.stringify({ mcpServers: servers })] : []),
+    ...taskGuardArgs(), ...(ro.extraArgs ?? [])]
   const profile = profileFor(cwd, key)
   if (profile.trim()) args.push('--append-system-prompt', profile)
   // Read once per run: a setting changed mid-run applies from the next one, so a
@@ -1319,6 +1375,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   try {
   return await new Promise<ClaudeResult>(resolve => {
     let buf = '', err = '', finalText = '', sessionId: string | undefined, isError = false, got = false
+    let usage: RunUsage | undefined, denials: string[] | undefined, usageLimited = false, resetsAt: number | undefined
     const textBlocks: string[] = []
     console.log(`[claude] stream in ${cwd}${resumeId ? ` (resume ${resumeId.slice(0, 8)})` : ' (new)'}`)
     // stdin = 'ignore' (/dev/null) so claude gets immediate EOF instead of waiting
@@ -1331,7 +1388,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     const child = spawn(CLAUDE_BIN, args, { cwd, env: runEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
     // An early turn's job has been registered since its status went up, with the
     // prompt as it was asked (for /jobs); the run gives it its process.
-    const job: Job = early?.job ?? { id: jobId, key, threadId, prompt, pgid: 0, askedBy, startedAt: Date.now(), statusMsgId: status?.message_id, steps: () => 0 }
+    const job: Job = early?.job ?? { id: jobId, key: ro.jobKey ?? key, threadId, prompt, pgid: 0, askedBy, startedAt: Date.now(), statusMsgId: status?.message_id, steps: () => 0 }
     job.child = child
     job.pgid = child.pid ?? 0
     job.steps = () => steps.length
@@ -1372,7 +1429,12 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
             textBlocks.push(ev.text)
             steps.push({ label: '💬 Said', detail: ev.text }); dirty = true; void editStatus()
           }
-          else if (ev.kind === 'result') { got = true; sessionId = ev.sessionId; isError = ev.isError; finalText = ev.text }
+          else if (ev.kind === 'result') {
+            got = true; sessionId = ev.sessionId; isError = ev.isError; finalText = ev.text
+            usage = ev.usage; denials = ev.denials
+            if (ev.usageLimited) usageLimited = true
+          }
+          else if (ev.kind === 'limit') { usageLimited = true; resetsAt = ev.resetsAt ?? resetsAt }
           else if (ev.kind === 'init') {
             if (ev.model || ev.cliVersion) {
               const prev = sessions[key]?.lastModel
@@ -1417,7 +1479,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
           await ctx.api.deleteMessage(ctx.chat!.id, status.message_id).catch(() => {})
         }
       }
-      resolve(res)
+      resolve({ ...res, ...(usage ? { usage } : {}), ...(denials ? { denials } : {}), ...(usageLimited ? { usageLimited, resetsAt } : {}) })
     }
     child.on('error', e => void finish({ text: `Failed to launch ${CLAUDE_BIN}: ${e}`, isError: true }))
     child.on('close', code => {
@@ -1453,7 +1515,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
       else void finish({ text: `Could not parse Claude output.\n\n${(err || `exit ${code}`).slice(-1500)}`, isError: true })
     })
   })
-  } finally { groupMem?.cleanup() }
+  } finally { groupMem?.cleanup(); own?.revoke() }
 }
 
 // ---------------------------------------------------------------------------
@@ -1592,9 +1654,10 @@ async function sendLegacyMd(ctx: Context, opts: any, text: string): Promise<numb
 // send that fell back to a path whose id we do not see, yields undefined and the
 // caller threads to the question instead.
 // `markup` goes on the last part only.
-async function sendRich(ctx: Context, threadId: number | undefined, text: string, replyTo?: number, markup?: any): Promise<number | undefined> {
+async function sendRich(ctx: Context, threadId: number | undefined, text: string, replyTo?: number, markup?: any, quiet = false): Promise<number | undefined> {
   noteBotMessage(keyFor(ctx.chat!.id, threadId))
   const base: any = destOpts({ threadId, replyTo })
+  if (quiet) base.disable_notification = true
   const parts = chunk(text, RICH_MAX)
   let only: number | undefined
   for (const [i, part] of parts.entries()) {
@@ -2894,7 +2957,7 @@ function cliComplete(model: string, system: string, user: string, timeoutMs = 12
 // the CLI for the turn, pinned to this one chat, and allowed without a prompt — they
 // only read what the group itself wrote.
 const HISTORY_TOOLS = ['mcp__history__search_history', 'mcp__history__read_messages', 'mcp__history__list_topics']
-function historyMcp(key: string): { args: string[]; tools: string[] } | undefined {
+function historyMcp(key: string): { servers: Record<string, unknown>; tools: string[] } | undefined {
   // A private continuation searches the group it continues.
   const link = privateLinks[key]
   if (link) key = keyFor(link.chat, link.thread)
@@ -2915,9 +2978,45 @@ function historyMcp(key: string): { args: string[]; tools: string[] } | undefine
     else env.XESIOUS_CONTEXT_EMBED = contextIndex()!.embedder!.name
   }
   for (const k of ['TG_CONTEXT_EMBED', 'TG_CONTEXT_EMBED_URL', 'TG_CONTEXT_DIGEST']) if (process.env[k]) env[k] = process.env[k]!
-  const config = { mcpServers: { history: { command: process.execPath, args: [join(HERE, 'context', 'mcp.ts')], env } } }
-  return { args: ['--mcp-config', JSON.stringify(config)], tools: HISTORY_TOOLS }
+  return { servers: { history: { command: process.execPath, args: [join(HERE, 'context', 'mcp.ts')], env } }, tools: HISTORY_TOOLS }
 }
+
+// The bot's own tools (tasks/mcp.ts) for a run: tasks and topics in the run's chat,
+// acting as the person the run is for, through a token that dies with the run. Not
+// for a private continuation or a private answer (private talk doesn't drive the
+// group), nor for runs that pass tasksTools: false (helpers, Auto turns, passthrough).
+// A task's own run gets the scheduled set, scoped to that task.
+function tasksMcpFor(ctx: Context, key: string, threadId: number | undefined, ro: RunOpts): { servers: Record<string, unknown>; tools: string[]; revoke: () => void } | undefined {
+  if (!TASKS || !taskApi || ro.tasksTools === false) return undefined
+  if (privateLinks[key] || askSource.has(key)) return undefined
+  const person = ctx.from
+  if (!person || person.is_bot || !ctx.chat) return undefined
+  // A task's run happens without a message from its group, so remember the group's
+  // name now, for the group memory that run is given.
+  const title = (ctx.chat as any).title
+  if (title && !ro.task) taskStore?.setMeta(`title:${ctx.chat.id}`, String(title))
+  const scope: Scope = {
+    kind: 'run', chat: String(ctx.chat.id), thread: threadId, person: String(person.id), personName: userName(person),
+    runKind: ro.task ? 'scheduled' : 'interactive', ...(ro.task ? { taskId: ro.task.taskId, runId: ro.task.runId } : {}),
+  }
+  const token = apiTokens.mint(scope)
+  const env = { XESIOUS_API_SOCK: taskApi.socket, XESIOUS_API_TOKEN: token, XESIOUS_RUN_KIND: scope.runKind! }
+  return {
+    servers: { xesious: { command: process.execPath, args: [join(HERE, 'tasks', 'mcp.ts')], env } },
+    tools: ['mcp__xesious'],
+    revoke: () => apiTokens.revoke(token),
+  }
+}
+
+// Claude Code's own schedulers would make a schedule that dies with this process
+// (session crons: off through the env, see childEnv), hold the run open waiting for
+// itself (ScheduleWakeup: `claude -p` waits for a pending wakeup, up to an hour) or
+// run in Anthropic's cloud and report to claude.ai (RemoteTrigger). And a run beside
+// others must not take messages from other Claude sessions on this machine.
+// Scheduling is the bot's.
+const taskGuardArgs = (): string[] => TASKS
+  ? ['--disallowedTools', 'RemoteTrigger,ScheduleWakeup', '--settings', JSON.stringify({ crossSessionInbound: 'refuse' })]
+  : []
 
 // The words the recall searches with: the message as typed, or — the topic's "Search
 // words" setting, on by default — written by Claude Haiku from the message and the
@@ -3644,7 +3743,7 @@ async function sendFile(ctx: Context, threadId: number | undefined, path: string
 // Returns the FIRST message id of the group, so a voice note can be threaded to the
 // answer even when the answer was a file. Undefined when nothing was sent, or when
 // the fallback path sent the files individually.
-async function sendFileGroup(ctx: Context, threadId: number | undefined, paths: string[], caption?: string, replyTo?: number, captionMode?: string, plainCaption?: string): Promise<number | undefined> {
+async function sendFileGroup(ctx: Context, threadId: number | undefined, paths: string[], caption?: string, replyTo?: number, captionMode?: string, plainCaption?: string, quiet = false): Promise<number | undefined> {
   const usable = paths.filter(p => existsSync(p) && statSync(p).isFile())
   if (usable.length === 0) return undefined
   const oversized = usable.map(tooBig).filter(Boolean)
@@ -3661,6 +3760,7 @@ async function sendFileGroup(ctx: Context, threadId: number | undefined, paths: 
   }
   noteBotMessage(keyFor(ctx.chat!.id, threadId))
   const opts: any = destOpts({ threadId, replyTo })
+  if (quiet) opts.disable_notification = true
   try {
     const sent: any = await ctx.api.sendMediaGroup(ctx.chat!.id, usable.map(one), opts)
     console.log(`[file->] group ${usable.map(p => basename(p)).join(' + ')}`)
@@ -3771,7 +3871,8 @@ function answerCaption(text: string, footer = ''): { text: string; mode?: string
 // `footer` is markdown that goes under the answer: at the end of the text, or of the
 // caption when the answer goes as a file.
 // `markup` (a reply keyboard) goes with an inline answer only; a file has none.
-async function deliver(ctx: Context, threadId: number | undefined, text: string, replyTo?: number, footer = '', markup?: any): Promise<number | undefined> {
+// quiet: no notification sound (a task's result in a group, for one).
+async function deliver(ctx: Context, threadId: number | undefined, text: string, replyTo?: number, footer = '', markup?: any, quiet = false): Promise<number | undefined> {
   const format = setting('replyFileFormat', keyFor(ctx.chat!.id, threadId)) as string
   if (answerGoesToFile(text, keyFor(ctx.chat!.id, threadId))) {
     const dir = mkdtempSync(join(tmpdir(), 'tg-'))
@@ -3793,10 +3894,10 @@ async function deliver(ctx: Context, threadId: number | undefined, text: string,
       const cap = answerCaption(text, footer)
       // The group's first message IS a thing to point at, so a long answer's voice
       // note hangs off the files rather than falling all the way back.
-      return await sendFileGroup(ctx, threadId, files, cap.text, replyTo, cap.mode, cap.plain)
+      return await sendFileGroup(ctx, threadId, files, cap.text, replyTo, cap.mode, cap.plain, quiet)
     } finally { rmSync(dir, { recursive: true, force: true }) }
   }
-  return sendRich(ctx, threadId, text + footer, replyTo, markup)
+  return sendRich(ctx, threadId, text + footer, replyTo, markup, quiet)
 }
 
 // ---------------------------------------------------------------------------
@@ -5164,9 +5265,14 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   // Not on an Auto turn: it may end in silence, and what it was handed would then
   // be spent without anyone having been told.
   const carried = !background && !kind.auto && bgNotes[key]?.length ? bgNotes[key].splice(0) : []
-  const preamble = carried.length
-    ? carried.map(t => `[xesious:${BRIDGE_NONCE}] a background task you started in this topic has finished. Its result:\n${t}`).join('\n\n') + '\n\n'
-    : ''
+  // What tasks' runs (and, with tasks on, background jobs) left for this topic. Kept in
+  // the tasks store, not in memory, so a restart between the run and this turn
+  // doesn't lose it.
+  const stored = !background && !kind.auto ? taskStore?.takeNotes(key) ?? [] : []
+  const preamble = [
+    ...carried.map(t => `[xesious:${BRIDGE_NONCE}] a background task you started in this topic has finished. Its result:\n${t}`),
+    ...stored.map(t => `[xesious:${BRIDGE_NONCE}] ${t}`),
+  ].join('\n\n') + (carried.length || stored.length ? '\n\n' : '')
   // Same idea for files that arrived without a caption. Foreground turns only: a
   // background job was asked for something specific and should not inherit an
   // upload that happened while it ran.
@@ -5245,11 +5351,15 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
     // The same stamp on both sides: neither outranks the other until one moves.
     if (linked) { const l = loadLinks(); if (l[linked.uuid]) { l[linked.uuid].sessionId = sessionId; l[linked.uuid].updated = at; saveLinks(l) } }
   }
+  // A /bg run is detached: /stop and interrupt mode in the topic leave it alone (its own
+  // Interrupt button still ends it), so it gets a job key, and a stop flag, of its own.
+  const detached = background && !promotedTurn && !isSynthesis && !childOf.has(key)
+  const jobKey = detached ? `${key}#bg-${replyTo ?? newJobId()}` : undefined
   try {
     const res = early?.job.outcome ? await endEarly(ctx, early)
-      : await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), { onInit: background ? undefined : bindSession, effort: effortFor(key), askedBy: replyTo, fork: background, silent: !!kind.auto, early })
-    if (stopped.has(key)) {
-      stopped.delete(key)
+      : await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), { onInit: background ? undefined : bindSession, effort: effortFor(key), askedBy: replyTo, fork: background, silent: !!kind.auto, early, jobKey, tasksTools: !kind.auto })
+    if (stopped.has(jobKey ?? key)) {
+      stopped.delete(jobKey ?? key)
       // Interrupting a part is not the same as the part finishing. It means you are
       // taking it over, so the parent waits instead of writing an answer from work
       // you just stopped — with a way out, so an abandoned part cannot strand the
@@ -5427,7 +5537,7 @@ const refreshing = new Set<string>()
 const passthroughCommand = (text: string) => text.trim().split(/\s+/)[0].toLowerCase().replace(/@\S+$/, '')
 async function runPassthrough(ctx: Context, threadId: number | undefined, key: string, text: string): Promise<string> {
   const cwd = resolveCwd(ctx, threadId)
-  const res = await runStreaming(ctx, threadId, key, passthroughCommand(text), cwd, sessions[key]?.sessionId, modeFor(key), modelFor(key), { silent: true })
+  const res = await runStreaming(ctx, threadId, key, passthroughCommand(text), cwd, sessions[key]?.sessionId, modeFor(key), modelFor(key), { silent: true, tasksTools: false })
   return res.text
 }
 
@@ -6064,7 +6174,7 @@ async function runPrivateAsk(ctx: Context, threadId: number | undefined, token: 
   try {
     const block = await privateContext(ctx, askKey, link, question, src.cwd, undefined, true).catch(e => { console.error(`[private] ${askKey}: ${e}`); return '' })
     const res = await runStreaming(ctx, threadId, askKey, block + frameFrom(ctx, question), src.cwd, sessions[gKey]?.sessionId,
-      modeFor(gKey), modelFor(gKey), { fork: true, silent: true, effort: effortFor(gKey) })
+      modeFor(gKey), modelFor(gKey), { fork: true, silent: true, effort: effortFor(gKey), tasksTools: false })
     const promoted = res.isError ? undefined : promoteBlock(res.blocks ?? [], res.text)
     const text = res.isError ? `⚠️ ${res.text || 'Something went wrong.'}`
       : res.noAnswer || !res.text.trim() ? 'No answer came back. Ask again, or carry it on in the DM.'
@@ -6704,7 +6814,7 @@ bot.on('message', async ctx => {
     if (!e?.sessionId) { await send(ctx, threadId, 'No session in this topic yet — nothing to compact.'); return }
     const instr = text.replace(/^\/compact(@\S+)?\s*/i, '').trim()  // optional focus instructions
     enqueue(key, async () => {
-      const res = await runStreaming(ctx, threadId, key, `/compact${instr ? ' ' + instr : ''}`, e.cwd, e.sessionId)
+      const res = await runStreaming(ctx, threadId, key, `/compact${instr ? ' ' + instr : ''}`, e.cwd, e.sessionId, undefined, undefined, { tasksTools: false })
       if (stopped.has(key)) { stopped.delete(key); return }
       if (res.sessionId) { sessions[key] = { cwd: e.cwd, sessionId: res.sessionId, updated: new Date().toISOString() }; saveState() }
       await send(ctx, threadId, res.isError
@@ -6738,7 +6848,7 @@ bot.on('message', async ctx => {
       // plan at all: "This message doesn't start with your verification marker"
       // (Tier 3, 2026-09-27).
       const res = await runStreaming(ctx, threadId, key, frameFrom(ctx, fanoutPlanPrompt(task, setting('fanoutMax', key) as number)), cwd,
-        sessions[key]?.sessionId, 'plan', modelFor(key), { effort: effortFor(key), fork: true })
+        sessions[key]?.sessionId, 'plan', modelFor(key), { effort: effortFor(key), fork: true, tasksTools: false })
       const items = parseFanoutPlan(res.text, { max: setting('fanoutMax', key) as number })
       if (thinking) await ctx.api.deleteMessage(ctx.chat!.id, thinking.message_id).catch(() => {})
       if (!items.length) {
@@ -6782,7 +6892,7 @@ bot.on('message', async ctx => {
     return
   }
   if (cmd === '/jobs' || cmd === '/ps') {
-    const running = jobsFor(key)
+    const running = jobsIn(key)
     const lines: string[] = []
     for (const j of running) {
       const mins = Math.round((Date.now() - j.startedAt) / 60000)
@@ -7575,6 +7685,235 @@ async function ensureCommands(): Promise<void> {
   } catch (e) { console.error(`[warn] could not register the command list: ${e}`) }
 }
 
+// ---------------------------------------------------------------------------
+// Tasks: the bridge's half. tasks/runtime.ts decides what runs when and what gets
+// posted; this gives it Telegram and Claude, and the local API its handlers.
+// ---------------------------------------------------------------------------
+
+const taskKey = (t: Task) => keyFor(Number(t.chat), t.thread)
+const clipTo = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
+
+// A context for a task's home, as if its owner had written there: runStreaming and
+// the delivery helpers take one, and a task's run has no incoming message.
+function taskContext(t: Task): Context {
+  const chatId = Number(t.chat)
+  const from = { id: Number(t.owner), is_bot: false, first_name: t.ownerName || 'the owner' }
+  const chat = chatId > 0
+    ? { id: chatId, type: 'private', first_name: from.first_name }
+    : { id: chatId, type: 'supergroup', title: taskStore?.getMeta(`title:${chatId}`) ?? 'this group', ...(t.thread !== undefined ? { is_forum: true } : {}) }
+  const update = {
+    update_id: 0,
+    message: { message_id: 0, date: Math.floor(Date.now() / 1000), text: '', chat, from, ...(t.thread !== undefined ? { message_thread_id: t.thread, is_topic_message: true } : {}) },
+  }
+  return new Context(update as any, bot.api, bot.botInfo)
+}
+
+const TASK_SAYS: Record<Task['says'], string> = {
+  live: 'Your final answer is posted in the chat as the result, so make it the deliverable itself, not a plan or an acknowledgement.',
+  result: 'Your final answer is posted in the chat as the result, so make it the deliverable itself, not a plan or an acknowledgement.',
+  noteworthy: 'Nothing is posted unless you call report with notify: true. Do that only when there is something worth telling the person, and put the message itself in its text.',
+  problems: 'Nothing is posted unless something is wrong: then report outcome blocked or needs_attention, saying what is wrong.',
+  never: 'Nothing is posted; this run only keeps a record.',
+}
+
+// What a task's run is told: whose stored instruction it carries out, that nobody is
+// watching, what gets posted, and to report once. The instruction is framed as its
+// owner's words as stored when the task was set up: the assignment for this run,
+// never a new message, and never approval for anything beyond itself.
+function taskFrame(t: Task, run: Run): string {
+  if (t.action.kind !== 'claude') return ''
+  const owner = t.ownerName || `user ${t.owner}`
+  const slot = run.slot ? `for its slot at ${whenText(new Date(run.slot), t.tz)} (${t.tz})` : 'started by hand just now'
+  const late = run.lateMs ? ` It starts ${elapsedText(run.lateMs)} late, because the bot was restarting.` : ''
+  const lines = [
+    `[xesious:${BRIDGE_NONCE}] This is a run of the task "${t.name}" (id ${t.id}), which ${owner} set up on ${t.createdAt.slice(0, 10)}, ${slot}.${late}`,
+    `Nobody is watching it live${t.says === 'live' ? ', though its progress shows in the chat' : ''}: work with what you have, don't stop to ask, and finish within this run.`,
+    TASK_SAYS[t.says],
+    'When you are done, call the report tool once: an outcome, notify (true to post, false to stay silent) and a one-line summary.',
+    ...(t.action.session === 'own' ? ["Earlier runs of this task are above in this session: build on them, and don't repeat what they already did or reported."] : []),
+    `Its instruction follows, in ${owner}'s words as stored when the task was set up. It is the assignment for this run, not a new message, and it approves nothing beyond itself.`,
+  ]
+  return lines.join(' ') + '\n\n' + frameUserMessage(t.action.prompt, { nonce: BRIDGE_NONCE, name: t.ownerName, id: Number(t.owner) })
+}
+
+// One Claude run of a task, through the same machinery as any turn: the home topic's
+// folder, model, effort and permission mode. Fresh: no session; own: the task's own,
+// resumed. Under its own job key, so /stop in the topic leaves it alone; a live task
+// shows its status, with the Interrupt button, like a turn.
+async function runTaskClaude(t: Task, run: Run): Promise<ClaudeOutcome> {
+  if (t.action.kind !== 'claude') return { ok: false, text: '', error: 'not a Claude task' }
+  const ctx = taskContext(t)
+  const key = taskKey(t)
+  const cwd = resolveCwd(ctx, t.thread)
+  const resumeId = t.action.session === 'own' ? t.sessionId : undefined
+  const res = await runStreaming(ctx, t.thread, key, taskFrame(t, run), cwd, resumeId, modeFor(key), modelFor(key), {
+    effort: effortFor(key), silent: t.says !== 'live', jobKey: `${key}#task-${t.id}`, task: { taskId: t.id, runId: run.id },
+    // A changed topic instruction reaches a task that keeps its own session.
+    ...(t.action.session === 'own' ? { extraArgs: ['--system-prompt-snapshot', 'off'] } : {}),
+  })
+  if (res.usageLimited) {
+    return { ok: false, text: '', usageLimited: true, retryAt: res.resetsAt ? new Date(res.resetsAt * 1000) : undefined, usage: res.usage, sessionId: res.sessionId }
+  }
+  const failed = res.isError || res.noAnswer
+  return {
+    ok: !failed, text: failed ? '' : res.text,
+    error: failed ? (res.noAnswer ? 'it ended without an answer' : clipTo(res.text, 300)) : undefined,
+    sessionId: res.sessionId, usage: res.usage, denials: res.denials,
+  }
+}
+
+const TASK_BUTTONS: Record<NonNullable<PostOpts['buttons']>, (t: Task) => any[][]> = {
+  reminder: t => [[{ text: '✅ Done', callback_data: `tk:ok:${t.id}` }, { text: '⏰ +15 min', callback_data: `tk:snz:${t.id}` }]],
+  alert: t => [[{ text: '▶️ Run now', callback_data: `tk:run:${t.id}` }, { text: '⏸ Pause', callback_data: `tk:pause:${t.id}` }]],
+  paused: t => [[{ text: '▶️ Resume', callback_data: `tk:resume:${t.id}` }]],
+  rerun: t => [[{ text: '▶️ Run again', callback_data: `tk:run:${t.id}` }]],
+}
+
+// Post for a task, in its home topic or its owner's private chat: the message id, or
+// undefined. A reminder names its owner, so it reaches them in a busy group. An alert
+// or notice that already has a message edits it rather than adding one.
+async function postTask(t: Task, kind: PostKind, text: string, o: PostOpts): Promise<number | undefined> {
+  const toDm = t.where === 'dm'
+  const chatId = toDm ? Number(t.owner) : Number(t.chat)
+  const threadId = toDm ? undefined : t.thread
+  const kb = o.buttons ? { inline_keyboard: TASK_BUTTONS[o.buttons](t) } : undefined
+  const late = o.lateMs && o.lateMs > 60_000 ? `${elapsedText(o.lateMs)} late: the bot was restarting` : ''
+  if (kind === 'result') {
+    const ctx = toDm ? dmContext({ id: Number(t.owner), is_bot: false, first_name: t.ownerName || 'you' } as any) : taskContext(t)
+    const id = await deliver(ctx, threadId, `**⏰ ${t.name}**${late ? ` _(${late})_` : ''}\n\n${text}`, undefined, '', kb, !o.loud)
+    // Files the run left in the topic's outbox go with its result.
+    await flushOutbox(ctx, threadId, resolveCwd(taskContext(t), t.thread), taskKey(t), id)
+    return id
+  }
+  const who = kind === 'reminder' && !toDm && Number(t.chat) < 0 ? `<a href="tg://user?id=${t.owner}">${escapeHtml(t.ownerName || 'you')}</a> ` : ''
+  const html = (kind === 'reminder' ? `🔔 ${who}${escapeHtml(text)}` : escapeHtml(text)) + (late ? ` <i>(${escapeHtml(late)})</i>` : '')
+  if (o.edit) {
+    const edited = await bot.api.editMessageText(chatId, o.edit, html, { parse_mode: 'HTML', ...(kb ? { reply_markup: kb } : {}) })
+      .then(() => true, e => String(e).includes('not modified'))
+    if (edited) return o.edit
+  }
+  const m = await bot.api.sendMessage(chatId, html, { ...destOpts({ threadId }), parse_mode: 'HTML', disable_notification: !o.loud, ...(kb ? { reply_markup: kb } : {}) })
+  noteBotMessage(keyFor(chatId, threadId))
+  return m.message_id
+}
+
+// May the person a task runs as still use its home? The rule isAllowed applies to a
+// message from them there, without a message to check.
+function taskOwnerAllowed(t: Task): boolean {
+  if (Number(t.chat) > 0) return ALLOWED_USERS.has(t.owner) || privateGuests.has(Number(t.owner))
+  if (TRUST_CHAT_MEMBERS) return ALLOWED_CHATS.has(t.chat)
+  return ALLOWED_USERS.has(t.owner) && ALLOWED_CHATS.has(t.chat)
+}
+
+function taskMayCreate(_scope: Scope): string | undefined { return undefined }
+
+// Anyone who may use the chat may pause, resume or run a task; changing or deleting
+// it is for whoever set it up, and the chat's admins.
+function taskMayManage(scope: Scope, t: Task, action: TaskAction): string | undefined {
+  if (scope.kind === 'operator') return undefined
+  if (action === 'pause' || action === 'resume' || action === 'run') return undefined
+  const p = scope.person ?? ''
+  if (p === t.owner || ALLOWED_USERS.has(p) || adminCache.get(`${t.chat}:${p}`)?.admin) return undefined
+  return `only ${t.ownerName || 'the person who set it up'} or an admin can ${action === 'delete' ? 'delete' : 'change'} it`
+}
+
+// A topic named by its id or by its name, in a chat: its thread id.
+function resolveTopicRef(chat: string, ref: string): number | undefined {
+  if (/^\d+$/.test(ref)) return Number(ref)
+  const want = ref.trim().toLowerCase()
+  for (const [k, n] of Object.entries(names)) {
+    const i = k.indexOf(':')
+    if (k.slice(0, i) === chat && n.trim().toLowerCase() === want) return Number(k.slice(i + 1)) || undefined
+  }
+  return undefined
+}
+
+const notYet = () => fail(501, "topic tools aren't switched on in this version yet")
+const taskBridge: BridgeHandlers = {
+  listTopics: notYet,
+  createTopic: notYet,
+  updateTopic: notYet,
+  // A task's run posting something before its result: a milestone, a warning.
+  async notify(s, body) {
+    if (s.runKind !== 'scheduled' || !s.taskId) return fail(403, "notify is for a task's own run; in a conversation, just answer")
+    const t = taskStore?.getTask(s.taskId)
+    if (!t) return fail(404, 'this run has no task')
+    const text = String(body?.text ?? '').trim()
+    if (!text) return fail(400, 'text is required')
+    const id = await postTask(t, 'notice', clipTo(text, 3500), { loud: !body?.silent })
+    return reply(200, { message: 'Posted.', message_id: id })
+  },
+  // A script on the host posting into a chat this bot serves: `xesious send`.
+  async send(s, body) {
+    if (s.kind !== 'operator') return fail(403, 'send is for scripts on the host, with the operator token')
+    const chat = String(body?.chat ?? '')
+    if (!(chat.startsWith('-') ? ALLOWED_CHATS.has(chat) : ALLOWED_USERS.has(chat))) return fail(403, `chat ${chat || '(none)'} is not one this bot serves`)
+    const text = String(body?.text ?? '').trim()
+    if (!text) return fail(400, 'text is required')
+    let thread: number | undefined
+    if (body?.topic !== undefined && body.topic !== null && body.topic !== '') {
+      thread = resolveTopicRef(chat, String(body.topic))
+      if (thread === undefined) return fail(404, `no topic "${body.topic}" in ${chat}`)
+    }
+    try {
+      const m = await bot.api.sendMessage(Number(chat), clipTo(text, 4000), { ...destOpts({ threadId: thread }), disable_notification: !!body?.silent })
+      noteBotMessage(keyFor(Number(chat), thread))
+      return reply(200, { message: 'Sent.', message_id: m.message_id })
+    } catch (e) {
+      return fail(502, `Telegram refused it: ${e}`)
+    }
+  },
+}
+
+// A task's card and the activity log: posted and edited by the Telegram side of
+// tasks; until then, the log.
+function refreshTaskCard(_t: Task, _what?: string): void {}
+function taskActivity(t: Task, text: string): void { console.log(`[tasks] ${taskKey(t)} ${t.id}: ${text}`) }
+
+// Open the store, start the local API and the loop. Tasks stay off, with a line in
+// the log, if any of it can't start: the bot itself must not fail over them.
+function startTasks(): void {
+  if (!TASKS || taskStore) return
+  try {
+    mkdirSync(TASKS_STATE, { recursive: true })
+    const store = new TaskStore(TASKS_DB)
+    taskStore = store
+    taskRuntime = new TaskRuntime({
+      store, now: () => taskNow(), log: s => console.log(s), dataDir: TASKS_DIR, maxClaude: TASKS_MAX_CLAUDE,
+      startedAt: taskNow(),
+      ownerAllowed: taskOwnerAllowed,
+      runClaude: runTaskClaude,
+      post: postTask,
+      cardChanged: t => refreshTaskCard(t),
+      note: (t, text) => store.addNote(taskKey(t), text),
+      activity: taskActivity,
+    })
+    taskService = new TaskService({
+      store, now: () => taskNow(),
+      mayCreate: taskMayCreate,
+      mayManage: taskMayManage,
+      isGroup: chat => chat.startsWith('-'),
+      changed: (t, what) => { taskRuntime?.wake(); refreshTaskCard(t, what); taskActivity(t, what) },
+      runNow: t => taskRuntime!.runNow(t.id),
+    })
+    apiTokens.addOperator(loadOperatorToken(API_TOKEN_FILE))
+    taskApi = startApi({ socket: API_SOCK, tokens: apiTokens, routes: taskRoutes(taskService, taskBridge), log: s => console.error(s) })
+    const { interrupted } = taskRuntime.start()
+    const active = store.listTasks({ states: ['active'] }).length
+    console.log(`     tasks          : on — ${active} active${interrupted.length ? `, ${interrupted.length} run(s) interrupted by the restart` : ''}; API at ${API_SOCK}`)
+  } catch (e) {
+    console.error(`[tasks] could not start (${e}); tasks are off until the next start`)
+    stopTasks()
+    TASKS = false
+  }
+}
+
+function stopTasks(): void {
+  taskRuntime?.stop()
+  taskApi?.stop()
+  taskApi = undefined
+}
+
 async function main() {
   const me = await bot.api.getMe()
   botUsername = me.username
@@ -7662,6 +8001,9 @@ async function main() {
     console.log(`[ok] cleaned ${pending.length} orphaned status message(s)`)
     pending = []; saveState()
   }
+  // After the orphaned statuses are gone: a run the restart cut short is told so in
+  // its topic, and nothing should delete that notice.
+  startTasks()
 
   // Resilient polling via @grammyjs/runner. The runner treats a 409 as fatal
   // (normally it means a real second instance). In our case a 409 right after a
@@ -7691,6 +8033,8 @@ async function main() {
     if (draining) return
     draining = true
     console.log(`[drain] ${why} — not accepting new messages; ${jobs.size} run(s) in flight`)
+    // No new task runs either; the ones going finish below like any other run.
+    taskRuntime?.stop()
     try { await handle?.stop() } catch {}          // stop fetching updates
     const deadline = Date.now() + DRAIN_MAX_MS
     while (jobs.size > 0 && Date.now() < deadline) await new Promise(r => setTimeout(r, 250))
@@ -7706,6 +8050,8 @@ async function main() {
     }
     try { writeFileSync(CLEAN_EXIT_MARKER, new Date().toISOString()) } catch {}
     try { rmSync(PID_FILE, { force: true }) } catch {}
+    stopTasks()
+    try { taskStore?.close() } catch {}
     console.log('[bye]')
     process.exit(0)
   }
@@ -7802,6 +8148,17 @@ export async function _autoLookNow(key: string): Promise<boolean> {
 export const _autoWaiting = autoWaiting
 export const _autoJoinedAt = autoJoinedAt
 export const _lastSpoke = lastSpoke
+
+// Tasks, from a test: switched on and started in-process, on a clock the test moves.
+export function _enableTasks(on = true): void { TASKS = on }
+export function _startTasks(): void { startTasks() }
+export function _stopTasks(): void {
+  stopTasks()
+  try { taskStore?.close() } catch {}
+  taskStore = undefined; taskRuntime = undefined; taskService = undefined
+}
+export const _tasks = () => ({ store: taskStore, runtime: taskRuntime, service: taskService, api: taskApi, tokens: apiTokens, socket: API_SOCK, dir: TASKS_DIR })
+export function _setTaskClock(fn: () => Date): void { taskNow = fn }
 
 // Guarded so the module can be imported by a test without starting a poller.
 if (import.meta.main) main().catch(e => { console.error(`[fatal] ${e}`); process.exit(1) })

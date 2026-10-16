@@ -61,8 +61,13 @@ export function latestAtOrBefore(t: Trigger, tz: string, at: Date): Date | undef
       if (at.getTime() < a) return undefined
       return new Date(a + Math.floor((at.getTime() - a) / t.everyMs) * t.everyMs)
     }
-    case 'cron':
-      return cronOf(t.expr, tz).previousRuns(1, new Date(at.getTime() + 1))[0]
+    case 'cron': {
+      // croner works in whole seconds and drops the milliseconds of its reference, so
+      // "before at + 1 ms" would mean "before at" and miss a slot due this very second.
+      // Look a second ahead, then keep only a slot that is not after `at`.
+      const prev = cronOf(t.expr, tz).previousRuns(1, new Date(at.getTime() + 1000))[0]
+      return prev && prev.getTime() <= at.getTime() ? prev : cronOf(t.expr, tz).previousRuns(1, at)[0]
+    }
   }
 }
 

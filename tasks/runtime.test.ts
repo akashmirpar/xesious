@@ -264,6 +264,12 @@ describe('health', () => {
     const once = mk({ name: 'Once', trigger: { kind: 'at', at: now.toISOString() }, nextDue: now.toISOString() })
     await tick()
     expect(store.getTask(once.id)!.nextDue).toBe(new Date(now.getTime() + 30 * 60_000).toISOString())
+    // When the CLI says when the limit resets, a minute after that.
+    const resets = new Date(now.getTime() + 2 * 3600_000)
+    claude = async () => ({ ok: false, text: '', usageLimited: true, retryAt: resets })
+    const twice = mk({ name: 'Twice', trigger: { kind: 'at', at: now.toISOString() }, nextDue: now.toISOString() })
+    await tick()
+    expect(store.getTask(twice.id)!.nextDue).toBe(new Date(resets.getTime() + 60_000).toISOString())
   })
 
   test('a task whose owner can no longer use the chat pauses instead of running', async () => {

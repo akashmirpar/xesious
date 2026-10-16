@@ -26,6 +26,7 @@ export interface ClaudeOutcome {
   error?: string
   timedOut?: boolean
   usageLimited?: boolean   // stopped by a usage limit: deferred, not failed
+  retryAt?: Date           // when that limit resets, if the CLI said
   canceled?: boolean       // a person stopped it
   sessionId?: string
   usage?: Usage
@@ -310,10 +311,11 @@ export class TaskRuntime {
 
     if (o.usageLimited) {
       run = this.store.updateRun(run.id, { ...base, state: 'deferred', reason: 'stopped by the usage limit' })!
-      // A one-off would never run otherwise: try again later, inside its window.
+      // A one-off would never run otherwise: try again once the limit has reset (a
+      // minute after, if the CLI said when), inside its window.
       if (t.trigger.kind === 'at' && t.state === 'active' && !t.nextDue) {
         const slot = new Date(run.slot ?? t.trigger.at).getTime()
-        const retry = this.d.now().getTime() + DEFERRED_RETRY_MS
+        const retry = o.retryAt ? o.retryAt.getTime() + 60_000 : this.d.now().getTime() + DEFERRED_RETRY_MS
         if (retry - slot < LIMITS.oneOffGraceMs) t = this.store.updateTask(t.id, { nextDue: new Date(retry).toISOString() })!
       }
       t = this.store.updateTask(t.id, { lastMark: 'deferred', lastRunAt: run.startedAt })!
