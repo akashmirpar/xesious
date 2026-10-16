@@ -60,6 +60,12 @@ const LAST_ARGS = join(TMP, 'last-args.json')
 process.env.XESIOUS_STUB_LAST_ARGS = LAST_ARGS
 const LAST_ENV = join(TMP, 'last-env.json')
 process.env.XESIOUS_STUB_LAST_ENV = LAST_ENV
+// Every MCP call the stub made (the MCPTASK scenario), one JSON line each.
+const MCP_LOG = join(TMP, 'mcp-calls.jsonl')
+process.env.XESIOUS_STUB_MCP_LOG = MCP_LOG
+// Tasks are on by default; off here, so every other test sees the command line it
+// always did. The task tests switch them on.
+process.env.TG_TASKS = '0'
 process.env.TG_SESSIONS_BASE = join(TMP, 'sessions')
 process.env.TG_STATE_FILE = STATE_FILE
 // Never the real state/live-links.json: the bridge reads it on every turn.
@@ -4760,6 +4766,37 @@ describe('tasks: the bridge runs them (phase 1)', () => {
     const mcp = JSON.parse(args[args.indexOf('--mcp-config') + 1])
     expect(mcp.mcpServers.xesious.env.XESIOUS_RUN_KIND).toBe('interactive')
   }, 20000)
+
+  // The real tasks server, started from the run's --mcp-config the way Claude Code
+  // starts it, over the real socket.
+  const lastMcpCall = () => JSON.parse(readFileSync(MCP_LOG, 'utf8').trim().split('\n').pop()!)
+
+  test('asked in a message, Claude creates the task through the tasks server, as the person who asked', async () => {
+    const before = calls.length
+    await incoming(5101, 'MCPTASK task_create {"name":"Stretch","message":"Stand up and stretch","in_minutes":30,"tz":"UTC"}')
+    expect(lastMcpCall()).toMatchObject({ tool: 'task_create', isError: false })
+    expect(lastMcpCall().text).toContain('Stretch')
+    const t = T().store.listTasks({ chat: '5101' }).find((x: any) => x.name === 'Stretch')!
+    expect(t).toMatchObject({ owner: '1', state: 'active', action: { kind: 'message', text: 'Stand up and stretch' } })
+    expect(t.nextDue).toBe(new Date(clock.getTime() + 30 * 60_000).toISOString())
+    expect(posted(before, 'mcpToolDone').length).toBe(1)
+  }, 20000)
+
+  test("a task's run reports through the tasks server: a noteworthy find is posted, in the run's own words", async () => {
+    const before = calls.length
+    const t = make({ name: 'Page watch', cron: '0 5 * * *', says: 'noteworthy',
+      prompt: 'MCPTASK report {"outcome":"needs_attention","notify":true,"summary":"Two new items","text":"Two new items on the page"}' })
+    await at('2026-10-22T05:00:00Z')
+    expect(lastMcpCall()).toMatchObject({ tool: 'report', isError: false })
+    expect(posted(before, 'Two new items on the page').length).toBe(1)
+    expect(T().store.runsFor(t.id)[0]).toMatchObject({ state: 'succeeded', outcome: 'needs_attention', summary: 'Two new items' })
+  }, 20000)
+
+  test("a person's turn can't report as a task's run: the tool isn't there", async () => {
+    await incoming(5101, 'MCPTASK report {"outcome":"done","notify":true,"summary":"x"}')
+    expect(lastMcpCall()).toMatchObject({ tool: 'report', isError: true })
+    expect(lastMcpCall().text).toContain('unknown tool report')
+  }, 20000)
 })
 
 describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
@@ -4786,13 +4823,20 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     return r.value.task
   }
   const settleCards = () => Bun.sleep(30)
-  async function tap(data: string, chat: number, thread?: number, who = ADA, msgId = 777, text = 'x'): Promise<Call[]> {
+  // A tap, and what it led to once the tasks it started are over (press: at once).
+  async function press(data: string, chat: number, thread?: number, who = ADA, msgId = 777, text = 'x'): Promise<Call[]> {
     const before = calls.length
     await bridge.bot.handleUpdate({ update_id: updateId++, callback_query: {
       id: `q${updateId}`, from: who, chat_instance: 'x', data,
       message: { message_id: msgId, date: 0, text, ...(thread ? { message_thread_id: thread, is_topic_message: true } : {}),
         chat: chat < 0 ? { id: chat, type: 'supergroup', title: 'G', is_forum: true } : { id: chat, type: 'private', first_name: who.first_name } },
     } })
+    await settleCards()
+    return calls.slice(before)
+  }
+  async function tap(data: string, chat: number, thread?: number, who = ADA, msgId = 777, text = 'x'): Promise<Call[]> {
+    const before = calls.length
+    await press(data, chat, thread, who, msgId, text)
     await T().runtime.idle()
     await settleCards()
     return calls.slice(before)
@@ -4806,6 +4850,11 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     return calls.slice(before)
   }
   const answers = (cs: Call[]) => cs.filter(c => c.method === 'answerCallbackQuery').map(c => String(c.payload.text ?? ''))
+  async function waitFor(pred: () => boolean, ms = 8000): Promise<void> {
+    const end = Date.now() + ms
+    while (!pred()) { if (Date.now() > end) throw new Error('timed out'); await new Promise(r => setTimeout(r, 25)) }
+  }
+  const jobKeys = (): string[] => bridge._jobs().map((j: any) => j.key)
 
   test("a new task's card goes into its topic, silently, with its buttons; the group's first task makes the activity topic", async () => {
     const before = calls.length
@@ -4949,6 +4998,46 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     await settleCards()
     expect(calls.slice(before2).some(c => c.method === 'createForumTopic')).toBe(false)
   })
+
+  test("/stop leaves a task's run and a /bg run be, and says so; the card and /jobs stop them", async () => {
+    const t = make({ name: 'Long one', prompt: 'TICKING', cron: '7 1 * * *' }, scopeOf(C, 501))
+    await settleCards()
+    const taskJob = `${C}:501#task-${t.id}`
+    // Run now: the card shows the run, with a way to stop it, at once.
+    let cs = await press(`tk:run:${t.id}`, C, 501)
+    expect(answers(cs)).toContain('Started.')
+    await waitFor(() => jobKeys().includes(taskJob))
+    await waitFor(() => calls.some(c => c.method === 'editMessageText' && c.payload.message_id === T().store.getTask(t.id).cardMsg &&
+      String(c.payload.text).includes('⏳ running since') && JSON.stringify(c.payload.reply_markup).includes(`tk:stop:${t.id}`)))
+    await say('/bg TICKING', 501)
+    await waitFor(() => jobKeys().some((k: string) => k.startsWith(`${C}:501#bg-`)))
+
+    cs = await say('/stop', 501)
+    const stop = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).includes("Nothing of this topic's conversation is running"))!
+    expect(String(stop.payload.text)).toContain('⏰ the task "Long one"')
+    expect(String(stop.payload.text)).toContain('🌿 /bg "TICKING"')
+    expect(jobKeys()).toContain(taskJob)
+
+    cs = await say('/jobs', 501)
+    const jobsList = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('Jobs in this topic'))!
+    expect(String(jobsList.payload.text)).toContain('⏰ the task "Long one"')
+    const stops: string[] = jobsList.payload.reply_markup.inline_keyboard.map((r: any) => r[0].callback_data)
+    expect(stops.length).toBe(2)
+
+    // From the card: the run ends canceled, which is not a failure.
+    cs = await press(`tk:stop:${t.id}`, C, 501)
+    expect(answers(cs)).toContain('Stopping it.')
+    await waitFor(() => !T().runtime.isRunning(t.id))
+    expect(T().store.runsFor(t.id)[0]).toMatchObject({ state: 'canceled', reason: 'stopped' })
+    expect(T().store.getTask(t.id).failStreak).toBe(0)
+
+    // From /jobs, the /bg run: it delivers what it has.
+    const bg = bridge._jobs().find((j: any) => j.key.startsWith(`${C}:501#bg-`))!
+    expect(stops).toContain(`jstop:${bg.id}`)
+    cs = await press(`jstop:${bg.id}`, C, 501)
+    expect(answers(cs)[0]).toContain('Interrupting')
+    await waitFor(() => !jobKeys().some((k: string) => k.startsWith(`${C}:501#bg-`)))
+  }, 30000)
 
   test("in General, topic_set_cwd moves General's folder once the turn is over; its name stays Telegram's", async () => {
     const token = T().tokens.mint(scopeOf(C, undefined))

@@ -78,7 +78,7 @@ off is now a **hard startup error**, not a warning.
 
 ## Commands
 
-In a group, the commands that only inform the person asking — `/status`, `/jobs`, `/usage` `/cost` `/context`, `/recall`, `/whoami`, `/help` and `/live` — are answered to that person alone: picked from the command menu, neither the command nor the reply is seen by the rest of the group. A slower one shows a private "checking" first and turns it into the answer. Typed by hand, the reply is private only where the bot is an admin (Telegram's rule), and otherwise visible as before — except `/live`, whose link is a key to the session: it then goes to your DM, and never into the group. Commands that change the topic for everyone (`/new`, `/mode`, `/model`, `/stop`, …) stay visible.
+In a group, the commands that only inform the person asking — `/status`, `/jobs`, `/tasks`, `/usage` `/cost` `/context`, `/recall`, `/whoami`, `/help` and `/live` — are answered to that person alone: picked from the command menu, neither the command nor the reply is seen by the rest of the group. A slower one shows a private "checking" first and turns it into the answer. Typed by hand, the reply is private only where the bot is an admin (Telegram's rule), and otherwise visible as before — except `/live`, whose link is a key to the session: it then goes to your DM, and never into the group. Commands that change the topic for everyone (`/new`, `/mode`, `/model`, `/stop`, …) stay visible.
 
 | Command | Effect |
 | --- | --- |
@@ -88,7 +88,7 @@ In a group, the commands that only inform the person asking — `/status`, `/job
 | `/new` (or `/clear`) | Start a fresh session in this topic. The old session id is **kept** (nothing deleted) — `/resume` to undo. Like Claude's own `/clear`, this resets context without deleting the session. |
 | `/resume [id]` | Restore the previous session (undo `/new`), or bind this topic to a specific past session — the 8-character prefix `/sessions` prints is enough, and an ambiguous one is refused rather than guessed |
 | `/compact [focus]` | Summarize this topic's session history to free up context (memory kept) |
-| `/stop` | Cancel the task currently running in this topic |
+| `/stop` | Cancel the turn currently running in this topic. A `/bg` run or a task's run there goes on: those stop from `/jobs` (or a task's card), and `/stop` says they are still running |
 | `/voice [on\|off\|parts on\|off]` | Voice mode: transcribe voice notes and speak answers back (eyes-free). Default from `TG_VOICE`. `parts` decides whether the progressive notes are sent or only the full file. |
 | `/interrupt [on\|off]` | Toggle interrupt mode: a new message cancels the running task and starts immediately (its reply comes as a new message) instead of queueing. Default from `TG_INTERRUPT`. |
 | `/mode [plan\|acceptEdits\|auto\|bypass]` | Show or set this topic's permission mode. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_PERMISSION_MODE`. |
@@ -100,6 +100,7 @@ In a group, the commands that only inform the person asking — `/status`, `/job
 | `/get <path>` | Send a file from this topic's directory back to you |
 | `/cwd <abs-path>` | Set this topic's working directory (resets its session) |
 | `/status` | Show this topic's session id, cwd and permission mode |
+| `/tasks` | What the bot does here on its own: this topic's reminders and scheduled runs (in General, the whole group's; in a DM, yours), to you alone, with Run now, Pause/Resume and History for each. `/tasks pause all` (admins) pauses every task in the group. See [Tasks](#tasks). |
 | `/sessions <dir…>` | List the Claude sessions stored for one or more directories (what the IDE/CLI picker shows), as a **tappable picker** — tap one to bind this topic to it, page through with `‹ Prev` / `Next ›` |
 | `/import <dir…>` | Make a topic for each session in the given directories — bound + recent history backfilled |
 | `/history [N]` | Re-post the last N turns of this topic's bound session |
@@ -353,6 +354,43 @@ Claude Code keeps its own memory per working directory, and every topic has its 
 - In a private continuation or a private answer (`/private`) the memory is **read-only**: the run gets a copy, thrown away afterwards, so private talk never reaches what the group sees. A plain DM gets no group memory.
 - The facts are plain files — read, edit or delete them on the server. `TG_GROUP_MEMORY=0` turns the whole thing off.
 
+## Tasks
+
+Things the bot does on its own, later or again and again, reporting where they were set up. Ask for one in plain words, in a topic or a DM:
+
+- "remind me in two hours to take the pills" — a 🔔 **reminder**: the message at its time, naming whoever asked, with ✅ Done and ⏰ +15 min.
+- "every weekday at 9, summarize what changed in the repo" — a ⏰ **scheduled** Claude run: a fresh session each time (or one session it keeps, if asked), in the topic's folder with its model, effort and permission mode, acting for the person who set it up.
+- "every evening, check the news and only tell us if something big happened" — a run that speaks only when it found something. A task can post its progress as it goes, its result (the default), only what's worth telling, only problems, or nothing; its history keeps every run either way. It can post to your DM instead, stop after a number of runs or at a date.
+
+Claude makes them with the bot's own `task_create` tool, passing the time as it was said (at a time, in N minutes, every N minutes, or a cron expression) and the time zone; the bridge does the date arithmetic, daylight saving included. Claude Code's own schedulers are switched off in the bot's runs: a session cron dies with its run, and a cloud trigger would report to claude.ai instead of here.
+
+What you see:
+
+- **A card** in the topic, posted silently when the task is made and edited as it changes: what it does, when it runs next, how its last runs went, with ▶️ Run now, ⏸ Pause or ▶️ Resume, 📜 History (sent to you alone) and 🗑 (which asks first). While a run is going: ⏹ Stop.
+- **The results.** In a group a result is silent unless the task was asked to be loud; reminders, finds, problems and repeated failures notify. The topic's next turn is told what the task posted, so Claude knows.
+- **`/tasks`**, the list, with the same buttons.
+- **The 🗂 Tasks topic**, made with a group's first task: every task created, changed, paused, failing or finished, logged silently with a link to its topic. `/config` turns it off.
+
+The rules:
+
+- Anyone who may use the bot in a chat may run, pause or stop a task there; changing or deleting one is for the person who set it up, the group's admins and the bot's own users. In `/config`, *Tasks: who may create them* can limit creating to admins.
+- A task acts for the person who set it up. If they can no longer use that chat, it pauses.
+- After the bot was down, a task runs once for the slot it missed if that slot is still recent (half its period, between 2 minutes and 2 hours; 12 hours for a reminder), never a backlog. A run cut off by a restart isn't run again by itself; its topic gets a ▶️ Run again button. After a start, Claude runs wait two minutes, then go a few at a time.
+- Two failures in a row raise an alert, edited in place rather than repeated; five pause the task. A run the account's usage limit stopped waits for the reset and doesn't count as a failure.
+- At most `TG_TASKS_MAX_CLAUDE` (2) scheduled Claude runs at once, 20 tasks per topic, at most one run a minute. Each run's model, tokens, cost and time are kept in its history.
+
+In a forum group Claude can also make a topic for a new piece of work (with its own folder, or one you name, and another topic's settings), rename a topic, or move one to another folder: `topic_create`, `topic_rename`, `topic_set_cwd`. Moving the topic you're talking in happens when the turn ends.
+
+Scripts on the server reach the bot through a Unix socket, `state/xesious.sock`, open only to the bot's user, with the operator token in `state/xesious.token`:
+
+```
+bun tasks/cli.ts send --chat -1001234567890 --topic Builds --silent "Nightly build finished"
+bun tasks/cli.ts tasks list
+bun tasks/cli.ts tasks pause <task id>
+```
+
+Each Claude run talks to it with a token of its own, scoped to its chat, topic and person, that dies with the run. `TG_TASKS=0` turns tasks off. Watching a feed or a page, hand-offs between topics and bots, and tasks that ask before they act are designed ([research/tasks/REPORT.md](research/tasks/REPORT.md)) but not built yet.
+
 ## Config
 
 All keys live in `.env` (see [.env.example](.env.example)). Several are only
@@ -374,6 +412,7 @@ defaults now — a group can override them with `/config` (see above). Highlight
   at that point. Neither photo is ever replaced automatically; `/logo bot|group` does
   that on purpose.
 - `TG_API_ROOT` — a local Bot API server, for files over 20 MB (see below).
+- `TG_TASKS` — [tasks](#tasks) (default on; `0` turns them off). `TG_TASKS_MAX_CLAUDE` caps the scheduled Claude runs at once (2); `TG_TASK_CREATORS` (`everyone`|`admins`) and `TG_TASKS_ACTIVITY` (`1`|`0`) are the defaults for the two task settings in `/config`; `TG_API_SOCKET` moves the local API's socket.
 
 ## Permission modes
 

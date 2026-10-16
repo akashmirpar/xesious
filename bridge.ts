@@ -926,6 +926,21 @@ const jobs = new Map<string, Job>()
 const jobsFor = (key: string) => [...jobs.values()].filter(j => j.key === key)
 // Every job of a topic, its detached ones (/bg, tasks) included: what /jobs lists.
 const jobsIn = (key: string) => [...jobs.values()].filter(j => j.key === key || j.key.startsWith(`${key}#`))
+// What the person asked, out of a framed prompt: what follows the frame's first line,
+// wherever it is (a group's turn may carry the conversation ahead of it).
+function askedIn(prompt: string): string {
+  const m = prompt.match(/\[xesious:[^\]]*\] message from [^\n]*\n/)
+  return m ? prompt.slice(prompt.indexOf(m[0]) + m[0].length) : prompt
+}
+// A job running beside its topic's own conversation, which /stop leaves be: a /bg
+// run or a task's run. What it is, in words, and the task it belongs to.
+function besideOf(j: Job): { label: string; taskId?: string } | undefined {
+  const m = j.key.match(/#(task|bg)-([^#]+)$/)
+  if (!m) return undefined
+  if (m[1] === 'task') return { label: `⏰ the task "${taskStore?.getTask(m[2])?.name ?? m[2]}"`, taskId: m[2] }
+  const asked = askedIn(j.prompt).replace(/\s+/g, ' ').trim()
+  return { label: `🌿 /bg "${asked.length > 40 ? `${asked.slice(0, 39)}…` : asked}"` }
+}
 // Short, because callback_data caps at 64 bytes and the id has to fit in a button.
 const newJobId = () => randomUUID().replace(/-/g, '').slice(0, 8)
 // Keyed by JOB id, never by topic (see the note in runStreaming's editStatus).
@@ -1115,6 +1130,8 @@ interface ClaudeResult {
   // What the run cost, what the permission mode refused, and whether the account's
   // usage limit stopped it (and when that resets): tasks record all of it per run.
   usage?: RunUsage; denials?: string[]; usageLimited?: boolean; resetsAt?: number
+  // Ended early by a person (/stop, Interrupt, a Stop button), and how.
+  stopped?: RunOutcome
 }
 
 // The permission postures the bridge offers, in ascending autonomy. `auto` routes
@@ -1231,9 +1248,9 @@ type RunOpts = {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Tasks — things the bot does on its own, later or again and again, and reports in
-// Telegram (tasks/, research/tasks/REPORT.md). Off unless TG_TASKS=1.
+// Telegram (tasks/, research/tasks/REPORT.md). On unless TG_TASKS=0.
 // ---------------------------------------------------------------------------
-let TASKS = /^(1|true|yes|on)$/i.test(process.env.TG_TASKS || '')
+let TASKS = !/^(0|false|no|off)$/i.test(process.env.TG_TASKS || '')
 const TASKS_STATE = dirname(STATE_FILE)
 const TASKS_DB = join(TASKS_STATE, 'tasks.db')
 const TASKS_DIR = join(TASKS_STATE, 'tasks')
@@ -1482,7 +1499,8 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
           await ctx.api.deleteMessage(ctx.chat!.id, status.message_id).catch(() => {})
         }
       }
-      resolve({ ...res, ...(usage ? { usage } : {}), ...(denials ? { denials } : {}), ...(usageLimited ? { usageLimited, resetsAt } : {}) })
+      resolve({ ...res, ...(usage ? { usage } : {}), ...(denials ? { denials } : {}), ...(usageLimited ? { usageLimited, resetsAt } : {}),
+        ...(job.outcome ? { stopped: job.outcome } : {}) })
     }
     child.on('error', e => void finish({ text: `Failed to launch ${CLAUDE_BIN}: ${e}`, isError: true }))
     child.on('close', code => {
@@ -6432,9 +6450,12 @@ bot.on('message', async ctx => {
   // Commands that only inform the person asking are answered to them alone in a group:
   // the room sees neither the command (registered hidden) nor the reply.
   const hiddenReply = ctx.chat.type !== 'private' && HIDDEN_REPLIES.has(cmd)
-  const answer = async (t: string): Promise<void> => {
-    if (hiddenReply) await replyOnlyTo(ctx, threadId, t, undefined, msg.message_id || undefined, ephemeralId, true)
-    else await send(ctx, threadId, t, true)
+  const answer = async (t: string, kb?: { inline_keyboard: any[][] }): Promise<void> => {
+    if (hiddenReply) await replyOnlyTo(ctx, threadId, t, kb, msg.message_id || undefined, ephemeralId, true)
+    else if (kb) {
+      noteBotMessage(key)
+      await ctx.api.sendMessage(chatId, t, { ...destOpts({ threadId }), reply_markup: kb, disable_notification: true }).catch(e => console.error(`[warn] sendMessage: ${e}`))
+    } else await send(ctx, threadId, t, true)
   }
 
   // A /private start link, opened: checked against the invite itself, since the
@@ -6463,11 +6484,12 @@ bot.on('message', async ctx => {
       `/whoami — show ids (for the allowlist)\n/new (or /clear) — fresh session here (old one kept; /resume to undo)\n` +
       `/resume [id] — restore the previous session, or bind a past session id\n` +
       `/compact [focus] — summarize this topic's history to free up context\n` +
-      `/stop — cancel the running task and discard its answer\n` +
+      `/stop — cancel this topic's running turn and discard its answer (/bg and task runs go on)\n` +
       `/interrupt — stop it early but keep what it produced (or on|off for the sticky mode)\n` +
       `/bg <task> — run it alongside this topic instead of blocking it\n` +
       `/fanout <task> — split it into parts, run them in parallel topics, then combine\n` +
       `/jobs — what is running here, and what earlier runs left behind\n` +
+      (TASKS ? `/tasks — what the bot does here on its own: reminders, scheduled runs. Ask for one in plain words ("remind me at 6 to…", "every weekday at 9, summarize…")\n` : '') +
       `/restart — restart the bridge; in-flight tasks finish first\n` +
       `/config — this group's settings (model, voice, mentions, instructions, who can edit; More settings for the rest)\n` +
       `/recall <question> — what each search engine finds for it in this group's history, side by side\n` +
@@ -6556,10 +6578,16 @@ bot.on('message', async ctx => {
     // /stop wants everything to stop; ending the model turn while ten minutes of
     // audio keeps arriving is the surprise this exists to remove.
     const spoke = cancelSpeech(key, '/stop')
+    // /bg runs and tasks' runs go on: they are not this conversation's. Said, so
+    // "nothing is running" is never said over one.
+    const beside = jobsIn(key).map(besideOf).filter(b => b !== undefined)
+    const besideNote = beside.length
+      ? `\n\nStill running here, on ${beside.length === 1 ? 'its' : 'their'} own: ${beside.map(b => b.label).join(', ')}. /jobs stops ${beside.length === 1 ? 'it' : 'them'}.`
+      : ''
     if (!running.length) {
-      await send(ctx, threadId, spoke
-        ? '⏹ Stopped speaking. Nothing else was running in this topic.'
-        : 'Nothing is running in this topic right now.', true)
+      await send(ctx, threadId, (spoke
+        ? '⏹ Stopped speaking. Nothing else of this conversation was running.'
+        : beside.length ? "Nothing of this topic's conversation is running." : 'Nothing is running in this topic right now.') + besideNote, true)
       return
     }
     stopped.add(key)
@@ -6567,7 +6595,7 @@ bot.on('message', async ctx => {
     // Quote the question being cancelled. By the time you cancel, that message is
     // far up the topic, and "cancelled" on its own does not say cancelled WHAT.
     await send(ctx, threadId,
-      `⏹ Cancelled — the run and everything it started are being stopped, and its answer is discarded.${spoke ? ' Speaking stopped too.' : ''}\nUse /interrupt instead to stop but keep the partial answer.`,
+      `⏹ Cancelled — the run and everything it started are being stopped, and its answer is discarded.${spoke ? ' Speaking stopped too.' : ''}\nUse /interrupt instead to stop but keep the partial answer.${besideNote}`,
       false, running.length === 1 ? running[0].askedBy : undefined)
     return
   }
@@ -6905,7 +6933,7 @@ bot.on('message', async ctx => {
     return
   }
   if (cmd === '/tasks') {
-    if (!TASKS || !taskStore || !taskService) { await answer('Tasks are off on this bot (TG_TASKS).'); return }
+    if (!TASKS || !taskStore || !taskService) { await answer('Tasks are switched off on this bot (TG_TASKS=0).'); return }
     const words = text.trim().split(/\s+/).slice(1).map(w => w.toLowerCase())
     const me = ctx.from!
     // /tasks pause all: an admin stopping every task in the group at once.
@@ -6943,11 +6971,15 @@ bot.on('message', async ctx => {
   if (cmd === '/jobs' || cmd === '/ps') {
     const running = jobsIn(key)
     const lines: string[] = []
+    // A Stop button for each run /stop leaves be; this conversation's own has /stop.
+    const stops: any[][] = []
     for (const j of running) {
       const mins = Math.round((Date.now() - j.startedAt) / 60000)
       const kids = groupSurvivors(j.pgid).length
+      const beside = besideOf(j)
       lines.push(`▶ ${j.id} — running ${mins}m, ${j.steps()} steps` + (kids ? `, ${kids} process${kids === 1 ? '' : 'es'}` : '') +
-        `\n   ${j.prompt.replace(/^\[xesious:[^\]]*\][^\n]*\n/, '').slice(0, 80).replace(/\s+/g, ' ')}`)
+        `\n   ${beside?.taskId ? beside.label : askedIn(j.prompt).slice(0, 80).replace(/\s+/g, ' ')}`)
+      if (beside && stops.length < 8) stops.push([{ text: `⏹ Stop ${j.id}`, callback_data: `jstop:${j.id}` }])
     }
     // Anything still alive in a FINISHED run's group is, by construction, work it
     // left behind — no command-line pattern matching, no guessing. Reported rather
@@ -6962,7 +6994,7 @@ bot.on('message', async ctx => {
     }
     await answer(lines.length
       ? `Jobs in this topic:\n\n${lines.join('\n\n')}`
-      : 'Nothing running in this topic, and nothing left behind.')
+      : 'Nothing running in this topic, and nothing left behind.', stops.length ? { inline_keyboard: stops } : undefined)
     return
   }
   if (cmd === '/kill') {
@@ -7458,6 +7490,18 @@ bot.on('callback_query:data', async ctx => {
       .catch(e => console.error(`[error] parallel ${rec.key}: ${e}`))
     return
   }
+  // Stop, from /jobs, for a run beside the topic's conversation. A /bg run delivers
+  // what it has, as its own Interrupt button does; a task's run just ends, and its
+  // card says so.
+  if (data.startsWith('jstop:')) {
+    const job = jobs.get(data.slice(6))
+    const beside = job && job.key.startsWith(`${ctx.chat!.id}:`) ? besideOf(job) : undefined
+    if (!job || !beside) { await ctx.answerCallbackQuery({ text: 'That run already finished.', show_alert: true }).catch(() => {}); return }
+    console.log(`[cb] ${data} chat=${ctx.chat?.id} from=${ctx.from?.id}: ${beside.label}`)
+    void endJob(job, beside.taskId ? 'discard' : 'keep')
+    await ctx.answerCallbackQuery({ text: beside.taskId ? 'Stopping it.' : 'Interrupting — sending what it has so far…' }).catch(() => {})
+    return
+  }
   if (data.startsWith('int:')) {
     const job = jobs.get(data.slice(4))
     if (!job) { await ctx.answerCallbackQuery({ text: 'That task already finished.', show_alert: true }).catch(() => {}); return }
@@ -7811,6 +7855,8 @@ async function runTaskClaude(t: Task, run: Run): Promise<ClaudeOutcome> {
   if (res.usageLimited) {
     return { ok: false, text: '', usageLimited: true, retryAt: res.resetsAt ? new Date(res.resetsAt * 1000) : undefined, usage: res.usage, sessionId: res.sessionId }
   }
+  // Stopped from its card or /jobs: not a failure, and nothing to post.
+  if (res.stopped) return { ok: false, text: '', canceled: true, usage: res.usage, sessionId: res.sessionId }
   const failed = res.isError || res.noAnswer
   return {
     ok: !failed, text: failed ? '' : res.text,
@@ -8031,10 +8077,16 @@ const taskBridge: BridgeHandlers = {
 const CARD_GAP_MS = 60_000
 const cards = new Map<string, { timer?: ReturnType<typeof setTimeout>; shown?: string; at: number }>()
 
+// A task's run in progress: its job, while its process runs.
+const taskJob = (t: Task) => [...jobs.values()].find(j => j.key === `${taskKey(t)}#task-${t.id}`)
+
 function cardKeyboard(t: Task): { inline_keyboard: any[][] } {
   if (t.state === 'deleted') return { inline_keyboard: [] }
   const row: any[] = []
-  if (t.state === 'active') row.push({ text: '▶️ Run now', callback_data: `tk:run:${t.id}` }, { text: '⏸ Pause', callback_data: `tk:pause:${t.id}` })
+  // While it runs, the run can be stopped from here: /stop in the topic leaves it be.
+  if (taskRuntime?.isRunning(t.id) && t.action.kind === 'claude') row.push({ text: '⏹ Stop', callback_data: `tk:stop:${t.id}` })
+  else if (t.state === 'active') row.push({ text: '▶️ Run now', callback_data: `tk:run:${t.id}` })
+  if (t.state === 'active') row.push({ text: '⏸ Pause', callback_data: `tk:pause:${t.id}` })
   else if (t.state === 'paused') row.push({ text: '▶️ Resume', callback_data: `tk:resume:${t.id}` })
   row.push({ text: '📜 History', callback_data: `tk:hist:${t.id}` }, { text: '🗑', callback_data: `tk:del:${t.id}` })
   return { inline_keyboard: [row] }
@@ -8170,6 +8222,15 @@ async function handleTaskCallback(ctx: Context, data: string): Promise<void> {
     case 'pause': await said(taskService.pause(scope, t.id), 'Paused.'); return
     case 'resume': await said(taskService.resume(scope, t.id), 'Resumed.'); return
     case 'hist': await showTaskHistory(ctx, t); await answer(); return
+    // Its run in progress, stopped: anyone who may pause it may stop it.
+    case 'stop': {
+      const job = taskJob(t)
+      if (!job) { await answer(taskRuntime?.isRunning(t.id) ? "It hasn't started yet; try again in a moment." : "It isn't running.", true); return }
+      console.log(`[tasks] ${taskKey(t)} ${t.id}: run stopped by ${userName(user)}`)
+      void endJob(job, 'discard')
+      await answer('Stopping it.')
+      return
+    }
     // Delete asks first, on the card itself.
     case 'del':
       await answer()
@@ -8205,7 +8266,8 @@ async function handleTaskCallback(ctx: Context, data: string): Promise<void> {
 // Open the store, start the local API and the loop. Tasks stay off, with a line in
 // the log, if any of it can't start: the bot itself must not fail over them.
 function startTasks(): void {
-  if (!TASKS || taskStore) return
+  if (taskStore) return
+  if (!TASKS) { console.log('     tasks          : off (TG_TASKS=0)'); return }
   try {
     mkdirSync(TASKS_STATE, { recursive: true })
     const store = new TaskStore(TASKS_DB)
@@ -8226,7 +8288,8 @@ function startTasks(): void {
       mayManage: taskMayManage,
       isGroup: chat => chat.startsWith('-'),
       changed: (t, what) => { taskRuntime?.wake(); refreshTaskCard(t, what); taskActivity(t, what) },
-      runNow: t => taskRuntime!.runNow(t.id),
+      // A person started it: the card shows it running, with Stop, at once.
+      runNow: t => { const r = taskRuntime!.runNow(t.id); if (r.runId) refreshTaskCard(t, 'run'); return r },
     })
     apiTokens.addOperator(loadOperatorToken(API_TOKEN_FILE))
     taskApi = startApi({ socket: API_SOCK, tokens: apiTokens, routes: taskRoutes(taskService, taskBridge), log: s => console.error(s) })
@@ -8437,6 +8500,7 @@ export const _seenUsers = () => seenUsers
 export const _setting = setting
 export const _awaitingInput = awaitingInput
 export const _clearAdminCache = () => adminCache.clear()
+export const _jobs = () => [...jobs.values()].map(j => ({ id: j.id, key: j.key }))
 export const _ensureCommands = ensureCommands
 export const _projectDir = projectDir
 export const _privateLinks = () => privateLinks

@@ -281,6 +281,8 @@ export class TaskRuntime {
   private async execClaude(t: Task, run: Run): Promise<void> {
     this.claudeActive++
     run = this.store.updateRun(run.id, { state: 'running', startedAt: this.d.now().toISOString() })!
+    // Its card shows it running, with a way to stop it.
+    this.d.cardChanged(this.store.getTask(t.id) ?? t)
     let o: ClaudeOutcome
     try {
       o = await this.d.runClaude(t, run)

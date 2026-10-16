@@ -21,6 +21,11 @@
  *   MIDTEXT→ init + a substantive text block + a tool_use + a closing sign-off,
  *            i.e. the shape where the answer is written mid-turn and the bridge
  *            used to deliver only the sign-off
+ *   TICKING→ init + a tool step every 300 ms until stopped → a long run the idle
+ *            watchdog leaves alone, for stopping it by hand
+ *   MCPTASK <tool> <json args> → starts the bot's own MCP server from --mcp-config,
+ *            as Claude Code would, and calls that tool over stdio; the call and its
+ *            answer are appended to $XESIOUS_STUB_MCP_LOG
  *   (else) → init + one Bash tool_use + success
  *
  * Every successful result echoes what the stub was invoked with, in letters-only
@@ -145,6 +150,20 @@ async function main() {
     return
   }
 
+  if (scenario === 'TICKING') {
+    const tick = setInterval(() => emit({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'sleep 1' } }] } }), 300)
+    setTimeout(() => { clearInterval(tick); result({ result: 'tickedToTheEnd' }) }, 30_000)
+    return
+  }
+  if (scenario === 'MCPTASK') {
+    const m = prompt.trim().match(/^MCPTASK\s+(\S+)\s*(\{[^\n]*\})?/)
+    const server = JSON.parse(val('--mcp-config') ?? '{}').mcpServers?.xesious
+    if (!m || !server) { result({ result: 'mcpNoServer' }); return }
+    const r = await callMcpTool(server, m[1], m[2] ? JSON.parse(m[2]) : {})
+    if (process.env.XESIOUS_STUB_MCP_LOG) appendFileSync(process.env.XESIOUS_STUB_MCP_LOG, JSON.stringify({ tool: m[1], ...r }) + '\n')
+    result({ result: r.isError ? 'mcpToolRefused' : 'mcpToolDone' })
+    return
+  }
   if (scenario === 'HANG') {
     // Stay genuinely alive (a real timer — a bare pending promise wouldn't keep the
     // event loop up, and Bun would exit immediately) so the bridge's
@@ -279,6 +298,42 @@ async function main() {
   // default: one tool step, then a success that echoes the invocation facts.
   emit({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'true' } }] } })
   result({ result: `okReply ${tag}` })
+}
+
+// One tool of an MCP server, called the way Claude Code calls it: the server started
+// as its config says, the handshake, then tools/call, newline-delimited over stdio.
+async function callMcpTool(server: { command: string; args?: string[]; env?: Record<string, string> }, name: string, args: unknown): Promise<{ text: string; isError: boolean }> {
+  const child = spawn(server.command, server.args ?? [], { env: { ...process.env, ...server.env }, stdio: ['pipe', 'pipe', 'inherit'] })
+  const waiting = new Map<number, (m: any) => void>()
+  let buf = ''
+  child.stdout!.setEncoding('utf8')
+  child.stdout!.on('data', (d: string) => {
+    buf += d
+    let nl: number
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim()
+      buf = buf.slice(nl + 1)
+      let m: any
+      try { m = JSON.parse(line) } catch { continue }
+      waiting.get(m.id)?.(m)
+    }
+  })
+  const write = (o: unknown) => child.stdin!.write(JSON.stringify({ jsonrpc: '2.0', ...(o as object) }) + '\n')
+  const ask = (id: number, method: string, params: unknown) => new Promise<any>((resolve, reject) => {
+    waiting.set(id, resolve)
+    write({ id, method, params })
+    setTimeout(() => reject(new Error(`no answer to ${method}`)), 10_000)
+  })
+  try {
+    await ask(1, 'initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'claude-stub', version: '0' } })
+    write({ method: 'notifications/initialized' })
+    const r = await ask(2, 'tools/call', { name, arguments: args })
+    return { text: (r.result?.content ?? []).map((c: any) => c.text ?? '').join('\n'), isError: !!r.result?.isError || !!r.error }
+  } catch (e) {
+    return { text: String(e), isError: true }
+  } finally {
+    child.kill()
+  }
 }
 
 main()

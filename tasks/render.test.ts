@@ -72,6 +72,16 @@ describe('the card', () => {
     expect(html).not.toContain('Next:')
     expect(html).toContain('🔇❌')
   })
+
+  test('a run in progress says so, and "last" is the last run that ended', () => {
+    const runs: Run[] = [
+      { id: 'x@3', task: 'x', trigger: 'manual', state: 'running', startedAt: '2026-10-16T12:00:00.000Z' },
+      { id: 'x@2', task: 'x', trigger: 'schedule', state: 'succeeded', startedAt: '2026-10-15T19:07:00.000Z', postedMsg: 4 },
+    ]
+    const html = cardHtml(task(), runs, new Date('2026-10-16T12:01:00Z'))
+    expect(html).toContain('⏳ running since Fri 16 Oct, 14:00')
+    expect(html).toContain('last: ✅ Thu 15 Oct, 21:07')
+  })
 })
 
 describe('runs', () => {

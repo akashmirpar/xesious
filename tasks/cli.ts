@@ -9,15 +9,18 @@
  *   bun tasks/cli.ts tasks pause <task id>
  *   bun tasks/cli.ts tasks resume <task id>
  *
- * XESIOUS_DIR points at the bot's folder when the script runs from elsewhere.
+ * XESIOUS_DIR points at the bot's folder when the script runs from elsewhere. Like the
+ * bot, it finds the socket and the token next to TG_STATE_FILE, or the socket at
+ * TG_API_SOCKET (bun reads them from the .env of the folder it runs in).
  */
 import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { callApi } from './api'
 
 const ROOT = process.env.XESIOUS_DIR || join(import.meta.dir, '..')
-const SOCK = join(ROOT, 'state', 'xesious.sock')
-const TOKEN_FILE = join(ROOT, 'state', 'xesious.token')
+const STATE = process.env.TG_STATE_FILE ? dirname(process.env.TG_STATE_FILE) : join(ROOT, 'state')
+const SOCK = process.env.TG_API_SOCKET || join(STATE, 'xesious.sock')
+const TOKEN_FILE = join(STATE, 'xesious.token')
 
 const USAGE = `usage:
   xesious send --chat <id> [--topic <id or name>] [--silent] <text…>

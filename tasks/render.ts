@@ -160,7 +160,9 @@ export function cardHtml(t: Task, runs: Run[], now = new Date()): string {
   else if (t.state === 'expired') lines.push('⌛ ended')
   else if (t.state === 'deleted') lines.push('🗑 deleted')
   else if (t.nextDue) lines.push(`Next: ${tgTime(new Date(t.nextDue), t.tz)} (${tgTime(new Date(t.nextDue), t.tz, 'r')})`)
-  const last = runs.find(r => r.state !== 'queued')
+  const running = runs.find(r => r.state === 'running')
+  if (running) lines.push(`⏳ running since ${esc(whenText(new Date(running.startedAt ?? now.toISOString()), t.tz))}`)
+  const last = runs.find(r => r.state !== 'queued' && r.state !== 'running')
   if (runs.length) {
     const strip = runs.slice(0, 8).reverse().map(r => MARK[markOf(r)]).join('')
     const lastText = last
