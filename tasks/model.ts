@@ -29,8 +29,11 @@ export type Action =
   | { kind: 'message'; text: string }
   // fresh: a new session each run, in the topic's folder. own: one session the task
   // keeps across its runs, so it remembers what earlier runs did. A watcher's events
-  // come with its run.
-  | { kind: 'claude'; prompt: string; session: 'fresh' | 'own' }
+  // come with its run; so do the recent runs of the tasks it watches (a watchdog).
+  | { kind: 'claude'; prompt: string; session: 'fresh' | 'own'; watch?: string[] }
+  // What other tasks did since the last digest, listed without Claude. of: their ids,
+  // or empty for every other task in the home topic.
+  | { kind: 'digest'; of: string[] }
   // A command with no AI (bash -c, in the topic's folder): its exit status decides,
   // and what it printed is posted as `says` decides.
   | { kind: 'script'; command: string; timeoutMs?: number }

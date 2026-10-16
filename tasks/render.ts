@@ -83,8 +83,9 @@ export function elapsedText(ms: number): string {
   return m % 60 ? `${h} h ${m % 60} min` : `${h} h`
 }
 
-// ⏰ Scheduled · 🔔 Reminder · 👀 Watch
+// ⏰ Scheduled · 🔔 Reminder · 👀 Watch · 📋 Digest
 export function kindLabel(t: Task): string {
+  if (t.action.kind === 'digest') return '📋 Digest'
   if (t.trigger.kind === 'watch') return '👀 Watch'
   return t.action.kind === 'message' ? '🔔 Reminder' : '⏰ Scheduled'
 }
@@ -109,6 +110,7 @@ export function actionText(t: Task): string {
   const watch = t.trigger.kind === 'watch'
   if (t.action.kind === 'none') return 'keeps it running; says something only if it fails'
   if (t.action.kind === 'script') return `runs a command${watch ? ' when it sees something' : ''} · ${SCRIPT_SAYS[t.says]}`
+  if (t.action.kind === 'digest') return t.action.of.length ? `lists what ${t.action.of.length === 1 ? 'a task' : `${t.action.of.length} tasks`} did, without Claude` : 'lists what the tasks in this topic did, without Claude'
   if (t.action.kind === 'message') return watch ? 'sends a message when it sees something' : 'sends a message'
   const session = t.action.session === 'own' ? 'Claude, in its own session (remembers earlier runs)' : 'Claude, a fresh session each run'
   return `${watch ? `${session}, when it sees something` : session} · ${SAYS_TEXT[t.says]}`
@@ -171,7 +173,7 @@ export function usageText(u: Usage | undefined): string {
 export interface WatchStatus { running: boolean; since?: string }
 
 // The card: one message per task in its home topic, edited when its state changes.
-export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchStatus): string {
+export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchStatus, related?: string[]): string {
   const lines: string[] = []
   lines.push(`${kindLabel(t)}: <b>${esc(t.name)}</b>`)
   const isWatch = t.trigger.kind === 'watch'
@@ -182,6 +184,7 @@ export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchSt
   if (t.trigger.kind === 'watch') lines.push(`<code>${esc(clip(t.trigger.command, 200))}</code>`)
   if (t.rule) lines.push(`Only ${esc(ruleText(t.rule))}`)
   if (t.action.kind === 'script') lines.push(`${isWatch ? 'Then runs ' : ''}<code>${esc(clip(t.action.command, 200))}</code>`)
+  if (related?.length) lines.push(`${t.action.kind === 'digest' ? 'Lists' : 'Watches'}: ${related.map(n => `<b>${esc(n)}</b>`).join(', ')}`)
   if (t.ai) {
     const n = t.filterSeen ? ` · ${t.filterSeen.toLocaleString('en-US')} considered, ${(t.filterPassed ?? 0).toLocaleString('en-US')} let through` : ''
     lines.push(`AI filter every ${esc(durationText(t.ai.everyMs))}: “${esc(clip(t.ai.question, 160))}”${n}`)
@@ -252,3 +255,53 @@ export function historyHtml(t: Task, runs: Run[]): string {
 }
 
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + '…' : s)
+
+// --- what tasks did: digests and watchdogs -----------------------------------------
+
+// A task and its runs since some time, newest first.
+export interface Activity { task: Task; runs: Run[] }
+
+const plural = (n: number, w: string) => `${n.toLocaleString('en-US')} ${w}${n === 1 ? '' : 's'}`
+
+// One line per task, for a digest posted in the topic (markdown): its runs since, by
+// mark, what the last one said or why it failed, and what a watcher saw.
+export function digestMarkdown(entries: Activity[], since: Date, tz: string): string {
+  const lines = [`**Since ${whenText(since, tz)}**`]
+  for (const { task: t, runs } of entries) {
+    const done = runs.filter(r => r.state !== 'queued' && r.state !== 'running')
+    const bits: string[] = []
+    if (t.trigger.kind === 'watch' && t.eventsSeen) bits.push(`${plural(t.eventsSeen, 'line')} seen in all`)
+    if (done.length) bits.push(`${plural(done.length, 'run')} ${done.slice(0, 12).reverse().map(r => MARK[markOf(r)]).join('')}`)
+    else bits.push('no runs')
+    const failed = done.filter(r => markOf(r) === 'failed')
+    const last = done[0]
+    let note = ''
+    if (last && markOf(last) === 'failed') note = `last failed: ${clip(last.reason ?? 'failed', 160)}`
+    else if (last?.summary) note = `“${clip(last.summary, 160)}”`
+    if (failed.length && markOf(last!) !== 'failed') bits.push(plural(failed.length, 'failure'))
+    if (t.state === 'paused') bits.push('⏸ paused')
+    if (t.watchError) bits.push(`⚠️ ${clip(t.watchError, 120)}`)
+    lines.push(`- **${t.name}** (${kindLabel(t).split(' ')[0]} ${scheduleText(t.trigger, tz)}): ${bits.join(' · ')}${note ? ` · ${note}` : ''}`)
+  }
+  if (entries.length === 0) lines.push('No tasks to report on.')
+  return lines.join('\n')
+}
+
+// The same, as material for a watchdog's run: every run since, plainly.
+export function watchedText(entries: Activity[], since: Date, tz: string): string {
+  const out: string[] = []
+  for (const { task: t, runs } of entries) {
+    const head = [`${t.name} (id ${t.id}; ${scheduleText(t.trigger, t.tz)}; ${t.state}${t.pauseReason ? `, ${pauseText(t)}` : ''}`]
+    if (t.failStreak) head.push(`${t.failStreak} failure(s) in a row`)
+    if (t.trigger.kind === 'watch') head.push(`watcher: ${t.watchError ? `failing (${t.watchError})` : 'fine'}, ${plural(t.eventsSeen ?? 0, 'line')} seen${t.lastEventAt ? `, the last at ${whenText(new Date(t.lastEventAt), tz)}` : ''}`)
+    out.push(`- ${head.join('; ')}):`)
+    if (!runs.length) out.push(`    no runs since ${whenText(since, tz)}`)
+    for (const r of runs.slice(0, 20)) {
+      const at = r.startedAt ?? r.slot
+      const len = r.startedAt && r.endedAt ? `, ${elapsedText(Date.parse(r.endedAt) - Date.parse(r.startedAt))}` : ''
+      const said = r.state === 'failed' || r.state === 'timed_out' || r.state === 'skipped' || r.state === 'deferred' || r.state === 'interrupted' ? r.reason : r.summary
+      out.push(`    ${at ? whenText(new Date(at), tz) : '?'} ${markOf(r)}${len}${said ? `: ${clip(said, 200)}` : ''}`)
+    }
+  }
+  return out.join('\n')
+}

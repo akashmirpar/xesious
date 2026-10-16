@@ -66,6 +66,17 @@ const WATCH_PROPS = {
     },
     required: ['op'],
   },
+  watch_tasks: {
+    type: 'array', items: { type: 'string' },
+    description: 'With a prompt: other tasks in this chat (ids or names) whose runs since the last run come with each run, so it can check on them. ' +
+      'A watchdog ("each morning check the backup and the sync tasks, tell me only if something is off"): it says noteworthy by default, so it speaks only when something looks wrong. Also for a summary written by Claude ("every evening, sum up what the news tasks found").',
+  },
+  digest: {
+    type: 'object',
+    description: 'Instead of message, prompt or script: a list of what other tasks did since the last digest, made without Claude: their runs, results, failures, what watchers saw. Posted silently. ' +
+      'of: task ids or names; leave it out for every other task in this topic. Give it a schedule ("every evening at 21:07"). For a summary written by Claude instead, give a prompt with watch_tasks.',
+    properties: { of: { type: 'array', items: { type: 'string' } } },
+  },
   ai_filter: {
     type: 'object',
     description: 'For a watcher, for what no rule can decide: every every_minutes (default 5) a small model reads the events that came (after the rule, if there is one) and lets through only those that answer question yes, each with why. ' +
@@ -171,7 +182,7 @@ const SCHEDULED_TOOLS = [
     description: "Post a short message in this task's topic now, in the middle of the run: a milestone or a warning. Your final result is posted by the bot, so don't repeat it here.",
     inputSchema: { type: 'object', properties: { text: { type: 'string' }, silent: { type: 'boolean' } }, required: ['text'] },
   },
-  { name: 'task_get', description: "This task's own definition and its last runs.", inputSchema: { type: 'object', properties: {} } },
+  { name: 'task_get', description: "This task's own definition and its last runs; with id, one of the tasks it watches.", inputSchema: { type: 'object', properties: { id: { type: 'string', description: 'Leave out for this task.' } } } },
   { name: 'task_pause', description: 'Pause this task until a person resumes it, for example when what it watches no longer exists.', inputSchema: { type: 'object', properties: {} } },
   { name: 'task_done', description: "Finish this task for good: its work is complete and it shouldn't run again.", inputSchema: { type: 'object', properties: {} } },
 ]
@@ -188,7 +199,7 @@ export function routeOf(name: string, a: any, kind: 'interactive' | 'scheduled')
   switch (name) {
     case 'task_create': return { method: 'POST', path: '/v1/tasks', body: rest }
     case 'task_list': return { method: 'GET', path: `/v1/tasks${a?.where ? `?where=${enc(a.where)}` : ''}` }
-    case 'task_get': return { method: 'GET', path: `/v1/tasks/${tid}` }
+    case 'task_get': return { method: 'GET', path: `/v1/tasks/${self && a?.id ? enc(String(a.id)) : tid}` }
     case 'task_update': return { method: 'PATCH', path: `/v1/tasks/${tid}`, body: rest }
     case 'task_pause': return { method: 'POST', path: `/v1/tasks/${tid}/pause`, body: {} }
     case 'task_resume': return { method: 'POST', path: `/v1/tasks/${tid}/resume`, body: {} }

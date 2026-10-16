@@ -27,7 +27,7 @@ import { join } from 'node:path'
 import { LIMITS, eventLimits, isStreaming, isWatch, type Run, type RunMark, type Task, type Usage, type WatchEvent } from './model'
 import type { TaskStore } from './store'
 import { manualRunId, nextAfter, resolveDue, slotRunId } from './schedule'
-import { elapsedText, markOf, whenText } from './render'
+import { digestMarkdown, elapsedText, markOf, whenText, type Activity } from './render'
 import type { PollResult, WatcherExit } from './watchers'
 import { applyRule } from './filters'
 import { lastLines, outputBlock, type ScriptOutcome } from './scripts'
@@ -305,8 +305,30 @@ export class TaskRuntime {
     switch (t.action.kind) {
       case 'message': return this.execMessage(t, run, 0)
       case 'script': return this.execScript(t, run)
+      case 'digest': return this.execDigest(t, run)
       default: return this.execClaude(t, run)
     }
+  }
+
+  // --- digests ------------------------------------------------------------------
+
+  // What the tasks it covers did since its last run, listed and posted: no Claude.
+  private async execDigest(t: Task, run: Run): Promise<void> {
+    run = this.store.updateRun(run.id, { state: 'running', startedAt: this.d.now().toISOString() })!
+    const since = t.lastRunAt ? new Date(t.lastRunAt) : new Date(this.d.now().getTime() - 24 * 3600_000)
+    const entries = activityOf(this.store, t, t.action.kind === 'digest' ? t.action.of : [], since)
+    const runs = entries.reduce((n, e) => n + e.runs.length, 0)
+    const id = await this.safePost(t, 'result', digestMarkdown(entries, since, t.tz), { loud: t.sound === 'loud', lateMs: run.lateMs, run })
+    const end = this.d.now().toISOString()
+    if (id === undefined) {
+      run = this.store.updateRun(run.id, { state: 'failed', reason: 'Telegram did not accept the digest', endedAt: end })!
+      this.inFlight.delete(t.id)
+      await this.onFailure(this.store.getTask(t.id)!, run, run.reason!)
+      return
+    }
+    run = this.store.updateRun(run.id, { state: 'succeeded', postedMsg: id, endedAt: end, summary: `${entries.length} task${entries.length === 1 ? '' : 's'}, ${runs} run${runs === 1 ? '' : 's'}` })!
+    this.inFlight.delete(t.id)
+    this.finishRun(t.id, run)
   }
 
   private track(p: Promise<void>): void {
@@ -850,4 +872,13 @@ export function eventText(template: string, run: Run): string {
   const used = Object.keys(fill).some(k => template.includes(k))
   const body = used ? template.replace(/\{event\}|\{value\}|\{why\}/g, k => fill[k]) : last ? `${template}\n${last.text}` : template
   return more > 0 ? `${body}\n(+${more} more since)` : body
+}
+
+// What some tasks did since a time: the ones named (in the same chat), or, with none
+// named, every other task in the home topic but digests. Their runs newest first.
+export function activityOf(store: TaskStore, t: Task, ids: string[], since: Date): Activity[] {
+  const tasks = ids.length
+    ? ids.map(id => store.getTask(id)).filter((x): x is Task => !!x && x.state !== 'deleted' && x.chat === t.chat)
+    : store.listTasks({ chat: t.chat, thread: t.thread ?? null }).filter(x => x.id !== t.id && x.action.kind !== 'digest')
+  return tasks.map(task => ({ task, runs: store.runsFor(task.id, 60).filter(r => Date.parse(r.startedAt ?? r.slot ?? '') >= since.getTime()) }))
 }

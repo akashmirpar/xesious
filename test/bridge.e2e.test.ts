@@ -5191,6 +5191,29 @@ describe('tasks: watchers (phase 2)', () => {
     expect(m.payload.disable_notification).toBe(false)
   }, 20000)
 
+  test("a watchdog's run sees what the tasks it watches did; a digest lists them in the topic, silently", async () => {
+    const before = calls.length
+    const backup = make({ name: 'Backup job', script: 'echo "backup: 12 files"', cron: '7 3 * * *' })
+    T().runtime.runNow(backup.id)
+    await waitFor(() => T().store.runsFor(backup.id).some((r: any) => r.state === 'succeeded'), 15000)
+    const dog = make({ name: 'Watchdog', prompt: 'Check the backup', cron: '7 9 * * *', watch_tasks: ['Backup job'] })
+    T().runtime.runNow(dog.id)
+    await waitFor(() => T().store.runsFor(dog.id).some((r: any) => r.state === 'succeeded'), 15000)
+    const p = readFileSync(LAST_PROMPT, 'utf8')
+    expect(p).toContain('It checks on other tasks')
+    expect(p).toContain(`- Backup job (id ${backup.id};`)
+    expect(p).toContain('backup: 12 files')
+    expect(p).toMatch(/message from Ada, id 1:\nCheck the backup$/)
+    const d = make({ digest: { of: ['Backup job', 'Watchdog'] }, cron: '7 22 * * *' })
+    T().runtime.runNow(d.id)
+    await waitFor(() => sent(before, 'Since ').length > 0, 15000)
+    const digest = sent(before, 'Since ')[0]
+    expect(textOf(digest)).toContain('📋 Digest')
+    expect(textOf(digest)).toContain('Backup job')
+    expect(textOf(digest)).toContain('“backup: 12 files”')
+    expect(digest.payload.disable_notification).toBe(true)
+  }, 30000)
+
   test('at its end it stops and says so; a tap gives it another week, and it starts again', async () => {
     const t = make({ name: 'Sync loop', watch: { command: 'sleep 30' }, keep_running: true })
     await waitFor(() => T().watchers.list().includes(t.id))

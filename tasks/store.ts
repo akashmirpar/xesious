@@ -317,6 +317,7 @@ function dupKey(t: Pick<Task, 'trigger' | 'action'>): string {
   const a = t.action.kind === 'message' ? `m:${norm(t.action.text)}`
     : t.action.kind === 'claude' ? `c:${t.action.session}:${norm(t.action.prompt)}`
     : t.action.kind === 'script' ? `s:${norm(t.action.command)}`
+    : t.action.kind === 'digest' ? `d:${[...t.action.of].sort().join(',')}`
     : 'none'
   const tr = t.trigger.kind === 'cron' ? `cron:${t.trigger.expr.trim().replace(/\s+/g, ' ')}`
     : t.trigger.kind === 'every' ? `every:${t.trigger.everyMs}`

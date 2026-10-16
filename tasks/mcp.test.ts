@@ -97,8 +97,14 @@ describe('the tasks MCP server', () => {
     const s = server('scheduled', { kind: 'run', chat: '-100777', runKind: 'scheduled', taskId: 'ab12cd', runId: 'ab12cd@1' })
     await s.rpc('tools/call', { name: 'report', arguments: { outcome: 'done', notify: true, summary: 'ok' } })
     expect(calls.at(-1)).toMatchObject({ path: '/v1/report', body: { outcome: 'done', notify: true, summary: 'ok' } })
-    await s.rpc('tools/call', { name: 'task_get', arguments: { id: 'zzz' } })
+    await s.rpc('tools/call', { name: 'task_get', arguments: {} })
     expect(calls.at(-1)!.path).toBe('/v1/tasks/self')
+    // An id reaches the bridge, which lets it read only a task this one watches.
+    await s.rpc('tools/call', { name: 'task_get', arguments: { id: 'zzz' } })
+    expect(calls.at(-1)!.path).toBe('/v1/tasks/zzz')
+    // What changes a task names its own, whatever it is given.
+    expect(routeOf('task_pause', { id: 'zzz' }, 'scheduled').path).toBe('/v1/tasks/self/pause')
+    expect(routeOf('task_done', { id: 'zzz' }, 'scheduled').path).toBe('/v1/tasks/self/done')
     s.close()
   })
 })

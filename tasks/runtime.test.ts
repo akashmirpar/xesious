@@ -622,3 +622,24 @@ describe('scripts', () => {
     expect(ran.length).toBe(2)
   })
 })
+
+test('a digest lists what the topic\'s other tasks did since it last ran, silently, without Claude', async () => {
+  const news = mk({ name: 'Nightly news' })
+  claude = async () => OK('Five stories today.')
+  await tick()
+  const d = mk({ name: 'Digest', action: { kind: 'digest', of: [] }, sound: 'silent', trigger: { kind: 'cron', expr: '0 22 * * *' }, nextDue: '2026-10-16T22:00:00.000Z' })
+  now = new Date('2026-10-16T22:00:00Z'); await tick()
+  const digest = posts.filter(p => p.task === d.id)
+  expect(digest.length).toBe(1)
+  expect(digest[0]).toMatchObject({ kind: 'result', opts: { loud: false } })
+  expect(digest[0].text).toContain('- **Nightly news**')
+  expect(digest[0].text).toContain('1 run ✅')
+  expect(store.runsFor(d.id)[0]).toMatchObject({ state: 'succeeded', summary: '1 task, 1 run' })
+  // The next one starts where this one stopped: the slot the clock jumped over is
+  // there, the run before is not.
+  now = new Date('2026-10-17T22:00:00Z'); await tick()
+  const second = posts.filter(p => p.task === d.id)[1].text
+  expect(second).toContain('1 run ⏭')
+  expect(second).not.toContain('✅')
+  expect(store.getTask(news.id)!.state).toBe('active')
+})

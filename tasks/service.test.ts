@@ -364,3 +364,39 @@ describe('scripts', () => {
     expect(create({ watch: { command: 'python3 feed.py' }, script: 'bash on-event.sh' }).action.kind).toBe('script')
   })
 })
+
+describe('digests and watchdogs', () => {
+  const e = (input: any) => { const r = svc.create(person, { tz: 'UTC', ...input }); return r.ok ? '' : r.error }
+
+  test('a digest of named tasks: silent, named Digest; on a schedule only', () => {
+    const news = create({ name: 'Nightly news', prompt: 'News', cron: '7 21 * * *' })
+    const d = create({ digest: { of: ['nightly news'] }, cron: '7 22 * * *' })
+    expect(d).toMatchObject({ action: { kind: 'digest', of: [news.id] }, name: 'Digest', sound: 'silent', says: 'result' })
+    expect(create({ digest: true, cron: '7 23 * * *' }).action).toEqual({ kind: 'digest', of: [] })
+    expect(e({ digest: { of: ['nope'] }, cron: '7 22 * * 1' })).toContain('digest.of: no task "nope" in this chat')
+    expect(e({ digest: {}, watch: { command: 'x' } })).toContain('a digest runs on a schedule')
+  })
+
+  test('a watchdog: the tasks it watches, by id or name; noteworthy unless told; not itself', () => {
+    const backup = create({ name: 'Backup', script: 'bash backup.sh', cron: '7 3 * * *' })
+    const sync = create({ name: 'Sync', script: 'bash sync.sh', cron: '7 4 * * *' })
+    const w = create({ name: 'Watchdog', prompt: 'Check the backup and the sync', cron: '7 9 * * *', watch_tasks: [backup.id, 'SYNC'] })
+    expect(w.action).toEqual({ kind: 'claude', prompt: 'Check the backup and the sync', session: 'fresh', watch: [backup.id, sync.id] })
+    expect(w).toMatchObject({ says: 'noteworthy', sound: 'loud' })
+    const r = svc.update(person, w.id, { watch_tasks: [w.id] })
+    expect(r.ok ? '' : r.error).toContain("can't include itself")
+    expect(e({ message: 'x', in_minutes: 5, watch_tasks: [backup.id] })).toContain('watch_tasks is for a prompt')
+  })
+
+  test("a watchdog's run may read the tasks it watches, and nothing else, and change none of them", () => {
+    const backup = create({ name: 'Backup', script: 'bash backup.sh', cron: '7 3 * * *' })
+    const other = create({ name: 'Other', script: 'bash other.sh', cron: '7 5 * * *' })
+    const w = create({ name: 'Watchdog', prompt: 'Check', cron: '7 9 * * *', watch_tasks: [backup.id] })
+    const run: Scope = { kind: 'run', chat: '-100777', thread: 5, runKind: 'scheduled', taskId: w.id, runId: `${w.id}@1` }
+    expect(svc.get(run, backup.id).ok).toBe(true)
+    const no = svc.get(run, other.id)
+    expect(no.ok ? '' : no.error).toContain('and the tasks it watches')
+    const p = svc.pause(run, backup.id)
+    expect(p.ok ? '' : p.error).toContain('can only change its own task')
+  })
+})

@@ -1,7 +1,7 @@
 import { test, expect, describe } from 'bun:test'
 import {
   cronText, scheduleText, durationText, frequencyText, cardHtml, listLine, runLine, markOf, usageText,
-  tgTime, esc, elapsedText, historyHtml,
+  tgTime, esc, elapsedText, historyHtml, digestMarkdown, watchedText,
 } from './render'
 import type { Run, Task } from './model'
 
@@ -168,4 +168,35 @@ test('the card says what a watcher lets through: its rule, and its AI filter wit
   expect(html).toContain('Only when it mentions “outage”, “degraded”')
   expect(html).toContain('AI filter every 5 minutes: “Is a major outage starting?” · 340 considered, 12 let through')
   expect(html).toContain('⚠️ the AI filter did not answer')
+})
+
+describe('what tasks did', () => {
+  const since = new Date('2026-10-16T00:00:00Z')
+  const news = task({ id: 'n1', name: 'Nightly news', tz: 'UTC' })
+  const watch = task({ id: 'w1', name: 'Price watch', tz: 'UTC', trigger: { kind: 'watch', command: 'x' }, eventsSeen: 1204 })
+  const backup = task({ id: 'b1', name: 'Backup', tz: 'UTC', failStreak: 2, action: { kind: 'script', command: 'bash backup.sh' } })
+  const r = (over: Partial<Run>): Run => ({ id: Math.random().toString(36), task: 'x', trigger: 'schedule', state: 'succeeded', startedAt: '2026-10-16T21:07:00.000Z', endedAt: '2026-10-16T21:09:00.000Z', ...over })
+  const entries = [
+    { task: news, runs: [r({ postedMsg: 4, summary: 'Five stories today' })] },
+    { task: watch, runs: [r({ trigger: 'event', postedMsg: 9, summary: 'price went below 300: 299' }), r({ trigger: 'event' })] },
+    { task: backup, runs: [r({ state: 'failed', reason: 'it exited with status 2: rsync: connection refused' })] },
+  ]
+
+  test('a digest: one line a task, its runs by mark, and what the last said or why it failed', () => {
+    const md = digestMarkdown(entries, since, 'UTC')
+    expect(md.split('\n')).toEqual([
+      '**Since Fri 16 Oct, 00:00**',
+      '- **Nightly news** (⏰ every day at 21:07): 1 run ✅ · “Five stories today”',
+      '- **Price watch** (👀 watches continuously): 1,204 lines seen in all · 2 runs 🔇✅ · “price went below 300: 299”',
+      '- **Backup** (⏰ every day at 21:07): 1 run ❌ · last failed: it exited with status 2: rsync: connection refused',
+    ])
+    expect(digestMarkdown([], since, 'UTC')).toContain('No tasks to report on.')
+  })
+
+  test("a watchdog's material: every run since, plainly, with each task's health", () => {
+    const text = watchedText(entries, since, 'UTC')
+    expect(text).toContain('- Backup (id b1; every day at 21:07; active; 2 failure(s) in a row):')
+    expect(text).toContain('    Fri 16 Oct, 21:07 failed, 2 min: it exited with status 2: rsync: connection refused')
+    expect(text).toContain('- Price watch (id w1; watches continuously; active; watcher: fine, 1,204 lines seen):')
+  })
 })

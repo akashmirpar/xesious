@@ -35,6 +35,8 @@ export interface TaskInput extends WhenInput {
   max_per_hour?: number
   stale_minutes?: number
   script?: string | { command?: string; timeout_minutes?: number }   // a command, no AI
+  watch_tasks?: string[]  // with prompt: tasks (ids or names) whose recent runs come with each run
+  digest?: { of?: string[] } | boolean   // a list of what tasks did, no AI
   rule?: any              // filters.ruleError says what it may be; null removes it
   ai_filter?: { question?: string; every_minutes?: number } | null
 }
@@ -86,8 +88,9 @@ export function taskView(t: Task, runs: Run[] = []) {
       ...(t.ai ? { ai_filter: { question: t.ai.question, every_minutes: t.ai.everyMs / 60_000, considered: t.filterSeen ?? 0, passed: t.filterPassed ?? 0, error: t.filterError } } : {}),
     } : {}),
     ...(t.action.kind === 'message' ? { message: t.action.text }
-      : t.action.kind === 'claude' ? { prompt: t.action.prompt, session: t.action.session, says: t.says }
+      : t.action.kind === 'claude' ? { prompt: t.action.prompt, session: t.action.session, says: t.says, ...(t.action.watch?.length ? { watch_tasks: t.action.watch } : {}) }
       : t.action.kind === 'script' ? { script: { command: t.action.command, timeout_minutes: (t.action.timeoutMs ?? LIMITS.scriptTimeoutMs) / 60_000 }, says: t.says }
+      : t.action.kind === 'digest' ? { digest: { of: t.action.of } }
       : { keep_running: true }),
     sound: t.sound, deliver_to: t.where === 'dm' ? 'dm' : 'topic',
     topic: t.thread, runs_done: t.runsDone,
@@ -121,11 +124,13 @@ export class TaskService {
   private get store() { return this.deps.store }
 
   // A task the caller may see: the run's own chat; for a scheduled run, only its own
-  // task ('self' names it).
-  private visible(scope: Scope, id: string): Result<Task> {
+  // task ('self' names it), and, to read, the tasks it watches.
+  private visible(scope: Scope, id: string, read = false): Result<Task> {
     if (scope.kind === 'run' && scope.runKind === 'scheduled') {
-      if (id !== 'self' && id !== scope.taskId) return err(403, 'a scheduled run can only see its own task')
-      id = scope.taskId ?? ''
+      const own = scope.taskId ? this.store.getTask(scope.taskId) : undefined
+      const watched = own?.action.kind === 'claude' ? own.action.watch ?? [] : []
+      if (id === 'self' || id === scope.taskId) id = scope.taskId ?? ''
+      else if (!(read && watched.includes(id))) return err(403, read ? 'a scheduled run can only see its own task, and the tasks it watches' : 'a scheduled run can only change its own task')
     }
     const t = this.store.getTask(id)
     if (!t || t.state === 'deleted') return err(404, `no task ${id}`)
@@ -164,7 +169,23 @@ export class TaskService {
     const keep = input.keep_running === true
     const scriptIn: any = typeof input.script === 'string' ? { command: input.script } : input.script
     const hasScript = scriptIn !== undefined && scriptIn !== null
-    if ([hasMsg, hasPrompt, hasScript, keep].filter(Boolean).length > 1) return err(400, 'give one of message (a reminder, or a line for each event), prompt (a Claude run), script (a command) or keep_running')
+    const digestIn: any = input.digest === true ? {} : input.digest
+    const hasDigest = digestIn !== undefined && digestIn !== null && digestIn !== false
+    if ([hasMsg, hasPrompt, hasScript, hasDigest, keep].filter(Boolean).length > 1) return err(400, 'give one of message (a reminder, or a line for each event), prompt (a Claude run), script (a command), digest or keep_running')
+    // Other tasks, named by id or by name, in this chat.
+    const tasksNamed = (refs: unknown, what: string): Result<string[]> => {
+      if (refs === undefined || refs === null) return ok([])
+      if (!Array.isArray(refs) || refs.length > 20) return err(400, `${what} is a list of at most 20 task ids or names`)
+      const ids: string[] = []
+      for (const ref of refs) {
+        const r = String(ref ?? '').trim()
+        const hit = this.store.getTask(r) ?? this.store.listTasks({ chat }).find(x => x.name.trim().toLowerCase() === r.toLowerCase())
+        if (!hit || hit.chat !== chat || hit.state === 'deleted') return err(404, `${what}: no task "${r}" in this chat`)
+        if (base && hit.id === base.id) return err(400, `${what}: a task can't include itself`)
+        if (!ids.includes(hit.id)) ids.push(hit.id)
+      }
+      return ok(ids)
+    }
     if (keep && !watching) return err(400, 'keep_running is for a watcher: give watch too')
     if (hasMsg) {
       if (input.message!.length > MAX.message) return err(400, `message is too long (at most ${MAX.message} characters)`)
@@ -172,7 +193,10 @@ export class TaskService {
     } else if (hasPrompt) {
       if (input.prompt!.length > MAX.prompt) return err(400, `prompt is too long (at most ${MAX.prompt} characters)`)
       const session = input.session ?? (base?.action.kind === 'claude' ? base.action.session : 'fresh')
-      action = { kind: 'claude', prompt: input.prompt!.trim(), session }
+      const w = tasksNamed(input.watch_tasks, 'watch_tasks')
+      if (!w.ok) return err(w.status, w.error)
+      const watch = input.watch_tasks !== undefined ? w.value! : base?.action.kind === 'claude' ? base.action.watch ?? [] : []
+      action = { kind: 'claude', prompt: input.prompt!.trim(), session, ...(watch.length ? { watch } : {}) }
     } else if (hasScript) {
       const command = String(scriptIn.command ?? '').trim()
       if (!command) return err(400, 'script needs command: what to run with bash in this topic\'s folder, e.g. "bash backup.sh"')
@@ -184,15 +208,24 @@ export class TaskService {
         timeoutMs = m.ms
       }
       action = { kind: 'script', command, ...(timeoutMs ? { timeoutMs } : {}) }
+    } else if (hasDigest) {
+      const o = tasksNamed(digestIn.of, 'digest.of')
+      if (!o.ok) return err(o.status, o.error)
+      action = { kind: 'digest', of: o.value! }
     } else if (keep) {
       action = { kind: 'none' }
     } else if (!base) {
       return err(400, watching
         ? 'a watcher needs message (sent for each event; {event} is the line it printed), prompt (what Claude does with the events) or keep_running: true'
         : 'give message (what to send, for a reminder) or prompt (what Claude should do when it runs)')
-    } else if (input.session && base.action.kind === 'claude') {
-      action = { ...base.action, session: input.session }
+    } else if (base.action.kind === 'claude' && (input.session || input.watch_tasks !== undefined)) {
+      const w = tasksNamed(input.watch_tasks, 'watch_tasks')
+      if (!w.ok) return err(w.status, w.error)
+      const watch = input.watch_tasks !== undefined ? w.value! : base.action.watch ?? []
+      action = { kind: 'claude', prompt: base.action.prompt, session: input.session ?? base.action.session, ...(watch.length ? { watch } : {}) }
     }
+    if (input.watch_tasks !== undefined && action!.kind !== 'claude') return err(400, 'watch_tasks is for a prompt: the Claude run that checks on them')
+    if (action!.kind === 'digest' && watching) return err(400, 'a digest runs on a schedule ("every evening at 21:07"), not on a watcher')
     if (input.session && input.session !== 'fresh' && input.session !== 'own') return err(400, 'session is fresh or own')
     if (action!.kind === 'none' && !watching) return err(400, 'only a watcher can be kept running with nothing to do: give message or prompt')
 
@@ -200,18 +233,23 @@ export class TaskService {
     if (input.sound !== undefined && input.sound !== 'loud' && input.sound !== 'silent') return err(400, 'sound is loud or silent')
     if (input.deliver_to !== undefined && input.deliver_to !== 'topic' && input.deliver_to !== 'dm') return err(400, 'deliver_to is topic or dm')
 
-    const says: Says = action!.kind === 'message' ? 'result' : action!.kind === 'none' ? 'problems' : (input.says ?? base?.says ?? 'result')
+    // A watchdog speaks only when something looks wrong, unless told otherwise.
+    const watchdog = action!.kind === 'claude' && !!action!.watch?.length
+    const says: Says = action!.kind === 'message' || action!.kind === 'digest' ? 'result' : action!.kind === 'none' ? 'problems'
+      : (input.says ?? (base && base.action.kind === action!.kind ? base.says : undefined) ?? (watchdog ? 'noteworthy' : 'result'))
     // Loud for what the person asked to receive and for what speaks only when it
     // matters (a watcher that saw something does); a result in a group is silent
     // unless asked otherwise.
-    const defaultSound: Sound = action!.kind === 'message' || says === 'noteworthy' || says === 'problems' || watching ? 'loud'
+    const defaultSound: Sound = action!.kind === 'digest' ? 'silent'
+      : action!.kind === 'message' || says === 'noteworthy' || says === 'problems' || watching ? 'loud'
       : this.deps.isGroup(chat) ? 'silent' : 'loud'
     const sound = input.sound ?? base?.sound ?? defaultSound
 
     let name = (input.name ?? base?.name ?? '').trim()
     if (!name) {
       const src = action!.kind === 'message' ? action!.text : action!.kind === 'claude' ? action!.prompt
-        : action!.kind === 'script' ? action!.command : trigger!.kind === 'watch' ? trigger!.command : 'task'
+        : action!.kind === 'script' ? action!.command : action!.kind === 'digest' ? 'Digest'
+        : trigger!.kind === 'watch' ? trigger!.command : 'task'
       name = src.replace(/\s+/g, ' ').slice(0, 40).trim() + (src.length > 40 ? '…' : '')
     }
 
@@ -432,7 +470,7 @@ export class TaskService {
   }
 
   get(scope: Scope, id: string): Result<ReturnType<typeof taskView>> {
-    const v = this.visible(scope, id)
+    const v = this.visible(scope, id, true)
     if (!v.ok) return err(v.status, v.error)
     return ok(taskView(v.value, this.store.runsFor(v.value.id, 5)))
   }
