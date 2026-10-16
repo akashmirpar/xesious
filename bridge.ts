@@ -1148,6 +1148,9 @@ interface ClaudeResult {
   usage?: RunUsage; denials?: string[]; usageLimited?: boolean; resetsAt?: number
   // Ended early by a person (/stop, Interrupt, a Stop button), and how.
   stopped?: RunOutcome
+  // It showed the person its plan with a Go ahead button (ExitPlanMode, through the
+  // bot as permission host): that message is its answer.
+  planShown?: boolean
 }
 
 // The permission postures the bridge offers, in ascending autonomy. `auto` routes
@@ -1528,7 +1531,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
         }
       }
       resolve({ ...res, ...(usage ? { usage } : {}), ...(denials ? { denials } : {}), ...(usageLimited ? { usageLimited, resetsAt } : {}),
-        ...(job.outcome ? { stopped: job.outcome } : {}) })
+        ...(job.outcome ? { stopped: job.outcome } : {}), ...(plansShownIn.delete(jobId) ? { planShown: true } : {}) })
     }
     child.on('error', e => void finish({ text: `Failed to launch ${CLAUDE_BIN}: ${e}`, isError: true }))
     child.on('close', code => {
@@ -5506,6 +5509,14 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
       return
     }
     if (!background && !res.isError && res.text.trim()) rememberAsked(key, said)
+    // A plan shown with its Go ahead button is this turn's answer. The line the turn
+    // ends with after it ("the plan is ready for you to approve") would come after it
+    // as a second answer, so it isn't posted. A fan-out part still settles below.
+    if (res.planShown && !res.isError && !childOf.get(key)) {
+      console.log(`[host] ${key}: its plan was shown; the closing line not posted: ${JSON.stringify(res.text.slice(0, 80))}`)
+      await flushOutbox(ctx, threadId, cwd, key, replyLink())
+      return
+    }
     // When the turn's closing block only promises future work or refers to work
     // the user never saw, deliver the substantive block before it as well. The
     // rest of the turn's text is in the run record above, so this is an
@@ -8824,6 +8835,8 @@ function recoverHandoffs(): void {
 // ---------------------------------------------------------------------------
 
 type HostDecision = { behavior: 'allow'; updatedInput: any } | { behavior: 'deny'; message: string }
+// The runs, by job id, that showed their plan: their closing line isn't posted.
+const plansShownIn = new Set<string>()
 interface HostQuestion { q: any; msgId?: number; picked: Set<number>; answer?: string; by?: string }
 interface HostWait {
   id: string
@@ -8954,6 +8967,7 @@ async function hostPlan(s: Scope, input: any): Promise<HostDecision> {
   const id = newJobId().slice(0, 6)
   for (const [k, p] of hostPlans) if (Date.now() - p.at > 24 * 3600_000) hostPlans.delete(k)
   hostPlans.set(id, { chat, thread: s.thread, person: s.person!, personName: s.personName, at: Date.now() })
+  if (s.jobId) plansShownIn.add(s.jobId)
   const ctx = taskContext({ chat: s.chat!, thread: s.thread, owner: s.person!, ownerName: s.personName } as Task)
   await deliver(ctx, s.thread, `**📋 The plan**\n\n${plan || '(it came without a plan)'}`, undefined, '', { inline_keyboard: [[{ text: '✅ Go ahead', callback_data: `ap:${id}:go` }]] }, false)
   return hostDeny('The plan is shown to the person, with a button to start it. End your turn now with one short line; do not carry it out.')

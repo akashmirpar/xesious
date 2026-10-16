@@ -5100,6 +5100,8 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     const plan = calls.slice(before).find(c => textOf(c).includes('The plan') && textOf(c).includes('Write the file'))!
     const go = plan.payload.reply_markup.inline_keyboard[0][0]
     expect(go.text).toBe('✅ Go ahead')
+    // The plan is the answer: the line the turn ended with isn't posted after it.
+    expect(calls.slice(before).some(c => textOf(c).includes('mcpToolDone'))).toBe(false)
     await press(go.callback_data, C, 501)
     await bridge._drainQueue(`${C}:501`)
     expect(readFileSync(LAST_PROMPT, 'utf8')).toContain('Go ahead with the plan you proposed above.')
