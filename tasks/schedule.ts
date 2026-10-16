@@ -39,7 +39,7 @@ const pollOf = (t: Extract<Trigger, { kind: 'watch' }>): Trigger | undefined =>
 // The first slot strictly after `after`.
 export function nextAfter(t: Trigger, tz: string, after: Date): Date | undefined {
   switch (t.kind) {
-    case 'after': return undefined
+    case 'after': case 'webhook': return undefined
     case 'watch': {
       const p = pollOf(t)
       return p ? nextAfter(p, tz, after) : undefined
@@ -62,7 +62,7 @@ export function nextAfter(t: Trigger, tz: string, after: Date): Date | undefined
 // The latest slot at or before `at`, if any.
 export function latestAtOrBefore(t: Trigger, tz: string, at: Date): Date | undefined {
   switch (t.kind) {
-    case 'after': return undefined
+    case 'after': case 'webhook': return undefined
     case 'watch': {
       const p = pollOf(t)
       return p ? latestAtOrBefore(p, tz, at) : undefined
@@ -95,7 +95,7 @@ export function periodMs(t: Trigger, tz: string, now = new Date()): number | und
   if (t.kind === 'at') return undefined
   if (t.kind === 'every') return t.everyMs
   if (t.kind === 'watch') return t.everyMs
-  if (t.kind === 'after') return undefined
+  if (t.kind === 'after' || t.kind === 'webhook') return undefined
   const runs = cronOf(t.expr, tz).nextRuns(6, now)
   let min = Infinity
   for (let i = 1; i < runs.length; i++) min = Math.min(min, runs[i].getTime() - runs[i - 1].getTime())
@@ -150,7 +150,7 @@ export const manualRunId = (taskId: string, now: Date) => `${taskId}@manual-${no
 
 // About how often a task runs, for the card ("Claude, about 5 runs a week").
 export function runsPerDay(t: Trigger, tz: string, now = new Date()): number | undefined {
-  if (t.kind === 'at' || t.kind === 'watch' || t.kind === 'after') return undefined
+  if (t.kind === 'at' || t.kind === 'watch' || t.kind === 'after' || t.kind === 'webhook') return undefined
   if (t.kind === 'every') return DAY / t.everyMs
   const runs = cronOf(t.expr, tz).nextRuns(60, now)
   if (runs.length < 2) return undefined

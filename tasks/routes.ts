@@ -15,6 +15,7 @@ export interface BridgeHandlers {
   approve(scope: Scope, body: any): Promise<ApiReply> | ApiReply
   handoff(scope: Scope, body: any): Promise<ApiReply> | ApiReply
   propose(scope: Scope, body: any): Promise<ApiReply> | ApiReply
+  run(scope: Scope, body: any): Promise<ApiReply> | ApiReply
 }
 
 const out = <T>(r: Result<T>, view: (v: T) => unknown = v => v): ApiReply =>
@@ -44,6 +45,8 @@ export function taskRoutes(svc: TaskService, bridge: BridgeHandlers): Route[] {
     { method: 'POST', path: '/v1/approve', handler: (s, q) => bridge.approve(s, q.body) },
     { method: 'POST', path: '/v1/handoff', handler: (s, q) => bridge.handoff(s, q.body) },
     { method: 'POST', path: '/v1/tasks/propose', handler: (s, q) => bridge.propose(s, q.body) },
+    { method: 'POST', path: '/v1/tasks/:id/fire', handler: (s, q) => out(svc.fire(s, q.params.id, q.body?.payload), v => ({ ...v, message: 'Fired: it runs now, given the payload.' })) },
+    { method: 'POST', path: '/v1/run', operatorOnly: true, handler: (s, q) => bridge.run(s, q.body) },
     { method: 'GET', path: '/v1/topics', handler: s => bridge.listTopics(s) },
     { method: 'POST', path: '/v1/topics', handler: (s, q) => bridge.createTopic(s, q.body) },
     { method: 'PATCH', path: '/v1/topics/:topic', handler: (s, q) => bridge.updateTopic(s, q.params.topic, q.body) },

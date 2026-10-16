@@ -26,6 +26,9 @@ export type Trigger =
   // After another task's run: when it worked, when it posted something, when it failed,
   // or any of these. That run's result comes with this one.
   | { kind: 'after'; task: string; name: string; on: 'success' | 'noteworthy' | 'failure' | 'any' }
+  // Only when fired: `xesious fire <task> [payload]` on the host, or its webhook,
+  // POST /hook/<task>/<secret> when the bot serves one (TG_TASKS_WEBHOOK_PORT).
+  | { kind: 'webhook'; secret: string }
 
 export type Action =
   // For a watcher, {event} in the text is the line that set it off.
@@ -164,7 +167,7 @@ export type RunState =
   | 'deferred'       // a usage limit stopped it; not a failure
   | 'waiting'        // it asked a question nobody has answered yet; an answer carries it on
 
-export type RunTrigger = 'schedule' | 'catchup' | 'manual' | 'event' | 'answer' | 'after'
+export type RunTrigger = 'schedule' | 'catchup' | 'manual' | 'event' | 'answer' | 'after' | 'fired'
 
 // What a run says about itself through the report tool.
 export type ReportOutcome = 'nothing_new' | 'done' | 'progress' | 'blocked' | 'needs_attention'
@@ -204,6 +207,7 @@ export interface Run {
   waitId?: string         // an answer run: the question it carries on from
   // An after run: the run of the other task that set it off.
   after?: { task: string; run: string; name: string; outcome: string; summary?: string; resultPath?: string; depth: number }
+  payload?: string        // a fired run: what it was fired with
   stepAt?: number         // a plan's run: the step it is at (from 1)
   stepResults?: StepResult[]
   progressMsg?: number    // its progress message, edited as its steps go by
@@ -310,4 +314,4 @@ export function eventLimits(t: Pick<Task, 'action' | 'limits'>): EventLimits {
 export const isWatch = (t: Pick<Task, 'trigger'>): t is Pick<Task, 'trigger'> & { trigger: Extract<Trigger, { kind: 'watch' }> } => t.trigger.kind === 'watch'
 export const isStreaming = (t: Pick<Task, 'trigger'>) => t.trigger.kind === 'watch' && !t.trigger.everyMs
 // No slots of its own: a streaming watcher, or a task that runs after another.
-export const hasNoSlots = (t: Pick<Task, 'trigger'>) => isStreaming(t) || t.trigger.kind === 'after'
+export const hasNoSlots = (t: Pick<Task, 'trigger'>) => isStreaming(t) || t.trigger.kind === 'after' || t.trigger.kind === 'webhook'

@@ -44,6 +44,7 @@ export function scheduleText(t: Trigger, tz: string): string {
     case 'cron': return cronText(t.expr)
     case 'watch': return t.everyMs ? `checks every ${durationText(t.everyMs)}` : 'watches continuously'
     case 'after': return `after “${t.name}” ${({ success: 'works', noteworthy: 'posts something', failure: 'fails', any: 'runs' } as const)[t.on]}`
+    case 'webhook': return 'when fired (xesious fire, or its webhook)'
   }
 }
 
@@ -89,6 +90,7 @@ export function kindLabel(t: Task): string {
   if (t.action.kind === 'digest') return '📋 Digest'
   if (t.action.kind === 'steps') return '🪜 Plan'
   if (t.trigger.kind === 'after') return '↪️ After'
+  if (t.trigger.kind === 'webhook') return '🔗 On call'
   if (t.trigger.kind === 'watch') return '👀 Watch'
   return t.action.kind === 'message' ? '🔔 Reminder' : '⏰ Scheduled'
 }
@@ -237,7 +239,7 @@ export function listLine(t: Task, runs: Run[]): string {
   const last = runs.find(r => r.state !== 'queued')
   const mark = t.state === 'paused' ? '⏸' : last ? MARK[markOf(last)] : '·'
   const when = t.state === 'active' && t.nextDue && t.trigger.kind !== 'watch' ? ` · next ${tgTime(new Date(t.nextDue), t.tz)}` : t.state === 'paused' ? ' · paused' : ''
-  const kind = t.action.kind === 'steps' ? '🪜' : t.trigger.kind === 'after' ? '↪️' : t.trigger.kind === 'watch' ? '👀' : t.action.kind === 'message' ? '🔔' : '⏰'
+  const kind = t.action.kind === 'steps' ? '🪜' : t.trigger.kind === 'after' ? '↪️' : t.trigger.kind === 'webhook' ? '🔗' : t.trigger.kind === 'watch' ? '👀' : t.action.kind === 'message' ? '🔔' : '⏰'
   // How it links to the rest: where it hands on, who made it.
   const flow = [
     t.then ? ` · then → ${esc(t.then.topicName ?? 'another topic')}` : '',
@@ -277,6 +279,8 @@ export function runLine(r: Run, tz: string): string {
   if (r.trigger === 'manual') bits.push('run now')
   if (r.trigger === 'catchup') bits.push('caught up')
   if (r.trigger === 'event') bits.push((r.folded ?? 1) > 1 ? `${r.folded} events` : 'an event')
+  if (r.trigger === 'fired') bits.push('fired')
+  if (r.trigger === 'after') bits.push('after another')
   if (r.startedAt && r.endedAt) bits.push(elapsedText(new Date(r.endedAt).getTime() - new Date(r.startedAt).getTime()))
   const u = usageText(r.usage)
   if (u) bits.push(esc(u))

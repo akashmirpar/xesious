@@ -388,6 +388,7 @@ function dupKey(t: Pick<Task, 'trigger' | 'action'>): string {
     : t.trigger.kind === 'every' ? `every:${t.trigger.everyMs}`
     : t.trigger.kind === 'watch' ? `watch:${norm(t.trigger.command)}:${t.trigger.everyMs ?? 'stream'}`
     : t.trigger.kind === 'after' ? `after:${t.trigger.task}:${t.trigger.on}`
+    : t.trigger.kind === 'webhook' ? 'webhook'
     : `at:${t.trigger.at}`
   const f = (t as Task).rule || (t as Task).ai ? `|${JSON.stringify((t as Task).rule ?? null)}|${norm((t as Task).ai?.question ?? '')}` : ''
   return `${tr}|${a}${f}`

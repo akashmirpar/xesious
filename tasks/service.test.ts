@@ -468,3 +468,25 @@ describe('after, child tasks and proposals', () => {
     expect(bad.ok).toBe(false)
   })
 })
+
+describe('fired tasks', () => {
+  test('a webhook task: no slots, a secret kept through edits; its view says how to fire it', () => {
+    const t = create({ name: 'Deploy note', message: 'Deployed: {payload}', webhook: true })
+    expect(t.trigger.kind).toBe('webhook')
+    expect(t.nextDue).toBeUndefined()
+    const secret = (t.trigger as any).secret
+    const u = svc.update(person, t.id, { name: 'Deploys', webhook: true })
+    expect(u.ok && (u.value.task.trigger as any).secret).toBe(secret)
+    const v = svc.get(person, t.id)
+    expect(v.ok && (v.value as any).webhook).toEqual({ fire: `bun tasks/cli.ts fire ${t.id} "<payload>"`, http_path: `/hook/${t.id}/${secret}` })
+  })
+  test('firing: as anyone who may run it, never from a scheduled run', () => {
+    svc = new TaskService({ store, now: () => now, mayCreate: () => undefined, mayManage: () => undefined, isGroup: c => c.startsWith('-'), changed: () => {}, runNow: () => ({ runId: 'x' }),
+      fire: (t, payload) => ({ runId: `${t.id}@fired:${payload}` }) })
+    const t = create({ name: 'Deploy note', message: 'Deployed: {payload}', webhook: true })
+    expect(svc.fire(operator, t.id, 'v1')).toMatchObject({ ok: true, value: { runId: `${t.id}@fired:v1` } })
+    expect(svc.fire(person, t.id, { v: 2 })).toMatchObject({ ok: true, value: { runId: `${t.id}@fired:{"v":2}` } })
+    const run: Scope = { kind: 'run', chat: '-100777', runKind: 'scheduled', taskId: t.id, runId: 'r' }
+    expect(svc.fire(run, t.id, 'x').ok).toBe(false)
+  })
+})

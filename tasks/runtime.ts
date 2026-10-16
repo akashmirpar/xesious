@@ -185,6 +185,20 @@ export class TaskRuntime {
 
   isRunning(taskId: string): boolean { return this.inFlight.has(taskId) }
 
+  // Run it now, given what it was fired with (xesious fire, its webhook).
+  fireNow(taskId: string, payload: string): { runId?: string; error?: string } {
+    const t = this.store.getTask(taskId)
+    if (!t || t.state === 'deleted') return { error: 'no such task' }
+    if (t.state !== 'active') return { error: `it is ${t.state}` }
+    if (t.action.kind === 'none') return { error: 'it only keeps a watcher running' }
+    if (this.inFlight.has(t.id)) return { error: 'it is running already' }
+    const now = this.d.now().getTime()
+    const run: Run = { id: `${t.id}@fired-${now.toString(36)}.${randomBytes(3).toString('hex')}`, task: t.id, trigger: 'fired', state: 'queued', payload }
+    if (!this.store.insertRun(run)) return { error: 'it was fired a moment ago' }
+    this.dispatch(t, run)
+    return { runId: run.id }
+  }
+
   // A person stopped a plan: it ends, canceled, once the step going ends (which the
   // bridge stops too).
   stopPlan(taskId: string): boolean {
@@ -711,10 +725,13 @@ export class TaskRuntime {
     let msgId: number | undefined
     let error: string | undefined
     const event = run.trigger === 'event'
-    const text = event ? eventText(t.action.text, run) : run.after ? t.action.text.split('{result}').join(run.after.summary ?? '') : t.action.text
+    const text = event ? eventText(t.action.text, run)
+      : run.after ? t.action.text.split('{result}').join(run.after.summary ?? '')
+      : run.payload !== undefined ? t.action.text.split('{payload}').join(run.payload)
+      : t.action.text
     try {
       msgId = await this.d.post(t, 'reminder', text,
-        { loud: t.sound === 'loud', lateMs: run.lateMs, buttons: event || run.after ? 'pause' : 'reminder', run })
+        { loud: t.sound === 'loud', lateMs: run.lateMs, buttons: event || run.after || run.payload !== undefined ? 'pause' : 'reminder', run })
       if (msgId === undefined) error = 'Telegram did not accept the message'
     } catch (e) {
       error = String((e as Error)?.message ?? e)

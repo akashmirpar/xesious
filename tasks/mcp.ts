@@ -66,6 +66,7 @@ const WATCH_PROPS = {
     },
     required: ['op'],
   },
+  webhook: { type: 'boolean', description: 'Instead of a time or a watcher: run only when fired, by a script on the host (`bun tasks/cli.ts fire <task id> "<payload>"`) or by its webhook when the bot serves them (task_get shows its path). The payload comes with the run; in a message, {payload} is replaced by it.' },
   after: {
     type: 'object',
     description: 'Instead of a time or a watcher: run after another task of this chat, given what its run gave. on: success (it worked, the default), noteworthy (it posted something), failure, or any. "When the nightly report is done, translate it", "when the backup fails, find out why".',

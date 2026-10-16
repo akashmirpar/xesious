@@ -122,3 +122,9 @@ test('the CLI reads its flags', () => {
   })
   expect(parseArgs(['tasks', 'pause', 'ab12cd'])).toEqual({ cmd: ['tasks', 'pause'], flags: {}, rest: ['ab12cd'] })
 })
+
+test('the CLI reads its words and its flags', () => {
+  expect(parseArgs(['ask', '--chat', '-100', '--options', 'Yes,No', 'Ship', 'it?'])).toEqual({ cmd: ['ask'], flags: { chat: '-100', options: 'Yes,No' }, rest: ['Ship', 'it?'] })
+  expect(parseArgs(['run', '--no-wait', '--chat', '1', 'go'])).toEqual({ cmd: ['run'], flags: { 'no-wait': true, chat: '1' }, rest: ['go'] })
+  expect(parseArgs(['fire', 'ab12cd', 'v1'])).toEqual({ cmd: ['fire'], flags: {}, rest: ['ab12cd', 'v1'] })
+})

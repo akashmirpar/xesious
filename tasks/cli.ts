@@ -6,6 +6,11 @@
  *
  *   bun tasks/cli.ts send --chat <id> [--topic <id or name>] [--silent] <text…>
  *   bun tasks/cli.ts notify [--silent] <text…>     (from a task's script: into its topic)
+ *   bun tasks/cli.ts ask --chat <id> [--topic <t>] [--options a,b] [--wait <minutes>] <question…>
+ *       prints the answer; exits with the option's number (0 for the first; 0 for an answer in
+ *       one's own words), or 124 if nobody answered in time
+ *   bun tasks/cli.ts run --chat <id> [--topic <t>] [--no-wait] <prompt…>   (a turn there; prints its result)
+ *   bun tasks/cli.ts fire <task id> [payload…]       (runs that task now, given the payload)
  *   bun tasks/cli.ts tasks list [--chat <id>]
  *   bun tasks/cli.ts tasks pause <task id>
  *   bun tasks/cli.ts tasks resume <task id>
@@ -27,6 +32,9 @@ const TOKEN_FILE = join(STATE, 'xesious.token')
 const USAGE = `usage:
   xesious send --chat <id> [--topic <id or name>] [--silent] <text…>
   xesious notify [--silent] <text…>        (from a task's script)
+  xesious ask --chat <id> [--topic <t>] [--options a,b] [--wait <minutes>] <question…>
+  xesious run --chat <id> [--topic <t>] [--no-wait] <prompt…>
+  xesious fire <task id> [payload…]
   xesious tasks list [--chat <id>]
   xesious tasks pause <task id>
   xesious tasks resume <task id>`
@@ -36,7 +44,7 @@ export function parseArgs(argv: string[]): { cmd: string[]; flags: Record<string
   const pos: string[] = []
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
-    if (a === '--silent') flags.silent = true
+    if (a === '--silent' || a === '--no-wait') flags[a.slice(2)] = true
     else if (a.startsWith('--')) { flags[a.slice(2)] = argv[i + 1] ?? ''; i++ }
     else pos.push(a)
   }
@@ -59,6 +67,28 @@ async function main(): Promise<number> {
       const text = rest.join(' ').trim()
       if (!flags.chat || !text) { console.error(USAGE); return 2 }
       r = await callApi(SOCK, token, 'POST', '/v1/send', { chat: String(flags.chat), topic: flags.topic === undefined ? undefined : String(flags.topic), text, silent: flags.silent === true })
+      break
+    }
+    case 'ask': {
+      const question = rest.join(' ').trim()
+      if (!flags.chat || !question) { console.error(USAGE); return 2 }
+      const options = typeof flags.options === 'string' ? flags.options.split(',').map(o => o.trim()).filter(Boolean) : []
+      r = await callApi(SOCK, token, 'POST', '/v1/ask', { chat: String(flags.chat), topic: flags.topic === undefined ? undefined : String(flags.topic), question, options, wait_minutes: flags.wait === undefined ? undefined : Number(flags.wait) })
+      if (r.status === 408) { console.error('nobody answered in time'); return 124 }
+      if (r.status < 400) { console.log(r.body.answer); return r.body.index > 0 ? r.body.index : 0 }
+      break
+    }
+    case 'run': {
+      const prompt = rest.join(' ').trim()
+      if (!flags.chat || !prompt) { console.error(USAGE); return 2 }
+      r = await callApi(SOCK, token, 'POST', '/v1/run', { chat: String(flags.chat), topic: flags.topic === undefined ? undefined : String(flags.topic), prompt, wait: flags['no-wait'] !== true })
+      if (r.status === 200) { console.log(r.body.result ?? ''); if (r.body.state !== 'done') { console.error(`it ${r.body.state}: ${r.body.error ?? ''}`); return 1 } return 0 }
+      break
+    }
+    case 'fire': {
+      const id = rest[0]
+      if (!id) { console.error(USAGE); return 2 }
+      r = await callApi(SOCK, token, 'POST', `/v1/tasks/${encodeURIComponent(id)}/fire`, { payload: rest.slice(1).join(' ') })
       break
     }
     case 'notify': {

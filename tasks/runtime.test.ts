@@ -874,3 +874,13 @@ describe('after, and child tasks', () => {
     expect(posts.find(p => p.task === kid.id)!.text).toContain('it was made by "Parent", which has ended')
   })
 })
+
+test('fired: a run now with its payload, in the message; not while paused or running', async () => {
+  const t = mk({ name: 'Deploy note', trigger: { kind: 'webhook', secret: 'x' }, action: { kind: 'message', text: 'Deployed: {payload}' }, nextDue: undefined })
+  expect(rt.fireNow(t.id, 'v1.2')).toMatchObject({ runId: expect.stringContaining(`${t.id}@fired-`) })
+  await rt.idle()
+  expect(posts.map(p => [p.text, p.opts.buttons])).toEqual([['Deployed: v1.2', 'pause']])
+  expect(store.runsFor(t.id)[0]).toMatchObject({ trigger: 'fired', payload: 'v1.2', state: 'succeeded' })
+  store.updateTask(t.id, { state: 'paused' })
+  expect(rt.fireNow(t.id, 'x').error).toBe('it is paused')
+})

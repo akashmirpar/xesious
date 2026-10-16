@@ -68,6 +68,9 @@ const FILTER_LOG = join(TMP, 'filter-calls.jsonl')
 process.env.XESIOUS_STUB_FILTER_LOG = FILTER_LOG
 // A plan's Codex step runs this instead of codex.
 process.env.TG_CODEX_BIN = join(import.meta.dir, 'codex-stub.sh')
+// The tasks' webhooks, on a high port of their own.
+const HOOK_PORT = 41000 + Math.floor(Math.random() * 2000)
+process.env.TG_TASKS_WEBHOOK_PORT = String(HOOK_PORT)
 // Tasks are on by default; off here, so every other test sees the command line it
 // always did. The task tests switch them on.
 process.env.TG_TASKS = '0'
@@ -5188,6 +5191,50 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     expect(p).toContain('set off by a run of the task "Report"')
     expect(p).toContain(`The run of the task "Report" (id ${report.id}) that set this one off worked`)
     expect(p).toMatch(/message from Ada, id 1:\nTranslate it$/)
+  }, 30000)
+
+  test('fired: from a script on the host (the real CLI), and by its webhook; the payload goes with it', async () => {
+    const t = make({ name: 'Deploy note', message: 'Deployed: {payload}', webhook: true }, scopeOf(C, 501))
+    const secret = T().store.getTask(t.id).trigger.secret
+    expect(secret).toMatch(/^[a-f0-9]{24}$/)
+    const op = readFileSync(join(TMP, 'xesious.token'), 'utf8').trim()
+    // Spawned, not spawnSync: the API it calls is served by this same process.
+    const cli = async (...args: string[]) => {
+      const p = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'tasks', 'cli.ts'), ...args], { env: { ...process.env, XESIOUS_API_SOCK: T().socket, XESIOUS_API_TOKEN: op }, stdout: 'pipe', stderr: 'pipe' })
+      const code = await p.exited
+      return { code, out: (await new Response(p.stdout).text()).trim(), err: (await new Response(p.stderr).text()).trim() }
+    }
+    let before = calls.length
+    expect((await cli('fire', t.id, 'v1.2', 'to', 'staging')).code).toBe(0)
+    await waitFor(() => calls.slice(before).some(c => textOf(c).includes('Deployed: v1.2 to staging')), 10000)
+    before = calls.length
+    const hook = await fetch(`http://127.0.0.1:${HOOK_PORT}/hook/${t.id}/${secret}`, { method: 'POST', body: 'v1.3' })
+    expect(hook.status).toBe(202)
+    await waitFor(() => calls.slice(before).some(c => textOf(c).includes('Deployed: v1.3')), 10000)
+    const wrong = await fetch(`http://127.0.0.1:${HOOK_PORT}/hook/${t.id}/${'0'.repeat(24)}`, { method: 'POST', body: 'x' })
+    expect(wrong.status).toBe(404)
+
+    // xesious ask: blocks until someone here answers; the exit code is the option.
+    before = calls.length
+    const asking = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'tasks', 'cli.ts'), 'ask', '--chat', String(C), '--topic', '501', '--options', 'Yes,No', 'Deploy to production?'],
+      { env: { ...process.env, XESIOUS_API_SOCK: T().socket, XESIOUS_API_TOKEN: op }, stdout: 'pipe' })
+    await waitFor(() => calls.slice(before).some(c => c.method === 'sendMessage' && String(c.payload.text).includes('Deploy to production?')), 10000)
+    const q = calls.slice(before).find(c => c.method === 'sendMessage' && String(c.payload.text).includes('Deploy to production?'))!
+    await press(q.payload.reply_markup.inline_keyboard[0][1].callback_data, C, 501)
+    expect(await asking.exited).toBe(1)
+    expect((await new Response(asking.stdout).text()).trim()).toBe('No')
+  }, 40000)
+
+  test('xesious run: a turn in a topic from a script on the host, its result back to the script', async () => {
+    const { callApi } = await import('../tasks/api')
+    const op = readFileSync(join(TMP, 'xesious.token'), 'utf8').trim()
+    const before = calls.length
+    const r = await callApi(T().socket, op, 'POST', '/v1/run', { chat: String(C), topic: '502', prompt: 'Write the release notes' })
+    expect(r.status).toBe(200)
+    expect(r.body.state).toBe('done')
+    expect(r.body.result).toContain('okReply')
+    expect(calls.slice(before).some(c => c.method === 'sendMessage' && c.payload.message_thread_id === 502 && String(c.payload.text).startsWith('⚙️ From a script on the host: Write the release notes'))).toBe(true)
+    expect(readFileSync(LAST_PROMPT, 'utf8')).toContain("Work handed to this topic by a script on the bot's host")
   }, 30000)
 
   test('the activity topic can be turned off for a group', async () => {

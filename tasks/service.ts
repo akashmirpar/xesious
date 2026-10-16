@@ -12,6 +12,7 @@
  */
 import { LIMITS, eventLimits, hasNoSlots, isStreaming, type EventLimits, type ReportOutcome, type Run, type Says, type Sound, type Step, type Task, type Trigger } from './model'
 import type { TaskStore } from './store'
+import { randomBytes } from 'node:crypto'
 import { firstDue, isValidTz, parseLocalTime, parseWhen, type WhenInput } from './schedule'
 import type { Scope } from './api'
 import { markOf, scheduleText, whenText } from './render'
@@ -40,6 +41,7 @@ export interface TaskInput extends WhenInput {
   then?: { handoff_to?: string; brief?: string } | null   // on success, its result handed to this topic
   steps?: any[]           // a plan: steps with gates (checked here, step by step)
   after?: { task?: string; on?: 'success' | 'noteworthy' | 'failure' | 'any' } | null  // runs after another task's run
+  webhook?: boolean       // runs only when fired (xesious fire, or its webhook)
   digest?: { of?: string[] } | boolean   // a list of what tasks did, no AI
   rule?: any              // filters.ruleError says what it may be; null removes it
   ai_filter?: { question?: string; every_minutes?: number } | null
@@ -61,6 +63,8 @@ export interface ServiceDeps {
   maxWatchers?: number    // streaming watchers the bot keeps running at once
   // A topic of a chat, by id or name ("General" too): its thread, or undefined if none.
   topicOf?(chat: string, ref: string): { thread?: number; name?: string } | undefined
+  // Run it now with what it was fired with.
+  fire?(task: Task, payload: string): { runId?: string; error?: string }
 }
 
 // Both branches name both fields, so reading .error after checking .ok type-checks
@@ -101,6 +105,7 @@ export function taskView(t: Task, runs: Run[] = []) {
       : { keep_running: true }),
     sound: t.sound, deliver_to: t.where === 'dm' ? 'dm' : 'topic',
     ...(t.then ? { then: { handoff_to: t.then.topicName ?? t.then.thread ?? 'General', brief: t.then.brief } } : {}),
+    ...(t.trigger.kind === 'webhook' ? { webhook: { fire: `bun tasks/cli.ts fire ${t.id} "<payload>"`, http_path: `/hook/${t.id}/${t.trigger.secret}` } } : {}),
     topic: t.thread, runs_done: t.runsDone,
     last_run: last ? { when: whenText(new Date(last.startedAt ?? last.slot ?? Date.now()), t.tz), result: markOf(last), summary: last.summary, error: last.state === 'failed' ? last.reason : undefined } : undefined,
   }
@@ -157,9 +162,13 @@ export class TaskService {
     const timeGiven = ['at', 'in_minutes', 'every_minutes', 'cron'].some(k => (input as any)[k] !== undefined && (input as any)[k] !== null && (input as any)[k] !== '')
     const watchGiven = input.watch !== undefined && input.watch !== null && (input.watch as any) !== ''
     const afterGiven = input.after !== undefined && input.after !== null
-    if ([watchGiven, timeGiven, afterGiven].filter(Boolean).length > 1) return err(400, 'give one of: a time (at, in_minutes, every_minutes, cron), watch, or after')
+    const hookGiven = input.webhook === true
+    if ([watchGiven, timeGiven, afterGiven, hookGiven].filter(Boolean).length > 1) return err(400, 'give one of: a time (at, in_minutes, every_minutes, cron), watch, after, or webhook')
     let trigger = base?.trigger
-    if (afterGiven) {
+    if (hookGiven) {
+      // Its secret stays with it: changing the task doesn't break the scripts that call it.
+      trigger = base?.trigger.kind === 'webhook' ? base.trigger : { kind: 'webhook', secret: randomBytes(12).toString('hex') }
+    } else if (afterGiven) {
       const ref = String(input.after!.task ?? '').trim()
       const hit = this.store.getTask(ref) ?? this.store.listTasks({ chat }).find(x => x.name.trim().toLowerCase() === ref.toLowerCase())
       if (!hit || hit.chat !== chat || hit.state === 'deleted') return err(404, `after: no task "${ref}" in this chat`)
@@ -581,6 +590,19 @@ export class TaskService {
     const task = this.store.updateTask(v.value.id, { state: 'done', nextDue: undefined }, this.deps.now())!
     this.deps.changed(task, 'done')
     return ok({ task })
+  }
+
+  // Run it now, given what it was fired with: a script on the host, or its webhook.
+  fire(scope: Scope, id: string, payload: unknown): Result<{ runId: string }> {
+    const v = this.visible(scope, id)
+    if (!v.ok) return err(v.status, v.error)
+    if (scope.runKind === 'scheduled') return err(403, "a scheduled run can't fire tasks")
+    const why = this.deps.mayManage(scope, v.value, 'run')
+    if (why) return err(403, why)
+    const text = typeof payload === 'string' ? payload : payload === undefined || payload === null ? '' : JSON.stringify(payload)
+    const r = this.deps.fire?.(v.value, text.slice(0, 64_000)) ?? { error: 'firing is not available here' }
+    if (!r.runId) return err(409, r.error ?? "it couldn't start")
+    return ok({ runId: r.runId })
   }
 
   async runNow(scope: Scope, id: string): Promise<Result<{ runId: string }>> {
