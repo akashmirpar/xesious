@@ -18,6 +18,11 @@ export interface ScriptOutcome {
 const KEEP = 64 * 1024      // of each stream: the end is what matters
 
 export function runScript(o: { command: string; cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal }): Promise<ScriptOutcome> {
+  return runCommand({ ...o, argv: ['bash', '-c', o.command] })
+}
+
+// Any program, the same way: low priority, its own group, a time limit, a stop.
+export function runCommand(o: { argv: string[]; cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal }): Promise<ScriptOutcome> {
   const started = Date.now()
   return new Promise(resolve => {
     let out = ''
@@ -32,7 +37,7 @@ export function runScript(o: { command: string; cwd: string; env: NodeJS.Process
     }
     let child: ReturnType<typeof spawn>
     try {
-      child = spawn('nice', ['-n', '10', 'bash', '-c', o.command], { cwd: o.cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: o.env })
+      child = spawn('nice', ['-n', '10', ...o.argv], { cwd: o.cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: o.env })
     } catch (e) {
       err = String(e)
       finish(null)

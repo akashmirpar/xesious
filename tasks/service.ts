@@ -10,7 +10,7 @@
  *     cannot create tasks yet (child tasks come with hand-offs, in phase 4);
  *   - the operator token (scripts on the host) can read and pause anything.
  */
-import { LIMITS, eventLimits, isStreaming, type EventLimits, type ReportOutcome, type Run, type Says, type Sound, type Task, type Trigger } from './model'
+import { LIMITS, eventLimits, isStreaming, type EventLimits, type ReportOutcome, type Run, type Says, type Sound, type Step, type Task, type Trigger } from './model'
 import type { TaskStore } from './store'
 import { firstDue, isValidTz, parseLocalTime, parseWhen, type WhenInput } from './schedule'
 import type { Scope } from './api'
@@ -38,6 +38,7 @@ export interface TaskInput extends WhenInput {
   watch_tasks?: string[]  // with prompt: tasks (ids or names) whose recent runs come with each run
   topic?: string | number // task_create: the topic it lives in, when not the caller's
   then?: { handoff_to?: string; brief?: string } | null   // on success, its result handed to this topic
+  steps?: any[]           // a plan: steps with gates (checked here, step by step)
   digest?: { of?: string[] } | boolean   // a list of what tasks did, no AI
   rule?: any              // filters.ruleError says what it may be; null removes it
   ai_filter?: { question?: string; every_minutes?: number } | null
@@ -95,6 +96,7 @@ export function taskView(t: Task, runs: Run[] = []) {
       : t.action.kind === 'claude' ? { prompt: t.action.prompt, session: t.action.session, says: t.says, ...(t.action.watch?.length ? { watch_tasks: t.action.watch } : {}) }
       : t.action.kind === 'script' ? { script: { command: t.action.command, timeout_minutes: (t.action.timeoutMs ?? LIMITS.scriptTimeoutMs) / 60_000 }, says: t.says }
       : t.action.kind === 'digest' ? { digest: { of: t.action.of } }
+      : t.action.kind === 'steps' ? { steps: t.action.steps.map((s, i) => ({ step: i + 1, ...s })), says: t.says }
       : { keep_running: true }),
     sound: t.sound, deliver_to: t.where === 'dm' ? 'dm' : 'topic',
     ...(t.then ? { then: { handoff_to: t.then.topicName ?? t.then.thread ?? 'General', brief: t.then.brief } } : {}),
@@ -176,7 +178,8 @@ export class TaskService {
     const hasScript = scriptIn !== undefined && scriptIn !== null
     const digestIn: any = input.digest === true ? {} : input.digest
     const hasDigest = digestIn !== undefined && digestIn !== null && digestIn !== false
-    if ([hasMsg, hasPrompt, hasScript, hasDigest, keep].filter(Boolean).length > 1) return err(400, 'give one of message (a reminder, or a line for each event), prompt (a Claude run), script (a command), digest or keep_running')
+    const hasSteps = Array.isArray(input.steps)
+    if ([hasMsg, hasPrompt, hasScript, hasDigest, hasSteps, keep].filter(Boolean).length > 1) return err(400, 'give one of message (a reminder, or a line for each event), prompt (a Claude run), script (a command), steps (a plan), digest or keep_running')
     // Other tasks, named by id or by name, in this chat.
     const tasksNamed = (refs: unknown, what: string): Result<string[]> => {
       if (refs === undefined || refs === null) return ok([])
@@ -213,6 +216,10 @@ export class TaskService {
         timeoutMs = m.ms
       }
       action = { kind: 'script', command, ...(timeoutMs ? { timeoutMs } : {}) }
+    } else if (hasSteps) {
+      const s = this.buildSteps(input.steps!, chat)
+      if (!s.ok) return err(s.status, s.error)
+      action = { kind: 'steps', steps: s.value! }
     } else if (hasDigest) {
       const o = tasksNamed(digestIn.of, 'digest.of')
       if (!o.ok) return err(o.status, o.error)
@@ -254,6 +261,7 @@ export class TaskService {
     if (!name) {
       const src = action!.kind === 'message' ? action!.text : action!.kind === 'claude' ? action!.prompt
         : action!.kind === 'script' ? action!.command : action!.kind === 'digest' ? 'Digest'
+        : action!.kind === 'steps' ? `Plan: ${action!.steps.map(s => s.name).join(', ')}`
         : trigger!.kind === 'watch' ? trigger!.command : 'task'
       name = src.replace(/\s+/g, ' ').slice(0, 40).trim() + (src.length > 40 ? '…' : '')
     }
@@ -313,7 +321,7 @@ export class TaskService {
         if (!chat.startsWith('-')) return err(400, 'then hands results between the topics of a group; this is a private chat')
         const to = this.deps.topicOf?.(chat, String(input.then.handoff_to))
         if (!to) return err(404, `then.handoff_to: no topic "${input.then.handoff_to}" here; topic_list lists them`)
-        if (action!.kind !== 'claude' && action!.kind !== 'script') return err(400, 'then is for a Claude run or a script, which have a result to hand on')
+        if (action!.kind !== 'claude' && action!.kind !== 'script' && action!.kind !== 'steps') return err(400, 'then is for a Claude run, a script or a plan, which have a result to hand on')
         then = { thread: to.thread, topicName: to.name ?? String(input.then.handoff_to), ...(input.then.brief ? { brief: String(input.then.brief).slice(0, 2000) } : {}) }
       }
     }
@@ -348,6 +356,64 @@ export class TaskService {
       limits: Object.keys(limits).length ? limits : undefined,
       rule, ai, then,
     } as any)
+  }
+
+  // A plan's steps, each checked: what it does, and where it goes after.
+  private buildSteps(raw: any[], chat: string): Result<Step[]> {
+    if (!raw.length || raw.length > LIMITS.stepsMax) return err(400, `steps is a list of 1 to ${LIMITS.stepsMax} steps`)
+    const kinds: Step['kind'][] = ['message', 'script', 'claude', 'codex', 'ask', 'handoff']
+    const out: Step[] = []
+    const go = (v: any, n: number, what: string): Result<number | 'next' | 'stop' | undefined> => {
+      if (v === undefined || v === null || v === '') return ok(undefined)
+      if (v === 'next' || v === 'stop') return ok(v)
+      const k = Number(v)
+      if (!Number.isInteger(k) || k < 1 || k > raw.length) return err(400, `step ${n}: ${what} is "next", "stop" or a step number from 1 to ${raw.length}`)
+      return ok(k)
+    }
+    for (let i = 0; i < raw.length; i++) {
+      const r = raw[i] ?? {}
+      const n = i + 1
+      if (!kinds.includes(r.kind)) return err(400, `step ${n}: kind is one of ${kinds.join(', ')}`)
+      const st: Step = { name: String(r.name ?? '').trim().slice(0, 60) || `${r.kind} ${n}`, kind: r.kind }
+      const need = (field: string, what: string): string | undefined => { const v = String(r[field] ?? '').trim(); return v ? v : (void 0) }
+      if (r.kind === 'message') { st.text = need('text', ''); if (!st.text) return err(400, `step ${n}: a message step needs text`) }
+      if (r.kind === 'script') { st.command = need('command', ''); if (!st.command) return err(400, `step ${n}: a script step needs command`) }
+      if (r.kind === 'claude' || r.kind === 'codex') {
+        st.prompt = need('prompt', '')
+        if (!st.prompt) return err(400, `step ${n}: a ${r.kind} step needs prompt`)
+        if (st.prompt.length > MAX.prompt) return err(400, `step ${n}: prompt is too long`)
+      }
+      if (r.kind === 'ask') {
+        st.question = need('question', '')
+        if (!st.question) return err(400, `step ${n}: an ask step needs question`)
+        if (Array.isArray(r.options)) st.options = r.options.map((o: any) => String(o).trim()).filter(Boolean).slice(0, 8)
+      }
+      if (r.kind === 'handoff') {
+        const to = r.topic !== undefined ? this.deps.topicOf?.(chat, String(r.topic)) : undefined
+        if (!to) return err(404, `step ${n}: a handoff step needs topic, one of this group's (topic_list lists them)`)
+        st.thread = to.thread
+        st.topicName = to.name ?? String(r.topic)
+        if (r.brief) st.brief = String(r.brief).slice(0, 4000)
+      }
+      if ((r.kind === 'script' || r.kind === 'codex') && r.timeout_minutes !== undefined && r.timeout_minutes !== null) {
+        const m = minutesIn(r.timeout_minutes, `step ${n}: timeout_minutes`, 1, LIMITS.scriptTimeoutMaxMs / 60_000)
+        if (m.error) return err(400, m.error)
+        st.timeoutMs = m.ms
+      }
+      const p = go(r.on_pass, n, 'on_pass')
+      if (!p.ok) return err(p.status, p.error)
+      const f = go(r.on_fail, n, 'on_fail')
+      if (!f.ok) return err(f.status, f.error)
+      if (p.value !== undefined) st.onPass = p.value
+      if (f.value !== undefined) st.onFail = f.value
+      if (r.retries !== undefined && r.retries !== null) {
+        const k = Number(r.retries)
+        if (!Number.isInteger(k) || k < 0 || k > LIMITS.stepRetriesMax) return err(400, `step ${n}: retries is 0 to ${LIMITS.stepRetriesMax}`)
+        if (k) st.retries = k
+      }
+      out.push(st)
+    }
+    return ok(out)
   }
 
   create(scope: Scope, input: TaskInput): Result<{ task: Task; duplicate?: boolean }> {

@@ -72,6 +72,32 @@ const WATCH_PROPS = {
     properties: { handoff_to: { type: 'string' }, brief: { type: 'string' } },
     required: ['handoff_to'],
   },
+  steps: {
+    type: 'array',
+    description: 'Instead of message, prompt or script: a plan, for work with gates that must not depend on a model following a prompt ("push only if the tests pass, try to fix once, then stop"). ' +
+      'The steps run one after another; each says where to go after it passes (on_pass, default the next) or fails (on_fail, default stop: the run fails, loud, naming the step), and may be tried again (retries, told how it failed). ' +
+      'A claude or codex step gets what the steps before it gave; its final answer is its result. A script step passes when it exits 0. Codex runs on the owner\'s ChatGPT plan, in this topic\'s folder. ' +
+      'Choose a single prompt for simple work, and steps when there are gates, retries or other tools.',
+    items: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'A word or two for the progress line: "fetch", "tests".' },
+        kind: { type: 'string', enum: ['message', 'script', 'claude', 'codex', 'ask', 'handoff'] },
+        text: { type: 'string', description: 'message: what to post.' },
+        command: { type: 'string', description: 'script: run with bash in this topic\'s folder; $XESIOUS_PREV is a file with the last step\'s output, $XESIOUS_STEPS a JSON file of all of them.' },
+        prompt: { type: 'string', description: 'claude or codex: the instruction for this step alone.' },
+        question: { type: 'string', description: 'ask: the question; its answer is the step\'s result.' },
+        options: { type: 'array', items: { type: 'string' } },
+        topic: { type: 'string', description: 'handoff: the topic it goes to.' },
+        brief: { type: 'string', description: 'handoff: what that topic should do.' },
+        timeout_minutes: { type: 'number' },
+        on_pass: { type: ['string', 'number'], description: '"next" (the default), "stop", or a step number.' },
+        on_fail: { type: ['string', 'number'], description: '"stop" (the default: the run failed), "next", or a step number.' },
+        retries: { type: 'number', description: '0 to 3.' },
+      },
+      required: ['kind'],
+    },
+  },
   watch_tasks: {
     type: 'array', items: { type: 'string' },
     description: 'With a prompt: other tasks in this chat (ids or names) whose runs since the last run come with each run, so it can check on them. ' +

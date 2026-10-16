@@ -34,12 +34,44 @@ export type Action =
   // What other tasks did since the last digest, listed without Claude. of: their ids,
   // or empty for every other task in the home topic.
   | { kind: 'digest'; of: string[] }
+  // A short plan whose gates the bridge keeps: "push only if the tests pass".
+  | { kind: 'steps'; steps: Step[] }
   // A command with no AI (bash -c, in the topic's folder): its exit status decides,
   // and what it printed is posted as `says` decides.
   | { kind: 'script'; command: string; timeoutMs?: number }
   // A watcher kept running for its own sake ("keep the sync loop running"): its output
   // goes nowhere, and only its failures are said.
   | { kind: 'none' }
+
+// One step of a plan, and where to go after it. Step numbers count from 1.
+export interface Step {
+  name: string
+  kind: 'message' | 'script' | 'claude' | 'codex' | 'ask' | 'handoff'
+  text?: string             // message
+  command?: string          // script
+  prompt?: string           // claude, codex
+  question?: string         // ask
+  options?: string[]
+  thread?: number           // handoff: the topic
+  topicName?: string
+  brief?: string
+  timeoutMs?: number        // script, codex
+  onPass?: number | 'next' | 'stop'   // after it worked (default: the next one)
+  onFail?: number | 'next' | 'stop'   // after it failed for good (default: stop, the run failed)
+  retries?: number          // tries again this many times, told how it failed
+}
+
+// What one step did, kept with its run.
+export interface StepResult {
+  step: number              // from 1
+  name: string
+  ok: boolean
+  output?: string
+  error?: string
+  attempt: number           // from 1
+  startedAt: string
+  endedAt?: string
+}
 
 // One line a watcher printed, and when; once a filter let it through, the value it
 // looked at and why it passed.
@@ -164,6 +196,9 @@ export interface Run {
   events?: WatchEvent[]   // what set off an event run (the newest, at most eventsPerRun)
   folded?: number         // how many events it covers in all
   waitId?: string         // an answer run: the question it carries on from
+  stepAt?: number         // a plan's run: the step it is at (from 1)
+  stepResults?: StepResult[]
+  progressMsg?: number    // its progress message, edited as its steps go by
 }
 
 // Work handed to another topic of the same group: by a run (the handoff tool) or by a
@@ -236,6 +271,10 @@ export const LIMITS = {
   handoffDepthMax: 3,
   handoffsPerHour: 30,               // per group
   handoffRunsAtOnce: 2,
+  // Plans:
+  stepsMax: 12,
+  stepRunsMax: 50,                   // step executions in one run, retries and loops included
+  stepRetriesMax: 3,
   // Questions:
   askWaitMaxMs: 10 * 60_000,         // a run waits this long at most for an answer, then parks
   askKeepMs: 24 * 60 * 60_000,       // a parked question is kept this long

@@ -402,3 +402,29 @@ describe('digests and watchdogs', () => {
     expect(p.ok ? '' : p.error).toContain('can only change its own task')
   })
 })
+
+describe('plans', () => {
+  const e = (input: any) => { const r = svc.create(person, { tz: 'UTC', cron: '7 10 * * 6', ...input }); return r.ok ? '' : r.error }
+  test('each step checked: what it does, and where it goes after', () => {
+    expect(e({ steps: [] })).toContain('steps is a list of 1 to 12')
+    expect(e({ steps: [{ kind: 'dance' }] })).toContain('step 1: kind is one of')
+    expect(e({ steps: [{ kind: 'script' }] })).toContain('step 1: a script step needs command')
+    expect(e({ steps: [{ kind: 'claude', prompt: 'x', on_fail: 9 }] })).toContain('step 1: on_fail is "next", "stop" or a step number from 1 to 1')
+    expect(e({ steps: [{ kind: 'script', command: 'x', retries: 7 }] })).toContain('retries is 0 to 3')
+    expect(e({ steps: [{ kind: 'handoff', topic: 'nowhere' }] })).toContain('step 1: a handoff step needs topic')
+    expect(e({ steps: [{ kind: 'script', command: 'x' }], prompt: 'y' })).toContain('give one of')
+  })
+  test('stored with its names and gates; named after its steps; its view lists them', () => {
+    const t = create({ cron: '7 10 * * 6', steps: [
+      { name: 'tests', kind: 'script', command: 'bun test', on_fail: 2 },
+      { name: 'fix', kind: 'codex', prompt: 'Fix the failing tests', retries: 1, on_pass: 1, timeout_minutes: 45 },
+    ] })
+    expect(t.action).toEqual({ kind: 'steps', steps: [
+      { name: 'tests', kind: 'script', command: 'bun test', onFail: 2 },
+      { name: 'fix', kind: 'codex', prompt: 'Fix the failing tests', retries: 1, onPass: 1, timeoutMs: 2_700_000 },
+    ] })
+    expect(t.name).toBe('Plan: tests, fix')
+    const v = svc.get(person, t.id)
+    expect(v.ok && (v.value as any).steps.map((x: any) => x.step)).toEqual([1, 2])
+  })
+})

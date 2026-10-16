@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TaskStore } from './store'
-import { TaskRuntime, eventText, type ClaudeOutcome, type FilterVerdict, type RuntimeDeps, type WatcherControl } from './runtime'
+import { TaskRuntime, eventText, type ClaudeOutcome, type FilterVerdict, type RuntimeDeps, type StepCall, type WatcherControl } from './runtime'
 import type { Run, Task, WatchEvent } from './model'
 import type { PollResult } from './watchers'
 import type { ScriptOutcome } from './scripts'
@@ -16,7 +16,7 @@ let notes: string[]
 let acts: string[]
 let timers: { fn: () => void; ms: number }[]
 let owner: boolean
-let claude: (t: Task, r: Run) => Promise<ClaudeOutcome>
+let claude: (t: Task, r: Run, step?: StepCall) => Promise<ClaudeOutcome>
 let rt: TaskRuntime
 let msg: number
 
@@ -27,7 +27,7 @@ function deps(over: Partial<RuntimeDeps> = {}): RuntimeDeps {
     store, now: () => now, log: () => {}, dataDir: join(dir, 'tasks'), maxClaude: 2,
     startedAt: new Date('2026-01-01T00:00:00Z'),
     ownerAllowed: () => owner,
-    runClaude: (t, r) => claude(t, r),
+    runClaude: (t, r, step) => claude(t, r, step),
     post: async (t, kind, text, opts) => { posts.push({ task: t.id, kind, text, opts }); return opts.edit ?? ++msg },
     cardChanged: () => {}, note: (_t, text) => { notes.push(text) }, activity: (_t, text) => { acts.push(text) },
     setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length }, clearTimer: () => {},
@@ -715,5 +715,119 @@ describe('questions', () => {
     store.createWait({ task: t.id, run: `${t.id}@r9`, chat: t.chat, question: 'Go?', askedAt: now.toISOString(), deadline: new Date(now.getTime() + 3600_000).toISOString(), state: 'open' })
     rt.start()
     expect(store.openWaits()[0].state).toBe('parked')
+  })
+})
+
+describe('plans', () => {
+  let calls: StepCall[]
+  let scripts: Record<string, ScriptOutcome[]>
+  const ran = (name: string) => calls.filter(c => c.step.name === name).length
+  beforeEach(() => {
+    calls = []
+    scripts = {}
+    rt.stop()
+    rt = new TaskRuntime(deps({
+      runScript: async (_t, _r, call) => {
+        calls.push(call!)
+        const q = scripts[call!.step.name] ?? []
+        return q.length > 1 ? q.shift()! : (q[0] ?? { code: 0, out: `${call!.step.name} ok\n`, err: '', timedOut: false, durationMs: 10 })
+      },
+    }))
+    claude = async (_t, _r, call) => { if (call) calls.push(call); return OK(`scoped: ${call?.prior.map(p => p.name).join('+')}`) }
+  })
+  const plan = (steps: any[], over: Partial<Task> = {}) => mk({ name: 'Weekend fix', action: { kind: 'steps', steps }, says: 'result', ...over })
+  const ok = (out = 'ok\n') => ({ code: 0, out, err: '', timedOut: false, durationMs: 5 })
+  const bad = (err = 'tests: 37 of 40 passed') => ({ code: 1, out: '', err, timedOut: false, durationMs: 5 })
+
+  test('steps in order, each told what came before; its progress edited as it goes; the last word is its result', async () => {
+    const t = plan([{ name: 'fetch', kind: 'script', command: 'f' }, { name: 'scope', kind: 'claude', prompt: 'Scope it' }, { name: 'push', kind: 'script', command: 'p' }])
+    await tick()
+    expect(calls.map(c => [c.n, c.step.name, c.prior.length])).toEqual([[1, 'fetch', 0], [2, 'scope', 1], [3, 'push', 2]])
+    const progress = posts.filter(p => p.kind === 'progress')
+    expect(progress[0].text).toBe('🪜 Weekend fix: ⏳ fetch')
+    expect(progress.at(-1)!.text).toBe('🪜 Weekend fix: ✅ fetch · ✅ scope · ✅ push\n✅ done')
+    // One message, edited: the first post made it (the harness numbers it 101).
+    expect(progress[0].opts.edit).toBeUndefined()
+    expect(progress.slice(1).every(p => p.opts.edit === 101)).toBe(true)
+    expect(posts.filter(p => p.kind === 'result').map(p => p.text)).toEqual(['push ok'])
+    expect(store.runsFor(t.id)[0]).toMatchObject({ state: 'succeeded', summary: '✅ fetch · ✅ scope · ✅ push' })
+  })
+
+  test("the gates: a failing test goes to the fix, which is tried again told why; push only once they pass", async () => {
+    scripts.tests = [bad(), ok('40 of 40\n')]
+    const t = plan([
+      { name: 'tests', kind: 'script', command: 't', onFail: 2 },
+      { name: 'fix', kind: 'claude', prompt: 'Fix it', onPass: 3, retries: 1 },
+      { name: 'tests again', kind: 'script', command: 't2', onPass: 4, onFail: 'stop' },
+      { name: 'push', kind: 'script', command: 'p' },
+    ])
+    await tick()
+    expect(calls.map(c => c.step.name)).toEqual(['tests', 'fix', 'tests again', 'push'])
+    expect(calls[1].prior[0]).toMatchObject({ name: 'tests', ok: false, error: 'it exited with status 1: tests: 37 of 40 passed' })
+    expect(store.runsFor(t.id)[0].state).toBe('succeeded')
+  })
+
+  test('a step that keeps failing: retried with how it failed, then the plan stops, loud, naming the step', async () => {
+    scripts.build = [bad('compile error'), bad('compile error'), bad('compile error')]
+    const t = plan([{ name: 'build', kind: 'script', command: 'b', retries: 2 }, { name: 'push', kind: 'script', command: 'p' }], { says: 'result' })
+    await tick()
+    expect(ran('build')).toBe(3)
+    expect(calls[1].lastFailure).toBe('it exited with status 1: compile error')
+    expect(ran('push')).toBe(0)
+    expect(store.runsFor(t.id)[0]).toMatchObject({ state: 'failed' })
+    expect(store.runsFor(t.id)[0].reason).toBe('step 1 (build): it exited with status 1: compile error')
+    expect(posts.find(p => p.kind === 'failure')).toMatchObject({ opts: { loud: true } })
+    expect(posts.filter(p => p.kind === 'progress').at(-1)!.text).toContain('❌ build ×3')
+  })
+
+  test('a loop that never ends is cut off', async () => {
+    const t = plan([{ name: 'a', kind: 'script', command: 'a', onPass: 2 }, { name: 'b', kind: 'script', command: 'b', onPass: 1 }])
+    await tick()
+    expect(calls.length).toBe(50)
+    expect(store.runsFor(t.id)[0].reason).toContain('went round 50 steps')
+  })
+
+  test('a question step: the plan waits, and the answer carries it on from the next step', async () => {
+    let p: Promise<any> | undefined
+    const asked: any[] = []
+    rt.stop()
+    rt = new TaskRuntime(deps({ runScript: async (_t, _r, call) => { calls.push(call!); return ok(`${call!.step.name} ok`) }, questionDone: w => { asked.push(w) } }))
+    const t = plan([{ name: 'draft', kind: 'script', command: 'd' }, { name: 'which', kind: 'ask', question: 'Post it?', options: ['Yes', 'No'] }, { name: 'post', kind: 'script', command: 'p' }])
+    void (p = rt.tick())
+    await new Promise(r => setTimeout(r, 10))
+    timers.find(x => x.ms === 10 * 60_000)!.fn()       // nobody answered within the wait
+    await p; await rt.idle()
+    expect(store.runsFor(t.id)[0]).toMatchObject({ state: 'waiting', stepAt: 2 })
+    expect(calls.map(c => c.step.name)).toEqual(['draft'])
+    const w = store.openWaits()[0]
+    rt.answer(w.id, 'Yes', 'Ada', '1')
+    await rt.idle()
+    expect(calls.map(c => [c.step.name, c.prior.map(r => `${r.name}:${r.output}`).join(',')])).toEqual([['draft', ''], ['post', 'draft:draft ok,which:Yes']])
+    expect(store.runsFor(t.id).find(r => r.trigger === 'answer')).toMatchObject({ state: 'succeeded' })
+  })
+
+  test('after a restart a plan carries on at the step it was at', async () => {
+    const t = plan([{ name: 'one', kind: 'script', command: '1' }, { name: 'two', kind: 'script', command: '2' }])
+    store.insertRun({ id: `${t.id}@x`, task: t.id, trigger: 'schedule', state: 'running', startedAt: now.toISOString(), stepAt: 2,
+      stepResults: [{ step: 1, name: 'one', ok: true, output: 'one ok', attempt: 1, startedAt: now.toISOString() }] })
+    const r = rt.start()
+    expect(r.interrupted).toEqual([])
+    await rt.idle()
+    expect(calls.map(c => c.step.name)).toEqual(['two'])
+    expect(store.getRun(`${t.id}@x`)!.state).toBe('succeeded')
+  })
+
+  test('a plan a person stops ends after the step going, canceled', async () => {
+    let release!: () => void
+    rt.stop()
+    rt = new TaskRuntime(deps({ runScript: async (_t, _r, call) => { calls.push(call!); if (calls.length === 1) await new Promise<void>(res => { release = res }); return ok() } }))
+    const t = plan([{ name: 'one', kind: 'script', command: '1' }, { name: 'two', kind: 'script', command: '2' }])
+    void rt.tick()
+    await new Promise(r => setTimeout(r, 10))
+    expect(rt.stopPlan(t.id)).toBe(true)
+    release()
+    await rt.idle()
+    expect(calls.map(c => c.step.name)).toEqual(['one'])
+    expect(store.runsFor(t.id)[0]).toMatchObject({ state: 'canceled', reason: 'stopped' })
   })
 })

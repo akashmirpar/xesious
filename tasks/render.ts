@@ -6,7 +6,7 @@
  * Times are written in the task's zone and wrapped in <tg-time>, which Telegram shows
  * in each reader's own zone and language; the written text is what older apps show.
  */
-import { eventLimits, type Run, type RunMark, type Task, type Trigger, type Usage } from './model'
+import { eventLimits, type Run, type RunMark, type Step, type StepResult, type Task, type Trigger, type Usage } from './model'
 import { runsPerDay } from './schedule'
 import { ruleText } from './filters'
 
@@ -86,6 +86,7 @@ export function elapsedText(ms: number): string {
 // ⏰ Scheduled · 🔔 Reminder · 👀 Watch · 📋 Digest
 export function kindLabel(t: Task): string {
   if (t.action.kind === 'digest') return '📋 Digest'
+  if (t.action.kind === 'steps') return '🪜 Plan'
   if (t.trigger.kind === 'watch') return '👀 Watch'
   return t.action.kind === 'message' ? '🔔 Reminder' : '⏰ Scheduled'
 }
@@ -111,6 +112,7 @@ export function actionText(t: Task): string {
   if (t.action.kind === 'none') return 'keeps it running; says something only if it fails'
   if (t.action.kind === 'script') return `runs a command${watch ? ' when it sees something' : ''} · ${SCRIPT_SAYS[t.says]}`
   if (t.action.kind === 'digest') return t.action.of.length ? `lists what ${t.action.of.length === 1 ? 'a task' : `${t.action.of.length} tasks`} did, without Claude` : 'lists what the tasks in this topic did, without Claude'
+  if (t.action.kind === 'steps') return `runs a plan of ${t.action.steps.length} step${t.action.steps.length === 1 ? '' : 's'} · ${SAYS_TEXT[t.says]}`
   if (t.action.kind === 'message') return watch ? 'sends a message when it sees something' : 'sends a message'
   const session = t.action.session === 'own' ? 'Claude, in its own session (remembers earlier runs)' : 'Claude, a fresh session each run'
   return `${watch ? `${session}, when it sees something` : session} · ${SAYS_TEXT[t.says]}`
@@ -187,6 +189,7 @@ export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchSt
   if (t.action.kind === 'script') lines.push(`${isWatch ? 'Then runs ' : ''}<code>${esc(clip(t.action.command, 200))}</code>`)
   if (related?.length) lines.push(`${t.action.kind === 'digest' ? 'Lists' : 'Watches'}: ${related.map(n => `<b>${esc(n)}</b>`).join(', ')}`)
   if (t.then) lines.push(`Then hands its result to <b>${esc(t.then.topicName ?? (t.then.thread === undefined ? 'General' : `topic ${t.then.thread}`))}</b>`)
+  if (t.action.kind === 'steps') lines.push(...t.action.steps.map((st, i) => esc(stepLine(st, i + 1))))
   if (t.ai) {
     const n = t.filterSeen ? ` · ${t.filterSeen.toLocaleString('en-US')} considered, ${(t.filterPassed ?? 0).toLocaleString('en-US')} let through` : ''
     lines.push(`AI filter every ${esc(durationText(t.ai.everyMs))}: “${esc(clip(t.ai.question, 160))}”${n}`)
@@ -333,4 +336,34 @@ export function watchedText(entries: Activity[], since: Date, tz: string): strin
     }
   }
   return out.join('\n')
+}
+
+// --- plans -------------------------------------------------------------------------
+
+const STEP_KIND: Record<Step['kind'], string> = { message: 'message', script: 'command', claude: 'Claude', codex: 'Codex', ask: 'question', handoff: 'hand-off' }
+const goText = (g: number | 'next' | 'stop' | undefined, dflt: string) => g === undefined ? dflt : g === 'next' ? 'the next' : g === 'stop' ? 'stop' : `step ${g}`
+
+// "3. tests (command) · fails → step 5, 1 retry"
+export function stepLine(st: Step, n: number): string {
+  const bits: string[] = []
+  if (st.onPass !== undefined && st.onPass !== 'next') bits.push(`passes → ${goText(st.onPass, 'the next')}`)
+  if (st.onFail !== undefined && st.onFail !== 'stop') bits.push(`fails → ${goText(st.onFail, 'stop')}`)
+  if (st.retries) bits.push(`${st.retries} ${st.retries === 1 ? 'retry' : 'retries'}`)
+  if (st.kind === 'handoff' && st.topicName) bits.push(`to ${st.topicName}`)
+  return `${n}. ${st.name} (${STEP_KIND[st.kind]})${bits.length ? ` · ${bits.join(', ')}` : ''}`
+}
+
+// How a plan's run went, step by step: the latest try of each step it ran, in order,
+// and the one it is at. "✅ fetch · ✅ scope · ❌ tests ×2 · ⏳ fix"
+export function stepsStrip(results: StepResult[], current?: { step: number; name: string }): string {
+  const parts: string[] = []
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i]
+    const tries = r.attempt > 1 ? ` ×${r.attempt}` : ''
+    // A retry replaces the try before it in the strip.
+    if (i + 1 < results.length && results[i + 1].step === r.step && results[i + 1].attempt === r.attempt + 1) continue
+    parts.push(`${r.ok ? '✅' : '❌'} ${r.name}${tries}`)
+  }
+  if (current) parts.push(`⏳ ${current.name}`)
+  return parts.join(' · ')
 }

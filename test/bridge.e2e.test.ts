@@ -66,6 +66,8 @@ process.env.XESIOUS_STUB_MCP_LOG = MCP_LOG
 // …and every question to a watcher's AI filter.
 const FILTER_LOG = join(TMP, 'filter-calls.jsonl')
 process.env.XESIOUS_STUB_FILTER_LOG = FILTER_LOG
+// A plan's Codex step runs this instead of codex.
+process.env.TG_CODEX_BIN = join(import.meta.dir, 'codex-stub.sh')
 // Tasks are on by default; off here, so every other test sees the command line it
 // always did. The task tests switch them on.
 process.env.TG_TASKS = '0'
@@ -5124,6 +5126,32 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     await waitFor(() => T().store.openHandoffs().length === 0, 15000)
     expect(readFileSync(LAST_PROMPT, 'utf8')).toContain('by its task "Daily draft"')
     expect(readFileSync(LAST_PROMPT, 'utf8')).toContain('What its run produced:')
+  }, 30000)
+
+  test('a plan: its steps one after another, each given what came before; one progress line, edited; the last word posted', async () => {
+    const before = calls.length
+    const t = make({ name: 'Weekend fix', cron: '7 10 * * 6', steps: [
+      { name: 'fetch', kind: 'script', command: 'echo "issue 123: the button is blue"' },
+      { name: 'scope', kind: 'claude', prompt: 'Write the spec' },
+      { name: 'implement', kind: 'codex', prompt: 'Implement the spec' },
+      { name: 'tests', kind: 'script', command: 'grep -q "codex did it" "$XESIOUS_PREV"', on_fail: 'stop' },
+    ] }, scopeOf(C, 501))
+    T().runtime.runNow(t.id)
+    await waitFor(() => T().store.runsFor(t.id).some((r: any) => r.state === 'succeeded' || r.state === 'failed'), 20000)
+    const run = T().store.runsFor(t.id)[0]
+    expect(run.state).toBe('succeeded')
+    expect(run.stepResults.map((r: any) => [r.name, r.ok])).toEqual([['fetch', true], ['scope', true], ['implement', true], ['tests', true]])
+    expect(run.stepResults[2].output).toBe('codex did it: Implement the spec')
+    // The Claude step: told which step it is, and given the fetch's output as material.
+    const p = readFileSync(LAST_PROMPT, 'utf8')
+    expect(p).toContain('This is step 2 of 4, "scope", of the plan "Weekend fix"')
+    expect(p).toContain('issue 123: the button is blue')
+    expect(p).toMatch(/message from Ada, id 1:\nWrite the spec$/)
+    const progress = calls.slice(before).filter(c => textOf(c).startsWith('🪜 Weekend fix'))
+    expect(progress[0].method).toBe('sendMessage')
+    expect(progress.slice(1).every(c => c.method === 'editMessageText')).toBe(true)
+    expect(textOf(progress.at(-1)!)).toContain('✅ fetch · ✅ scope · ✅ implement · ✅ tests')
+    expect(calls.slice(before).some(c => textOf(c).includes('codex did it: Implement the spec') && !textOf(c).startsWith('🪜'))).toBe(true)
   }, 30000)
 
   test('the activity topic can be turned off for a group', async () => {

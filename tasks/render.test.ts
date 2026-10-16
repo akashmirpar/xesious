@@ -1,7 +1,7 @@
 import { test, expect, describe } from 'bun:test'
 import {
   cronText, scheduleText, durationText, frequencyText, cardHtml, listLine, runLine, markOf, usageText,
-  tgTime, esc, elapsedText, historyHtml, digestMarkdown, watchedText,
+  tgTime, esc, elapsedText, historyHtml, digestMarkdown, watchedText, stepLine, stepsStrip,
 } from './render'
 import type { Run, Task } from './model'
 
@@ -199,4 +199,15 @@ describe('what tasks did', () => {
     expect(text).toContain('    Fri 16 Oct, 21:07 failed, 2 min: it exited with status 2: rsync: connection refused')
     expect(text).toContain('- Price watch (id w1; watches continuously; active; watcher: fine, 1,204 lines seen):')
   })
+})
+
+test('a plan on its card, and how its run went', () => {
+  expect(stepLine({ name: 'tests', kind: 'script', command: 'x', onFail: 5, retries: 1 }, 3)).toBe('3. tests (command) · fails → step 5, 1 retry')
+  expect(stepLine({ name: 'post', kind: 'handoff', thread: 9, topicName: 'Posting' }, 4)).toBe('4. post (hand-off) · to Posting')
+  const r = (step: number, name: string, ok: boolean, attempt = 1) => ({ step, name, ok, attempt, startedAt: '' })
+  expect(stepsStrip([r(1, 'fetch', true), r(2, 'tests', false), r(2, 'tests', true, 2)], { step: 3, name: 'push' })).toBe('✅ fetch · ✅ tests ×2 · ⏳ push')
+  const card = cardHtml(task({ action: { kind: 'steps', steps: [{ name: 'fetch', kind: 'script', command: 'f' }, { name: 'fix', kind: 'codex', prompt: 'p' }] } }), [])
+  expect(card).toContain('🪜 Plan: <b>Nightly &lt;news&gt;</b>')
+  expect(card).toContain('runs a plan of 2 steps')
+  expect(card).toContain('1. fetch (command)\n2. fix (Codex)')
 })

@@ -24,10 +24,10 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
-import { LIMITS, eventLimits, isStreaming, isWatch, type Run, type RunMark, type Task, type Usage, type Wait, type WatchEvent } from './model'
+import { LIMITS, eventLimits, isStreaming, isWatch, type Run, type RunMark, type Step, type StepResult, type Task, type Usage, type Wait, type WatchEvent } from './model'
 import type { TaskStore } from './store'
 import { manualRunId, nextAfter, resolveDue, slotRunId } from './schedule'
-import { digestMarkdown, elapsedText, markOf, whenText, type Activity } from './render'
+import { digestMarkdown, elapsedText, markOf, stepsStrip, whenText, type Activity } from './render'
 import type { PollResult, WatcherExit } from './watchers'
 import { applyRule } from './filters'
 import { lastLines, outputBlock, type ScriptOutcome } from './scripts'
@@ -45,7 +45,17 @@ export interface ClaudeOutcome {
   denials?: string[]       // actions the permission mode blocked
 }
 
-export type PostKind = 'reminder' | 'result' | 'failure' | 'alert' | 'notice' | 'question'
+export type PostKind = 'reminder' | 'result' | 'failure' | 'alert' | 'notice' | 'question' | 'progress'
+
+// One step of a plan, as the bridge runs it: which, the results before it, and how
+// its last try failed, if it is being tried again.
+export interface StepCall {
+  n: number
+  step: Step
+  prior: StepResult[]
+  lastFailure?: string                        // how its last try failed
+  answer?: { question: string; answer: string; by?: string }  // what it asked before it stopped, and the answer
+}
 
 export interface PostOpts {
   loud: boolean
@@ -76,7 +86,7 @@ export interface RuntimeDeps {
   startedAt: Date
   // Is the person the task runs as still allowed where it posts?
   ownerAllowed(task: Task): boolean
-  runClaude(task: Task, run: Run): Promise<ClaudeOutcome>
+  runClaude(task: Task, run: Run, step?: StepCall): Promise<ClaudeOutcome>
   // Post into the task's home (or the owner's DM); the message id, or undefined.
   post(task: Task, kind: PostKind, text: string, opts: PostOpts): Promise<number | undefined>
   cardChanged(task: Task): void
@@ -91,8 +101,11 @@ export interface RuntimeDeps {
   // The AI filter: which of these lines answer the task's question. undefined when
   // it couldn't answer (they are asked about again next time).
   filter?(task: Task, question: string, items: string[]): Promise<FilterVerdict | undefined>
-  // A script's run (scripts.ts); without it, scripts fail.
-  runScript?(task: Task, run: Run): Promise<ScriptOutcome>
+  // A script's run (scripts.ts); without it, scripts fail. A plan's script step and
+  // Codex step, and its hand-off step, likewise.
+  runScript?(task: Task, run: Run, step?: StepCall): Promise<ScriptOutcome>
+  runCodex?(task: Task, run: Run, step: StepCall): Promise<ScriptOutcome>
+  stepHandoff?(task: Task, run: Run, step: StepCall): Promise<{ ok: boolean; error?: string }>
   maxScripts?: number      // scripts at once, across every task (2)
   // A question was answered, or let go: its message says so.
   questionDone?(wait: Wait): void
@@ -122,6 +135,8 @@ export class TaskRuntime {
   private polling = new Set<string>()
   private filtering = new Set<string>()
   private waiters = new Map<string, (r: { answer: string; by: string }) => void>()
+  private resumed: string[] = []
+  private stopping = new Set<string>()      // plans a person stopped: they end after the step going
   private later = new Map<string, unknown>()     // per task: a cooldown's end, a watcher's restart
 
   constructor(private d: RuntimeDeps) {}
@@ -130,11 +145,16 @@ export class TaskRuntime {
   private setTimer(fn: () => void, ms: number) { return (this.d.setTimer ?? ((f, m) => setTimeout(f, m)))(fn, ms) }
   private clearTimer(t: unknown) { (this.d.clearTimer ?? (x => clearTimeout(x as any)))(t) }
 
-  // Close what a restart left open, then start the loop.
+  // Close what a restart left open, then start the loop; plans carry on.
   start(): { interrupted: Run[] } {
     const interrupted = this.recover()
+    for (const id of this.resumed.splice(0)) {
+      const run = this.store.getRun(id)
+      const t = run && this.store.getTask(run.task)
+      if (run && t) this.dispatch(t, run)
+    }
     this.arm()
-    return { interrupted }
+    return { interrupted: interrupted.filter(r => this.store.getRun(r.id)?.state === 'interrupted') }
   }
 
   stop(): void {
@@ -165,6 +185,14 @@ export class TaskRuntime {
 
   isRunning(taskId: string): boolean { return this.inFlight.has(taskId) }
 
+  // A person stopped a plan: it ends, canceled, once the step going ends (which the
+  // bridge stops too).
+  stopPlan(taskId: string): boolean {
+    if (!this.inFlight.has(taskId)) return false
+    this.stopping.add(taskId)
+    return true
+  }
+
   private arm(delay?: number): void {
     if (this.stopped) return
     if (this.timer) this.clearTimer(this.timer)
@@ -183,6 +211,13 @@ export class TaskRuntime {
     for (const w of this.store.openWaits()) if (w.state === 'open') this.store.updateWait(w.id, { state: 'parked' })
     const open = this.store.openRuns()
     for (const r of open) {
+      const t0 = this.store.getTask(r.task)
+      // A plan saved each step as it went: it carries on at the one it was at.
+      if (t0 && t0.state !== 'deleted' && t0.action.kind === 'steps' && r.stepAt !== undefined) {
+        this.store.updateRun(r.id, { state: 'queued' })
+        this.resumed.push(r.id)
+        continue
+      }
       const run = this.store.updateRun(r.id, { state: 'interrupted', reason: 'the bot restarted during this run', endedAt: this.d.now().toISOString() })!
       const t = this.store.getTask(r.task)
       if (!t || t.state === 'deleted') continue
@@ -309,7 +344,7 @@ export class TaskRuntime {
 
   // Room for one more of its kind: Claude runs and scripts have their caps.
   private free(t: Task): boolean {
-    if (t.action.kind === 'claude') return this.claudeActive < this.d.maxClaude
+    if (t.action.kind === 'claude' || t.action.kind === 'steps') return this.claudeActive < this.d.maxClaude
     if (t.action.kind === 'script') return this.scriptActive < (this.d.maxScripts ?? 2)
     return true
   }
@@ -319,8 +354,181 @@ export class TaskRuntime {
       case 'message': return this.execMessage(t, run, 0)
       case 'script': return this.execScript(t, run)
       case 'digest': return this.execDigest(t, run)
+      case 'steps': return this.execSteps(t, run)
       default: return this.execClaude(t, run)
     }
+  }
+
+  // --- plans ----------------------------------------------------------------------
+
+  // A plan's run: its steps one after another, each where the one before says, each
+  // result saved as it goes, so a restart carries on at the step it was at; a progress
+  // message edited silently as they go by. The gates are the bridge's: a step runs
+  // only when the one before allows it.
+  private async execSteps(t: Task, run: Run): Promise<void> {
+    if (t.action.kind !== 'steps') return
+    const steps = t.action.steps
+    this.claudeActive++
+    let results: StepResult[] = run.stepResults ?? []
+    let at = run.stepAt ?? 1
+    let answered: StepCall['answer']
+    // Carrying on from an answered question. A question step gave the answer; a Claude
+    // step that asked is done again, told the answer.
+    if (run.trigger === 'answer' && run.waitId && run.stepAt === undefined) {
+      const w = this.store.getWait(run.waitId)
+      const asked = w ? this.store.getRun(w.run) : undefined
+      if (w && asked?.stepAt !== undefined) {
+        const st = steps[asked.stepAt - 1]
+        results = [...(asked.stepResults ?? [])]
+        if (st?.kind === 'ask') {
+          results.push({ step: asked.stepAt, name: st.name, ok: true, output: w.answer, attempt: 1, startedAt: w.askedAt, endedAt: this.d.now().toISOString() })
+          at = this.nextStep(st, true, asked.stepAt, steps.length) ?? steps.length + 1
+        } else {
+          at = asked.stepAt
+          answered = { question: w.question, answer: w.answer ?? '', by: w.answeredBy }
+        }
+        run = this.store.updateRun(run.id, { progressMsg: asked.progressMsg })!
+      }
+    }
+    run = this.store.updateRun(run.id, { state: 'running', startedAt: run.startedAt ?? this.d.now().toISOString(), stepAt: at, stepResults: results })!
+    this.d.cardChanged(this.store.getTask(t.id) ?? t)
+    let failed: StepResult | undefined
+    let parked = false
+    let canceled = false
+    let done = 0
+    this.stopping.delete(t.id)
+    try {
+      while (at >= 1 && at <= steps.length) {
+        if (this.stopping.has(t.id)) { canceled = true; break }
+        const st = steps[at - 1]
+        let res: StepResult | undefined
+        for (let attempt = 1; attempt <= 1 + (st.retries ?? 0); attempt++) {
+          if (++done > LIMITS.stepRunsMax) break
+          await this.progress(t, run.id, results, { step: at, name: st.name })
+          const startedAt = this.d.now().toISOString()
+          const o = await this.runStep(t, this.store.getRun(run.id)!, { n: at, step: st, prior: results, ...(res && !res.ok ? { lastFailure: res.error ?? res.output } : {}), ...(answered ? { answer: answered } : {}) })
+          answered = undefined
+          if (this.stopping.has(t.id)) { canceled = true; break }
+          if (o.parked) { parked = true; break }
+          res = { step: at, name: st.name, ok: o.ok, ...(o.output ? { output: clipText(o.output, 8000) } : {}), ...(o.error ? { error: clipText(o.error, 600) } : {}), attempt, startedAt, endedAt: this.d.now().toISOString() }
+          results = [...results, res]
+          run = this.store.updateRun(run.id, { stepResults: results, stepAt: at })!
+          if (res.ok) break
+        }
+        if (parked || canceled) break
+        if (done > LIMITS.stepRunsMax) {
+          failed = { step: at, name: st.name, ok: false, error: `it went round ${LIMITS.stepRunsMax} steps without finishing`, attempt: 1, startedAt: this.d.now().toISOString() }
+          break
+        }
+        const next = this.nextStep(st, res!.ok, at, steps.length)
+        if (next === undefined) { if (!res!.ok) failed = res; break }
+        at = next
+        run = this.store.updateRun(run.id, { stepAt: at })!
+      }
+    } catch (e) {
+      failed = { step: at, name: steps[at - 1]?.name ?? '?', ok: false, error: String((e as Error)?.message ?? e), attempt: 1, startedAt: this.d.now().toISOString() }
+    } finally {
+      this.claudeActive--
+    }
+    try {
+      if (canceled) {
+        await this.progress(t, run.id, results, undefined, '⏹ stopped')
+        this.store.updateRun(run.id, { state: 'canceled', reason: 'stopped', endedAt: this.d.now().toISOString(), summary: stepsStrip(results) })
+        this.d.cardChanged(this.store.updateTask(t.id, { lastMark: 'interrupted', lastRunAt: run.startedAt })!)
+      } else if (parked) await this.parkSteps(t.id, run.id, results, at)
+      else await this.settleSteps(t.id, run.id, results, failed)
+    } finally {
+      this.stopping.delete(t.id)
+      this.inFlight.delete(t.id)
+      this.startWaiting()
+      this.afterRun(t.id)
+    }
+  }
+
+  // Where a plan goes after a step: a step number, or undefined to stop there.
+  private nextStep(st: Step | undefined, ok: boolean, at: number, count: number): number | undefined {
+    const go = ok ? (st?.onPass ?? 'next') : (st?.onFail ?? 'stop')
+    if (go === 'stop') return undefined
+    const n = go === 'next' ? at + 1 : go
+    return n >= 1 && n <= count ? n : undefined
+  }
+
+  private async runStep(t: Task, run: Run, call: StepCall): Promise<{ ok: boolean; output?: string; error?: string; parked?: boolean }> {
+    const st = call.step
+    const ended = (o: ScriptOutcome) => o.code === 0 && !o.timedOut && !o.stopped
+      ? { ok: true, output: o.out.trim() }
+      : { ok: false, output: o.out.trim(), error: o.stopped ? 'stopped' : o.timedOut ? 'it ran past its time limit' : `it exited with status ${o.code}${o.err.trim() ? `: ${lastLines(o.err)}` : ''}` }
+    switch (st.kind) {
+      case 'message': {
+        const id = await this.safePost(t, 'notice', st.text ?? '', { loud: false })
+        return id === undefined ? { ok: false, error: 'Telegram did not take the message' } : { ok: true, output: st.text }
+      }
+      case 'script':
+        return this.d.runScript ? ended(await this.d.runScript(t, run, call)) : { ok: false, error: 'scripts are not available here' }
+      case 'codex':
+        return this.d.runCodex ? ended(await this.d.runCodex(t, run, call)) : { ok: false, error: 'Codex is not available here' }
+      case 'claude': {
+        const o = await this.d.runClaude(t, run, call)
+        // It stopped to ask someone: the plan waits with it.
+        if (this.store.waitsForRun(run.id).some(w => w.state === 'parked')) return { ok: false, parked: true }
+        if (o.canceled) return { ok: false, error: 'stopped' }
+        if (o.usageLimited) return { ok: false, error: 'the usage limit stopped it' }
+        return o.ok ? { ok: true, output: o.text } : { ok: false, error: o.error ?? 'it ended without an answer' }
+      }
+      case 'ask': {
+        const r = await this.ask(t.id, run.id, { question: st.question ?? st.name, options: st.options, waitMs: LIMITS.askWaitMaxMs })
+        if (r.parked) return { ok: false, parked: true }
+        return r.error ? { ok: false, error: r.error } : { ok: true, output: r.answer }
+      }
+      case 'handoff': {
+        const r = this.d.stepHandoff ? await this.d.stepHandoff(t, run, call) : { ok: false, error: 'hand-offs are not available here' }
+        return r.ok ? { ok: true, output: `handed to ${st.topicName ?? 'the topic'}` } : { ok: false, error: r.error }
+      }
+    }
+  }
+
+  // Its progress message: posted with its first step, edited as the steps go by.
+  private async progress(t: Task, runId: string, results: StepResult[], current?: { step: number; name: string }, end?: string): Promise<void> {
+    const run = this.store.getRun(runId)
+    if (!run) return
+    const text = `🪜 ${t.name}: ${stepsStrip(results, current)}${end ? `\n${end}` : ''}`
+    const id = await this.safePost(t, 'progress', text, { loud: false, ...(run.progressMsg ? { edit: run.progressMsg } : {}) })
+    if (id !== undefined && id !== run.progressMsg) this.store.updateRun(runId, { progressMsg: id })
+  }
+
+  // Stopped at a question nobody has answered yet: the answer carries it on from the
+  // next step.
+  private async parkSteps(taskId: string, runId: string, results: StepResult[], at: number): Promise<void> {
+    const t = this.store.getTask(taskId)!
+    const parked = this.store.waitsForRun(runId).find(w => w.state === 'parked')
+    await this.progress(t, runId, results, undefined, `❔ waiting for an answer to step ${at}`)
+    this.store.updateRun(runId, { state: 'waiting', reason: `waiting for an answer: “${clipText(parked?.question ?? 'its question', 120)}”`, stepAt: at, stepResults: results })
+    this.d.cardChanged(this.store.updateTask(t.id, { lastMark: 'waiting', lastRunAt: this.store.getRun(runId)!.startedAt })!)
+  }
+
+  private async settleSteps(taskId: string, runId: string, results: StepResult[], failed: StepResult | undefined): Promise<void> {
+    const t = this.store.getTask(taskId)!
+    let run = this.store.getRun(runId)!
+    const end = this.d.now().toISOString()
+    if (t.state === 'deleted') { this.store.updateRun(run.id, { state: 'canceled', reason: 'the task was deleted while it ran', endedAt: end }); return }
+    const strip = stepsStrip(results)
+    if (failed) {
+      await this.progress(t, run.id, results, undefined, `❌ stopped at step ${failed.step}, ${failed.name}`)
+      const reason = `step ${failed.step} (${failed.name}): ${failed.error ?? 'failed'}`
+      run = this.store.updateRun(run.id, { state: 'failed', reason, endedAt: end, summary: strip })!
+      await this.onFailure(this.store.getTask(t.id)!, run, reason)
+      return
+    }
+    await this.progress(t, run.id, results, undefined, '✅ done')
+    // Its result: the last step that had something to say, or how it went.
+    const said = [...results].reverse().find(r => r.ok && (r.output ?? '').trim())
+    const text = (said?.output ?? '').trim() || strip
+    if (t.then && text) await this.handOn(t, run, text)
+    let postedMsg: number | undefined
+    if (t.says === 'live' || t.says === 'result') postedMsg = await this.safePost(t, 'result', text, { loud: t.sound === 'loud', lateMs: run.lateMs, run })
+    run = this.store.updateRun(run.id, { state: 'succeeded', endedAt: end, summary: strip, ...(postedMsg ? { postedMsg } : {}) })!
+    if (postedMsg) this.d.note(t, `The plan "${t.name}" ran at ${new Date(run.startedAt ?? end).toISOString()} (${strip}) and posted: ${text.replace(/\s+/g, ' ').slice(0, 280)}`)
+    this.finishRun(t.id, run)
   }
 
   // --- digests ------------------------------------------------------------------
@@ -410,7 +618,7 @@ export class TaskRuntime {
   // one is.
   private carryOn(w: Wait): void {
     const t = this.store.getTask(w.task)
-    if (!t || t.state === 'deleted' || t.action.kind !== 'claude') return
+    if (!t || t.state === 'deleted' || (t.action.kind !== 'claude' && t.action.kind !== 'steps')) return
     if (this.inFlight.has(t.id)) { this.soon(`${t.id}:answer:${w.id}`, 5000, () => this.carryOn(w)); return }
     const asked = this.store.getRun(w.run)
     if (asked?.state === 'waiting') this.store.updateRun(asked.id, { state: 'succeeded', summary: `asked “${clipText(w.question, 80)}”, answered “${clipText(w.answer ?? '', 80)}”` })
@@ -937,7 +1145,7 @@ export class TaskRuntime {
       const id = await this.safePost(t, 'alert', `⚠️ ${t.name} failed ${streak} times in a row. Last error: ${reason}`, { loud: !t.alertMsg, edit: t.alertMsg, buttons: 'alert', run })
       t = this.store.updateTask(t.id, { alertMsg: id ?? t.alertMsg, alertAt: this.d.now().toISOString() })!
       this.d.activity(t, `⚠️ ${t.name} failed ${streak} times in a row`)
-    } else if (t.says === 'live' || t.says === 'problems') {
+    } else if (t.says === 'live' || t.says === 'problems' || t.action.kind === 'steps') {
       // Someone watching, or a task whose whole job is to say when something fails.
       await this.safePost(t, 'failure', `⚠️ ${t.name} failed: ${reason}`, { loud: true, run })
     } else {
