@@ -356,11 +356,14 @@ Claude Code keeps its own memory per working directory, and every topic has its 
 
 ## Tasks
 
-Things the bot does on its own, later or again and again, reporting where they were set up. Ask for one in plain words, in a topic or a DM:
+Things the bot does on its own, later, again and again, or when something happens, reporting where they were set up. Ask for one in plain words, in a topic or a DM:
 
 - "remind me in two hours to take the pills" — a 🔔 **reminder**: the message at its time, naming whoever asked, with ✅ Done and ⏰ +15 min.
 - "every weekday at 9, summarize what changed in the repo" — a ⏰ **scheduled** Claude run: a fresh session each time (or one session it keeps, if asked), in the topic's folder with its model, effort and permission mode, acting for the person who set it up.
 - "every evening, check the news and only tell us if something big happened" — a run that speaks only when it found something. A task can post its progress as it goes, its result (the default), only what's worth telling, only problems, or nothing; its history keeps every run either way. It can post to your DM instead, stop after a number of runs or at a date.
+- "tell me when this product's price drops below 300", "when the share price moves more than 1% in 3 minutes, find out why", "keep the sync loop running" — a 👀 **watcher**: see [Watchers](#watchers).
+- "every night, back up the database; only tell me if it fails" — a **script**: a command, with no AI. Its status decides; what it prints is posted as the task says (its output; only when it printed something; only when it fails, every failure, loud).
+- "every evening, list what my tasks did" — a 📋 **digest**, made without Claude; "each morning, check the backup and sync tasks and tell me only if something is off" — a **watchdog**, a Claude run handed what those tasks did since its last run.
 
 Claude makes them with the bot's own `task_create` tool, passing the time as it was said (at a time, in N minutes, every N minutes, or a cron expression) and the time zone; the bridge does the date arithmetic, daylight saving included. Claude Code's own schedulers are switched off in the bot's runs: a session cron dies with its run, and a cloud trigger would report to claude.ai instead of here.
 
@@ -377,7 +380,8 @@ The rules:
 - A task acts for the person who set it up. If they can no longer use that chat, it pauses.
 - After the bot was down, a task runs once for the slot it missed if that slot is still recent (half its period, between 2 minutes and 2 hours; 12 hours for a reminder), never a backlog. A run cut off by a restart isn't run again by itself; its topic gets a ▶️ Run again button. After a start, Claude runs wait two minutes, then go a few at a time.
 - Two failures in a row raise an alert, edited in place rather than repeated; five pause the task. A run the account's usage limit stopped waits for the reset and doesn't count as a failure.
-- At most `TG_TASKS_MAX_CLAUDE` (2) scheduled Claude runs at once, 20 tasks per topic, at most one run a minute. Each run's model, tokens, cost and time are kept in its history.
+- At most `TG_TASKS_MAX_CLAUDE` (2) scheduled Claude runs at once, 2 scripts at once, 20 tasks per topic, at most one run a minute. Each run's model, tokens, cost and time are kept in its history.
+- Anything that runs more often than hourly (a watcher, a short interval) ends after 7 days unless it was given an end; its end says so in its topic, with ▶️ Keep it 7 more days. An end can be moved further, not removed.
 
 In a forum group Claude can also make a topic for a new piece of work (with its own folder, or one you name, and another topic's settings), rename a topic, or move one to another folder: `topic_create`, `topic_rename`, `topic_set_cwd`. Moving the topic you're talking in happens when the turn ends.
 
@@ -389,7 +393,17 @@ bun tasks/cli.ts tasks list
 bun tasks/cli.ts tasks pause <task id>
 ```
 
-Each Claude run talks to it with a token of its own, scoped to its chat, topic and person, that dies with the run. `TG_TASKS=0` turns tasks off. Watching a feed or a page, hand-offs between topics and bots, and tasks that ask before they act are designed ([research/tasks/REPORT.md](research/tasks/REPORT.md)) but not built yet.
+Each Claude run talks to it with a token of its own, scoped to its chat, topic and person, that dies with the run; so does a task's script, which can post in its topic with `bun "$XESIOUS_CLI" notify "…"`. `TG_TASKS=0` turns tasks off. Hand-offs between topics and bots, multi-step tasks and tasks that ask before they act are designed ([research/tasks/REPORT.md](research/tasks/REPORT.md)) but not built yet.
+
+### Watchers
+
+A watcher is a small program in the topic's folder that Claude writes for the task and runs once to show it works. Every line it prints is an event. It is either **polled**, run every few minutes, printing what it found and exiting (a page, an API), or **streaming**, kept running (a websocket, a feed). The bot runs it itself; nothing needs setting up on the server.
+
+- Each event can send a message (`{event}` is the line, `{value}` and `{why}` what the rule saw), or start a Claude run that gets the lines as material, or run a script. A watcher can also be kept running for its own sake, its failures the only thing said.
+- **Rules**, exact and free, decide which events count: a value above or below a number, crossing it (once, and again only after it came back), a move of X% within a window, a change, words, a pattern; on the line or a field of its JSON. Their state outlasts a restart.
+- An **AI filter**, for what no rule can decide ("does this suggest a major outage is starting?"): what passes the rule waits, and every few minutes the topic's judge (as Auto mode has it: Haiku, Sonnet or the local model) is asked which items answer the question, and why. One small call per batch, only when something came; the card counts what it considered and let through.
+- At most one run per cooldown (5 minutes for Claude, 1 for a message) and so many an hour (6, 20); what comes meanwhile is folded into the next run. Events older than 10 minutes are dropped: a price move from an hour ago isn't news.
+- A streaming watcher runs detached, at low priority, in its own process group, and outlives a restart: the next start picks it up, by its pid and start time, and reads what it printed meanwhile. It ends itself an hour after the bot is gone for good. One that dies starts again after a backoff; two failures in a row alert the topic, five pause the task. At most `TG_TASKS_MAX_WATCHERS` (8) run at once.
 
 ## Config
 
@@ -412,7 +426,7 @@ defaults now — a group can override them with `/config` (see above). Highlight
   at that point. Neither photo is ever replaced automatically; `/logo bot|group` does
   that on purpose.
 - `TG_API_ROOT` — a local Bot API server, for files over 20 MB (see below).
-- `TG_TASKS` — [tasks](#tasks) (default on; `0` turns them off). `TG_TASKS_MAX_CLAUDE` caps the scheduled Claude runs at once (2); `TG_TASK_CREATORS` (`everyone`|`admins`) and `TG_TASKS_ACTIVITY` (`1`|`0`) are the defaults for the two task settings in `/config`; `TG_API_SOCKET` moves the local API's socket.
+- `TG_TASKS` — [tasks](#tasks) (default on; `0` turns them off). `TG_TASKS_MAX_CLAUDE` caps the scheduled Claude runs at once (2), `TG_TASKS_MAX_WATCHERS` the streaming watchers kept running (8); `TG_TASK_CREATORS` (`everyone`|`admins`) and `TG_TASKS_ACTIVITY` (`1`|`0`) are the defaults for the two task settings in `/config`; `TG_API_SOCKET` moves the local API's socket.
 
 ## Permission modes
 

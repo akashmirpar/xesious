@@ -214,7 +214,7 @@ function baseProfile(cwd: string, key: string): string {
     '- If a request is ambiguous or needs a decision, ask one clarifying question and stop.',
     '- Assume no editor or file selection is open. Ignore any IDE/editor framing from earlier in this conversation; the user is in a chat.',
     `- Files the user sends are saved in ./${inb}/. To send a file back, put it in ./${out}/ and it is delivered then cleared.`,
-    ...(TASKS ? ["- This bot can do things later or on a schedule and report here: reminders, and Claude runs at a time or again and again. When the person asks for that, use the xesious task_create tool, not TaskCreate (your private to-do list) or CronCreate. It can also create topics and set a topic's folder (topic_create, topic_set_cwd)."] : []),
+    ...(TASKS ? ["- This bot can do things later, on a schedule or when something happens, and report here: reminders, Claude runs, commands, digests, and watchers (a small program you write that the bot keeps an eye on). When the person asks for that, use the xesious task_create tool, not TaskCreate (your private to-do list) or CronCreate. It can also create topics and set a topic's folder (topic_create, topic_set_cwd)."] : []),
     ...attributionProfileLines(BRIDGE_NONCE),
   ].join('\n')
 }
