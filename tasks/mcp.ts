@@ -213,7 +213,7 @@ const HANDOFF_TOOL = {
     type: 'object',
     properties: {
       topic: { type: 'string', description: 'The topic it goes to: id or name, from topic_list.' },
-      bot: { type: 'string', description: "Optional: when that topic is another xesious bot's (\"@PostingBot\"), one this bot knows as a peer; the hand-off then goes to it as a message there, and its answer comes back." },
+      bot: { type: 'string', description: "Optional: another bot in this group that does it there, by its username (\"@PostingBot\"), one this bot knows. Another xesious bot gets it as a hand-off and answers when done. A bot of another kind gets the brief as a message, so start it with that bot's command (\"/forecast Paris\"); its reply is the answer, best effort, with no files." },
       brief: { type: 'string' },
       files: { type: 'array', items: { type: 'string' } },
     },

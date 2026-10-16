@@ -8453,6 +8453,10 @@ ${text}`
 const PEER_BOTS = (process.env.TG_PEER_BOTS || '').split(',').map(s => s.trim().replace(/^@/, '').toLowerCase()).filter(Boolean)
 const isPeer = (u: { id: number; username?: string } | undefined) => !!u && (PEER_BOTS.includes(String(u.id)) || (!!u.username && PEER_BOTS.includes(u.username.toLowerCase())))
 const HANDOFF_TAG = /#handoff-([a-z0-9]{6,12})\b/i
+// Bots that aren't xesious, best effort: one gets the brief as a message (its command,
+// or a mention), and its reply to that message is the answer.
+const OTHER_BOTS = (process.env.TG_OTHER_BOTS || '').split(',').map(s => s.trim().replace(/^@/, '').toLowerCase()).filter(b => b && !PEER_BOTS.includes(b))
+const isOtherBot = (u: { id: number; username?: string } | undefined) => !!u?.username && OTHER_BOTS.includes(u.username.toLowerCase())
 const SERVED_DIR = join(TASKS_STATE, 'served')
 const SERVE_MS = 24 * 3600_000
 const PEER_FILE_MAX = 50 * 1024 * 1024
@@ -8526,9 +8530,36 @@ async function startPeerHandoff(a: HandoffAsk & { peer: string }): Promise<{ han
   return { handoff: h }
 }
 
+// To a bot that isn't xesious: the brief as its command when it starts with one
+// ("/forecast Paris" → "/forecast@WeatherBot Paris", which a bot in privacy mode still
+// gets), else as a mention; no files, no tag. Its reply to that message is the answer.
+async function startBotAsk(a: HandoffAsk & { peer: string }): Promise<{ handoff?: Handoff; error?: string }> {
+  const store = taskStore!
+  const chatId = Number(a.chat)
+  if (a.files?.length) return { error: `@${a.peer} isn't a xesious bot: it gets the brief as a message, without files` }
+  if (a.depth > LIMITS.handoffDepthMax) return { error: `this work was handed on ${LIMITS.handoffDepthMax} times already; finish it here` }
+  if (ownHandoffsLastHour(a.chat) >= LIMITS.handoffsPerHour) return { error: `at most ${LIMITS.handoffsPerHour} hand-offs an hour in a group; try again later` }
+  const brief = a.brief.trim()
+  if (brief.length > PEER_TEXT_MAX) return { error: `a message to @${a.peer} is at most ${PEER_TEXT_MAX} characters` }
+  const cmd = brief.match(/^\/([a-z0-9_]{1,32})(?:@\w+)?(\s[\s\S]*)?$/i)
+  const text = cmd ? `/${cmd[1]}@${a.peer}${cmd[2] ?? ''}` : `@${a.peer} ${brief}`
+  let h = store.createHandoff({ chat: a.chat, fromThread: a.fromThread, toThread: a.toThread, brief, files: [], by: a.by, byName: a.byName,
+    fromTask: a.fromTask, depth: a.depth, state: 'sent', createdAt: new Date().toISOString(), peer: a.peer, direction: 'out', plain: true,
+    deadline: new Date(taskNow().getTime() + LIMITS.otherBotAnswerMs).toISOString() })
+  const m = await bot.api.sendMessage(chatId, text, { ...destOpts({ threadId: a.toThread }), link_preview_options: { is_disabled: true } }).catch(e => { console.error(`[handoff] to @${a.peer}: ${e}`); return null })
+  if (!m) { store.updateHandoff(h.id, { state: 'failed', error: "Telegram didn't take the message", endedAt: new Date().toISOString() }); return { error: "Telegram didn't take the message" } }
+  const line = await bot.api.sendMessage(chatId, peerLineHead(h, messageLink(chatId, a.toThread, m.message_id)),
+    { ...destOpts({ threadId: a.fromThread }), parse_mode: 'HTML', disable_notification: true, link_preview_options: { is_disabled: true } }).catch(() => null)
+  h = store.updateHandoff(h.id, { peerMsg: m.message_id, dstMsg: m.message_id, srcMsg: line?.message_id })!
+  const from = topicNameOf(chatId, a.fromThread), to = topicNameOf(chatId, a.toThread)
+  console.log(`[handoff] ${a.chat}: ${from} asked @${a.peer} in ${to} (${h.id})`)
+  logHandoff(h, `➡️ ${from} asked @${a.peer} in ${to}: ${handoffFirstLine(brief)}`)
+  return { handoff: h }
+}
+
 const peerLineHead = (h: Handoff, there?: string) => {
   const to = topicNameOf(Number(h.chat), h.toThread)
-  return `➡️ Handed to @${escapeHtml(h.peer ?? '?')} in ${there ? `<a href="${there}">${escapeHtml(to)}</a>` : `<b>${escapeHtml(to)}</b>`}: ${escapeHtml(handoffFirstLine(h.brief))}`
+  return `➡️ ${h.plain ? 'Asked' : 'Handed to'} @${escapeHtml(h.peer ?? '?')} in ${there ? `<a href="${there}">${escapeHtml(to)}</a>` : `<b>${escapeHtml(to)}</b>`}: ${escapeHtml(handoffFirstLine(h.brief))}`
 }
 
 // One of this bot's hand-offs to another, answered or past its deadline: the line in
@@ -8542,14 +8573,15 @@ async function settlePeerHandoff(h: Handoff, ok: boolean, said: string, link?: s
   const chatId = Number(h.chat)
   const to = topicNameOf(chatId, h.toThread)
   const there = link ?? (h.peerMsg ? messageLink(chatId, h.toThread, h.peerMsg) : undefined)
-  if (h.srcMsg) await bot.api.editMessageText(chatId, h.srcMsg, `${peerLineHead(h, there)}\n${ok ? `✅ Done${late ? ', late' : ''}` : `❌ ${escapeHtml(said)}`}`,
+  const okText = h.plain ? `✅ ${escapeHtml(said.length > 300 ? `${said.slice(0, 299)}…` : said)}` : `✅ Done${late ? ', late' : ''}`
+  if (h.srcMsg) await bot.api.editMessageText(chatId, h.srcMsg, `${peerLineHead(h, there)}\n${ok ? okText : `❌ ${escapeHtml(said)}`}`,
     { parse_mode: 'HTML', link_preview_options: { is_disabled: true } }).catch(() => {})
   console.log(`[handoff] ${h.chat}: @${h.peer} answered ${h.id}: ${ok ? 'done' : said}`)
   logHandoff(h, `${ok ? '✅' : '❌'} ${topicNameOf(chatId, h.fromThread)} → @${h.peer} in ${to}: ${ok ? 'done' : said}`)
   if (ok || late) return
   const t = h.fromTask ? store.getTask(h.fromTask) : undefined
   if (t) await postTask(t, 'failure', `⚠️ ${t.name}: what it handed to @${h.peer} didn't get done: ${said}`, { loud: true }).catch(() => {})
-  else if (timedOut) await bot.api.sendMessage(chatId, `⚠️ The work handed to @${h.peer} in ${to} didn't get done: ${said}`,
+  else if (timedOut && !h.plain) await bot.api.sendMessage(chatId, `⚠️ The work handed to @${h.peer} in ${to} didn't get done: ${said}`,
     { ...destOpts({ threadId: h.fromThread }), link_preview_options: { is_disabled: true } }).catch(() => {})
 }
 
@@ -8558,7 +8590,7 @@ async function sweepPeerHandoffs(): Promise<void> {
   if (!taskStore) return
   const now = taskNow().getTime()
   const due = taskStore.sentHandoffs().filter(h => h.deadline && Date.parse(h.deadline) <= now)
-  await Promise.all(due.map(h => settlePeerHandoff(h, false, `@${h.peer} didn't answer within ${elapsedText(LIMITS.peerAnswerMs)}`, undefined, true).catch(() => {})))
+  await Promise.all(due.map(h => settlePeerHandoff(h, false, `@${h.peer} didn't answer within ${elapsedText(h.plain ? LIMITS.otherBotAnswerMs : LIMITS.peerAnswerMs)}`, undefined, true).catch(() => {})))
   try {
     for (const d of readdirSync(SERVED_DIR)) {
       const p = join(SERVED_DIR, d)
@@ -8595,17 +8627,28 @@ async function fetchInto(url: string, dir: string, name: string): Promise<string
 async function handlePeerMessage(ctx: Context): Promise<void> {
   const msg = ctx.message as any
   const from = ctx.from!
-  if (!TASKS || !taskStore || !msg || !isPeer(from)) return
+  if (!TASKS || !taskStore || !msg || (!isPeer(from) && !isOtherBot(from))) return
   const chat = String(ctx.chat!.id)
   if (!ALLOWED_CHATS.has(chat)) return
   const text = String(msg.text ?? msg.caption ?? '')
-  const tag = text.match(HANDOFF_TAG)?.[1]?.toLowerCase()
-  if (!tag) return
   const peer = (from.username ?? String(from.id)).toLowerCase()
   // In a forum every message "replies" to its topic's creation; that is not a reply.
   const re = msg.reply_to_message && !msg.reply_to_message.forum_topic_created ? msg.reply_to_message : undefined
   let myId: number | undefined
   try { myId = bot.botInfo.id } catch {}
+  // A bot of another kind: only its reply to what this one asked it, as the answer.
+  if (!isPeer(from)) {
+    if (!re || myId === undefined || re.from?.id !== myId) return
+    const asked = taskStore.handoffsSince(chat, new Date(Date.now() - 2 * 24 * 3600_000).toISOString())
+      .find(x => x.plain && x.direction === 'out' && x.peer === peer && x.peerMsg === re.message_id)
+    if (!asked || (asked.state !== 'sent' && !(asked.state === 'failed' && asked.overdue))) return
+    const thread = msg.message_thread_id as number | undefined
+    if (recordsFor(keyFor(Number(chat), thread))) recordMessage(msg, false, false, true)
+    await settlePeerHandoff(asked, true, text.trim() || '(an answer without text)', messageLink(Number(chat), thread, msg.message_id))
+    return
+  }
+  const tag = text.match(HANDOFF_TAG)?.[1]?.toLowerCase()
+  if (!tag) return
   if (re && myId !== undefined && re.from?.id === myId) {
     const ours = taskStore.handoffByTag(tag, 'out')
     if (!ours || ours.chat !== chat || ours.peer !== peer || ours.peerMsg !== re.message_id) return
@@ -9063,10 +9106,11 @@ const taskBridge: BridgeHandlers = {
     const files = Array.isArray(body?.files) ? body.files.map((f: any) => String(f)) : undefined
     const peer = body?.bot ? String(body.bot).trim().replace(/^@/, '').toLowerCase() : undefined
     if (peer !== undefined && !/^[a-z][a-z0-9_]{3,31}$/.test(peer)) return fail(400, 'bot is the other bot\'s username, like "@PostingBot"')
-    if (peer && !PEER_BOTS.includes(peer)) return fail(403, `@${peer} isn't a bot this one hands off to (TG_PEER_BOTS)`)
+    if (peer && !PEER_BOTS.includes(peer) && !OTHER_BOTS.includes(peer)) return fail(403, `@${peer} isn't a bot this one hands off to (TG_PEER_BOTS, TG_OTHER_BOTS)`)
     const ask = { chat: s.chat, fromThread: s.thread, toThread, brief, files, by: s.person, byName: s.personName, fromTask: s.taskId, depth: (s.handoffDepth ?? 0) + 1 }
-    const r = peer ? await startPeerHandoff({ ...ask, peer }) : await startHandoff(ask)
+    const r = !peer ? await startHandoff(ask) : PEER_BOTS.includes(peer) ? await startPeerHandoff({ ...ask, peer }) : await startBotAsk({ ...ask, peer })
     if (r.error) return fail(409, r.error)
+    if (peer && !PEER_BOTS.includes(peer)) return reply(201, { message: `Asked @${peer} in ${topicNameOf(Number(s.chat), toThread)}. Its reply there, if it replies to that message within ${elapsedText(LIMITS.otherBotAnswerMs)}, is its answer; this topic's line shows it.`, id: r.handoff!.id })
     if (peer) return reply(201, { message: `Handed to @${peer} in ${topicNameOf(Number(s.chat), toThread)}: it does it there and answers; this topic gets a line when it does.`, id: r.handoff!.id })
     return reply(201, { message: `Handed to ${topicNameOf(Number(s.chat), toThread)}: it runs there now and posts its result there, and this topic gets a line when it is done.`, id: r.handoff!.id })
   },

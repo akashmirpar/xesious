@@ -237,6 +237,7 @@ export interface Handoff {
   peerTag?: string
   deadline?: string
   overdue?: boolean          // failed for want of an answer; a late one still settles it
+  plain?: boolean            // to a bot that isn't xesious: the brief as a message, its reply the answer
   result?: string
   resultLink?: string
   createdAt: string
@@ -296,6 +297,7 @@ export const LIMITS = {
   handoffRunsAtOnce: 2,
   peerHandoffsPerHour: 20,           // from one other bot
   peerAnswerMs: 6 * 60 * 60_000,     // a hand-off to another bot not answered in this long is said to have failed
+  otherBotAnswerMs: 30 * 60_000,     // a bot that isn't xesious answers by then, or not at all
   // Child tasks, made by a task's own run:
   childrenPerParent: 3,
   childDepthMax: 2,

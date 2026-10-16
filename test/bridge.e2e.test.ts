@@ -73,6 +73,8 @@ const HOOK_PORT = 41000 + Math.floor(Math.random() * 2000)
 process.env.TG_TASKS_WEBHOOK_PORT = String(HOOK_PORT)
 // Another xesious bot in the groups, which this one hands off to and takes work from.
 process.env.TG_PEER_BOTS = '@PostingBot'
+// …and a bot of another kind, asked best effort.
+process.env.TG_OTHER_BOTS = 'WeatherBot'
 // Tasks are on by default; off here, so every other test sees the command line it
 // always did. The task tests switch them on.
 process.env.TG_TASKS = '0'
@@ -5185,7 +5187,7 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     // Only to the bots it knows, by their usernames; a long brief goes whole, as a file.
     const tok = T().tokens.mint(scopeOf(C, 501))
     const stranger = await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', bot: 'StrangerBot', brief: 'x' })
-    expect([stranger.status, stranger.body.error]).toEqual([403, "@strangerbot isn't a bot this one hands off to (TG_PEER_BOTS)"])
+    expect([stranger.status, stranger.body.error]).toEqual([403, "@strangerbot isn't a bot this one hands off to (TG_PEER_BOTS, TG_OTHER_BOTS)"])
     expect((await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', bot: '12345', brief: 'x' })).status).toBe(400)
     const b2 = calls.length
     const long = `Long brief. ${'word '.repeat(1200)}The end.`
@@ -5270,6 +5272,40 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     const { cs, id } = await botSays('@testbot, hand-off from X · Y:\nAnd on.\n#handoff-aa5bbb #depth-4', 503)
     expect(sent(cs, '❌ #handoff-aa5bbb failed: it was handed on 3 times already')!.payload.reply_parameters).toMatchObject({ message_id: id })
     expect(T().store.handoffByTag('aa5bbb', 'in', 'postingbot')).toMatchObject({ state: 'failed' })
+  }, 30000)
+
+  test("to a bot that isn't xesious, best effort: the brief as its command, and its reply to that is the answer", async () => {
+    const WEATHER = { id: 557, is_bot: true, first_name: 'Weather', username: 'WeatherBot' }
+    const before = calls.length
+    await say('MCPTASK handoff {"topic":"503","bot":"@WeatherBot","brief":"/forecast Paris"}', 501)
+    expect(lastMcp()).toMatchObject({ tool: 'handoff', isError: false })
+    const cs = calls.slice(before)
+    expect(sent(cs, '/forecast@weatherbot Paris')!.payload.message_thread_id).toBe(503)
+    expect(sent(cs, '➡️ Asked @weatherbot in')!.payload.message_thread_id).toBe(501)
+    const h = T().store.sentHandoffs().find((x: any) => x.peer === 'weatherbot')!
+    expect(h).toMatchObject({ plain: true, deadline: '2026-10-16T12:30:00.000Z' })
+    expect(typeof h.peerMsg).toBe('number')
+    // What it says that isn't a reply to that is nothing to this bot.
+    await botSays('Tomorrow: rain', 503, { who: WEATHER })
+    expect(T().store.getHandoff(h.id).state).toBe('sent')
+    const { cs: ans } = await botSays('Paris tomorrow: sunny, 21°C', 503, { who: WEATHER, replyTo: ours(h.peerMsg) })
+    expect(T().store.getHandoff(h.id)).toMatchObject({ state: 'done', result: 'Paris tomorrow: sunny, 21°C' })
+    expect(ans.some(c => c.method === 'editMessageText' && String(c.payload.text).includes('✅ Paris tomorrow: sunny, 21°C'))).toBe(true)
+    expect(readFileSync(join(TMP, 'messages', String(C), '503.jsonl'), 'utf8')).toContain('sunny, 21°C')
+    // Plain words go as a mention; files don't go at all.
+    const tok = T().tokens.mint(scopeOf(C, 501))
+    const b2 = calls.length
+    expect((await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '503', bot: 'weatherbot', brief: 'what about Rome?' })).status).toBe(201)
+    expect(sent(calls.slice(b2), '@weatherbot what about Rome?')).toBeTruthy()
+    const withFile = await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '503', bot: 'weatherbot', brief: 'x', files: ['a.txt'] })
+    expect([withFile.status, withFile.body.error]).toEqual([409, "@weatherbot isn't a xesious bot: it gets the brief as a message, without files"])
+    T().tokens.revoke(tok)
+    // Unanswered: failed, without an alarm.
+    const b3 = calls.length
+    try { bridge._setTaskClock(() => new Date('2026-10-16T13:00:00Z')); await bridge._sweepPeerHandoffs() } finally { bridge._setTaskClock(() => new Date('2026-10-16T12:00:00Z')) }
+    const rome = T().store.handoffsSince(String(C), '2000-01-01T00:00:00Z').find((x: any) => x.brief === 'what about Rome?')!
+    expect(rome).toMatchObject({ state: 'failed', error: "@weatherbot didn't answer within 30 min" })
+    expect(calls.slice(b3).some(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('⚠️'))).toBe(false)
   }, 30000)
 
   test('a plan: its steps one after another, each given what came before; one progress line, edited; the last word posted', async () => {
