@@ -96,6 +96,8 @@ export interface RuntimeDeps {
   maxScripts?: number      // scripts at once, across every task (2)
   // A question was answered, or let go: its message says so.
   questionDone?(wait: Wait): void
+  // A task's then: its result handed on to another topic.
+  handOn?(task: Task, run: Run, text: string): Promise<void>
 }
 
 export interface FilterVerdict { pass: { n: number; why: string }[]; by: string }
@@ -481,6 +483,7 @@ export class TaskRuntime {
     }
     const out = o.out.trim()
     const post = t.says === 'live' || t.says === 'result' || (t.says === 'noteworthy' && out !== '')
+    if (t.then && (out || t.says !== 'noteworthy')) await this.handOn(t, run, out || 'It finished, with nothing printed.')
     let postedMsg: number | undefined
     if (post) {
       const text = out ? outputBlock(out) : `Done in ${elapsedText(o.durationMs)}, with nothing printed.`
@@ -607,6 +610,8 @@ export class TaskRuntime {
     // It worked. What gets posted follows the task's setting and the run's report.
     const text = (run.reportText || o.text || run.summary || '').trim()
     const post = this.shouldPost(t, run)
+    // Its then: the result handed on, before the post sends the files it made.
+    if (t.then && text && (t.says !== 'noteworthy' || run.notify)) await this.handOn(t, run, text)
     let postedMsg: number | undefined
     if (post && text) {
       postedMsg = await this.safePost(t, 'result', text, { loud: t.sound === 'loud', lateMs: run.lateMs, run })
@@ -617,6 +622,10 @@ export class TaskRuntime {
       this.d.note(t, `The task "${t.name}" ran at ${new Date(run.startedAt ?? end).toISOString()} and posted: ${gist}${resultPath ? ` (full result: ${resultPath})` : ''}`)
     }
     this.finishRun(t.id, run)
+  }
+
+  private async handOn(t: Task, run: Run, text: string): Promise<void> {
+    try { await this.d.handOn?.(t, run, text) } catch (e) { this.d.log(`[tasks] ${t.id}: handing on failed: ${e}`) }
   }
 
   private shouldPost(t: Task, run: Run): boolean {

@@ -109,6 +109,7 @@ export interface Task {
   watchFails?: number     // the watcher's failures in a row
   watchError?: string     // the last of them, in words
   watchRetryAt?: string   // a streaming watcher that died starts again from here
+  then?: { thread?: number; topicName?: string; brief?: string }  // on success, its result handed to this topic
   rule?: Rule
   ai?: AiFilter
   filterSeen?: number     // events the AI filter was asked about
@@ -165,6 +166,28 @@ export interface Run {
   waitId?: string         // an answer run: the question it carries on from
 }
 
+// Work handed to another topic of the same group: by a run (the handoff tool) or by a
+// task whose definition says so (Task.then). It runs there as a turn of its own, in
+// that topic's folder with its settings, as the person who handed it off.
+export interface Handoff {
+  id: string
+  chat: string
+  fromThread?: number
+  toThread?: number
+  brief: string
+  files: string[]            // names in the target topic's inbox
+  by: string                 // the person it runs as
+  byName?: string
+  fromTask?: string          // a task's run that handed it off
+  depth: number              // 1 from a person or a task; one more each time it is handed on
+  state: 'queued' | 'running' | 'done' | 'failed'
+  createdAt: string
+  endedAt?: string
+  srcMsg?: number            // the line in the source topic, edited when it ends
+  dstMsg?: number            // its header in the target topic
+  error?: string
+}
+
 // A question a task's run asked a person (the ask tool). The run waits a few minutes
 // for the answer; if none comes it stops, parked, and the answer carries it on later,
 // in its own session. After a day the default answer is used, or the question let go.
@@ -209,6 +232,10 @@ export const LIMITS = {
   pollTimeoutMs: 5 * 60_000,         // a polled watcher must print and exit within this
   watchUpResetMs: 10 * 60_000,       // a streaming watcher up this long starts its failure count afresh
   watchBackoffMs: [5_000, 15_000, 60_000, 5 * 60_000, 15 * 60_000],
+  // Hand-offs:
+  handoffDepthMax: 3,
+  handoffsPerHour: 30,               // per group
+  handoffRunsAtOnce: 2,
   // Questions:
   askWaitMaxMs: 10 * 60_000,         // a run waits this long at most for an answer, then parks
   askKeepMs: 24 * 60 * 60_000,       // a parked question is kept this long

@@ -186,6 +186,7 @@ export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchSt
   if (t.rule) lines.push(`Only ${esc(ruleText(t.rule))}`)
   if (t.action.kind === 'script') lines.push(`${isWatch ? 'Then runs ' : ''}<code>${esc(clip(t.action.command, 200))}</code>`)
   if (related?.length) lines.push(`${t.action.kind === 'digest' ? 'Lists' : 'Watches'}: ${related.map(n => `<b>${esc(n)}</b>`).join(', ')}`)
+  if (t.then) lines.push(`Then hands its result to <b>${esc(t.then.topicName ?? (t.then.thread === undefined ? 'General' : `topic ${t.then.thread}`))}</b>`)
   if (t.ai) {
     const n = t.filterSeen ? ` · ${t.filterSeen.toLocaleString('en-US')} considered, ${(t.filterPassed ?? 0).toLocaleString('en-US')} let through` : ''
     lines.push(`AI filter every ${esc(durationText(t.ai.everyMs))}: “${esc(clip(t.ai.question, 160))}”${n}`)

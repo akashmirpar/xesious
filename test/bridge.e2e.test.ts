@@ -5086,6 +5086,46 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     expect(readFileSync(LAST_PROMPT, 'utf8')).toContain('Go ahead with the plan you proposed above.')
   }, 20000)
 
+  test('a hand-off: a turn here hands work to another topic, which does it as a turn of its own and says so in both', async () => {
+    const notes = join(TMP, 'handoff-notes.txt')
+    writeFileSync(notes, 'three findings')
+    const before = calls.length
+    await say(`MCPTASK handoff {"topic":"502","brief":"Write a summary of the notes.\\nKeep it short.","files":["${notes}"]}`, 501)
+    expect(lastMcp()).toMatchObject({ tool: 'handoff', isError: false })
+    await waitFor(() => T().store.openHandoffs().length === 0 && calls.slice(before).some(c => c.method === 'editMessageText' && String(c.payload.text).includes('✅ Done')), 15000)
+    const cs = calls.slice(before)
+    const header = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('⬅️ From'))!
+    expect(header.payload).toMatchObject({ chat_id: C, message_thread_id: 502, disable_notification: true })
+    expect(String(header.payload.text)).toContain('Ada: Write a summary of the notes.\n📎 handoff-notes.txt')
+    const line = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('➡️ Handed to'))!
+    expect(line.payload.message_thread_id).toBe(501)
+    // The work ran in the other topic, told it is relayed, with its file in that topic's inbox.
+    const p = readFileSync(LAST_PROMPT, 'utf8')
+    expect(p).toContain('Work handed to this topic from the topic')
+    expect(p).toContain('--- brief:\nWrite a summary of the notes.\nKeep it short.\n--- end of brief')
+    expect(readFileSync(join(bridge._sessions()[`${C}:502`].cwd, 'inbox', 'handoff-notes.txt'), 'utf8')).toBe('three findings')
+    // Its result went there; the line here says it is done.
+    expect(cs.some(c => ['sendMessage', 'sendRichMessage'].includes(c.method) && c.payload.message_thread_id === 502 && textOf(c).includes('okReply'))).toBe(true)
+    // A chain can't go on forever.
+    const deep = T().tokens.mint({ ...scopeOf(C, 502), handoffDepth: 3 })
+    const { callApi } = await import('../tasks/api')
+    const r = await callApi(T().socket, deep, 'POST', '/v1/handoff', { topic: '501', brief: 'and back' })
+    expect(r.status).toBe(409)
+    expect(r.body.error).toContain('handed on 3 times already')
+    T().tokens.revoke(deep)
+  }, 30000)
+
+  test("a task's then: when its run works, its result goes on to another topic", async () => {
+    const t = make({ name: 'Daily draft', prompt: 'Draft the post', cron: '7 9 * * *', then: { handoff_to: '502', brief: 'Publish this draft.' } }, scopeOf(C, 501))
+    expect(T().store.getTask(t.id).then).toMatchObject({ thread: 502, brief: 'Publish this draft.' })
+    const before = calls.length
+    T().runtime.runNow(t.id)
+    await waitFor(() => calls.slice(before).some(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('⬅️ From') && String(c.payload.text).includes('Publish this draft.')), 15000)
+    await waitFor(() => T().store.openHandoffs().length === 0, 15000)
+    expect(readFileSync(LAST_PROMPT, 'utf8')).toContain('by its task "Daily draft"')
+    expect(readFileSync(LAST_PROMPT, 'utf8')).toContain('What its run produced:')
+  }, 30000)
+
   test('the activity topic can be turned off for a group', async () => {
     const G = -100999
     bridge._groupSettings()[String(G)] = { ...(bridge._groupSettings()[String(G)] ?? {}), activityTopic: false }

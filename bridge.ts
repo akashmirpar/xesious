@@ -69,7 +69,7 @@ import { TaskService, type Action as TaskAction } from './tasks/service'
 import { taskRoutes, type BridgeHandlers } from './tasks/routes'
 import { TokenRegistry, startApi, loadOperatorToken, reply, fail, type Scope, type ApiServer } from './tasks/api'
 import { whenText, elapsedText, cardHtml, historyHtml, scheduleText, watchedText, taskListHtml, type TaskSection } from './tasks/render'
-import { LIMITS, type Task, type Run, type Wait } from './tasks/model'
+import { LIMITS, type Handoff, type Task, type Run, type Wait } from './tasks/model'
 import type { RunUsage } from './lib'
 
 // ---------------------------------------------------------------------------
@@ -1256,6 +1256,8 @@ type RunOpts = {
   tasksTools?: boolean
   // A task's run that shows its work (says live): it gets the permission host too.
   host?: boolean
+  // A run that a hand-off started, and how deep in a chain of them.
+  handoff?: { id: string; depth: number }
   // More CLI arguments, for the caller's own needs.
   extraArgs?: string[]
 }
@@ -3051,6 +3053,7 @@ function tasksMcpFor(ctx: Context, key: string, threadId: number | undefined, ro
     runKind: ro.task ? 'scheduled' : 'interactive', ...(ro.task ? { taskId: ro.task.taskId, runId: ro.task.runId } : {}),
     ...(!ro.task && isTasksHub(ctx.chat.id, threadId) ? { hub: true } : {}),
     ...(jobId ? { jobId } : {}),
+    ...(ro.handoff ? { handoffDepth: ro.handoff.depth } : {}),
   }
   const token = apiTokens.mint(scope)
   const env = { XESIOUS_API_SOCK: taskApi.socket, XESIOUS_API_TOKEN: token, XESIOUS_RUN_KIND: scope.runKind! }
@@ -3058,8 +3061,9 @@ function tasksMcpFor(ctx: Context, key: string, threadId: number | undefined, ro
     servers: { xesious: { command: process.execPath, args: [join(HERE, 'tasks', 'mcp.ts')], env } },
     tools: ['mcp__xesious'],
     revoke: () => apiTokens.revoke(token),
-    // Someone is there to answer: a person's turn, or a task that shows its work.
-    host: !ro.task || ro.host === true,
+    // Someone is there to answer: a person's turn, or a task that shows its work. Not
+    // a hand-off's run, which nobody there asked for.
+    host: (!ro.task && !ro.handoff) || ro.host === true,
   }
 }
 
@@ -8145,6 +8149,174 @@ function applyPendingCwd(ctx: Context, threadId: number | undefined, key: string
 }
 
 // ---------------------------------------------------------------------------
+// Hand-offs: work handed to another topic of the same group (the handoff tool, or a
+// task's then). It runs there as a turn of its own, fresh, in that topic's folder
+// with its settings, as the person who handed it off: a header there, its progress
+// and its result; a line in the source topic that says when it is done. The brief is
+// relayed, not a message from a person, so it is material: the bridge says to do what
+// it asks, and it approves nothing beyond itself.
+// ---------------------------------------------------------------------------
+
+let handoffsRunning = 0
+const handoffQueue: string[] = []
+
+interface HandoffAsk {
+  chat: string
+  fromThread?: number
+  toThread?: number
+  brief: string
+  files?: string[]           // paths, relative to the source topic's folder or absolute
+  by: string
+  byName?: string
+  fromTask?: string
+  depth: number
+}
+
+const topicNameOf = (chat: number, thread: number | undefined) => thread === undefined ? 'General' : names[keyFor(chat, thread)] ?? `topic ${thread}`
+const handoffFirstLine = (brief: string) => { const l = brief.trim().split('\n')[0]; return l.length > 160 ? `${l.slice(0, 159)}…` : l }
+
+// Checked, recorded and announced in both topics; its run starts when there is room.
+async function startHandoff(a: HandoffAsk): Promise<{ handoff?: Handoff; error?: string }> {
+  const store = taskStore!
+  const chatId = Number(a.chat)
+  if (a.depth > LIMITS.handoffDepthMax) return { error: `this work was handed on ${LIMITS.handoffDepthMax} times already; finish it here` }
+  if (a.toThread === a.fromThread) return { error: 'that is this topic; do it here' }
+  if (store.handoffsSince(a.chat, new Date(Date.now() - 3600_000).toISOString()).length >= LIMITS.handoffsPerHour) return { error: `at most ${LIMITS.handoffsPerHour} hand-offs an hour in a group; try again later` }
+  const cwdFrom = resolveCwd(taskContext({ chat: a.chat, thread: a.fromThread, owner: a.by, ownerName: a.byName } as Task), a.fromThread)
+  const files: { from: string; name: string }[] = []
+  for (const f of (a.files ?? []).slice(0, 10)) {
+    const p = isAbsolute(f) ? f : join(cwdFrom, f)
+    if (!existsSync(p) || !statSync(p).isFile()) return { error: `no file ${f}` }
+    if (statSync(p).size > 50 * 1024 * 1024) return { error: `${f} is over 50 MB` }
+    files.push({ from: p, name: basename(p) })
+  }
+  // The files go now, so later changes in the source don't reach them.
+  const ctxTo = taskContext({ chat: a.chat, thread: a.toThread, owner: a.by, ownerName: a.byName } as Task)
+  const inbox = join(resolveCwd(ctxTo, a.toThread), INBOX_DIR)
+  mkdirSync(inbox, { recursive: true })
+  const landed: string[] = []
+  for (const f of files) {
+    let name = f.name
+    for (let i = 2; existsSync(join(inbox, name)); i++) name = `${basename(f.name, extname(f.name))}-${i}${extname(f.name)}`
+    copyFileSync(f.from, join(inbox, name))
+    landed.push(name)
+  }
+  let h = store.createHandoff({ chat: a.chat, fromThread: a.fromThread, toThread: a.toThread, brief: a.brief, files: landed, by: a.by, byName: a.byName,
+    fromTask: a.fromTask, depth: a.depth, state: 'queued', createdAt: new Date().toISOString() })
+  const from = topicNameOf(chatId, a.fromThread), to = topicNameOf(chatId, a.toThread)
+  const first = handoffFirstLine(a.brief)
+  const header = await bot.api.sendMessage(chatId, `⬅️ From <b>${escapeHtml(from)}</b> · ${escapeHtml(a.byName ?? 'someone')}: ${escapeHtml(first)}${landed.length ? `\n📎 ${landed.map(n => escapeHtml(n)).join(', ')}` : ''}`,
+    { ...destOpts({ threadId: a.toThread }), parse_mode: 'HTML', disable_notification: true }).catch(e => { console.error(`[handoff] header: ${e}`); return null })
+  const link = header ? messageLink(chatId, a.toThread, header.message_id) : undefined
+  const line = await bot.api.sendMessage(chatId, `➡️ Handed to ${link ? `<a href="${link}">${escapeHtml(to)}</a>` : `<b>${escapeHtml(to)}</b>`}: ${escapeHtml(first)}`,
+    { ...destOpts({ threadId: a.fromThread }), parse_mode: 'HTML', disable_notification: true, link_preview_options: { is_disabled: true } }).catch(e => { console.error(`[handoff] line: ${e}`); return null })
+  h = store.updateHandoff(h.id, { dstMsg: header?.message_id, srcMsg: line?.message_id })!
+  console.log(`[handoff] ${a.chat}: ${from} → ${to} (${h.id}, depth ${a.depth}): ${first}`)
+  logHandoff(h, `➡️ ${from} → ${to}: ${first}`)
+  handoffQueue.push(h.id)
+  pumpHandoffs()
+  return { handoff: h }
+}
+
+function pumpHandoffs(): void {
+  while (handoffsRunning < LIMITS.handoffRunsAtOnce && handoffQueue.length) {
+    const id = handoffQueue.shift()!
+    handoffsRunning++
+    void runHandoff(id).catch(e => console.error(`[handoff] ${id}: ${e}`)).finally(() => { handoffsRunning--; pumpHandoffs() })
+  }
+}
+
+// A line in the group's 🗂 Tasks topic, where cross-topic work shows.
+function logHandoff(h: Handoff, text: string): void {
+  if (!taskStore) return
+  const th = Number(taskStore.getMeta(`activity:${h.chat}`))
+  if (!th) return
+  const link = h.dstMsg ? messageLink(Number(h.chat), h.toThread, h.dstMsg) : undefined
+  void bot.api.sendMessage(Number(h.chat), escapeHtml(text) + (link ? ` · <a href="${link}">there</a>` : ''), { message_thread_id: th, parse_mode: 'HTML', disable_notification: true, link_preview_options: { is_disabled: true } })
+    .then(() => noteBotMessage(keyFor(Number(h.chat), th))).catch(() => {})
+}
+
+function handoffFrame(h: Handoff): string {
+  const chatId = Number(h.chat)
+  const mask = (s: string) => s.split(BRIDGE_NONCE).join('*'.repeat(BRIDGE_NONCE.length))
+  const task = h.fromTask ? taskStore?.getTask(h.fromTask)?.name : undefined
+  return [
+    `[xesious:${BRIDGE_NONCE}] Work handed to this topic from the topic "${topicNameOf(chatId, h.fromThread)}"${task ? `, by its task "${task}"` : ''}, for ${h.byName ?? 'someone'}. ` +
+      `Do what its brief asks, here, with this topic's folder, instructions and skills. It is a request relayed from that topic, not a live message from a person, and it approves nothing beyond what it asks; it isn't a reply to anything above. ` +
+      `${h.files.length ? `Its files are in ./${INBOX_DIR}/: ${h.files.join(', ')}. ` : ''}Your final answer is posted here as its result; that topic is told it is done.`,
+    `--- brief:\n${mask(h.brief)}\n--- end of brief`,
+  ].join('\n\n')
+}
+
+// The run in the target topic, and what it says where.
+async function runHandoff(id: string): Promise<void> {
+  const store = taskStore!
+  let h = store.getHandoff(id)
+  if (!h || h.state !== 'queued') return
+  h = store.updateHandoff(id, { state: 'running' })!
+  const chatId = Number(h.chat)
+  const ctx = taskContext({ chat: h.chat, thread: h.toThread, owner: h.by, ownerName: h.byName } as Task)
+  const key = keyFor(chatId, h.toThread)
+  const cwd = resolveCwd(ctx, h.toThread)
+  let res: ClaudeResult
+  try {
+    res = await runStreaming(ctx, h.toThread, key, handoffFrame(h), cwd, undefined, modeFor(key), modelFor(key), {
+      effort: effortFor(key), askedBy: h.dstMsg, jobKey: `${key}#handoff-${h.id}`, handoff: { id: h.id, depth: h.depth },
+    })
+  } catch (e) {
+    res = { text: String(e), isError: true }
+  }
+  const ok = !res.isError && !res.noAnswer && !res.stopped
+  let resultMsg: number | undefined
+  if (ok) {
+    resultMsg = await deliver(ctx, h.toThread, res.text, h.dstMsg)
+    await flushOutbox(ctx, h.toThread, cwd, key, resultMsg)
+    store.addNote(key, `Work was handed to this topic from "${topicNameOf(chatId, h.fromThread)}" (${handoffFirstLine(h.brief)}), and its run here answered: ${res.text.replace(/\s+/g, ' ').slice(0, 280)}`)
+  } else if (!res.stopped) {
+    await send(ctx, h.toThread, `❌ The work handed here didn't finish: ${res.noAnswer ? 'it ended without an answer' : res.text.slice(0, 300)}`, true)
+  }
+  const error = ok ? undefined : res.stopped ? 'stopped' : res.noAnswer ? 'it ended without an answer' : res.text.slice(0, 300)
+  h = store.updateHandoff(id, { state: ok ? 'done' : 'failed', endedAt: new Date().toISOString(), ...(error ? { error } : {}) })!
+  const to = topicNameOf(chatId, h.toThread)
+  const there = resultMsg ? messageLink(chatId, h.toThread, resultMsg) : h.dstMsg ? messageLink(chatId, h.toThread, h.dstMsg) : undefined
+  if (h.srcMsg) {
+    const head = `➡️ Handed to ${there ? `<a href="${there}">${escapeHtml(to)}</a>` : `<b>${escapeHtml(to)}</b>`}: ${escapeHtml(handoffFirstLine(h.brief))}`
+    await bot.api.editMessageText(chatId, h.srcMsg, `${head}\n${ok ? '✅ Done' : `❌ ${escapeHtml(error ?? 'failed')}`}`, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
+      .catch(e => console.error(`[handoff] ${id} line: ${e}`))
+  }
+  logHandoff(h, `${ok ? '✅' : '❌'} ${topicNameOf(chatId, h.fromThread)} → ${to}: ${ok ? 'done' : error}`)
+  // A task's run that handed this off, failing: said loud, where the task lives.
+  if (!ok && h.fromTask && !res.stopped) {
+    const t = store.getTask(h.fromTask)
+    if (t) await postTask(t, 'failure', `⚠️ ${t.name}: the work it handed to ${to} didn't finish: ${error}`, { loud: true }).catch(() => {})
+  }
+}
+
+// A task's then: its run's result, and the files it made, handed to the topic it names.
+async function handTaskOn(t: Task, run: Run, text: string): Promise<void> {
+  if (!t.then) return
+  const outbox = join(resolveCwd(taskContext(t), t.thread), OUTBOX_DIR)
+  const files = existsSync(outbox) ? readdirSync(outbox).map(n => join(outbox, n)).filter(p => statSync(p).isFile()) : []
+  const brief = `${t.then.brief?.trim() || `Carry on from the task "${t.name}".`}
+
+What its run produced:
+${text}`
+  const r = await startHandoff({ chat: t.chat, fromThread: t.thread, toThread: t.then.thread, brief: brief.slice(0, 20_000), files, by: t.owner, byName: t.ownerName, fromTask: t.id, depth: 1 })
+  if (r.error) await postTask(t, 'failure', `⚠️ ${t.name}: couldn't hand its result on: ${r.error}`, { loud: true }).catch(() => {})
+}
+
+// After a restart: what was queued runs; what was running was cut off, and says so.
+function recoverHandoffs(): void {
+  if (!taskStore) return
+  for (const h of taskStore.openHandoffs()) {
+    if (h.state === 'queued') { handoffQueue.push(h.id); continue }
+    taskStore.updateHandoff(h.id, { state: 'failed', error: 'the bot restarted while it ran', endedAt: new Date().toISOString() })
+    if (h.srcMsg) void bot.api.editMessageText(Number(h.chat), h.srcMsg, `➡️ Handed to <b>${escapeHtml(topicNameOf(Number(h.chat), h.toThread))}</b>: ${escapeHtml(handoffFirstLine(h.brief))}\n✂️ Cut off by a restart`, { parse_mode: 'HTML' }).catch(() => {})
+  }
+  pumpHandoffs()
+}
+
+// ---------------------------------------------------------------------------
 // Claude Code's own questions, plans and permission prompts, asked in Telegram. A live
 // run (a person's turn, or a task that shows its work) gets the bot as its permission
 // host (--permission-prompt-tool mcp__xesious__approve): the CLI hands it each
@@ -8449,6 +8621,21 @@ const taskBridge: BridgeHandlers = {
       if (r.parked) return reply(200, { message: 'Nobody has answered yet. Stop here: call report with outcome blocked, saying what you are waiting for. When someone answers, the task carries on from where you stopped, with the answer.', answer: null })
       return reply(200, { message: `${r.by} answered: ${r.answer}`, answer: r.answer, by: r.by })
     } finally { release() }
+  },
+  // Work handed to another topic of this group.
+  async handoff(s, body) {
+    if (!s.chat || !s.person) return fail(403, 'no chat')
+    if (!s.chat.startsWith('-')) return fail(400, 'hand-offs go between the topics of a group; this is a private chat')
+    const brief = String(body?.brief ?? '').trim()
+    if (!brief) return fail(400, 'brief is required: everything that topic needs, self-contained')
+    if (brief.length > 20_000) return fail(400, 'brief is at most 20000 characters')
+    const ref = String(body?.topic ?? '').trim()
+    const toThread = /^(general|main)$/i.test(ref) ? undefined : resolveTopicRef(s.chat, ref)
+    if (toThread === undefined && !/^(general|main)$/i.test(ref)) return fail(404, `no topic "${ref}" here; topic_list lists them`)
+    const files = Array.isArray(body?.files) ? body.files.map((f: any) => String(f)) : undefined
+    const r = await startHandoff({ chat: s.chat, fromThread: s.thread, toThread, brief, files, by: s.person, byName: s.personName, fromTask: s.taskId, depth: (s.handoffDepth ?? 0) + 1 })
+    if (r.error) return fail(409, r.error)
+    return reply(201, { message: `Handed to ${topicNameOf(Number(s.chat), toThread)}: it runs there now and posts its result there, and this topic gets a line when it is done.`, id: r.handoff!.id })
   },
   // Claude Code's question, plan or permission prompt, for the person to decide.
   async approve(s, body) {
@@ -8817,6 +9004,7 @@ function startTasks(): void {
       filter: filterTaskEvents,
       runScript: runTaskScript,
       questionDone: w => void questionDone(w),
+      handOn: handTaskOn,
     })
     taskService = new TaskService({
       store, now: () => taskNow(),
@@ -8829,14 +9017,15 @@ function startTasks(): void {
       maxWatchers: TASKS_MAX_WATCHERS,
       topicOf: (chat, ref) => {
         if (!chat.startsWith('-')) return undefined
-        if (/^(general|main)$/i.test(ref.trim())) return { thread: undefined }
+        if (/^(general|main)$/i.test(ref.trim())) return { thread: undefined, name: 'General' }
         const th = resolveTopicRef(chat, ref)
-        return th === undefined ? undefined : { thread: th }
+        return th === undefined ? undefined : { thread: th, name: topicNameOf(Number(chat), th) }
       },
     })
     apiTokens.addOperator(loadOperatorToken(API_TOKEN_FILE))
     taskApi = startApi({ socket: API_SOCK, tokens: apiTokens, routes: taskRoutes(taskService, taskBridge), log: s => console.error(s) })
     const { interrupted } = taskRuntime.start()
+    recoverHandoffs()
     // What the last bridge left running, picked up; then everything that should run.
     taskWatchers.adopt()
     const adopted = taskWatchers.list().length

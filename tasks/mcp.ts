@@ -66,6 +66,12 @@ const WATCH_PROPS = {
     },
     required: ['op'],
   },
+  then: {
+    type: 'object',
+    description: "Optional, for a prompt or a script: when a run succeeds, hand its result, and the files it made, to another topic of this group, which carries on there (\"when the video is ready, the Posting topic publishes it\"). handoff_to: the topic (id or name). brief: what that topic should do with it. Give null to remove it.",
+    properties: { handoff_to: { type: 'string' }, brief: { type: 'string' } },
+    required: ['handoff_to'],
+  },
   watch_tasks: {
     type: 'array', items: { type: 'string' },
     description: 'With a prompt: other tasks in this chat (ids or names) whose runs since the last run come with each run, so it can check on them. ' +
@@ -164,6 +170,23 @@ const INTERACTIVE_TOOLS = [
 
 // Claude Code's own questions, plans and permission prompts, handed to the bot to
 // ask the person in Telegram (--permission-prompt-tool mcp__xesious__approve).
+// Work handed to another topic of this group, for both kinds of run.
+const HANDOFF_TOOL = {
+  name: 'handoff',
+  description: "Hand work to another topic of this group, where it is done as a turn of its own, in that topic's folder with its own instructions and skills, as the person you work for. " +
+      'Use it when the work belongs there ("when the video is ready, the Posting topic publishes it"). brief: everything that topic needs, self-contained, since it starts without this conversation. ' +
+      "files: paths in this topic's folder to go along (they arrive in that topic's inbox). The topic gets a header and posts its own result; this topic gets a line that says when it is done.",
+  inputSchema: {
+    type: 'object',
+    properties: {
+      topic: { type: 'string', description: 'The topic it goes to: id or name, from topic_list.' },
+      brief: { type: 'string' },
+      files: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['topic', 'brief'],
+  },
+}
+
 const APPROVE_TOOL = {
   name: 'approve',
   description: "The bot's own: how Claude Code's questions, plans and permission prompts reach the person in the chat. Don't call it yourself.",
@@ -210,7 +233,7 @@ const SCHEDULED_TOOLS = [
   { name: 'task_done', description: "Finish this task for good: its work is complete and it shouldn't run again.", inputSchema: { type: 'object', properties: {} } },
 ]
 
-export const toolsFor = (kind: 'interactive' | 'scheduled') => [...(kind === 'scheduled' ? SCHEDULED_TOOLS : INTERACTIVE_TOOLS), APPROVE_TOOL]
+export const toolsFor = (kind: 'interactive' | 'scheduled') => [...(kind === 'scheduled' ? SCHEDULED_TOOLS : INTERACTIVE_TOOLS), HANDOFF_TOOL, APPROVE_TOOL]
 
 const enc = encodeURIComponent
 
@@ -233,6 +256,7 @@ export function routeOf(name: string, a: any, kind: 'interactive' | 'scheduled')
     case 'notify': return { method: 'POST', path: '/v1/notify', body: a }
     case 'ask': return { method: 'POST', path: '/v1/ask', body: a }
     case 'approve': return { method: 'POST', path: '/v1/approve', body: a }
+    case 'handoff': return { method: 'POST', path: '/v1/handoff', body: a }
     case 'topic_list': return { method: 'GET', path: '/v1/topics' }
     case 'topic_create': return { method: 'POST', path: '/v1/topics', body: a }
     case 'topic_rename': return { method: 'PATCH', path: `/v1/topics/${enc(String(a?.topic ?? 'this'))}`, body: { name: a?.name } }

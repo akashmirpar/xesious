@@ -37,6 +37,7 @@ export interface TaskInput extends WhenInput {
   script?: string | { command?: string; timeout_minutes?: number }   // a command, no AI
   watch_tasks?: string[]  // with prompt: tasks (ids or names) whose recent runs come with each run
   topic?: string | number // task_create: the topic it lives in, when not the caller's
+  then?: { handoff_to?: string; brief?: string } | null   // on success, its result handed to this topic
   digest?: { of?: string[] } | boolean   // a list of what tasks did, no AI
   rule?: any              // filters.ruleError says what it may be; null removes it
   ai_filter?: { question?: string; every_minutes?: number } | null
@@ -57,7 +58,7 @@ export interface ServiceDeps {
   runNow(task: Task): Promise<{ runId?: string; error?: string }> | { runId?: string; error?: string }
   maxWatchers?: number    // streaming watchers the bot keeps running at once
   // A topic of a chat, by id or name ("General" too): its thread, or undefined if none.
-  topicOf?(chat: string, ref: string): { thread?: number } | undefined
+  topicOf?(chat: string, ref: string): { thread?: number; name?: string } | undefined
 }
 
 // Both branches name both fields, so reading .error after checking .ok type-checks
@@ -96,6 +97,7 @@ export function taskView(t: Task, runs: Run[] = []) {
       : t.action.kind === 'digest' ? { digest: { of: t.action.of } }
       : { keep_running: true }),
     sound: t.sound, deliver_to: t.where === 'dm' ? 'dm' : 'topic',
+    ...(t.then ? { then: { handoff_to: t.then.topicName ?? t.then.thread ?? 'General', brief: t.then.brief } } : {}),
     topic: t.thread, runs_done: t.runsDone,
     last_run: last ? { when: whenText(new Date(last.startedAt ?? last.slot ?? Date.now()), t.tz), result: markOf(last), summary: last.summary, error: last.state === 'failed' ? last.reason : undefined } : undefined,
   }
@@ -302,6 +304,19 @@ export class TaskService {
       rule = undefined; ai = undefined
     }
     if ((rule || ai) && action!.kind === 'none') return err(400, 'a watcher kept running for its own sake has nothing to filter: give message or prompt')
+
+    // Its then: on success, its result handed to another topic of this group.
+    let then = base?.then
+    if (input.then !== undefined) {
+      if (input.then === null || !input.then.handoff_to) then = undefined
+      else {
+        if (!chat.startsWith('-')) return err(400, 'then hands results between the topics of a group; this is a private chat')
+        const to = this.deps.topicOf?.(chat, String(input.then.handoff_to))
+        if (!to) return err(404, `then.handoff_to: no topic "${input.then.handoff_to}" here; topic_list lists them`)
+        if (action!.kind !== 'claude' && action!.kind !== 'script') return err(400, 'then is for a Claude run or a script, which have a result to hand on')
+        then = { thread: to.thread, topicName: to.name ?? String(input.then.handoff_to), ...(input.then.brief ? { brief: String(input.then.brief).slice(0, 2000) } : {}) }
+      }
+    }
     // A batch mustn't go stale while it waits for the filter.
     if (ai && limits.staleMs === undefined && ai.everyMs * 2 > 10 * 60_000) limits.staleMs = ai.everyMs * 2
     if (name.length > MAX.name) return err(400, `name is too long (at most ${MAX.name} characters)`)
@@ -331,7 +346,7 @@ export class TaskService {
       where: input.deliver_to ? (input.deliver_to === 'dm' ? 'dm' : 'home') : (base?.where ?? 'home'),
       until, times, nextDue: nextDue?.toISOString(),
       limits: Object.keys(limits).length ? limits : undefined,
-      rule, ai,
+      rule, ai, then,
     } as any)
   }
 

@@ -10,10 +10,10 @@
  */
 import { Database } from 'bun:sqlite'
 import { randomBytes } from 'node:crypto'
-import { LIMITS, type Run, type Task, type TaskState, type Wait, type WatchEvent } from './model'
+import { LIMITS, type Handoff, type Run, type Task, type TaskState, type Wait, type WatchEvent } from './model'
 import type { RuleState } from './filters'
 
-const SCHEMA = 3
+const SCHEMA = 4
 
 // A streaming watcher as the bridge started it: enough to find it again after a
 // restart (its pid, and the start time that proves the pid is still it) and to read on
@@ -71,6 +71,8 @@ export class TaskStore {
       CREATE TABLE IF NOT EXISTS rule_state (task TEXT PRIMARY KEY, doc TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS waits (id TEXT PRIMARY KEY, task TEXT NOT NULL, state TEXT NOT NULL, doc TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS waits_state ON waits (state);
+      CREATE TABLE IF NOT EXISTS handoffs (id TEXT PRIMARY KEY, chat TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, doc TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS handoffs_chat ON handoffs (chat, created_at);
     `)
     this.db.query("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)").run(String(SCHEMA))
   }
@@ -87,7 +89,7 @@ export class TaskStore {
 
   // --- tasks ---------------------------------------------------------------------
 
-  private newId(table: 'tasks' | 'waits'): string {
+  private newId(table: 'tasks' | 'waits' | 'handoffs'): string {
     for (;;) {
       // Six base-36 characters: short enough for a card's buttons and to type, and two
       // billion of them.
@@ -320,6 +322,34 @@ export class TaskStore {
   }
   waitsForRun(run: string): Wait[] {
     return (this.db.query('SELECT doc FROM waits').all() as any[]).map(r => JSON.parse(r.doc)).filter((w: Wait) => w.run === run)
+  }
+
+  // --- hand-offs between topics ------------------------------------------------------
+
+  createHandoff(h: Omit<Handoff, 'id'>): Handoff {
+    const handoff: Handoff = { ...h, id: this.newId('handoffs') }
+    this.db.query('INSERT INTO handoffs (id, chat, state, created_at, doc) VALUES (?, ?, ?, ?, ?)').run(handoff.id, handoff.chat, handoff.state, handoff.createdAt, JSON.stringify(handoff))
+    return handoff
+  }
+  getHandoff(id: string): Handoff | undefined {
+    const row = this.db.query('SELECT doc FROM handoffs WHERE id = ?').get(id) as any
+    return row ? JSON.parse(row.doc) : undefined
+  }
+  updateHandoff(id: string, patch: Partial<Handoff>): Handoff | undefined {
+    const cur = this.getHandoff(id)
+    if (!cur) return undefined
+    const next: Handoff = { ...cur, ...patch, id }
+    for (const k of Object.keys(patch) as (keyof Handoff)[]) if (patch[k] === undefined) delete (next as any)[k]
+    this.db.query('UPDATE handoffs SET state = ?, doc = ? WHERE id = ?').run(next.state, JSON.stringify(next), id)
+    return next
+  }
+  // A group's hand-offs since a time, newest first.
+  handoffsSince(chat: string, since: string): Handoff[] {
+    return (this.db.query('SELECT doc FROM handoffs WHERE chat = ? AND created_at >= ? ORDER BY created_at DESC').all(chat, since) as any[]).map(r => JSON.parse(r.doc))
+  }
+  // Those a restart left queued or running.
+  openHandoffs(): Handoff[] {
+    return (this.db.query("SELECT doc FROM handoffs WHERE state IN ('queued','running')").all() as any[]).map(r => JSON.parse(r.doc))
   }
 }
 

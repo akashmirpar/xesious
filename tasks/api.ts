@@ -28,6 +28,7 @@ export interface Scope {
   runId?: string
   hub?: boolean          // a turn in the group's 🗂 Tasks topic, where every topic's tasks are managed
   jobId?: string         // the bridge's job for this run, so a wait on a person can hold its watchdog
+  handoffDepth?: number  // a run that a hand-off started: how deep in a chain of them it is
 }
 
 export class TokenRegistry {
