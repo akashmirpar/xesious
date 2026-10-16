@@ -3051,22 +3051,24 @@ function tasksMcpFor(ctx: Context, key: string, threadId: number | undefined, ro
   // When only admins may create tasks here, know now whether this person is one: the
   // check at task_create can't wait for Telegram.
   if (!ro.task && ctx.chat.id < 0 && setting('taskCreators', keyFor(ctx.chat.id, undefined)) === 'admins') void isChatAdmin(ctx.chat.id, person.id)
+  // Someone is there to answer: a person's turn, or a task that shows its work. Not
+  // a hand-off's run, which nobody there asked for.
+  const host = (!ro.task && !ro.handoff) || ro.host === true
   const scope: Scope = {
     kind: 'run', chat: String(ctx.chat.id), thread: threadId, person: String(person.id), personName: userName(person),
     runKind: ro.task ? 'scheduled' : 'interactive', ...(ro.task ? { taskId: ro.task.taskId, runId: ro.task.runId } : {}),
     ...(!ro.task && isTasksHub(ctx.chat.id, threadId) ? { hub: true } : {}),
     ...(jobId ? { jobId } : {}),
     ...(ro.handoff ? { handoffDepth: ro.handoff.depth, handoffId: ro.handoff.id } : {}),
+    ...(host ? { host: true } : {}),
   }
   const token = apiTokens.mint(scope)
-  const env = { XESIOUS_API_SOCK: taskApi.socket, XESIOUS_API_TOKEN: token, XESIOUS_RUN_KIND: scope.runKind! }
+  const env = { XESIOUS_API_SOCK: taskApi.socket, XESIOUS_API_TOKEN: token, XESIOUS_RUN_KIND: scope.runKind!, ...(host ? { XESIOUS_HOST: '1' } : {}) }
   return {
     servers: { xesious: { command: process.execPath, args: [join(HERE, 'tasks', 'mcp.ts')], env } },
     tools: ['mcp__xesious'],
     revoke: () => apiTokens.revoke(token),
-    // Someone is there to answer: a person's turn, or a task that shows its work. Not
-    // a hand-off's run, which nobody there asked for.
-    host: (!ro.task && !ro.handoff) || ro.host === true,
+    host,
   }
 }
 
@@ -9165,6 +9167,7 @@ const taskBridge: BridgeHandlers = {
   },
   // Claude Code's question, plan or permission prompt, for the person to decide.
   async approve(s, body) {
+    if (!s.host) return fail(403, "approve is how Claude Code asks the person in a live run; this run has nobody to ask")
     const d = await hostDecide(s, String(body?.tool_name ?? ''), body?.input ?? {})
     return reply(200, { decision: JSON.stringify(d) })
   },

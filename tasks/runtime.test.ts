@@ -830,6 +830,28 @@ describe('plans', () => {
     expect(calls.map(c => c.step.name)).toEqual(['one'])
     expect(store.runsFor(t.id)[0]).toMatchObject({ state: 'canceled', reason: 'stopped' })
   })
+
+  test("what its Claude steps cost adds up on the run, with what the permission mode blocked", async () => {
+    claude = async (_t, _r, call) => {
+      if (call) calls.push(call)
+      return { ...OK('done'), usage: { model: 'sonnet', inputTokens: 1000, outputTokens: 200, costUsd: 0.01, turns: 2 }, ...(call?.step.name === 'two' ? { denials: ['Bash: git push'] } : {}) }
+    }
+    const t = plan([{ name: 'one', kind: 'claude', prompt: '1' }, { name: 'mid', kind: 'script', command: 'm' }, { name: 'two', kind: 'claude', prompt: '2' }])
+    await tick()
+    expect(store.runsFor(t.id)[0]).toMatchObject({ state: 'succeeded', usage: { model: 'sonnet', inputTokens: 2000, outputTokens: 400, costUsd: 0.02, turns: 4 }, denials: ['Bash: git push'] })
+  })
+
+  test('a Claude step the usage limit stops: the plan is deferred, not failed, and says so quietly', async () => {
+    claude = async (_t, _r, call) => { if (call) calls.push(call); return { ok: false, text: '', usageLimited: true } }
+    const t = plan([{ name: 'fetch', kind: 'script', command: 'f' }, { name: 'scope', kind: 'claude', prompt: 'Scope it' }, { name: 'push', kind: 'script', command: 'p' }])
+    await tick()
+    expect(calls.map(c => c.step.name)).toEqual(['fetch', 'scope'])
+    expect(store.runsFor(t.id)[0]).toMatchObject({ state: 'deferred', reason: 'stopped by the usage limit at step 2' })
+    expect(store.getTask(t.id)).toMatchObject({ lastMark: 'deferred', failStreak: 0 })
+    expect(posts.some(p => p.kind === 'failure')).toBe(false)
+    expect(posts.filter(p => p.kind === 'progress').at(-1)!.text).toBe('🪜 Weekend fix: ✅ fetch\n⏳ the usage limit stopped step 2')
+    expect(acts).toContain('⏳ Weekend fix: deferred by the usage limit, at step 2')
+  })
 })
 
 describe('after, and child tasks', () => {

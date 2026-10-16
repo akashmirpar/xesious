@@ -5308,6 +5308,13 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     expect(calls.slice(b3).some(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('⚠️'))).toBe(false)
   }, 30000)
 
+  test('approve is only for a run that is the permission host', async () => {
+    const tok = T().tokens.mint({ ...scopeOf(C, 501), runKind: 'scheduled', taskId: 'x', runId: 'x@1' })
+    const r = await callApi(T().socket, tok, 'POST', '/v1/approve', { tool_name: 'Bash', input: { command: 'ls' } })
+    expect([r.status, r.body.error]).toEqual([403, 'approve is how Claude Code asks the person in a live run; this run has nobody to ask'])
+    T().tokens.revoke(tok)
+  })
+
   test('one run hands off at most five times', async () => {
     const tok = T().tokens.mint({ ...scopeOf(C, 501), runKind: 'scheduled', taskId: 'cap001', runId: 'cap001@1' })
     for (let i = 1; i <= 5; i++) expect((await callApi(T().socket, tok, 'POST', '/v1/handoff', { topic: '502', bot: 'postingbot', brief: `part ${i}` })).status).toBe(201)

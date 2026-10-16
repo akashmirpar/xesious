@@ -11,6 +11,7 @@
  *   XESIOUS_API_SOCK   the bridge's socket
  *   XESIOUS_API_TOKEN  this run's token
  *   XESIOUS_RUN_KIND   interactive (a person's message) or scheduled (a task's own run)
+ *   XESIOUS_HOST       1 when the run is the permission host: only then is approve here
  *
  * The same minimal JSON-RPC over stdio as context/mcp.ts.
  */
@@ -19,6 +20,7 @@ import { callApi } from './api'
 const SOCK = process.env.XESIOUS_API_SOCK || ''
 const TOKEN = process.env.XESIOUS_API_TOKEN || ''
 const KIND = process.env.XESIOUS_RUN_KIND === 'scheduled' ? 'scheduled' : 'interactive'
+const HOST = process.env.XESIOUS_HOST === '1'
 
 // Versions this server implements: tools only, which every one of them has. Answer
 // with one of these, never by echoing whatever a newer client asks for.
@@ -278,7 +280,9 @@ const SCHEDULED_TOOLS = [
   { name: 'task_done', description: "Finish this task for good: its work is complete and it shouldn't run again.", inputSchema: { type: 'object', properties: {} } },
 ]
 
-export const toolsFor = (kind: 'interactive' | 'scheduled') => [...(kind === 'scheduled' ? SCHEDULED_TOOLS : INTERACTIVE_TOOLS), HANDOFF_TOOL, APPROVE_TOOL]
+// approve only where Claude Code calls it, as the permission host (which hides it from
+// the model); a run without one never sees it.
+export const toolsFor = (kind: 'interactive' | 'scheduled', host = false) => [...(kind === 'scheduled' ? SCHEDULED_TOOLS : INTERACTIVE_TOOLS), HANDOFF_TOOL, ...(host ? [APPROVE_TOOL] : [])]
 
 const enc = encodeURIComponent
 
@@ -312,7 +316,7 @@ export function routeOf(name: string, a: any, kind: 'interactive' | 'scheduled')
 }
 
 async function call(name: string, args: any): Promise<{ text: string; isError: boolean }> {
-  if (!toolsFor(KIND).some(t => t.name === name)) throw new Error(`unknown tool ${name}`)
+  if (!toolsFor(KIND, HOST).some(t => t.name === name)) throw new Error(`unknown tool ${name}`)
   if (!SOCK || !TOKEN) throw new Error('the tasks server was started without the bridge socket or a token')
   const r = routeOf(name, args ?? {}, KIND)
   // The permission host's answer is the decision itself, as Claude Code reads it; one
@@ -337,7 +341,7 @@ async function handle(msg: any): Promise<void> {
     if (method === 'initialize') {
       send({ jsonrpc: '2.0', id, result: { protocolVersion: negotiate(params?.protocolVersion), capabilities: { tools: {} }, serverInfo: { name: 'xesious-tasks', version: '1.0.0' } } })
     } else if (method === 'tools/list') {
-      send({ jsonrpc: '2.0', id, result: { tools: toolsFor(KIND) } })
+      send({ jsonrpc: '2.0', id, result: { tools: toolsFor(KIND, HOST) } })
     } else if (method === 'tools/call') {
       const r = await call(params?.name, params?.arguments ?? {})
       send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: r.text }], ...(r.isError ? { isError: true } : {}) } })

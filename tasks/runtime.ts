@@ -409,6 +409,7 @@ export class TaskRuntime {
     let failed: StepResult | undefined
     let parked = false
     let canceled = false
+    let deferred: { retryAt?: Date } | undefined
     let done = 0
     this.stopping.delete(t.id)
     try {
@@ -424,12 +425,13 @@ export class TaskRuntime {
           answered = undefined
           if (this.stopping.has(t.id)) { canceled = true; break }
           if (o.parked) { parked = true; break }
+          if (o.deferred) { deferred = o.deferred; break }
           res = { step: at, name: st.name, ok: o.ok, ...(o.output ? { output: clipText(o.output, 8000) } : {}), ...(o.error ? { error: clipText(o.error, 600) } : {}), attempt, startedAt, endedAt: this.d.now().toISOString() }
           results = [...results, res]
           run = this.store.updateRun(run.id, { stepResults: results, stepAt: at })!
           if (res.ok) break
         }
-        if (parked || canceled) break
+        if (parked || canceled || deferred) break
         if (done > LIMITS.stepRunsMax) {
           failed = { step: at, name: st.name, ok: false, error: `it went round ${LIMITS.stepRunsMax} steps without finishing`, attempt: 1, startedAt: this.d.now().toISOString() }
           break
@@ -450,6 +452,7 @@ export class TaskRuntime {
         this.store.updateRun(run.id, { state: 'canceled', reason: 'stopped', endedAt: this.d.now().toISOString(), summary: stepsStrip(results) })
         this.d.cardChanged(this.store.updateTask(t.id, { lastMark: 'interrupted', lastRunAt: run.startedAt })!)
       } else if (parked) await this.parkSteps(t.id, run.id, results, at)
+      else if (deferred) await this.deferSteps(t.id, run.id, results, at, deferred.retryAt)
       else await this.settleSteps(t.id, run.id, results, failed)
     } finally {
       this.stopping.delete(t.id)
@@ -467,7 +470,7 @@ export class TaskRuntime {
     return n >= 1 && n <= count ? n : undefined
   }
 
-  private async runStep(t: Task, run: Run, call: StepCall): Promise<{ ok: boolean; output?: string; error?: string; parked?: boolean }> {
+  private async runStep(t: Task, run: Run, call: StepCall): Promise<{ ok: boolean; output?: string; error?: string; parked?: boolean; deferred?: { retryAt?: Date } }> {
     const st = call.step
     const ended = (o: ScriptOutcome) => o.code === 0 && !o.timedOut && !o.stopped
       ? { ok: true, output: o.out.trim() }
@@ -483,10 +486,12 @@ export class TaskRuntime {
         return this.d.runCodex ? ended(await this.d.runCodex(t, run, call)) : { ok: false, error: 'Codex is not available here' }
       case 'claude': {
         const o = await this.d.runClaude(t, run, call)
+        this.addUsage(run.id, o.usage, o.denials)
         // It stopped to ask someone: the plan waits with it.
         if (this.store.waitsForRun(run.id).some(w => w.state === 'parked')) return { ok: false, parked: true }
         if (o.canceled) return { ok: false, error: 'stopped' }
-        if (o.usageLimited) return { ok: false, error: 'the usage limit stopped it' }
+        // A usage limit isn't the step failing: the plan is deferred, as a run is.
+        if (o.usageLimited) return { ok: false, error: 'the usage limit stopped it', deferred: { retryAt: o.retryAt } }
         return o.ok ? { ok: true, output: o.text } : { ok: false, error: o.error ?? 'it ended without an answer' }
       }
       case 'ask': {
@@ -508,6 +513,44 @@ export class TaskRuntime {
     const text = `🪜 ${t.name}: ${stepsStrip(results, current)}${end ? `\n${end}` : ''}`
     const id = await this.safePost(t, 'progress', text, { loud: false, ...(run.progressMsg ? { edit: run.progressMsg } : {}) })
     if (id !== undefined && id !== run.progressMsg) this.store.updateRun(runId, { progressMsg: id })
+  }
+
+  // Stopped by the usage limit: deferred, not failed. The plan starts again at its next
+  // time; a one-off, once the limit has reset.
+  private async deferSteps(taskId: string, runId: string, results: StepResult[], at: number, retryAt?: Date): Promise<void> {
+    let t = this.store.getTask(taskId)!
+    await this.progress(t, runId, results, undefined, `⏳ the usage limit stopped step ${at}`)
+    const run = this.store.updateRun(runId, { state: 'deferred', reason: `stopped by the usage limit at step ${at}`, endedAt: this.d.now().toISOString(), summary: stepsStrip(results), stepAt: at, stepResults: results })!
+    this.rearmOneOff(t, run, retryAt)
+    t = this.store.updateTask(t.id, { lastMark: 'deferred', lastRunAt: run.startedAt })!
+    this.d.activity(t, `⏳ ${t.name}: deferred by the usage limit, at step ${at}`)
+    this.d.cardChanged(t)
+    this.arm()
+  }
+
+  // A one-off the usage limit stopped would never run otherwise: tried again once the
+  // limit has reset (a minute after, if the CLI said when), inside its window.
+  private rearmOneOff(t: Task, run: Run, retryAt?: Date): void {
+    if (t.trigger.kind !== 'at' || t.state !== 'active' || t.nextDue) return
+    const slot = new Date(run.slot ?? t.trigger.at).getTime()
+    const retry = retryAt ? retryAt.getTime() + 60_000 : this.d.now().getTime() + DEFERRED_RETRY_MS
+    if (retry - slot < LIMITS.oneOffGraceMs) this.store.updateTask(t.id, { nextDue: new Date(retry).toISOString() })
+  }
+
+  // What a plan's Claude steps cost, and what the permission mode blocked in them:
+  // added up on the run, as one run's are.
+  private addUsage(runId: string, u?: Usage, denials?: string[]): void {
+    if (!u && !denials?.length) return
+    const run = this.store.getRun(runId)
+    if (!run) return
+    const add = (a?: number, b?: number) => a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0)
+    const c = run.usage ?? {}
+    const usage: Usage | undefined = u ? {
+      model: u.model ?? c.model, inputTokens: add(c.inputTokens, u.inputTokens), outputTokens: add(c.outputTokens, u.outputTokens),
+      cacheReadTokens: add(c.cacheReadTokens, u.cacheReadTokens), cacheWriteTokens: add(c.cacheWriteTokens, u.cacheWriteTokens),
+      costUsd: add(c.costUsd, u.costUsd), turns: add(c.turns, u.turns), durationMs: add(c.durationMs, u.durationMs),
+    } : undefined
+    this.store.updateRun(runId, { ...(usage ? { usage } : {}), ...(denials?.length ? { denials: [...(run.denials ?? []), ...denials] } : {}) })
   }
 
   // Stopped at a question nobody has answered yet: the answer carries it on from the
@@ -798,13 +841,7 @@ export class TaskRuntime {
 
     if (o.usageLimited) {
       run = this.store.updateRun(run.id, { ...base, state: 'deferred', reason: 'stopped by the usage limit' })!
-      // A one-off would never run otherwise: try again once the limit has reset (a
-      // minute after, if the CLI said when), inside its window.
-      if (t.trigger.kind === 'at' && t.state === 'active' && !t.nextDue) {
-        const slot = new Date(run.slot ?? t.trigger.at).getTime()
-        const retry = o.retryAt ? o.retryAt.getTime() + 60_000 : this.d.now().getTime() + DEFERRED_RETRY_MS
-        if (retry - slot < LIMITS.oneOffGraceMs) t = this.store.updateTask(t.id, { nextDue: new Date(retry).toISOString() })!
-      }
+      this.rearmOneOff(t, run, o.retryAt)
       t = this.store.updateTask(t.id, { lastMark: 'deferred', lastRunAt: run.startedAt })!
       this.d.activity(t, `⏳ ${t.name}: deferred by the usage limit`)
       this.d.cardChanged(t)

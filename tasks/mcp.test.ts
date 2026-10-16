@@ -70,9 +70,12 @@ describe('the tasks MCP server', () => {
   test('a person\'s run gets the task and topic tools; a scheduled run gets report, notify and its own task', async () => {
     const a = server('interactive', { kind: 'run', chat: '-100777', person: '1', runKind: 'interactive' })
     const names = (await a.rpc('tools/list')).result.tools.map((t: any) => t.name)
-    expect(names).toEqual(['task_create', 'task_list', 'task_get', 'task_update', 'task_pause', 'task_resume', 'task_delete', 'task_run_now', 'topic_list', 'topic_create', 'topic_rename', 'topic_set_cwd', 'handoff', 'approve'])
+    expect(names).toEqual(['task_create', 'task_list', 'task_get', 'task_update', 'task_pause', 'task_resume', 'task_delete', 'task_run_now', 'topic_list', 'topic_create', 'topic_rename', 'topic_set_cwd', 'handoff'])
     a.close()
-    expect(toolsFor('scheduled').map(t => t.name)).toEqual(['task_create', 'task_propose', 'report', 'ask', 'notify', 'task_get', 'task_pause', 'task_done', 'handoff', 'approve'])
+    expect(toolsFor('scheduled').map(t => t.name)).toEqual(['task_create', 'task_propose', 'report', 'ask', 'notify', 'task_get', 'task_pause', 'task_done', 'handoff'])
+    // approve is there only for a run that is the permission host, where Claude Code calls it.
+    expect(toolsFor('interactive', true).map(t => t.name).at(-1)).toBe('approve')
+    expect(toolsFor('scheduled', true).map(t => t.name).at(-1)).toBe('approve')
     // The descriptions steer away from the CLI's own to-do list and session crons.
     expect(toolsFor('interactive')[0].description).toContain('NOT TaskCreate')
     expect(toolsFor('interactive')[0].description).toContain('CronCreate')

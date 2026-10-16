@@ -30,6 +30,7 @@ export interface Scope {
   jobId?: string         // the bridge's job for this run, so a wait on a person can hold its watchdog
   handoffDepth?: number  // a run that a hand-off started: how deep in a chain of them it is
   handoffId?: string     // …and which hand-off that is
+  host?: boolean         // the run is the permission host: its approve calls are Claude Code's
 }
 
 export class TokenRegistry {

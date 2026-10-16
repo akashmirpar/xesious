@@ -108,6 +108,12 @@ export function taskView(t: Task, runs: Run[] = []) {
     ...(t.trigger.kind === 'webhook' ? { webhook: { fire: `bun tasks/cli.ts fire ${t.id} "<payload>"`, http_path: `/hook/${t.id}/${t.trigger.secret}` } } : {}),
     topic: t.thread, runs_done: t.runsDone,
     last_run: last ? { when: whenText(new Date(last.startedAt ?? last.slot ?? Date.now()), t.tz), result: markOf(last), summary: last.summary, error: last.state === 'failed' ? last.reason : undefined } : undefined,
+    // One task asked for: what its runs did lately, for "what did it do this week?" and
+    // for a watchdog reading the tasks it watches.
+    ...(runs.length > 1 ? { recent_runs: runs.filter(r => r.state !== 'queued').slice(0, 10).map(r => ({
+      when: whenText(new Date(r.startedAt ?? r.slot ?? Date.now()), t.tz), trigger: r.trigger, result: markOf(r),
+      ...(r.summary ? { summary: r.summary.slice(0, 300) } : {}), ...(r.reason && r.state !== 'succeeded' ? { why: r.reason.slice(0, 300) } : {}),
+    })) } : {}),
   }
 }
 
@@ -619,7 +625,7 @@ export class TaskService {
   get(scope: Scope, id: string): Result<ReturnType<typeof taskView>> {
     const v = this.visible(scope, id, true)
     if (!v.ok) return err(v.status, v.error)
-    return ok(taskView(v.value, this.store.runsFor(v.value.id, 5)))
+    return ok(taskView(v.value, this.store.runsFor(v.value.id, 10)))
   }
 
   list(scope: Scope, where: 'topic' | 'chat' | undefined, chat?: string): Result<ReturnType<typeof taskView>[]> {

@@ -264,6 +264,21 @@ describe('watchers', () => {
     expect(k).toMatchObject({ action: { kind: 'none' }, says: 'problems' })
   })
 
+  test("one task, asked for: what its runs did lately; a list shows only each one's last", () => {
+    const t = create({ prompt: 'Back up the photos', cron: '0 3 * * *' })
+    store.insertRun({ id: `${t.id}@1`, task: t.id, trigger: 'schedule', state: 'succeeded', startedAt: '2026-10-14T01:00:00.000Z', summary: 'backed up 120 files' })
+    store.insertRun({ id: `${t.id}@2`, task: t.id, trigger: 'schedule', state: 'failed', startedAt: '2026-10-15T01:00:00.000Z', reason: 'the disk was full' })
+    store.insertRun({ id: `${t.id}@3`, task: t.id, trigger: 'manual', state: 'succeeded', startedAt: '2026-10-15T09:00:00.000Z', summary: 'backed up 2 files' })
+    const v = svc.get(person, t.id)
+    expect(v.ok && (v.value as any).recent_runs).toEqual([
+      { when: 'Thu 15 Oct, 11:00', trigger: 'manual', result: 'quiet', summary: 'backed up 2 files' },
+      { when: 'Thu 15 Oct, 03:00', trigger: 'schedule', result: 'failed', why: 'the disk was full' },
+      { when: 'Wed 14 Oct, 03:00', trigger: 'schedule', result: 'quiet', summary: 'backed up 120 files' },
+    ])
+    const l = svc.list(person, {})
+    expect(l.ok && (l.value as any[]).find(x => x.id === t.id).recent_runs).toBeUndefined()
+  })
+
   test("its limits are its own; the view shows them, with what it saw", () => {
     const t = create({ watch: { command: 'python3 price.py' }, prompt: 'Find out why', cooldown_minutes: 15, max_per_hour: 4, stale_minutes: 5 })
     expect(t.limits).toEqual({ cooldownMs: 900_000, maxPerHour: 4, staleMs: 300_000 })
