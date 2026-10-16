@@ -211,3 +211,8 @@ test('a plan on its card, and how its run went', () => {
   expect(card).toContain('runs a plan of 2 steps')
   expect(card).toContain('1. fetch (command)\n2. fix (Codex)')
 })
+
+test('how a task links to the rest, in a list line', () => {
+  const t = task({ name: 'Translate', trigger: { kind: 'after', task: 'r1', name: 'Report', on: 'success' }, nextDue: undefined, then: { thread: 9, topicName: 'Posting' }, parent: 'p1', parentName: 'Research' })
+  expect(listLine(t, [])).toBe('· ↪️ <b>Translate</b> — after “Report” works · then → Posting · made by Research')
+})

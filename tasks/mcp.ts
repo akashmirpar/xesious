@@ -66,6 +66,12 @@ const WATCH_PROPS = {
     },
     required: ['op'],
   },
+  after: {
+    type: 'object',
+    description: 'Instead of a time or a watcher: run after another task of this chat, given what its run gave. on: success (it worked, the default), noteworthy (it posted something), failure, or any. "When the nightly report is done, translate it", "when the backup fails, find out why".',
+    properties: { task: { type: 'string', description: 'Its id or name.' }, on: { type: 'string', enum: ['success', 'noteworthy', 'failure', 'any'] } },
+    required: ['task'],
+  },
   then: {
     type: 'object',
     description: "Optional, for a prompt or a script: when a run succeeds, hand its result, and the files it made, to another topic of this group, which carries on there (\"when the video is ready, the Posting topic publishes it\"). handoff_to: the topic (id or name). brief: what that topic should do with it. Give null to remove it.",
@@ -221,6 +227,16 @@ const APPROVE_TOOL = {
 
 const SCHEDULED_TOOLS = [
   {
+    name: 'task_create',
+    description: "Make a child task of this one: something to do later or again, for a while (\"look again in two hours\", \"check this page every 10 minutes until it changes\"), the same fields as for any task. At most 3 at a time, made two levels deep at most; it ends when this task does, or within a week. For one that should outlast this task, use task_propose.",
+    inputSchema: { type: 'object', properties: TASK_FIELDS, required: ['tz'] },
+  },
+  {
+    name: 'task_propose',
+    description: 'Suggest a task that would outlast this one, for a person to create with a tap: the same fields as task_create. It is posted with Create and No.',
+    inputSchema: { type: 'object', properties: TASK_FIELDS, required: ['tz'] },
+  },
+  {
     name: 'report',
     description: "Say what this run found or did, once, before you finish. notify: true to post it (the bot posts text if you give one, otherwise your summary), false to stay silent, for example when a check found nothing new. Whether anything is posted also follows the task's own setting, and failures are reported by the bot itself. outcome: nothing_new, done, progress, blocked (you couldn't do it; say why in the summary) or needs_attention.",
     inputSchema: {
@@ -270,6 +286,7 @@ export function routeOf(name: string, a: any, kind: 'interactive' | 'scheduled')
   const { id: _drop, ...rest } = a ?? {}
   switch (name) {
     case 'task_create': return { method: 'POST', path: '/v1/tasks', body: rest }
+    case 'task_propose': return { method: 'POST', path: '/v1/tasks/propose', body: rest }
     case 'task_list': return { method: 'GET', path: `/v1/tasks${a?.where ? `?where=${enc(a.where)}` : ''}` }
     case 'task_get': return { method: 'GET', path: `/v1/tasks/${self && a?.id ? enc(String(a.id)) : tid}` }
     case 'task_update': return { method: 'PATCH', path: `/v1/tasks/${tid}`, body: rest }

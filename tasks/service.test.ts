@@ -256,7 +256,7 @@ describe('watchers', () => {
     expect(e({ watch: {}, message: 'x' })).toContain('watch needs command')
     expect(e({ watch: { command: 'x' } })).toContain('a watcher needs message')
     expect(e({ watch: { command: 'x', every_minutes: 0.5 }, message: 'x' })).toContain('at least 1')
-    expect(e({ watch: { command: 'x' }, in_minutes: 5, message: 'x' })).toContain('not both')
+    expect(e({ watch: { command: 'x' }, in_minutes: 5, message: 'x' })).toContain('give one of: a time')
     expect(e({ keep_running: true, in_minutes: 5 })).toContain('keep_running is for a watcher')
     expect(e({ watch: { command: 'x' }, message: 'x', cooldown_minutes: -1 })).toContain('cooldown_minutes is between')
     expect(e({ watch: { command: 'x' }, message: 'x', max_per_hour: 500 })).toContain('max_per_hour')
@@ -426,5 +426,45 @@ describe('plans', () => {
     expect(t.name).toBe('Plan: tests, fix')
     const v = svc.get(person, t.id)
     expect(v.ok && (v.value as any).steps.map((x: any) => x.step)).toEqual([1, 2])
+  })
+})
+
+describe('after, child tasks and proposals', () => {
+  const run = (t: Task): Scope => ({ kind: 'run', chat: t.chat, thread: t.thread, person: t.owner, personName: t.ownerName, runKind: 'scheduled', taskId: t.id, runId: `${t.id}@1` })
+
+  test('after another task: by id or name, on what; no slots of its own; never round in a circle', () => {
+    const report = create({ name: 'Nightly report', prompt: 'Report', cron: '7 21 * * *' })
+    const tr = create({ name: 'Translate it', prompt: 'Translate the report', after: { task: 'nightly report' } })
+    expect(tr.trigger).toEqual({ kind: 'after', task: report.id, name: 'Nightly report', on: 'success' })
+    expect(tr.nextDue).toBeUndefined()
+    const loop = svc.update(person, report.id, { after: { task: tr.id } })
+    expect(loop.ok ? '' : loop.error).toContain('would go round forever')
+    const e = svc.create(person, { tz: 'UTC', prompt: 'x', after: { task: report.id, on: 'sometimes' as any } })
+    expect(e.ok ? '' : e.error).toContain('after.on is')
+  })
+
+  test("a task's run makes child tasks: at most three, two levels, ending with it or within a week", () => {
+    const parent = create({ name: 'Research', prompt: 'Look into it', cron: '7 9 * * *', until: '2026-10-19 12:00' })
+    const kid = svc.create(run(parent), { tz: 'Europe/Berlin', prompt: 'Look again', every_minutes: 120 })
+    expect(kid.ok && kid.value.task).toMatchObject({ parent: parent.id, parentName: 'Research', childDepth: 1, createdBy: `run:${parent.id}@1`, until: parent.until })
+    const free = create({ name: 'Free', prompt: 'x', cron: '7 8 * * *' })
+    const kid2 = svc.create(run(free), { tz: 'UTC', prompt: 'later', in_minutes: 60 * 24 * 30 })
+    expect(kid2.ok && kid2.value.task.until).toBe(new Date(now.getTime() + 7 * 24 * 3600_000).toISOString())
+    for (const m of [2, 3]) expect(svc.create(run(parent), { tz: 'UTC', prompt: `again ${m}`, every_minutes: 60 * m }).ok).toBe(true)
+    const fourth = svc.create(run(parent), { tz: 'UTC', prompt: 'one more', every_minutes: 300 })
+    expect(fourth.ok ? '' : fourth.error).toContain('3 child tasks already')
+    const grand = svc.create(run((kid as any).value.task), { tz: 'UTC', prompt: 'deeper', in_minutes: 30 })
+    expect(grand.ok && grand.value.task.childDepth).toBe(2)
+    const great = svc.create(run((grand as any).value.task), { tz: 'UTC', prompt: 'deeper still', in_minutes: 30 })
+    expect(great.ok ? '' : great.error).toContain('2 levels at most')
+  })
+
+  test('a proposal is checked, not made', () => {
+    const before = store.listTasks().length
+    const c = svc.check(person, { tz: 'UTC', name: 'Weekly sum-up', prompt: 'Sum up the week', cron: '7 17 * * 5' })
+    expect(c.ok && c.value.task).toMatchObject({ id: 'proposal', name: 'Weekly sum-up' })
+    expect(store.listTasks().length).toBe(before)
+    const bad = svc.check(person, { tz: 'UTC', prompt: 'x' })
+    expect(bad.ok).toBe(false)
   })
 })

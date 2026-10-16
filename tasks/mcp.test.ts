@@ -72,7 +72,7 @@ describe('the tasks MCP server', () => {
     const names = (await a.rpc('tools/list')).result.tools.map((t: any) => t.name)
     expect(names).toEqual(['task_create', 'task_list', 'task_get', 'task_update', 'task_pause', 'task_resume', 'task_delete', 'task_run_now', 'topic_list', 'topic_create', 'topic_rename', 'topic_set_cwd', 'handoff', 'approve'])
     a.close()
-    expect(toolsFor('scheduled').map(t => t.name)).toEqual(['report', 'ask', 'notify', 'task_get', 'task_pause', 'task_done', 'handoff', 'approve'])
+    expect(toolsFor('scheduled').map(t => t.name)).toEqual(['task_create', 'task_propose', 'report', 'ask', 'notify', 'task_get', 'task_pause', 'task_done', 'handoff', 'approve'])
     // The descriptions steer away from the CLI's own to-do list and session crons.
     expect(toolsFor('interactive')[0].description).toContain('NOT TaskCreate')
     expect(toolsFor('interactive')[0].description).toContain('CronCreate')

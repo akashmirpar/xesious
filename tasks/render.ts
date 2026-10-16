@@ -43,6 +43,7 @@ export function scheduleText(t: Trigger, tz: string): string {
     case 'every': return `every ${durationText(t.everyMs)}`
     case 'cron': return cronText(t.expr)
     case 'watch': return t.everyMs ? `checks every ${durationText(t.everyMs)}` : 'watches continuously'
+    case 'after': return `after “${t.name}” ${({ success: 'works', noteworthy: 'posts something', failure: 'fails', any: 'runs' } as const)[t.on]}`
   }
 }
 
@@ -87,6 +88,7 @@ export function elapsedText(ms: number): string {
 export function kindLabel(t: Task): string {
   if (t.action.kind === 'digest') return '📋 Digest'
   if (t.action.kind === 'steps') return '🪜 Plan'
+  if (t.trigger.kind === 'after') return '↪️ After'
   if (t.trigger.kind === 'watch') return '👀 Watch'
   return t.action.kind === 'message' ? '🔔 Reminder' : '⏰ Scheduled'
 }
@@ -189,6 +191,7 @@ export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchSt
   if (t.action.kind === 'script') lines.push(`${isWatch ? 'Then runs ' : ''}<code>${esc(clip(t.action.command, 200))}</code>`)
   if (related?.length) lines.push(`${t.action.kind === 'digest' ? 'Lists' : 'Watches'}: ${related.map(n => `<b>${esc(n)}</b>`).join(', ')}`)
   if (t.then) lines.push(`Then hands its result to <b>${esc(t.then.topicName ?? (t.then.thread === undefined ? 'General' : `topic ${t.then.thread}`))}</b>`)
+  if (t.parent) lines.push(`Made by the task <b>${esc(t.parentName ?? t.parent)}</b>; it ends when that one does`)
   if (t.action.kind === 'steps') lines.push(...t.action.steps.map((st, i) => esc(stepLine(st, i + 1))))
   if (t.ai) {
     const n = t.filterSeen ? ` · ${t.filterSeen.toLocaleString('en-US')} considered, ${(t.filterPassed ?? 0).toLocaleString('en-US')} let through` : ''
@@ -234,8 +237,13 @@ export function listLine(t: Task, runs: Run[]): string {
   const last = runs.find(r => r.state !== 'queued')
   const mark = t.state === 'paused' ? '⏸' : last ? MARK[markOf(last)] : '·'
   const when = t.state === 'active' && t.nextDue && t.trigger.kind !== 'watch' ? ` · next ${tgTime(new Date(t.nextDue), t.tz)}` : t.state === 'paused' ? ' · paused' : ''
-  const kind = t.trigger.kind === 'watch' ? '👀' : t.action.kind === 'message' ? '🔔' : '⏰'
-  return `${mark} ${kind} <b>${esc(t.name)}</b> — ${esc(scheduleText(t.trigger, t.tz))}${when}`
+  const kind = t.action.kind === 'steps' ? '🪜' : t.trigger.kind === 'after' ? '↪️' : t.trigger.kind === 'watch' ? '👀' : t.action.kind === 'message' ? '🔔' : '⏰'
+  // How it links to the rest: where it hands on, who made it.
+  const flow = [
+    t.then ? ` · then → ${esc(t.then.topicName ?? 'another topic')}` : '',
+    t.parent ? ` · made by ${esc(t.parentName ?? t.parent)}` : '',
+  ].join('')
+  return `${mark} ${kind} <b>${esc(t.name)}</b> — ${esc(scheduleText(t.trigger, t.tz))}${when}${flow}`
 }
 
 // A list of tasks, numbered: one topic's, or a whole group's under its topics. As

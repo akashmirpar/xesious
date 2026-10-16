@@ -831,3 +831,46 @@ describe('plans', () => {
     expect(store.runsFor(t.id)[0]).toMatchObject({ state: 'canceled', reason: 'stopped' })
   })
 })
+
+describe('after, and child tasks', () => {
+  const after = (source: Task, on: any, over: Partial<Task> = {}) => mk({
+    name: 'Follow-up', trigger: { kind: 'after', task: source.id, name: source.name, on }, nextDue: undefined, ...over,
+  })
+
+  test('a task runs after another when its run meets the condition, given that run', async () => {
+    const seen: Run[] = []
+    claude = async (t, r) => { seen.push(r); return t.name === 'Report' ? { ...OK('The report.'), } : OK('Translated.') }
+    const report = mk({ name: 'Report' })
+    const onWork = after(report, 'success', { name: 'Translate' })
+    const onFail = after(report, 'failure', { name: 'Fix', action: { kind: 'claude', prompt: 'Find out why', session: 'fresh' } })
+    await tick()
+    expect(seen.map(r => r.task)).toEqual([report.id, onWork.id])
+    expect(seen[1]).toMatchObject({ trigger: 'after', after: { task: report.id, name: 'Report', outcome: 'noteworthy', depth: 1 } })
+    expect(store.runsFor(onFail.id)).toEqual([])
+  })
+
+  test('a failure sets off what waits for one; a chain of them stops at five', async () => {
+    claude = async () => ({ ok: false, text: '', error: 'boom' })
+    const a = mk({ name: 'A' })
+    const b = after(a, 'failure', { name: 'B' })
+    await tick()
+    expect(store.runsFor(b.id)[0]).toMatchObject({ trigger: 'after', after: { outcome: 'failure' } })
+    // Five deep already: no sixth.
+    const c = after(b, 'any', { name: 'C' })
+    const deep = { id: `${b.id}@deep`, task: b.id, trigger: 'after', state: 'failed', after: { task: a.id, run: 'x', name: 'A', outcome: 'failure', depth: 5 } } as Run
+    store.insertRun(deep)
+    ;(rt as any).fireAfter(store.getTask(b.id)!, deep)
+    await rt.idle()
+    expect(store.runsFor(c.id).filter(r => r.after?.depth === 6)).toEqual([])
+  })
+
+  test('a child ends when its parent does, and says why', async () => {
+    const parent = mk({ name: 'Parent' })
+    const kid = mk({ name: 'Kid', parent: parent.id, parentName: 'Parent', childDepth: 1, nextDue: '2026-10-20T00:00:00.000Z' })
+    store.updateTask(parent.id, { state: 'deleted' })
+    rt.sync()
+    await rt.idle()
+    expect(store.getTask(kid.id)!.state).toBe('expired')
+    expect(posts.find(p => p.task === kid.id)!.text).toContain('it was made by "Parent", which has ended')
+  })
+})

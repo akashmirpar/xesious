@@ -5154,6 +5154,42 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     expect(calls.slice(before).some(c => textOf(c).includes('codex did it: Implement the spec') && !textOf(c).startsWith('🪜'))).toBe(true)
   }, 30000)
 
+  test("a task's run makes a child task through the real tasks server; one that would outlast it is proposed, and a tap makes it", async () => {
+    const parent = make({ name: 'Research', cron: '7 9 * * *', prompt: 'MCPTASK task_create {"name":"Look again","prompt":"Look again later","in_minutes":120,"tz":"UTC"}' }, scopeOf(C, 501))
+    T().runtime.runNow(parent.id)
+    await waitFor(() => T().store.listTasks({ chat: String(C) }).some((x: any) => x.name === 'Look again'), 15000)
+    const kid = T().store.listTasks({ chat: String(C) }).find((x: any) => x.name === 'Look again')!
+    expect(kid).toMatchObject({ parent: parent.id, parentName: 'Research', childDepth: 1, owner: '1' })
+    expect(kid.createdBy).toStartWith(`run:${parent.id}@`)
+    await waitFor(() => T().store.runsFor(parent.id).some((r: any) => r.state !== 'queued' && r.state !== 'running'), 15000)
+
+    const before = calls.length
+    const asks = make({ name: 'Ideas', cron: '7 8 * * *', prompt: 'MCPTASK task_propose {"name":"Weekly sum-up","prompt":"Sum up the week","cron":"7 17 * * 5","tz":"UTC"}' }, scopeOf(C, 501))
+    T().runtime.runNow(asks.id)
+    await waitFor(() => calls.slice(before).some(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('💡')), 15000)
+    const prop = calls.slice(before).find(c => c.method === 'sendMessage' && String(c.payload.text).startsWith('💡'))!
+    expect(String(prop.payload.text)).toContain('<b>Ideas</b> suggests a task:\n⏰ Scheduled: <b>Weekly sum-up</b>')
+    expect(T().store.listTasks({ chat: String(C) }).some((x: any) => x.name === 'Weekly sum-up')).toBe(false)
+    const cs = await press(prop.payload.reply_markup.inline_keyboard[0][0].callback_data, C, 501)
+    expect(answers(cs)).toContain('Made.')
+    const made = T().store.listTasks({ chat: String(C) }).find((x: any) => x.name === 'Weekly sum-up')!
+    expect(made).toMatchObject({ owner: '1', createdBy: 'person:1' })
+    expect(made.parent).toBeUndefined()
+    await waitFor(() => T().store.runsFor(asks.id).some((r: any) => r.state !== 'queued' && r.state !== 'running'), 15000)
+  }, 40000)
+
+  test('a task that runs after another: when that one works, it runs, told what it gave', async () => {
+    const report = make({ name: 'Report', cron: '7 21 * * *', prompt: 'Write the report' }, scopeOf(C, 501))
+    const tr = make({ name: 'Translate', prompt: 'Translate it', after: { task: 'Report' } }, scopeOf(C, 501))
+    expect(T().store.getTask(tr.id).trigger).toMatchObject({ kind: 'after', task: report.id, on: 'success' })
+    T().runtime.runNow(report.id)
+    await waitFor(() => T().store.runsFor(tr.id).some((r: any) => r.state === 'succeeded'), 20000)
+    const p = readFileSync(LAST_PROMPT, 'utf8')
+    expect(p).toContain('set off by a run of the task "Report"')
+    expect(p).toContain(`The run of the task "Report" (id ${report.id}) that set this one off worked`)
+    expect(p).toMatch(/message from Ada, id 1:\nTranslate it$/)
+  }, 30000)
+
   test('the activity topic can be turned off for a group', async () => {
     const G = -100999
     bridge._groupSettings()[String(G)] = { ...(bridge._groupSettings()[String(G)] ?? {}), activityTopic: false }

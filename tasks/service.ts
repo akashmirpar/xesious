@@ -10,7 +10,7 @@
  *     cannot create tasks yet (child tasks come with hand-offs, in phase 4);
  *   - the operator token (scripts on the host) can read and pause anything.
  */
-import { LIMITS, eventLimits, isStreaming, type EventLimits, type ReportOutcome, type Run, type Says, type Sound, type Step, type Task, type Trigger } from './model'
+import { LIMITS, eventLimits, hasNoSlots, isStreaming, type EventLimits, type ReportOutcome, type Run, type Says, type Sound, type Step, type Task, type Trigger } from './model'
 import type { TaskStore } from './store'
 import { firstDue, isValidTz, parseLocalTime, parseWhen, type WhenInput } from './schedule'
 import type { Scope } from './api'
@@ -39,6 +39,7 @@ export interface TaskInput extends WhenInput {
   topic?: string | number // task_create: the topic it lives in, when not the caller's
   then?: { handoff_to?: string; brief?: string } | null   // on success, its result handed to this topic
   steps?: any[]           // a plan: steps with gates (checked here, step by step)
+  after?: { task?: string; on?: 'success' | 'noteworthy' | 'failure' | 'any' } | null  // runs after another task's run
   digest?: { of?: string[] } | boolean   // a list of what tasks did, no AI
   rule?: any              // filters.ruleError says what it may be; null removes it
   ai_filter?: { question?: string; every_minutes?: number } | null
@@ -155,9 +156,22 @@ export class TaskService {
 
     const timeGiven = ['at', 'in_minutes', 'every_minutes', 'cron'].some(k => (input as any)[k] !== undefined && (input as any)[k] !== null && (input as any)[k] !== '')
     const watchGiven = input.watch !== undefined && input.watch !== null && (input.watch as any) !== ''
-    if (watchGiven && timeGiven) return err(400, 'give watch or a time (at, in_minutes, every_minutes, cron), not both')
+    const afterGiven = input.after !== undefined && input.after !== null
+    if ([watchGiven, timeGiven, afterGiven].filter(Boolean).length > 1) return err(400, 'give one of: a time (at, in_minutes, every_minutes, cron), watch, or after')
     let trigger = base?.trigger
-    if (watchGiven) {
+    if (afterGiven) {
+      const ref = String(input.after!.task ?? '').trim()
+      const hit = this.store.getTask(ref) ?? this.store.listTasks({ chat }).find(x => x.name.trim().toLowerCase() === ref.toLowerCase())
+      if (!hit || hit.chat !== chat || hit.state === 'deleted') return err(404, `after: no task "${ref}" in this chat`)
+      if (base && hit.id === base.id) return err(400, "after: a task can't run after itself")
+      const on = input.after!.on ?? 'success'
+      if (!['success', 'noteworthy', 'failure', 'any'].includes(on)) return err(400, 'after.on is success, noteworthy, failure or any')
+      // One that runs after this, round and round, would never stop.
+      for (let x: Task | undefined = hit, n = 0; x?.trigger.kind === 'after' && n < 20; x = this.store.getTask(x.trigger.task), n++) {
+        if (base && x.trigger.task === base.id) return err(400, `after: "${hit.name}" already runs after this one; that would go round forever`)
+      }
+      trigger = { kind: 'after', task: hit.id, name: hit.name, on }
+    } else if (watchGiven) {
       const w = parseWatch(input.watch, now)
       if (w.error) return err(400, w.error)
       // The same command at the same pace keeps its anchor, so an edit doesn't move its checks.
@@ -416,9 +430,32 @@ export class TaskService {
     return ok(out)
   }
 
+  // What a task would be, checked but not made: a scheduled run's proposal of one that
+  // outlasts it, which a person then creates.
+  check(scope: Scope, input: TaskInput): Result<{ task: Task }> {
+    if (scope.kind !== 'run' || !scope.chat || !scope.person) return err(403, 'no chat')
+    const b = this.build(input, undefined, scope.chat)
+    if (!b.ok) return err(b.status, b.error)
+    if (!b.value.nextDue && !hasNoSlots(b.value)) return err(400, 'that time has already passed')
+    const now = this.deps.now().toISOString()
+    return ok({ task: { ...b.value, id: 'proposal', chat: scope.chat, thread: scope.thread, owner: scope.person, ownerName: scope.personName,
+      createdBy: `person:${scope.person}`, createdAt: now, updatedAt: now, state: 'active', runsDone: 0, failStreak: 0 } as Task })
+  }
+
   create(scope: Scope, input: TaskInput): Result<{ task: Task; duplicate?: boolean }> {
     if (scope.kind !== 'run' || !scope.chat || !scope.person) return err(403, 'tasks are created from a conversation, as the person who asked')
-    if (scope.runKind === 'scheduled') return err(403, "a scheduled run can't create tasks")
+    // A task's own run may make child tasks: a few, not deep, ending with it or within a
+    // week. One that should outlast it is proposed for a person to create.
+    let parent: Task | undefined
+    let depth = 0
+    if (scope.runKind === 'scheduled') {
+      parent = scope.taskId ? this.store.getTask(scope.taskId) : undefined
+      if (!parent) return err(403, "a scheduled run can't create tasks")
+      depth = (parent.childDepth ?? 0) + 1
+      if (depth > LIMITS.childDepthMax) return err(403, `a task made by a task's run can't make more (${LIMITS.childDepthMax} levels at most); propose it with task_propose for a person to create`)
+      const kids = this.store.listTasks({ chat: parent.chat, states: ['active', 'paused'] }).filter(x => x.parent === parent!.id)
+      if (kids.length >= LIMITS.childrenPerParent) return err(409, `this task has ${LIMITS.childrenPerParent} child tasks already; one has to finish first`)
+    }
     const why = this.deps.mayCreate(scope)
     if (why) return err(403, why)
     // Its home: the caller's topic, or another of this chat it was asked to live in.
@@ -430,7 +467,12 @@ export class TaskService {
     }
     const b = this.build(input, undefined, scope.chat)
     if (!b.ok) return err(b.status, b.error)
-    if (!b.value.nextDue && !isStreaming(b.value)) return err(400, 'that time has already passed')
+    if (!b.value.nextDue && !hasNoSlots(b.value)) return err(400, 'that time has already passed')
+    if (parent) {
+      const now = this.deps.now().getTime()
+      const ends = [b.value.until, parent.until, new Date(now + LIMITS.childMaxMs).toISOString()].filter(Boolean) as string[]
+      ;(b.value as any).until = ends.sort()[0]
+    }
     const dup = this.store.findDuplicate(scope.chat, thread, b.value)
     if (dup) return ok({ task: dup, duplicate: true })
     if (this.store.countInTopic(scope.chat, thread) >= LIMITS.tasksPerTopic) {
@@ -442,7 +484,8 @@ export class TaskService {
     }
     const task = this.store.createTask({
       ...b.value, chat: scope.chat, thread, owner: scope.person, ownerName: scope.personName,
-      createdBy: `person:${scope.person}`,
+      createdBy: parent ? `run:${scope.runId}` : `person:${scope.person}`,
+      ...(parent ? { parent: parent.id, parentName: parent.name, childDepth: depth } : {}),
     }, this.deps.now())
     this.deps.changed(task, 'created')
     return ok({ task }, 201)
@@ -458,7 +501,7 @@ export class TaskService {
     if (!b.ok) return err(b.status, b.error)
     const t = v.value
     const retimed = JSON.stringify(b.value.trigger) !== JSON.stringify(t.trigger) || b.value.tz !== t.tz
-    if (retimed && !b.value.nextDue && !isStreaming(b.value)) return err(400, 'that time has already passed')
+    if (retimed && !b.value.nextDue && !hasNoSlots(b.value)) return err(400, 'that time has already passed')
     const patch: Partial<Task> = { ...b.value }
     // A changed schedule replaces the old one; an unchanged one keeps its next slot.
     if (!retimed) patch.nextDue = t.nextDue
@@ -490,7 +533,7 @@ export class TaskService {
     const t = v.value
     if (t.state !== 'paused') return err(409, `it is ${t.state}, not paused`)
     const next = firstDue(t.trigger, t.tz, this.deps.now())
-    if (!next && !isStreaming(t)) return err(409, 'its time has passed while it was paused; give it a new time with task_update')
+    if (!next && !hasNoSlots(t)) return err(409, 'its time has passed while it was paused; give it a new time with task_update')
     const task = this.store.updateTask(t.id, {
       state: 'active', pauseReason: undefined, failStreak: 0, nextDue: next?.toISOString(),
       watchFails: undefined, watchError: undefined, watchRetryAt: undefined,
@@ -511,7 +554,7 @@ export class TaskService {
     if (t.state !== 'expired' && t.state !== 'active') return err(409, `it is ${t.state}`)
     const now = this.deps.now()
     const next = t.state === 'expired' ? firstDue(t.trigger, t.tz, now) : undefined
-    if (t.state === 'expired' && !next && !isStreaming(t)) return err(409, 'it has nothing left to run; give it a new time with task_update')
+    if (t.state === 'expired' && !next && !hasNoSlots(t)) return err(409, 'it has nothing left to run; give it a new time with task_update')
     const task = this.store.updateTask(t.id, {
       until: undefined, ...(t.state === 'expired' ? { state: 'active', nextDue: next?.toISOString(), watchFails: undefined, watchError: undefined, watchRetryAt: undefined } : {}),
     }, now)!

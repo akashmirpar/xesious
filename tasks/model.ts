@@ -23,6 +23,9 @@ export type Trigger =
   // run at anchor + k·everyMs, its output read when it exits. Without, it streams: kept
   // running, read as it prints. Every line it prints is an event.
   | { kind: 'watch'; command: string; everyMs?: number; anchor?: string }
+  // After another task's run: when it worked, when it posted something, when it failed,
+  // or any of these. That run's result comes with this one.
+  | { kind: 'after'; task: string; name: string; on: 'success' | 'noteworthy' | 'failure' | 'any' }
 
 export type Action =
   // For a watcher, {event} in the text is the line that set it off.
@@ -142,6 +145,9 @@ export interface Task {
   watchError?: string     // the last of them, in words
   watchRetryAt?: string   // a streaming watcher that died starts again from here
   then?: { thread?: number; topicName?: string; brief?: string }  // on success, its result handed to this topic
+  parent?: string         // a child task: the task whose run made it
+  parentName?: string
+  childDepth?: number     // 1 for a child, 2 for a child's child
   rule?: Rule
   ai?: AiFilter
   filterSeen?: number     // events the AI filter was asked about
@@ -158,7 +164,7 @@ export type RunState =
   | 'deferred'       // a usage limit stopped it; not a failure
   | 'waiting'        // it asked a question nobody has answered yet; an answer carries it on
 
-export type RunTrigger = 'schedule' | 'catchup' | 'manual' | 'event' | 'answer'
+export type RunTrigger = 'schedule' | 'catchup' | 'manual' | 'event' | 'answer' | 'after'
 
 // What a run says about itself through the report tool.
 export type ReportOutcome = 'nothing_new' | 'done' | 'progress' | 'blocked' | 'needs_attention'
@@ -196,6 +202,8 @@ export interface Run {
   events?: WatchEvent[]   // what set off an event run (the newest, at most eventsPerRun)
   folded?: number         // how many events it covers in all
   waitId?: string         // an answer run: the question it carries on from
+  // An after run: the run of the other task that set it off.
+  after?: { task: string; run: string; name: string; outcome: string; summary?: string; resultPath?: string; depth: number }
   stepAt?: number         // a plan's run: the step it is at (from 1)
   stepResults?: StepResult[]
   progressMsg?: number    // its progress message, edited as its steps go by
@@ -271,6 +279,11 @@ export const LIMITS = {
   handoffDepthMax: 3,
   handoffsPerHour: 30,               // per group
   handoffRunsAtOnce: 2,
+  // Child tasks, made by a task's own run:
+  childrenPerParent: 3,
+  childDepthMax: 2,
+  childMaxMs: 7 * 24 * 60 * 60_000,  // a child ends with its parent, or after this
+  afterDepthMax: 5,                  // tasks set off one after another
   // Plans:
   stepsMax: 12,
   stepRunsMax: 50,                   // step executions in one run, retries and loops included
@@ -296,3 +309,5 @@ export function eventLimits(t: Pick<Task, 'action' | 'limits'>): EventLimits {
 
 export const isWatch = (t: Pick<Task, 'trigger'>): t is Pick<Task, 'trigger'> & { trigger: Extract<Trigger, { kind: 'watch' }> } => t.trigger.kind === 'watch'
 export const isStreaming = (t: Pick<Task, 'trigger'>) => t.trigger.kind === 'watch' && !t.trigger.everyMs
+// No slots of its own: a streaming watcher, or a task that runs after another.
+export const hasNoSlots = (t: Pick<Task, 'trigger'>) => isStreaming(t) || t.trigger.kind === 'after'

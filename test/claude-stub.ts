@@ -326,10 +326,12 @@ async function callMcpTool(server: { command: string; args?: string[]; env?: Rec
     }
   })
   const write = (o: unknown) => child.stdin!.write(JSON.stringify({ jsonrpc: '2.0', ...(o as object) }) + '\n')
+  // Each call's time limit goes once it is answered: an armed timer would keep this
+  // process, and so the run, alive for its whole length after the result.
   const ask = (id: number, method: string, params: unknown) => new Promise<any>((resolve, reject) => {
-    waiting.set(id, resolve)
+    const timer = setTimeout(() => reject(new Error(`no answer to ${method}`)), 10_000)
+    waiting.set(id, m => { clearTimeout(timer); resolve(m) })
     write({ id, method, params })
-    setTimeout(() => reject(new Error(`no answer to ${method}`)), 10_000)
   })
   try {
     await ask(1, 'initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'claude-stub', version: '0' } })

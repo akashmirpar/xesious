@@ -711,9 +711,10 @@ export class TaskRuntime {
     let msgId: number | undefined
     let error: string | undefined
     const event = run.trigger === 'event'
+    const text = event ? eventText(t.action.text, run) : run.after ? t.action.text.split('{result}').join(run.after.summary ?? '') : t.action.text
     try {
-      msgId = await this.d.post(t, 'reminder', event ? eventText(t.action.text, run) : t.action.text,
-        { loud: t.sound === 'loud', lateMs: run.lateMs, buttons: event ? 'pause' : 'reminder', run })
+      msgId = await this.d.post(t, 'reminder', text,
+        { loud: t.sound === 'loud', lateMs: run.lateMs, buttons: event || run.after ? 'pause' : 'reminder', run })
       if (msgId === undefined) error = 'Telegram did not accept the message'
     } catch (e) {
       error = String((e as Error)?.message ?? e)
@@ -871,6 +872,30 @@ export class TaskRuntime {
     if (alert !== undefined) void this.safePost(t, 'alert', `✅ ${t.name} is working again.`, { loud: false, edit: alert })
     t = this.endIfFinished(t, t.nextDue ? new Date(t.nextDue) : undefined)
     this.d.cardChanged(t)
+    this.fireAfter(t, this.store.getRun(run.id) ?? run)
+  }
+
+  // The tasks that run after this one: each whose condition its run met starts, given
+  // that run. Works includes a run that posted; a chain of them stops at five.
+  private fireAfter(source: Task, run: Run): void {
+    const outcome = run.state === 'succeeded' ? (run.postedMsg ? 'noteworthy' : 'success') : run.state === 'failed' || run.state === 'timed_out' ? 'failure' : undefined
+    if (!outcome) return
+    const depth = (run.after?.depth ?? 0) + 1
+    for (const t of this.store.listTasks({ chat: source.chat, states: ['active'] })) {
+      if (t.trigger.kind !== 'after' || t.trigger.task !== source.id) continue
+      const on = t.trigger.on
+      if (!(on === 'any' || on === outcome || (on === 'success' && outcome === 'noteworthy'))) continue
+      if (depth > LIMITS.afterDepthMax) { this.d.log(`[tasks] ${t.id}: not run after ${source.id}, ${LIMITS.afterDepthMax} tasks set each other off already`); continue }
+      const now = this.d.now().getTime()
+      const id = `${t.id}@after-${now.toString(36)}.${randomBytes(3).toString('hex')}`
+      if (this.inFlight.has(t.id)) {
+        this.store.insertRun({ id, task: t.id, trigger: 'after', state: 'skipped', reason: `still running when "${source.name}" ended`, slot: new Date(now).toISOString() })
+        continue
+      }
+      const r: Run = { id, task: t.id, trigger: 'after', state: 'queued',
+        after: { task: source.id, run: run.id, name: source.name, outcome, summary: run.reportText ?? run.summary, resultPath: run.resultPath, depth } }
+      if (this.store.insertRun(r)) this.dispatch(t, r)
+    }
   }
 
   // A task with nothing left to run is done (one-off, or out of runs) or expired
@@ -891,10 +916,10 @@ export class TaskRuntime {
   }
 
   // Past its end date: it stops, and its topic is told, with a tap for another week.
-  private expire(t: Task): Task {
+  private expire(t: Task, why?: string): Task {
     const task = this.store.updateTask(t.id, { state: 'expired', nextDue: undefined, watchRetryAt: undefined })!
     if (isWatch(task)) { this.d.watchers?.stop(task.id); this.store.dropEvents(task.id) }
-    const until = task.until ? `: it was set to run until ${whenText(new Date(task.until), task.tz)}` : ''
+    const until = why ? `: ${why}` : task.until ? `: it was set to run until ${whenText(new Date(task.until), task.tz)}` : ''
     void this.safePost(task, 'notice', `⌛ ${task.name} has ended${until}.`, { loud: false, buttons: 'renew' })
     this.d.activity(task, `⌛ ${task.name} ended`)
     this.d.cardChanged(task)
@@ -910,6 +935,11 @@ export class TaskRuntime {
     const now = this.d.now().getTime()
     const want = new Map<string, Task>()
     for (const t of this.store.listTasks({ states: ['active'] })) {
+      // A child ends with its parent.
+      if (t.parent) {
+        const p = this.store.getTask(t.parent)
+        if (!p || p.state === 'deleted' || p.state === 'done' || p.state === 'expired') { this.expire(t, `it was made by "${t.parentName ?? 'a task'}", which has ended`); continue }
+      }
       if (!isWatch(t)) continue
       if (t.until && Date.parse(t.until) <= now) { this.expire(t); continue }
       // A watcher acts for its owner too: one who can no longer use the chat stops it.
@@ -1153,6 +1183,7 @@ export class TaskRuntime {
     }
     if (t.trigger.kind === 'at' && t.state === 'active' && !t.nextDue) t = this.store.updateTask(t.id, { state: 'done' })!
     this.d.cardChanged(t)
+    this.fireAfter(t, this.store.getRun(run.id) ?? run)
   }
 
   private async safePost(t: Task, kind: PostKind, text: string, opts: PostOpts): Promise<number | undefined> {
