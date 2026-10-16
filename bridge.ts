@@ -40,7 +40,7 @@ import {
   FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
   type FanoutPlanItem,
   frameUserMessage, attributionProfileLines,
-  SETTINGS, settingDef, resolveSetting, choiceLabel, normalizeUsername, canEditSettings, pinPendingEditor,
+  SETTINGS, TASK_SETTING_IDS, settingDef, resolveSetting, choiceLabel, normalizeUsername, canEditSettings, pinPendingEditor,
   DEFAULT_EDITORS, escapeHtml, type SettingDef,
   effectiveAnswers, effectiveRecords, foldRecords, contextParts, sinceMark, replyWindow, convLine, fitNewest,
   conversationPreamble, conversationFile, type ConvRecord, type Answers, type SettingValue, type SettingSource, type EditorPolicy, type EditorMode,
@@ -65,7 +65,7 @@ import { TaskRuntime, type ClaudeOutcome, type PostKind, type PostOpts } from '.
 import { TaskService, type Action as TaskAction } from './tasks/service'
 import { taskRoutes, type BridgeHandlers } from './tasks/routes'
 import { TokenRegistry, startApi, loadOperatorToken, reply, fail, type Scope, type ApiServer } from './tasks/api'
-import { whenText, elapsedText } from './tasks/render'
+import { whenText, elapsedText, cardHtml, historyHtml, listLine, scheduleText } from './tasks/render'
 import type { Task, Run } from './tasks/model'
 import type { RunUsage } from './lib'
 
@@ -211,6 +211,7 @@ function baseProfile(cwd: string, key: string): string {
     '- If a request is ambiguous or needs a decision, ask one clarifying question and stop.',
     '- Assume no editor or file selection is open. Ignore any IDE/editor framing from earlier in this conversation; the user is in a chat.',
     `- Files the user sends are saved in ./${inb}/. To send a file back, put it in ./${out}/ and it is delivered then cleared.`,
+    ...(TASKS ? ["- This bot can do things later or on a schedule and report here: reminders, and Claude runs at a time or again and again. When the person asks for that, use the xesious task_create tool, not TaskCreate (your private to-do list) or CronCreate. It can also create topics and set a topic's folder (topic_create, topic_set_cwd)."] : []),
     ...attributionProfileLines(BRIDGE_NONCE),
   ].join('\n')
 }
@@ -584,6 +585,8 @@ function serverDefault(id: string): SettingValue {
     case 'fanoutMax': return FANOUT_MAX
     case 'fanoutConcurrency': return FANOUT_CONCURRENCY
     case 'fanoutTopics': return FANOUT_TOPICS
+    case 'taskCreators': return /^admins?$/i.test(process.env.TG_TASK_CREATORS || '') ? 'admins' : 'everyone'
+    case 'activityTopic': return !/^(0|false|no|off)$/i.test(process.env.TG_TASKS_ACTIVITY || '')
   }
   throw new Error(`no server default for setting ${id}`)
 }
@@ -1961,6 +1964,8 @@ function homeScreen(tok: string, m: ConfigMenu, access: ConfigAccess, level: 'ba
   const where = m.isPrivate ? '' : `\nOpened in: ${topicTitle(key)}`
   const rows: Screen['kb']['inline_keyboard'] = SETTINGS
     .filter(d => d.level === level && !(m.isPrivate && d.kind === 'editors'))
+    // Task settings belong to groups, and only where the bot has tasks.
+    .filter(d => !TASK_SETTING_IDS.has(d.id) || (TASKS && !m.isPrivate))
     .map(d => [{ text: `${d.emoji} ${d.label}: ${valueText(d, key)}`, callback_data: cb(tok, `s${SETTINGS.indexOf(d)}`) }])
   // The context engine has its own page, in groups (a DM has no history to search).
   if (level === 'advanced' && !m.isPrivate) rows.unshift([{ text: '🔎 Context engine ›', callback_data: cb(tok, 'C') }])
@@ -2995,6 +3000,12 @@ function tasksMcpFor(ctx: Context, key: string, threadId: number | undefined, ro
   // name now, for the group memory that run is given.
   const title = (ctx.chat as any).title
   if (title && !ro.task) taskStore?.setMeta(`title:${ctx.chat.id}`, String(title))
+  // And whether it has topics: a task set up in General is still a forum's, and gets
+  // the activity topic.
+  if ((ctx.chat as any).is_forum && !ro.task && taskStore?.getMeta(`forum:${ctx.chat.id}`) !== '1') taskStore?.setMeta(`forum:${ctx.chat.id}`, '1')
+  // When only admins may create tasks here, know now whether this person is one: the
+  // check at task_create can't wait for Telegram.
+  if (!ro.task && ctx.chat.id < 0 && setting('taskCreators', keyFor(ctx.chat.id, undefined)) === 'admins') void isChatAdmin(ctx.chat.id, person.id)
   const scope: Scope = {
     kind: 'run', chat: String(ctx.chat.id), thread: threadId, person: String(person.id), personName: userName(person),
     runKind: ro.task ? 'scheduled' : 'interactive', ...(ro.task ? { taskId: ro.task.taskId, runId: ro.task.runId } : {}),
@@ -5497,6 +5508,8 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   } finally {
     // Put up for a run that then failed to start: nothing else would take it down.
     if (early && !early.job.child) await dropEarlyStatus(ctx, early)
+    // A folder this turn asked for (topic_set_cwd on its own topic), now that it is over.
+    if (!background) applyPendingCwd(ctx, threadId, key)
   }
 }
 
@@ -5858,7 +5871,7 @@ const privateInvites = new PrivateInvites()
 // Commands whose reply only informs the person asking: in a group they are answered
 // to that person alone (and registered hidden, so the room does not see the command
 // either). Those that change the topic for everyone stay visible.
-const HIDDEN_REPLIES = new Set(['/whoami', '/id', '/help', '/status', '/jobs', '/ps', '/live', '/recall', '/usage', '/cost', '/context'])
+const HIDDEN_REPLIES = new Set(['/whoami', '/id', '/help', '/status', '/jobs', '/ps', '/tasks', '/live', '/recall', '/usage', '/cost', '/context'])
 type PrivateSource = { chat: number; thread?: number; cwd: string; topic: string; group: string; origin?: string; reply?: ConvRecord }
 type DmSettings = { mode?: string; model?: string; effort?: string }
 
@@ -6891,6 +6904,42 @@ bot.on('message', async ctx => {
       .catch(e => console.error(`[error] bg ${key}: ${e}`))
     return
   }
+  if (cmd === '/tasks') {
+    if (!TASKS || !taskStore || !taskService) { await answer('Tasks are off on this bot (TG_TASKS).'); return }
+    const words = text.trim().split(/\s+/).slice(1).map(w => w.toLowerCase())
+    const me = ctx.from!
+    // /tasks pause all: an admin stopping every task in the group at once.
+    if (words[0] === 'pause' && words[1] === 'all') {
+      const admin = ctx.chat.type === 'private' || ALLOWED_USERS.has(String(me.id)) || await isChatAdmin(chatId, me.id)
+      if (!admin) { await answer('Only an admin can pause every task here.'); return }
+      const active = taskStore.listTasks({ chat: String(chatId), states: ['active'] })
+      for (const t of active) taskService.pause({ kind: 'run', chat: String(chatId), thread: t.thread, person: String(me.id), personName: userName(me), runKind: 'interactive' }, t.id)
+      await answer(active.length ? `Paused ${active.length} task${active.length === 1 ? '' : 's'}. Each one resumes from its card, or from /tasks.` : 'No active tasks to pause here.')
+      return
+    }
+    // In a topic, that topic's; in General, the whole group's; in a DM, the person's.
+    const inTopic = ctx.chat.type !== 'private' && threadId !== undefined
+    const list = taskStore.listTasks({ chat: String(chatId), ...(inTopic ? { thread: threadId } : {}), states: ['active', 'paused'] })
+    if (!list.length) {
+      await answer(`No tasks ${inTopic ? 'in this topic' : 'here'} yet. Ask for one in plain words: "remind me in two hours to…", "every weekday at 9, summarize…".`)
+      return
+    }
+    const shown = list.slice(0, 12)
+    const where = inTopic ? 'in this topic' : ctx.chat.type === 'private' ? 'here' : 'in this group'
+    const html = [`<b>Tasks ${where}</b>`, ...shown.map((t, i) => `${i + 1}. ${listLine(t, taskStore!.runsFor(t.id, 1))}`),
+      ...(list.length > shown.length ? [`…and ${list.length - shown.length} more`] : [])].join('\n')
+    const kb = { inline_keyboard: shown.slice(0, 8).map((t, i) => [
+      { text: `${i + 1}. ▶️ Run now`, callback_data: `tk:run:${t.id}` },
+      t.state === 'active' ? { text: '⏸ Pause', callback_data: `tk:pause:${t.id}` } : { text: '▶️ Resume', callback_data: `tk:resume:${t.id}` },
+      { text: '📜', callback_data: `tk:hist:${t.id}` },
+    ]) }
+    if (ctx.chat.type === 'private') {
+      await ctx.api.sendMessage(chatId, html, { parse_mode: 'HTML', reply_markup: kb, link_preview_options: { is_disabled: true } }).catch(e => console.error(`[tasks] /tasks: ${e}`))
+    } else {
+      await replyOnlyTo(ctx, threadId, html, kb, msg.message_id || undefined, ephemeralId, true, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } })
+    }
+    return
+  }
   if (cmd === '/jobs' || cmd === '/ps') {
     const running = jobsIn(key)
     const lines: string[] = []
@@ -7314,6 +7363,11 @@ bot.on('callback_query:data', async ctx => {
     return
   }
   if (data.startsWith('pva:')) { await continueAskInDm(ctx, data.slice(4)); return }
+  if (data.startsWith('tk:')) {
+    console.log(`[cb] ${data} chat=${ctx.chat?.id} from=${ctx.from?.id}`)
+    await handleTaskCallback(ctx, data)
+    return
+  }
   const key = keyFor(ctx.chat!.id, ctx.callbackQuery.message?.message_thread_id)
   // Every `[in]` line in the log is a message, so a tap used to be invisible: the log
   // could not tell "the button was never pressed" from "it was pressed and the run
@@ -7660,6 +7714,7 @@ const BOT_COMMANDS: { command: string; description: string; is_ephemeral?: boole
   { command: 'voice', description: 'Speak answers back' },
   { command: 'status', description: "This topic's session, directory and settings", is_ephemeral: true },
   { command: 'jobs', description: 'What is running here', is_ephemeral: true },
+  { command: 'tasks', description: 'What the bot does here on its own: reminders, schedules', is_ephemeral: true },
   { command: 'compact', description: "Summarize this topic's history" },
   { command: 'resume', description: 'Undo /new, or bind a past session' },
   { command: 'fork', description: 'Continue this conversation in a second topic' },
@@ -7677,11 +7732,13 @@ async function ensureCommands(): Promise<void> {
   try {
     const got: unknown = await bot.api.getMyCommands().catch(() => [])
     const now = Array.isArray(got) ? got : []
+    // /tasks only where the bot has tasks.
+    const commands = BOT_COMMANDS.filter(c => c.command !== 'tasks' || TASKS)
     const same = JSON.stringify(now.map(c => [c.command, c.description, !!(c as any).is_ephemeral])) ===
-      JSON.stringify(BOT_COMMANDS.map(c => [c.command, c.description, !!c.is_ephemeral]))
+      JSON.stringify(commands.map(c => [c.command, c.description, !!c.is_ephemeral]))
     if (same) return
-    await bot.api.setMyCommands(BOT_COMMANDS)
-    console.log(`[ok] registered ${BOT_COMMANDS.length} commands (hidden: ${BOT_COMMANDS.filter(c => c.is_ephemeral).map(c => '/' + c.command).join(' ')})`)
+    await bot.api.setMyCommands(commands)
+    console.log(`[ok] registered ${commands.length} commands (hidden: ${commands.filter(c => c.is_ephemeral).map(c => '/' + c.command).join(' ')})`)
   } catch (e) { console.error(`[warn] could not register the command list: ${e}`) }
 }
 
@@ -7805,7 +7862,15 @@ function taskOwnerAllowed(t: Task): boolean {
   return ALLOWED_USERS.has(t.owner) && ALLOWED_CHATS.has(t.chat)
 }
 
-function taskMayCreate(_scope: Scope): string | undefined { return undefined }
+// The group's choice (/config "Tasks: who may create them"): anyone who may use the
+// bot here, or only its admins and the bot's own users. A DM is its own person's.
+function taskMayCreate(scope: Scope): string | undefined {
+  if (!scope.chat?.startsWith('-')) return undefined
+  if (setting('taskCreators', keyFor(Number(scope.chat), undefined)) !== 'admins') return undefined
+  const p = scope.person ?? ''
+  if (ALLOWED_USERS.has(p) || adminCache.get(`${scope.chat}:${p}`)?.admin) return undefined
+  return 'in this group only admins can create tasks (an admin can change that in /config)'
+}
 
 // Anyone who may use the chat may pause, resume or run a task; changing or deleting
 // it is for whoever set it up, and the chat's admins.
@@ -7828,11 +7893,105 @@ function resolveTopicRef(chat: string, ref: string): number | undefined {
   return undefined
 }
 
-const notYet = () => fail(501, "topic tools aren't switched on in this version yet")
+// A folder a topic may work in: an absolute path to a directory that exists, the
+// same rule as /cwd.
+const usableDir = (p: string) => isAbsolute(p) && existsSync(p) && statSync(p).isDirectory()
+// New topics per group, the last hour: at most ten, so a run can't flood a group.
+const topicsMade = new Map<string, number[]>()
+function mayMakeTopic(chat: string): boolean {
+  const recent = (topicsMade.get(chat) ?? []).filter(t => Date.now() - t < 3600_000)
+  topicsMade.set(chat, recent)
+  return recent.length < 10
+}
+// A folder change asked for in a topic's own turn waits for that turn to end: the
+// turn binds its session on the folder it started in, and would undo the change.
+const pendingCwd = new Map<string, string>()
+function applyPendingCwd(ctx: Context, threadId: number | undefined, key: string): void {
+  const p = pendingCwd.get(key)
+  if (!p) return
+  pendingCwd.delete(key)
+  sessions[key] = { cwd: p }
+  topicSessionChanged(key)
+  void send(ctx, threadId, `📁 This topic now works in ${p}, with a fresh conversation.`, true)
+}
+
 const taskBridge: BridgeHandlers = {
-  listTopics: notYet,
-  createTopic: notYet,
-  updateTopic: notYet,
+  // The chat's topics the bot knows, with their folders and settings.
+  listTopics(s) {
+    if (!s.chat) return fail(403, 'no chat')
+    const keys = new Set([...Object.keys(names), ...Object.keys(sessions)].filter(k => k.startsWith(`${s.chat}:`) && !k.includes('#')))
+    const topics = [...keys].map(k => {
+      const th = k.slice(k.indexOf(':') + 1)
+      return { id: th === 'main' ? null : Number(th), name: names[k] ?? (th === 'main' ? 'General' : `topic ${th}`), cwd: sessions[k]?.cwd,
+        mode: modeFor(k), model: modelFor(k) || 'default', ...(th !== 'main' && Number(th) === s.thread ? { this: true } : {}) }
+    })
+    return reply(200, { topics })
+  },
+  // A new forum topic for a new piece of work, with its own folder (or one given),
+  // optionally with another topic's settings.
+  async createTopic(s, body) {
+    if (s.runKind !== 'interactive' || !s.chat) return fail(403, 'topics are created from a conversation')
+    if (!s.chat.startsWith('-')) return fail(400, 'topics belong to forum groups; this is a private chat')
+    const name = String(body?.name ?? '').trim()
+    if (!name || name.length > 128) return fail(400, 'name is required, at most 128 characters')
+    if (body?.cwd !== undefined && body.cwd !== '' && !usableDir(String(body.cwd))) return fail(400, `cwd must be an absolute path to an existing folder: ${body.cwd}`)
+    let like: string | undefined
+    if (body?.like !== undefined && body.like !== '') {
+      const th = resolveTopicRef(s.chat, String(body.like))
+      if (th === undefined) return fail(404, `no topic "${body.like}" here`)
+      like = keyFor(Number(s.chat), th)
+    }
+    if (!mayMakeTopic(s.chat)) return fail(429, 'at most 10 new topics an hour in a group; try again later')
+    let tid: number
+    try {
+      tid = (await bot.api.createForumTopic(Number(s.chat), name, TOPIC_ICON ? { icon_custom_emoji_id: TOPIC_ICON } : {})).message_thread_id
+    } catch (e) {
+      return fail(502, `Telegram refused to create the topic (${e}); the bot needs the right to manage topics`)
+    }
+    topicsMade.get(s.chat)!.push(Date.now())
+    const key = keyFor(Number(s.chat), tid)
+    names[key] = name
+    sessions[key] = { cwd: body?.cwd ? String(body.cwd) : ensureDir(uniqueTopicDir(sanitize(name), key, tid)) }
+    // Settings carried over as /fork carries them.
+    if (like) for (const m of [modes, models, efforts, voice] as Record<string, any>[]) if (m[like] !== undefined) m[key] = m[like]
+    saveState()
+    const link = topicLink(Number(s.chat), tid)
+    return reply(201, { message: `Created the topic "${name}"${link ? ` (${link})` : ''}, working in ${sessions[key].cwd}.`, topic: tid, name, cwd: sessions[key].cwd, link })
+  },
+  // Rename a topic, or move it to another folder (with a fresh conversation, as /cwd).
+  async updateTopic(s, ref, body) {
+    if (s.runKind !== 'interactive' || !s.chat) return fail(403, 'topics are changed from a conversation')
+    // "this" is the conversation's own place: a topic, or General or a DM, which have
+    // a folder like any topic but no name the bot can change.
+    const tid = ref === 'this' ? s.thread : resolveTopicRef(s.chat, ref)
+    if (tid === undefined && ref !== 'this') return fail(404, `no topic "${ref}" here`)
+    const key = keyFor(Number(s.chat), tid)
+    const done: string[] = []
+    if (body?.name !== undefined) {
+      if (tid === undefined) return fail(400, s.chat.startsWith('-') ? "General can't be renamed from here; rename it in Telegram" : 'a private chat has no topic name to change')
+      const name = String(body.name).trim()
+      if (!name || name.length > 128) return fail(400, 'name must be 1 to 128 characters')
+      try { await bot.api.editForumTopic(Number(s.chat), tid, { name }) } catch (e) { return fail(502, `Telegram refused to rename it (${e})`) }
+      names[key] = name
+      saveState()
+      done.push(`renamed to "${name}"`)
+    }
+    if (body?.cwd !== undefined) {
+      const p = String(body.cwd)
+      if (!usableDir(p)) return fail(400, `cwd must be an absolute path to an existing folder: ${p}`)
+      if (tid === s.thread) {
+        pendingCwd.set(key, p)
+        done.push(`it moves to ${p}, with a fresh conversation, when this turn ends`)
+      } else {
+        sessions[key] = { cwd: p }
+        topicSessionChanged(key)
+        done.push(`it now works in ${p}, with a fresh conversation`)
+      }
+    }
+    if (!done.length) return fail(400, 'give a name or a cwd')
+    const label = names[key] ?? (tid !== undefined ? `topic ${tid}` : s.chat.startsWith('-') ? 'General' : 'this chat')
+    return reply(200, { message: `${label}: ${done.join('; ')}.` })
+  },
   // A task's run posting something before its result: a milestone, a warning.
   async notify(s, body) {
     if (s.runKind !== 'scheduled' || !s.taskId) return fail(403, "notify is for a task's own run; in a conversation, just answer")
@@ -7865,10 +8024,183 @@ const taskBridge: BridgeHandlers = {
   },
 }
 
-// A task's card and the activity log: posted and edited by the Telegram side of
-// tasks; until then, the log.
-function refreshTaskCard(_t: Task, _what?: string): void {}
-function taskActivity(t: Task, text: string): void { console.log(`[tasks] ${taskKey(t)} ${t.id}: ${text}`) }
+// The card: one message per task in its home, posted when the task is made and edited
+// when its state changes. Never more than once a minute for what runs change: a
+// group's ~20 messages a minute are shared by every topic, edits included. What a
+// person just did shows at once.
+const CARD_GAP_MS = 60_000
+const cards = new Map<string, { timer?: ReturnType<typeof setTimeout>; shown?: string; at: number }>()
+
+function cardKeyboard(t: Task): { inline_keyboard: any[][] } {
+  if (t.state === 'deleted') return { inline_keyboard: [] }
+  const row: any[] = []
+  if (t.state === 'active') row.push({ text: '▶️ Run now', callback_data: `tk:run:${t.id}` }, { text: '⏸ Pause', callback_data: `tk:pause:${t.id}` })
+  else if (t.state === 'paused') row.push({ text: '▶️ Resume', callback_data: `tk:resume:${t.id}` })
+  row.push({ text: '📜 History', callback_data: `tk:hist:${t.id}` }, { text: '🗑', callback_data: `tk:del:${t.id}` })
+  return { inline_keyboard: [row] }
+}
+
+async function showTaskCard(id: string): Promise<void> {
+  const t = taskStore?.getTask(id)
+  if (!t || !taskStore) return
+  const html = cardHtml(t, taskStore.runsFor(t.id, 8), taskNow())
+  const kb = cardKeyboard(t)
+  const shown = html + JSON.stringify(kb)
+  const c = cards.get(t.id) ?? { at: 0 }
+  cards.set(t.id, c)
+  if (t.cardMsg) {
+    if (c.shown === shown) return
+    const edited = await bot.api.editMessageText(Number(t.chat), t.cardMsg, html, { parse_mode: 'HTML', reply_markup: kb })
+      .then(() => true, e => String(e).includes('not modified'))
+    if (edited) { c.shown = shown; c.at = Date.now(); return }
+    // Gone, or too old to edit: post a fresh one below.
+  }
+  if (t.state === 'deleted') return
+  const m = await bot.api.sendMessage(Number(t.chat), html, { ...destOpts({ threadId: t.thread }), parse_mode: 'HTML', disable_notification: true, reply_markup: kb })
+    .catch(e => { console.error(`[tasks] card for ${t.id}: ${e}`); return null })
+  if (!m) return
+  noteBotMessage(taskKey(t))
+  taskStore.updateTask(t.id, { cardMsg: m.message_id })
+  c.shown = shown; c.at = Date.now()
+}
+
+function refreshTaskCard(t: Task, what?: string): void {
+  if (!taskStore) return
+  const c = cards.get(t.id) ?? { at: 0 }
+  cards.set(t.id, c)
+  const asked = what !== undefined
+  if (c.timer && asked) { clearTimeout(c.timer); c.timer = undefined }
+  if (c.timer) return            // one is due already; it shows the latest state
+  const wait = asked ? 0 : Math.max(0, c.at + CARD_GAP_MS - Date.now())
+  c.timer = setTimeout(() => { c.timer = undefined; void showTaskCard(t.id) }, wait)
+}
+
+// The activity topic: in a forum group, "🗂 Tasks", where every task created,
+// changed, paused or failing is logged silently. Made with the group's first task;
+// if the bot may not manage topics it says so once, where that task lives.
+const activityMaking = new Map<string, Promise<number | undefined>>()
+function activityThread(t: Task): Promise<number | undefined> {
+  if (!taskStore || !t.chat.startsWith('-')) return Promise.resolve(undefined)
+  // A group without topics has nowhere to put it.
+  if (t.thread === undefined && taskStore.getMeta(`forum:${t.chat}`) !== '1') return Promise.resolve(undefined)
+  if (setting('activityTopic', keyFor(Number(t.chat), undefined)) === false) return Promise.resolve(undefined)
+  const known = taskStore.getMeta(`activity:${t.chat}`)
+  if (known === 'none') return Promise.resolve(undefined)
+  if (known) return Promise.resolve(Number(known))
+  const making = activityMaking.get(t.chat)
+  if (making) return making
+  const p = (async () => {
+    try {
+      const topic = await bot.api.createForumTopic(Number(t.chat), '🗂 Tasks', TOPIC_ICON ? { icon_custom_emoji_id: TOPIC_ICON } : {})
+      const th = topic.message_thread_id
+      taskStore!.setMeta(`activity:${t.chat}`, String(th))
+      names[keyFor(Number(t.chat), th)] = '🗂 Tasks'
+      saveState()
+      await bot.api.sendMessage(Number(t.chat), "This topic logs what the bot's tasks do in this group: created, changed, paused, failing. Mute it if you like. /tasks lists them, and /config can turn this topic off.",
+        { message_thread_id: th, disable_notification: true }).catch(() => {})
+      return th
+    } catch (e) {
+      taskStore!.setMeta(`activity:${t.chat}`, 'none')
+      console.error(`[tasks] could not create the activity topic in ${t.chat}: ${e}`)
+      await bot.api.sendMessage(Number(t.chat), "I couldn't create the 🗂 Tasks topic, where I'd log what tasks do here: I need the right to manage topics. /config can turn that topic off.",
+        { ...destOpts({ threadId: t.thread }), disable_notification: true }).catch(() => {})
+      return undefined
+    } finally {
+      activityMaking.delete(t.chat)
+    }
+  })()
+  activityMaking.set(t.chat, p)
+  return p
+}
+
+const CHANGE_TEXT: Record<string, (t: Task) => string> = {
+  created: t => `⏰ "${t.name}" created by ${t.ownerName || 'someone'}: ${scheduleText(t.trigger, t.tz)}`,
+  updated: t => `✏️ "${t.name}" changed: ${scheduleText(t.trigger, t.tz)}`,
+  paused: t => `⏸ "${t.name}" paused`,
+  resumed: t => `▶️ "${t.name}" resumed`,
+  deleted: t => `🗑 "${t.name}" deleted`,
+  done: t => `✔️ "${t.name}" finished`,
+}
+function taskActivity(t: Task, text: string): void {
+  const line = CHANGE_TEXT[text]?.(t) ?? text
+  console.log(`[tasks] ${taskKey(t)} ${t.id}: ${line}`)
+  void activityThread(t).then(th => {
+    if (th === undefined || th === t.thread) return
+    const link = t.thread !== undefined ? topicLink(Number(t.chat), t.thread) : undefined
+    const html = escapeHtml(line) + (link ? ` · <a href="${link}">${escapeHtml(names[taskKey(t)] ?? 'its topic')}</a>` : '')
+    return bot.api.sendMessage(Number(t.chat), html, { message_thread_id: th, parse_mode: 'HTML', disable_notification: true, link_preview_options: { is_disabled: true } })
+      .then(() => noteBotMessage(keyFor(Number(t.chat), th)))
+  }).catch(e => console.error(`[tasks] activity: ${e}`))
+}
+
+// A task's run history, to the person who tapped: privately in a group. A tap lets
+// even a bot that isn't an admin send that person one private message, within 15 s,
+// so it is sent before the tap is answered; a visible, silent one if that fails.
+async function showTaskHistory(ctx: Context, t: Task): Promise<void> {
+  const html = historyHtml(t, taskStore?.runsFor(t.id, 20) ?? [])
+  const threadId = ctx.callbackQuery?.message?.message_thread_id
+  const opts = { parse_mode: 'HTML' as const, link_preview_options: { is_disabled: true } }
+  if (ctx.chat?.type === 'private') {
+    await ctx.api.sendMessage(ctx.chat.id, html, opts).catch(e => console.error(`[tasks] history: ${e}`))
+    return
+  }
+  const sent = await ctx.api.sendMessage(ctx.chat!.id, html, { ...destOpts({ threadId }), ...opts,
+    ephemeral_message_parameters: { receiver_user_id: ctx.from!.id, callback_query_id: ctx.callbackQuery!.id } } as any)
+    .catch(e => { console.error(`[tasks] history, privately: ${e}`); return null })
+  if (!sent) await ctx.api.sendMessage(ctx.chat!.id, html, { ...destOpts({ threadId }), ...opts, disable_notification: true }).catch(e => console.error(`[tasks] history: ${e}`))
+}
+
+// A tap on a task's card, reminder, alert or /tasks list.
+async function handleTaskCallback(ctx: Context, data: string): Promise<void> {
+  const [, act, id] = data.split(':')
+  const answer = (text = '', alert = false) => ctx.answerCallbackQuery(text ? { text, show_alert: alert } : {}).catch(() => {})
+  if (!taskService || !taskStore) { await answer('Tasks are off on this bot.', true); return }
+  const t = taskStore.getTask(id ?? '')
+  if (!t || t.state === 'deleted') { await answer('That task no longer exists.', true); return }
+  const here = String(ctx.chat?.id)
+  if (here !== t.chat && !(t.where === 'dm' && here === t.owner)) { await answer('That task belongs to another chat.', true); return }
+  const user = ctx.from!
+  // Fresh admin status, so the rule for changing and deleting sees it.
+  if (ctx.chat!.type !== 'private') await isChatAdmin(ctx.chat!.id, user.id)
+  const scope: Scope = { kind: 'run', chat: t.chat, thread: t.thread, person: String(user.id), personName: userName(user), runKind: 'interactive' }
+  const msg = ctx.callbackQuery?.message as any
+  const said = (r: { ok: boolean; error?: string }, okText: string) => answer(r.ok ? okText : r.error, !r.ok)
+  switch (act) {
+    case 'run': await said(await taskService.runNow(scope, t.id), 'Started.'); return
+    case 'pause': await said(taskService.pause(scope, t.id), 'Paused.'); return
+    case 'resume': await said(taskService.resume(scope, t.id), 'Resumed.'); return
+    case 'hist': await showTaskHistory(ctx, t); await answer(); return
+    // Delete asks first, on the card itself.
+    case 'del':
+      await answer()
+      if (msg) await ctx.api.editMessageReplyMarkup(msg.chat.id, msg.message_id, { reply_markup: { inline_keyboard: [[
+        { text: '🗑 Yes, delete it', callback_data: `tk:delok:${t.id}`, style: 'danger' } as any, { text: 'No', callback_data: `tk:keep:${t.id}` },
+      ]] } }).catch(() => {})
+      return
+    case 'delok': {
+      const r = taskService.remove(scope, t.id)
+      await said(r, 'Deleted.')
+      if (!r.ok) refreshTaskCard(t, 'kept')
+      return
+    }
+    case 'keep': await answer(); refreshTaskCard(t, 'kept'); return
+    // A reminder done: it says so, and its buttons go.
+    case 'ok':
+      await answer('👍')
+      if (msg?.text) await ctx.api.editMessageText(msg.chat.id, msg.message_id, `✅ ${escapeHtml(String(msg.text))}`, { parse_mode: 'HTML' }).catch(() => {})
+      return
+    // A reminder again in 15 minutes: the same task, moved.
+    case 'snz': {
+      const r = taskService.update(scope, t.id, { in_minutes: 15 })
+      await said(r, 'Again in 15 minutes.')
+      if (r.ok && msg?.text) {
+        await ctx.api.editMessageText(msg.chat.id, msg.message_id, `⏰ ${escapeHtml(String(msg.text))}\n<i>Again at ${escapeHtml(whenText(new Date(r.value.task.nextDue!), t.tz))}.</i>`, { parse_mode: 'HTML' }).catch(() => {})
+      }
+      return
+    }
+  }
+  await answer()
+}
 
 // Open the store, start the local API and the loop. Tasks stay off, with a line in
 // the log, if any of it can't start: the bot itself must not fail over them.

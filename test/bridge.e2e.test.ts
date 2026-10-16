@@ -4761,3 +4761,209 @@ describe('tasks: the bridge runs them (phase 1)', () => {
     expect(mcp.mcpServers.xesious.env.XESIOUS_RUN_KIND).toBe('interactive')
   }, 20000)
 })
+
+describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
+  const C = -100888
+  const ADA = { id: 1, is_bot: false, first_name: 'Ada' }
+  const BEN = { id: 7, is_bot: false, first_name: 'Ben' }   // a member, not an admin, not allowlisted
+  let mid = 990000
+  const T = () => bridge._tasks()
+  let callApi: any
+  beforeAll(async () => {
+    ;({ callApi } = await import('../tasks/api'))
+    bridge._enableTasks(true)
+    bridge._setTaskClock(() => new Date('2026-10-16T12:00:00Z'))
+    bridge._startTasks()
+  })
+  afterAll(() => { bridge._stopTasks(); bridge._enableTasks(false); bridge._setTrustChatMembers(false) })
+  afterEach(() => { for (const t of T().store.listTasks()) T().store.updateTask(t.id, { state: 'deleted', nextDue: undefined }) })
+
+  const scopeOf = (chat: number, thread: number | undefined, who = ADA) =>
+    ({ kind: 'run', chat: String(chat), thread, person: String(who.id), personName: who.first_name, runKind: 'interactive' })
+  const make = (input: any, scope: any) => {
+    const r = T().service.create(scope, { tz: 'UTC', ...input })
+    if (!r.ok) throw new Error(r.error)
+    return r.value.task
+  }
+  const settleCards = () => Bun.sleep(30)
+  async function tap(data: string, chat: number, thread?: number, who = ADA, msgId = 777, text = 'x'): Promise<Call[]> {
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, callback_query: {
+      id: `q${updateId}`, from: who, chat_instance: 'x', data,
+      message: { message_id: msgId, date: 0, text, ...(thread ? { message_thread_id: thread, is_topic_message: true } : {}),
+        chat: chat < 0 ? { id: chat, type: 'supergroup', title: 'G', is_forum: true } : { id: chat, type: 'private', first_name: who.first_name } },
+    } })
+    await T().runtime.idle()
+    await settleCards()
+    return calls.slice(before)
+  }
+  async function say(text: string, thread?: number, who = ADA): Promise<Call[]> {
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, message: {
+      message_id: mid++, date: Math.floor(Date.now() / 1000), text, ...(thread ? { message_thread_id: thread, is_topic_message: true } : {}),
+      chat: { id: C, type: 'supergroup', title: 'G', is_forum: true }, from: who } })
+    await bridge._drainQueue(`${C}:${thread ?? 'main'}`)
+    return calls.slice(before)
+  }
+  const answers = (cs: Call[]) => cs.filter(c => c.method === 'answerCallbackQuery').map(c => String(c.payload.text ?? ''))
+
+  test("a new task's card goes into its topic, silently, with its buttons; the group's first task makes the activity topic", async () => {
+    const before = calls.length
+    const t = make({ name: 'Nightly news', prompt: 'Summarize the news', cron: '7 21 * * *' }, scopeOf(C, 501))
+    await settleCards()
+    const cs = calls.slice(before)
+    const card = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('⏰ Scheduled: <b>Nightly news</b>'))!
+    expect(card.payload).toMatchObject({ chat_id: C, message_thread_id: 501, parse_mode: 'HTML', disable_notification: true })
+    expect(card.payload.reply_markup.inline_keyboard[0].map((b: any) => b.callback_data)).toEqual([`tk:run:${t.id}`, `tk:pause:${t.id}`, `tk:hist:${t.id}`, `tk:del:${t.id}`])
+    expect(T().store.getTask(t.id).cardMsg).toBeGreaterThan(0)
+    const topic = cs.find(c => c.method === 'createForumTopic' && c.payload.name === '🗂 Tasks')
+    expect(topic).toBeTruthy()
+    // The line is HTML, so the name's quotes travel as &quot;.
+    expect(cs.some(c => c.method === 'sendMessage' && String(c.payload.text).includes('Nightly news&quot; created by Ada'))).toBe(true)
+    // Once per group: the next task logs into the same topic.
+    const before2 = calls.length
+    make({ name: 'Weekly report', prompt: 'Report', cron: '7 9 * * 1' }, scopeOf(C, 502))
+    await settleCards()
+    expect(calls.slice(before2).some(c => c.method === 'createForumTopic')).toBe(false)
+  })
+
+  test('from the card: pause, resume, history, and delete after a confirmation', async () => {
+    const t = make({ name: 'Digest', prompt: 'Digest', cron: '7 8 * * *' }, scopeOf(C, 501))
+    await settleCards()
+    let cs = await tap(`tk:pause:${t.id}`, C, 501)
+    expect(answers(cs)).toContain('Paused.')
+    expect(T().store.getTask(t.id).state).toBe('paused')
+    expect(cs.some(c => c.method === 'editMessageText' && c.payload.message_id === T().store.getTask(t.id).cardMsg && String(c.payload.text).includes('⏸ paused'))).toBe(true)
+    cs = await tap(`tk:resume:${t.id}`, C, 501)
+    expect(answers(cs)).toContain('Resumed.')
+    cs = await tap(`tk:hist:${t.id}`, C, 501)
+    expect(cs.some(c => c.method === 'sendMessage' && c.payload.ephemeral_message_parameters?.receiver_user_id === 1 && String(c.payload.text).includes('no runs yet'))).toBe(true)
+    cs = await tap(`tk:del:${t.id}`, C, 501)
+    expect(T().store.getTask(t.id).state).toBe('active')
+    expect(cs.some(c => c.method === 'editMessageReplyMarkup' && JSON.stringify(c.payload.reply_markup).includes(`tk:delok:${t.id}`))).toBe(true)
+    cs = await tap(`tk:delok:${t.id}`, C, 501)
+    expect(answers(cs)).toContain('Deleted.')
+    expect(T().store.getTask(t.id).state).toBe('deleted')
+  })
+
+  test('anyone here may pause a task; only the person who set it up, or an admin, may delete it', async () => {
+    bridge._setTrustChatMembers(true)
+    try {
+      const t = make({ name: "Ada's task", prompt: 'Something', cron: '7 7 * * *' }, scopeOf(C, 501))
+      let cs = await tap(`tk:delok:${t.id}`, C, 501, BEN)
+      expect(answers(cs)[0]).toContain('only Ada or an admin can delete it')
+      expect(T().store.getTask(t.id).state).toBe('active')
+      cs = await tap(`tk:pause:${t.id}`, C, 501, BEN)
+      expect(answers(cs)).toContain('Paused.')
+    } finally { bridge._setTrustChatMembers(false) }
+  })
+
+  test("a reminder's buttons: done, and again in 15 minutes", async () => {
+    const t = make({ message: 'Stretch', in_minutes: 1 }, scopeOf(5101, undefined))
+    let cs = await tap(`tk:snz:${t.id}`, 5101, undefined, ADA, 4242, '🔔 Stretch')
+    expect(answers(cs)).toContain('Again in 15 minutes.')
+    expect(T().store.getTask(t.id).nextDue).toBe('2026-10-16T12:15:00.000Z')
+    expect(cs.some(c => c.method === 'editMessageText' && c.payload.message_id === 4242 && String(c.payload.text).includes('Again at'))).toBe(true)
+    cs = await tap(`tk:ok:${t.id}`, 5101, undefined, ADA, 4243, '🔔 Stretch')
+    expect(cs.some(c => c.method === 'editMessageText' && c.payload.message_id === 4243 && String(c.payload.text).startsWith('✅'))).toBe(true)
+  })
+
+  test("/tasks: this topic's tasks, privately, with buttons; in General, the whole group's; /tasks pause all", async () => {
+    const a = make({ name: 'Alpha', prompt: 'A', cron: '7 6 * * *' }, scopeOf(C, 501))
+    const b = make({ name: 'Beta', prompt: 'B', cron: '7 5 * * *' }, scopeOf(C, 502))
+    let cs = await say('/tasks', 501)
+    // Private where Telegram allows it (the command arrives hidden, or the bot is an
+    // admin); visible otherwise, as here.
+    const reply = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('Tasks in this topic'))!
+    expect(String(reply.payload.text)).toContain('Alpha')
+    expect(String(reply.payload.text)).not.toContain('Beta')
+    expect(reply.payload.reply_markup.inline_keyboard[0][0].callback_data).toBe(`tk:run:${a.id}`)
+    cs = await say('/tasks')
+    const all = cs.find(c => c.method === 'sendMessage' && String(c.payload.text).includes('Tasks in this group'))!
+    expect(String(all.payload.text)).toContain('Alpha')
+    expect(String(all.payload.text)).toContain('Beta')
+    await say('/tasks pause all')
+    expect([a.id, b.id].map(id => T().store.getTask(id).state)).toEqual(['paused', 'paused'])
+  })
+
+  test('who may create tasks: only admins, when the group says so', async () => {
+    bridge._setTrustChatMembers(true)
+    bridge._groupSettings()[String(C)] = { ...(bridge._groupSettings()[String(C)] ?? {}), taskCreators: 'admins' }
+    try {
+      const r = T().service.create(scopeOf(C, 501, BEN), { tz: 'UTC', message: 'm', in_minutes: 5 })
+      expect(r.ok ? '' : r.error).toContain('only admins can create tasks')
+      expect(T().service.create(scopeOf(C, 501, ADA), { tz: 'UTC', message: 'm', in_minutes: 5 }).ok).toBe(true)
+    } finally {
+      delete bridge._groupSettings()[String(C)].taskCreators
+      bridge._setTrustChatMembers(false)
+    }
+  })
+
+  test("the topic tools: create a topic with its folder, rename it, move another topic's folder; this topic's waits for its turn", async () => {
+    const token = T().tokens.mint(scopeOf(C, 501))
+    const folder = join(TMP, 'research-folder')
+    mkdirSync(folder, { recursive: true })
+    const before = calls.length
+    const made = await callApi(T().socket, token, 'POST', '/v1/topics', { name: 'Research', cwd: folder })
+    expect(made.status).toBe(201)
+    expect(calls.slice(before).some(c => c.method === 'createForumTopic' && c.payload.name === 'Research')).toBe(true)
+    const tid = made.body.topic
+    expect(bridge._sessions()[`${C}:${tid}`].cwd).toBe(folder)
+    expect((await callApi(T().socket, token, 'PATCH', '/v1/topics/Research', { name: 'Research notes' })).status).toBe(200)
+    expect(calls.some(c => c.method === 'editForumTopic' && c.payload.name === 'Research notes')).toBe(true)
+    const list = await callApi(T().socket, token, 'GET', '/v1/topics')
+    expect(list.body.topics.some((x: any) => x.id === tid && x.name === 'Research notes' && x.cwd === folder)).toBe(true)
+    const other = join(TMP, 'other-folder')
+    mkdirSync(other, { recursive: true })
+    expect((await callApi(T().socket, token, 'PATCH', `/v1/topics/${tid}`, { cwd: other })).status).toBe(200)
+    expect(bridge._sessions()[`${C}:${tid}`].cwd).toBe(other)
+    const mine = await callApi(T().socket, token, 'PATCH', '/v1/topics/this', { cwd: other })
+    expect(mine.body.message).toContain('when this turn ends')
+    expect((await callApi(T().socket, token, 'POST', '/v1/topics', { name: 'Bad', cwd: '/no/such/folder' })).status).toBe(400)
+    T().tokens.revoke(token)
+  })
+
+  test('the activity topic can be turned off for a group', async () => {
+    const G = -100999
+    bridge._groupSettings()[String(G)] = { ...(bridge._groupSettings()[String(G)] ?? {}), activityTopic: false }
+    try {
+      const before = calls.length
+      make({ name: 'Quiet', prompt: 'Q', cron: '7 4 * * *' }, scopeOf(G, 601))
+      await settleCards()
+      expect(calls.slice(before).some(c => c.method === 'createForumTopic')).toBe(false)
+    } finally { delete bridge._groupSettings()[String(G)].activityTopic }
+  })
+
+  test("a task set up in a forum's General is logged too; a group without topics has no activity topic", async () => {
+    // A turn in General is how the bridge learns the group has topics.
+    await say('hello')
+    const before = calls.length
+    make({ name: 'General digest', prompt: 'D', cron: '7 3 * * *' }, scopeOf(C, undefined))
+    await settleCards()
+    const th = Number(T().store.getMeta(`activity:${C}`))
+    expect(th).toBeGreaterThan(0)
+    expect(calls.slice(before).some(c => c.method === 'sendMessage' && c.payload.message_thread_id === th &&
+      String(c.payload.text).includes('General digest&quot; created by Ada'))).toBe(true)
+    const before2 = calls.length
+    make({ name: 'Plain', prompt: 'P', cron: '7 2 * * *' }, scopeOf(-100777, undefined))
+    await settleCards()
+    expect(calls.slice(before2).some(c => c.method === 'createForumTopic')).toBe(false)
+  })
+
+  test("in General, topic_set_cwd moves General's folder once the turn is over; its name stays Telegram's", async () => {
+    const token = T().tokens.mint(scopeOf(C, undefined))
+    const folder = join(TMP, 'general-folder')
+    mkdirSync(folder, { recursive: true })
+    try {
+      const named = await callApi(T().socket, token, 'PATCH', '/v1/topics/this', { name: 'Lobby' })
+      expect(named.status).toBe(400)
+      expect(named.body.error).toContain("General can't be renamed")
+      const moved = await callApi(T().socket, token, 'PATCH', '/v1/topics/this', { cwd: folder })
+      expect(moved.status).toBe(200)
+      expect(moved.body.message).toBe(`General: it moves to ${folder}, with a fresh conversation, when this turn ends.`)
+    } finally { T().tokens.revoke(token) }
+    const cs = await say('hello again')
+    expect(bridge._sessions()[`${C}:main`].cwd).toBe(folder)
+    expect(cs.some(c => c.method === 'sendMessage' && String(c.payload.text).includes(`now works in ${folder}`))).toBe(true)
+  })
+})

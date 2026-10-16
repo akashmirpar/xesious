@@ -1989,7 +1989,15 @@ export const SETTINGS: SettingDef[] = [
   { id: 'fanoutTopics', label: 'Fan-out: part topics after', emoji: '🧹', level: 'advanced', kind: 'choice', topic: true,
     help: 'What happens to the part topics once a fan-out is combined.',
     choices: [{ value: 'ask', label: 'ask' }, { value: 'keep', label: 'keep' }, { value: 'close', label: 'close' }, { value: 'delete', label: 'delete' }] },
+  // Tasks: shown only where the bot has them (TASK_SETTING_IDS).
+  { id: 'taskCreators', label: 'Tasks: who may create them', emoji: '⏰', level: 'advanced', kind: 'choice', topic: false,
+    help: 'Tasks run on their own, later or on a schedule, as the person who set them up and on the bot\'s Claude usage. "anyone" is anyone who may use the bot here; "admins" is the group\'s admins and the bot\'s own users. Anyone may still pause one.',
+    choices: [{ value: 'everyone', label: 'anyone' }, { value: 'admins', label: 'admins' }] },
+  { id: 'activityTopic', label: 'Tasks: activity topic', emoji: '🗂', level: 'advanced', kind: 'choice', topic: false,
+    help: 'A "🗂 Tasks" topic where the bot logs, silently, every task created, changed, paused or failing in this group. Made with the group\'s first task.',
+    choices: onOff },
 ]
+export const TASK_SETTING_IDS = new Set(['taskCreators', 'activityTopic'])
 
 export const settingDef = (id: string): SettingDef | undefined => SETTINGS.find(s => s.id === id)
 
