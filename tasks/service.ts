@@ -15,6 +15,7 @@ import type { TaskStore } from './store'
 import { firstDue, isValidTz, parseLocalTime, parseWhen, runsOften, type WhenInput } from './schedule'
 import type { Scope } from './api'
 import { markOf, scheduleText, whenText } from './render'
+import { ruleError, ruleText, toRule } from './filters'
 
 export interface TaskInput extends WhenInput {
   name?: string
@@ -33,6 +34,8 @@ export interface TaskInput extends WhenInput {
   cooldown_minutes?: number
   max_per_hour?: number
   stale_minutes?: number
+  rule?: any              // filters.ruleError says what it may be; null removes it
+  ai_filter?: { question?: string; every_minutes?: number } | null
 }
 
 export type Change = 'created' | 'updated' | 'paused' | 'resumed' | 'deleted' | 'done'
@@ -78,6 +81,8 @@ export function taskView(t: Task, runs: Run[] = []) {
       watch: { command: t.trigger.command, ...(t.trigger.everyMs ? { every_minutes: t.trigger.everyMs / 60_000 } : { streaming: true }) },
       ...(t.action.kind !== 'none' ? { cooldown_minutes: lim.cooldownMs / 60_000, max_per_hour: lim.maxPerHour, stale_minutes: lim.staleMs / 60_000 } : {}),
       events_seen: t.eventsSeen ?? 0, watcher_error: t.watchError,
+      ...(t.rule ? { rule: ruleText(t.rule) } : {}),
+      ...(t.ai ? { ai_filter: { question: t.ai.question, every_minutes: t.ai.everyMs / 60_000, considered: t.filterSeen ?? 0, passed: t.filterPassed ?? 0, error: t.filterError } } : {}),
     } : {}),
     ...(t.action.kind === 'message' ? { message: t.action.text }
       : t.action.kind === 'claude' ? { prompt: t.action.prompt, session: t.action.session, says: t.says }
@@ -210,6 +215,38 @@ export class TaskService {
       if (!Number.isInteger(n) || n < 1 || n > 120) return err(400, 'max_per_hour is a whole number between 1 and 120')
       limits.maxPerHour = n
     }
+
+    // What decides which events start a run: a watcher's alone. A task that stops
+    // watching loses them, unless this very input gave them.
+    const empty = (v: any) => v === null || (typeof v === 'object' && !Array.isArray(v) && !Object.keys(v).length)
+    let rule = base?.rule
+    if (input.rule !== undefined) {
+      if (empty(input.rule)) rule = undefined
+      else {
+        const e = ruleError(input.rule)
+        if (e) return err(400, e)
+        rule = toRule(input.rule)
+      }
+    }
+    let ai = base?.ai
+    if (input.ai_filter !== undefined) {
+      if (empty(input.ai_filter)) ai = undefined
+      else {
+        const q = String(input.ai_filter!.question ?? '').trim()
+        if (!q) return err(400, 'ai_filter.question is what the model is asked of each event, such as "Does this suggest a major outage is starting?"')
+        if (q.length > 1000) return err(400, 'ai_filter.question is at most 1000 characters')
+        const m = minutesIn(input.ai_filter!.every_minutes ?? 5, 'ai_filter.every_minutes', 1, 60)
+        if (m.error) return err(400, m.error)
+        ai = { question: q, everyMs: m.ms! }
+      }
+    }
+    if (!watching) {
+      if ((input.rule !== undefined && rule) || (input.ai_filter !== undefined && ai)) return err(400, 'rule and ai_filter are for a watcher: give watch too')
+      rule = undefined; ai = undefined
+    }
+    if ((rule || ai) && action!.kind === 'none') return err(400, 'a watcher kept running for its own sake has nothing to filter: give message or prompt')
+    // A batch mustn't go stale while it waits for the filter.
+    if (ai && limits.staleMs === undefined && ai.everyMs * 2 > 10 * 60_000) limits.staleMs = ai.everyMs * 2
     if (name.length > MAX.name) return err(400, `name is too long (at most ${MAX.name} characters)`)
 
     let until = base?.until
@@ -244,6 +281,7 @@ export class TaskService {
       where: input.deliver_to ? (input.deliver_to === 'dm' ? 'dm' : 'home') : (base?.where ?? 'home'),
       until, times, nextDue: nextDue?.toISOString(),
       limits: Object.keys(limits).length ? limits : undefined,
+      rule, ai,
     } as any)
   }
 

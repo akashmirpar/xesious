@@ -157,3 +157,15 @@ describe('watchers on the card', () => {
     expect(runLine(r, 'UTC')).toContain('3 events')
   })
 })
+
+test('the card says what a watcher lets through: its rule, and its AI filter with what it let through', () => {
+  const t = task({
+    name: 'Outage feed', trigger: { kind: 'watch', command: 'python3 feed.py' }, nextDue: undefined,
+    rule: { op: 'contains', words: ['outage', 'degraded'] }, ai: { question: 'Is a major outage starting?', everyMs: 300_000 },
+    filterSeen: 340, filterPassed: 12, filterError: 'the AI filter did not answer; it asks again at its next batch',
+  })
+  const html = cardHtml(t, [], new Date('2026-10-16T12:00:00Z'), { running: true })
+  expect(html).toContain('Only when it mentions “outage”, “degraded”')
+  expect(html).toContain('AI filter every 5 minutes: “Is a major outage starting?” · 340 considered, 12 let through')
+  expect(html).toContain('⚠️ the AI filter did not answer')
+})

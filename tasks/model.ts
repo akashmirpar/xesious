@@ -35,8 +35,23 @@ export type Action =
   // goes nowhere, and only its failures are said.
   | { kind: 'none' }
 
-// One line a watcher printed, and when.
-export interface WatchEvent { at: string; text: string }
+// One line a watcher printed, and when; once a filter let it through, the value it
+// looked at and why it passed.
+export interface WatchEvent { at: string; text: string; value?: string; why?: string }
+
+// Which events start a run (filters.ts): a test on the line, or on a field of its JSON.
+export type RuleOp = 'above' | 'below' | 'crosses_above' | 'crosses_below' | 'change_pct' | 'changed' | 'contains' | 'matches'
+export interface Rule {
+  op: RuleOp
+  field?: string          // a JSON path ("price", "data.last"); the whole line without one
+  value?: number          // the threshold; for change_pct, the percent
+  windowMs?: number       // change_pct: within this
+  words?: string[]        // contains: any of these, any case
+  pattern?: string        // matches: a regular expression, any case
+}
+
+// A cheap model asked, every so often, which of the events that came answer a question.
+export interface AiFilter { question: string; everyMs: number }
 
 // How a watcher's events may start runs: at most one run per cooldown and so many an
 // hour, events that come meanwhile folded into the next run, and none older than the
@@ -88,6 +103,12 @@ export interface Task {
   watchFails?: number     // the watcher's failures in a row
   watchError?: string     // the last of them, in words
   watchRetryAt?: string   // a streaming watcher that died starts again from here
+  rule?: Rule
+  ai?: AiFilter
+  filterSeen?: number     // events the AI filter was asked about
+  filterPassed?: number   // …and let through
+  lastFilterAt?: string
+  filterError?: string
 }
 
 export type RunState =

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TaskStore } from './store'
-import { TaskRuntime, eventText, type ClaudeOutcome, type RuntimeDeps, type WatcherControl } from './runtime'
+import { TaskRuntime, eventText, type ClaudeOutcome, type FilterVerdict, type RuntimeDeps, type WatcherControl } from './runtime'
 import type { Run, Task, WatchEvent } from './model'
 import type { PollResult } from './watchers'
 
@@ -471,6 +471,76 @@ describe('watchers', () => {
     rt.sync()
     expect(store.getTask(t.id)).toMatchObject({ state: 'paused', pauseReason: 'owner' })
     expect(running.size).toBe(0)
+  })
+
+  test('a rule: only what passes starts a run, with its value and why; a crossing is remembered across a restart', async () => {
+    const t = stream({ rule: { op: 'crosses_below', field: 'price', value: 300 }, action: { kind: 'message', text: 'Below 300 ({value}): {why}' }, limits: { cooldownMs: 0 } })
+    rt.onEvents(t.id, [ev('{"price": 305}'), ev('{"price": 299}'), ev('{"price": 298}')])
+    await rt.idle()
+    expect(posts.map(p => p.text)).toEqual(['Below 300 (299): price went below 300: 299'])
+    rt.stop(); rt = new TaskRuntime(deps({ watchers: fake }))
+    rt.onEvents(t.id, [ev('{"price": 297}')]); await rt.idle()
+    expect(posts.length).toBe(1)
+    rt.onEvents(t.id, [ev('{"price": 301}'), ev('{"price": 296}')]); await rt.idle()
+    expect(posts.length).toBe(2)
+  })
+
+  describe('the AI filter', () => {
+    let asked: { q: string; items: string[] }[]
+    let verdict: FilterVerdict | undefined
+    beforeEach(() => {
+      asked = []; verdict = { pass: [], by: 'haiku' }
+      rt.stop()
+      rt = new TaskRuntime(deps({ watchers: fake, filter: async (_t, q, items) => { asked.push({ q, items }); return verdict } }))
+    })
+    // Whatever was set to run later (the batch), now.
+    const runLater = async () => { for (const x of timers.splice(0)) x.fn(); await rt.idle() }
+    const filtered = (over: Partial<Task> = {}) => stream({
+      name: 'Outage feed', rule: { op: 'contains', words: ['outage'] }, ai: { question: 'Is a major outage starting?', everyMs: 5 * 60_000 },
+      action: { kind: 'claude', prompt: 'Check other sources and say what is happening', session: 'own' }, limits: { cooldownMs: 0 }, ...over,
+    })
+
+    test('what passes the rule waits for the batch; one question for all of it; what passes that starts one run, with why', async () => {
+      const seen: Run[] = []
+      claude = async (_t, r) => { seen.push(r); return OK('A major outage is starting in one region.') }
+      const t = filtered()
+      rt.onEvents(t.id, [ev('Minor outage fixed'), ev('Lunch menu'), ev('Major outage in one region')])
+      await rt.idle()
+      expect(asked).toEqual([])
+      expect(seen).toEqual([])
+      verdict = { pass: [{ n: 2, why: 'a new, major outage' }], by: 'haiku' }
+      await runLater()
+      expect(asked).toEqual([{ q: 'Is a major outage starting?', items: ['Minor outage fixed', 'Major outage in one region'] }])
+      expect(seen.length).toBe(1)
+      expect(seen[0].events).toMatchObject([{ text: 'Major outage in one region', why: 'a new, major outage' }])
+      expect(store.getTask(t.id)).toMatchObject({ filterSeen: 2, filterPassed: 1 })
+    })
+
+    test('none pass: no run, only counted; with no candidates it asks nothing', async () => {
+      const t = filtered()
+      rt.onEvents(t.id, [ev('outage drill next week')])
+      await runLater()
+      expect(asked.length).toBe(1)
+      expect(posts).toEqual([])
+      expect(store.getTask(t.id)).toMatchObject({ filterSeen: 1, filterPassed: 0 })
+      await runLater(); await tick()
+      expect(asked.length).toBe(1)
+    })
+
+    test("if it can't answer, the batch is asked about again at the next one, and the card says so", async () => {
+      const t = filtered()
+      verdict = undefined
+      rt.onEvents(t.id, [ev('outage?')])
+      await runLater()
+      expect(store.getTask(t.id)!.filterError).toContain('did not answer')
+      expect(timers.some(x => x.ms === 5 * 60_000)).toBe(true)
+      verdict = { pass: [{ n: 1, why: 'yes' }], by: 'haiku' }
+      later(5 * 60_000)
+      await runLater()
+      expect(asked.map(a => a.items)).toEqual([['outage?'], ['outage?']])
+      expect(store.getTask(t.id)!.filterError).toBeUndefined()
+      expect(posts.filter(p => p.kind === 'result').length).toBe(1)
+    })
   })
 
   test('run now: a polled one looks at once; a streaming one waiting out a backoff starts', async () => {

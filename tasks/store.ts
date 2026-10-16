@@ -11,6 +11,7 @@
 import { Database } from 'bun:sqlite'
 import { randomBytes } from 'node:crypto'
 import { LIMITS, type Run, type Task, type TaskState, type WatchEvent } from './model'
+import type { RuleState } from './filters'
 
 const SCHEMA = 2
 
@@ -64,9 +65,10 @@ export class TaskStore {
       CREATE INDEX IF NOT EXISTS notes_key ON notes (key, taken_at);
       CREATE TABLE IF NOT EXISTS watchers (task TEXT PRIMARY KEY, doc TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT NOT NULL, at TEXT NOT NULL, text TEXT NOT NULL
+        id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT NOT NULL, stage TEXT NOT NULL, doc TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS events_task ON events (task, id);
+      CREATE INDEX IF NOT EXISTS events_task ON events (task, stage, id);
+      CREATE TABLE IF NOT EXISTS rule_state (task TEXT PRIMARY KEY, doc TEXT NOT NULL);
     `)
     this.db.query("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)").run(String(SCHEMA))
   }
@@ -250,31 +252,44 @@ export class TaskStore {
     return (this.db.query('SELECT task, doc FROM watchers').all() as any[]).map(r => ({ task: r.task, proc: JSON.parse(r.doc) }))
   }
 
-  // --- events waiting for a run ------------------------------------------------
-  // What a watcher printed that is to start a run, kept until the run takes it: a run
+  // --- events waiting ------------------------------------------------------------
+  // What a watcher printed, kept until it is used: 'ready' events wait for a run (one
   // already going, a cooldown or the hourly cap holds them, and they are folded into
-  // the next run. Only the newest are kept.
+  // the next run); 'candidate' ones wait for the AI filter's next batch. Only the
+  // newest are kept.
 
-  addEvents(task: string, events: WatchEvent[]): void {
-    const q = this.db.query('INSERT INTO events (task, at, text) VALUES (?, ?, ?)')
-    for (const e of events) q.run(task, e.at, e.text)
-    const old = this.db.query('SELECT id FROM events WHERE task = ? ORDER BY id DESC LIMIT -1 OFFSET ?').all(task, LIMITS.pendingEventsKept) as any[]
+  addEvents(task: string, events: WatchEvent[], stage: EventStage = 'ready'): void {
+    const q = this.db.query('INSERT INTO events (task, stage, doc) VALUES (?, ?, ?)')
+    for (const e of events) q.run(task, stage, JSON.stringify(e))
+    const old = this.db.query('SELECT id FROM events WHERE task = ? AND stage = ? ORDER BY id DESC LIMIT -1 OFFSET ?').all(task, stage, LIMITS.pendingEventsKept) as any[]
     for (const r of old) this.db.query('DELETE FROM events WHERE id = ?').run(r.id)
   }
   // Oldest first, and gone from here.
-  takeEvents(task: string): WatchEvent[] {
-    const rows = this.db.query('SELECT id, at, text FROM events WHERE task = ? ORDER BY id').all(task) as any[]
-    this.db.query('DELETE FROM events WHERE task = ?').run(task)
-    return rows.map(r => ({ at: r.at, text: r.text }))
+  takeEvents(task: string, stage: EventStage = 'ready'): WatchEvent[] {
+    const rows = this.db.query('SELECT id, doc FROM events WHERE task = ? AND stage = ? ORDER BY id').all(task, stage) as any[]
+    this.db.query('DELETE FROM events WHERE task = ? AND stage = ?').run(task, stage)
+    return rows.map(r => JSON.parse(r.doc))
   }
-  countEvents(task: string): number {
-    return Number((this.db.query('SELECT COUNT(*) AS n FROM events WHERE task = ?').get(task) as any)?.n ?? 0)
+  countEvents(task: string, stage: EventStage = 'ready'): number {
+    return Number((this.db.query('SELECT COUNT(*) AS n FROM events WHERE task = ? AND stage = ?').get(task, stage) as any)?.n ?? 0)
   }
-  tasksWithEvents(): string[] {
-    return (this.db.query('SELECT DISTINCT task FROM events').all() as any[]).map(r => r.task)
+  tasksWithEvents(stage: EventStage = 'ready'): string[] {
+    return (this.db.query('SELECT DISTINCT task FROM events WHERE stage = ?').all(stage) as any[]).map(r => r.task)
   }
   dropEvents(task: string): void { this.db.query('DELETE FROM events WHERE task = ?').run(task) }
+
+  // --- rule state --------------------------------------------------------------------
+
+  getRuleState(task: string): RuleState {
+    const row = this.db.query('SELECT doc FROM rule_state WHERE task = ?').get(task) as any
+    return row ? JSON.parse(row.doc) : {}
+  }
+  setRuleState(task: string, st: RuleState): void {
+    this.db.query('INSERT OR REPLACE INTO rule_state (task, doc) VALUES (?, ?)').run(task, JSON.stringify(st))
+  }
 }
+
+export type EventStage = 'ready' | 'candidate'
 
 // The JSON part: everything except what the columns hold.
 function docOf(t: Task): Omit<Task, 'id' | 'chat' | 'thread' | 'state' | 'nextDue'> {
@@ -306,6 +321,7 @@ function dupKey(t: Pick<Task, 'trigger' | 'action'>): string {
     : t.trigger.kind === 'every' ? `every:${t.trigger.everyMs}`
     : t.trigger.kind === 'watch' ? `watch:${norm(t.trigger.command)}:${t.trigger.everyMs ?? 'stream'}`
     : `at:${t.trigger.at}`
-  return `${tr}|${a}`
+  const f = (t as Task).rule || (t as Task).ai ? `|${JSON.stringify((t as Task).rule ?? null)}|${norm((t as Task).ai?.question ?? '')}` : ''
+  return `${tr}|${a}${f}`
 }
 const norm = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim()

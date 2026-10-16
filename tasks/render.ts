@@ -8,6 +8,7 @@
  */
 import { eventLimits, type Run, type RunMark, type Task, type Trigger, type Usage } from './model'
 import { runsPerDay } from './schedule'
+import { ruleText } from './filters'
 
 export const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
@@ -170,6 +171,12 @@ export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchSt
   const freq = t.action.kind === 'claude' ? frequencyText(t, now) : undefined
   lines.push([sched, esc(actionText(t)), t.action.kind === 'none' ? '' : t.sound === 'loud' ? '🔔 loud' : '🔕 silent', freq ? esc(freq) : ''].filter(Boolean).join(' · '))
   if (t.trigger.kind === 'watch') lines.push(`<code>${esc(clip(t.trigger.command, 200))}</code>`)
+  if (t.rule) lines.push(`Only ${esc(ruleText(t.rule))}`)
+  if (t.ai) {
+    const n = t.filterSeen ? ` · ${t.filterSeen.toLocaleString('en-US')} considered, ${(t.filterPassed ?? 0).toLocaleString('en-US')} let through` : ''
+    lines.push(`AI filter every ${esc(durationText(t.ai.everyMs))}: “${esc(clip(t.ai.question, 160))}”${n}`)
+    if (t.filterError) lines.push(`⚠️ ${esc(t.filterError)}`)
+  }
   if (t.action.kind === 'message') lines.push(`“${esc(t.action.text)}”`)
   if (t.state === 'paused') lines.push(`⏸ ${esc(pauseText(t))}`)
   else if (t.state === 'done') lines.push('✔️ done')

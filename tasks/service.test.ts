@@ -311,3 +311,35 @@ describe('watchers', () => {
     expect(svc.create(person, { tz: 'UTC', watch: { command: 'b', every_minutes: 5 }, message: '{event}' }).ok).toBe(true)
   })
 })
+
+describe('rules and the AI filter', () => {
+  const e = (input: any) => { const r = svc.create(person, { tz: 'UTC', ...input }); return r.ok ? '' : r.error }
+  const w = { watch: { command: 'python3 feed.py' }, message: '{event}' }
+
+  test('checked when given, and only for a watcher', () => {
+    expect(e({ ...w, rule: { op: 'below' } })).toContain('rule.value')
+    expect(e({ ...w, ai_filter: { question: '' } })).toContain('ai_filter.question')
+    expect(e({ ...w, ai_filter: { question: 'Big?', every_minutes: 90 } })).toContain('ai_filter.every_minutes is between 1 and 60')
+    expect(e({ message: 'x', in_minutes: 5, rule: { op: 'changed' } })).toContain('rule and ai_filter are for a watcher')
+    expect(e({ watch: { command: 'x' }, keep_running: true, rule: { op: 'changed' } })).toContain('nothing to filter')
+  })
+
+  test('stored as given; a slow batch makes events keep longer; null removes them', () => {
+    const t = create({ ...w, rule: { op: 'crosses_below', field: 'price', value: 300 }, ai_filter: { question: 'Is it a real drop?', every_minutes: 15 } })
+    expect(t.rule).toEqual({ op: 'crosses_below', field: 'price', value: 300 })
+    expect(t.ai).toEqual({ question: 'Is it a real drop?', everyMs: 900_000 })
+    expect(t.limits?.staleMs).toBe(1_800_000)
+    const v = svc.get(person, t.id)
+    expect(v.ok && v.value).toMatchObject({ rule: 'when price goes below 300', ai_filter: { question: 'Is it a real drop?', every_minutes: 15, considered: 0, passed: 0 } })
+    const r = svc.update(person, t.id, { rule: null, ai_filter: null })
+    expect(r.ok && r.value.task.rule).toBeUndefined()
+    expect(r.ok && r.value.task.ai).toBeUndefined()
+  })
+
+  test('a watcher made into a timed task loses them', () => {
+    const t = create({ ...w, rule: { op: 'changed' } })
+    const r = svc.update(person, t.id, { cron: '7 9 * * *', message: 'Morning' })
+    expect(r.ok && r.value.task.rule).toBeUndefined()
+    expect(r.ok && r.value.task.trigger.kind).toBe('cron')
+  })
+})

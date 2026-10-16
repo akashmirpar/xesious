@@ -50,11 +50,34 @@ const WATCH_PROPS = {
   cooldown_minutes: { type: 'number', description: "For a watcher: at least this long between runs (default 5 for a prompt, 1 for a message). Events that come meanwhile are folded into the next run." },
   max_per_hour: { type: 'number', description: 'For a watcher: at most this many runs an hour (default 6 for a prompt, 20 for a message).' },
   stale_minutes: { type: 'number', description: 'For a watcher: events older than this are dropped, e.g. after a restart (default 10).' },
+  rule: {
+    type: 'object',
+    description: 'For a watcher: only events that pass this test start a run; free and exact, so prefer it to an AI filter where it can decide. ' +
+      'op: above or below (every event past value); crosses_above or crosses_below (once, when it goes past value, and again only after it came back); ' +
+      'change_pct (moved at least value % within window_minutes, either way, e.g. 1 within 3); changed (differs from the last one); contains (any of words, any case); matches (a regular expression, any case). ' +
+      'field: a JSON path into the line ("price", "data.last") when the watcher prints JSON; without it the whole line, and for the number tests the first number in it. Give null to remove it.',
+    properties: {
+      op: { type: 'string', enum: ['above', 'below', 'crosses_above', 'crosses_below', 'change_pct', 'changed', 'contains', 'matches'] },
+      field: { type: 'string' },
+      value: { type: 'number' },
+      window_minutes: { type: 'number' },
+      words: { type: 'array', items: { type: 'string' } },
+      pattern: { type: 'string' },
+    },
+    required: ['op'],
+  },
+  ai_filter: {
+    type: 'object',
+    description: 'For a watcher, for what no rule can decide: every every_minutes (default 5) a small model reads the events that came (after the rule, if there is one) and lets through only those that answer question yes, each with why. ' +
+      'One small call per batch, and only when events came. For noisy feeds: "Does this suggest a major cloud outage is starting, not commentary or old news?" Give null to remove it.',
+    properties: { question: { type: 'string' }, every_minutes: { type: 'number' } },
+    required: ['question'],
+  },
 }
 
 const TASK_FIELDS = {
   name: { type: 'string', description: "A short name for the task's card, e.g. 'Nightly news'." },
-  message: { type: 'string', description: 'For a reminder: the exact text the bot sends at the time. For a watcher: the text sent for each event, where {event} is the line the watcher printed.' },
+  message: { type: 'string', description: 'For a reminder: the exact text the bot sends at the time. For a watcher: the text sent for each event: {event} is the line the watcher printed, {value} what its rule looked at, {why} why it passed.' },
   prompt: { type: 'string', description: "For work Claude does when the task runs: a complete, self-contained instruction. The run starts without this conversation, in this topic's folder and with its instructions. For a watcher, the events that set it off come with the run." },
   ...WHEN_PROPS,
   ...WATCH_PROPS,

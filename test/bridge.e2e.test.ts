@@ -63,6 +63,9 @@ process.env.XESIOUS_STUB_LAST_ENV = LAST_ENV
 // Every MCP call the stub made (the MCPTASK scenario), one JSON line each.
 const MCP_LOG = join(TMP, 'mcp-calls.jsonl')
 process.env.XESIOUS_STUB_MCP_LOG = MCP_LOG
+// …and every question to a watcher's AI filter.
+const FILTER_LOG = join(TMP, 'filter-calls.jsonl')
+process.env.XESIOUS_STUB_FILTER_LOG = FILTER_LOG
 // Tasks are on by default; off here, so every other test sees the command line it
 // always did. The task tests switch them on.
 process.env.TG_TASKS = '0'
@@ -5141,6 +5144,24 @@ describe('tasks: watchers (phase 2)', () => {
     expect(alert.payload.disable_notification).toBe(false)
     expect(alert.payload.reply_markup.inline_keyboard[0].map((b: any) => b.text)).toEqual(['🔄 Try again', '⏸ Pause'])
     expect(T().store.getTask(t.id).watchFails).toBe(2)
+  }, 20000)
+
+  test('a rule and an AI filter: only what passes both is sent, with why; the rest is only counted', async () => {
+    const before = calls.length
+    const t = make({
+      name: 'Outage feed', watch: { command: 'printf "outage drill next week\\nMajor outage in one region stubPASS\\nlunch menu\\n"', every_minutes: 60 },
+      rule: { op: 'contains', words: ['outage'] }, ai_filter: { question: 'Is a major outage starting?' }, message: '🚨 {event} — {why}',
+    })
+    await waitFor(() => sent(before, '🚨 Major outage in one region stubPASS — the stub says so').length > 0, 15000)
+    const asked = readFileSync(FILTER_LOG, 'utf8').trim().split('\n').map(l => JSON.parse(l)).filter(c => c.prompt.includes('Is a major outage starting?'))
+    expect(asked.length).toBe(1)
+    expect(asked[0].model).toBe('haiku')
+    expect(asked[0].prompt).toContain('1. outage drill next week\n2. Major outage in one region stubPASS')
+    expect(asked[0].prompt).not.toContain('lunch menu')
+    expect(T().store.getTask(t.id)).toMatchObject({ filterSeen: 2, filterPassed: 1 })
+    const events = calls.slice(before).filter(c => textOf(c).startsWith('👀 ') && !textOf(c).startsWith('👀 Watch'))
+    // Named for whoever set it up, as a reminder is: in a muted group too, it reaches them.
+    expect(events.map(c => textOf(c))).toEqual(['👀 <a href="tg://user?id=1">Ada</a> 🚨 Major outage in one region stubPASS — the stub says so'])
   }, 20000)
 
   test('at its end it stops and says so; a tap gives it another week, and it starts again', async () => {

@@ -135,6 +135,13 @@ async function main() {
     result({ result: `${msg} stubQueryWords` })
     return
   }
+  // A watcher's AI filter: the items with stubPASS in them pass; every call is logged.
+  if (/You screen items from an automated feed/.test(val('--system-prompt') ?? '')) {
+    if (process.env.XESIOUS_STUB_FILTER_LOG) appendFileSync(process.env.XESIOUS_STUB_FILTER_LOG, JSON.stringify({ model, prompt: rawPrompt }) + '\n')
+    const pass = [...rawPrompt.matchAll(/^(\d+)\. (.*)$/gm)].filter(m => /stubPASS/.test(m[2])).map(m => ({ n: Number(m[1]), why: 'the stub says so' }))
+    result({ result: JSON.stringify({ pass }) })
+    return
+  }
   if (/Rewrite the line below so a speech synthesiser/.test(rawPrompt)) {
     const line = (rawPrompt.match(/<line>\n([\s\S]*)\n<\/line>/)?.[1] ?? '').trim()
     result({ result: `SPOKEN(${line})` })

@@ -15,18 +15,21 @@
  *
  * Watchers: sync() keeps every active streaming watcher running and stops the rest; a
  * polled one is run at its slots. What they print comes to onEvents: stale lines are
- * dropped, and the rest wait for a run, at most one per cooldown and so many an hour,
- * events that come meanwhile folded into the next. A watcher that dies is a failure
- * of its own (onWatcherExit): started again with backoff, alerting at two in a row and
- * pausing the task at five.
+ * dropped, the task's rule (filters.ts) keeps the ones that pass, its AI filter, if it
+ * has one, screens those in batches, and what is left waits for a run: at most one per
+ * cooldown and so many an hour, events that come meanwhile folded into the next. A
+ * watcher that dies is a failure of its own (onWatcherExit): started again with
+ * backoff, alerting at two in a row and pausing the task at five.
  */
 import { mkdirSync, writeFileSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import { LIMITS, eventLimits, isStreaming, isWatch, type Run, type RunMark, type Task, type Usage, type WatchEvent } from './model'
 import type { TaskStore } from './store'
 import { manualRunId, nextAfter, resolveDue, slotRunId } from './schedule'
 import { elapsedText, markOf, whenText } from './render'
 import type { PollResult, WatcherExit } from './watchers'
+import { applyRule } from './filters'
 
 export interface ClaudeOutcome {
   ok: boolean              // the run finished and produced an answer
@@ -80,7 +83,14 @@ export interface RuntimeDeps {
   // Without it, watcher tasks are never started.
   watchers?: WatcherControl
   maxWatchers?: number     // streaming watchers at once, across every task (8)
+  // The AI filter: which of these lines answer the task's question. undefined when
+  // it couldn't answer (they are asked about again next time).
+  filter?(task: Task, question: string, items: string[]): Promise<FilterVerdict | undefined>
 }
+
+export interface FilterVerdict { pass: { n: number; why: string }[]; by: string }
+
+const FILTER_BATCH = 50
 
 const WARMUP_MS = 2 * 60_000
 const CATCHUP_BATCH = 5
@@ -97,7 +107,7 @@ export class TaskRuntime {
   private stopped = false
   private pending = new Set<Promise<void>>()
   private polling = new Set<string>()
-  private eventSeq = 0
+  private filtering = new Set<string>()
   private later = new Map<string, unknown>()     // per task: a cooldown's end, a watcher's restart
 
   constructor(private d: RuntimeDeps) {}
@@ -172,6 +182,7 @@ export class TaskRuntime {
     if (this.stopped) return
     try { this.sync() } catch (e) { this.d.log(`[tasks] watchers: ${e}`) }
     for (const id of this.store.tasksWithEvents()) this.fireEvents(id)
+    for (const id of this.store.tasksWithEvents('candidate')) this.scheduleFilter(id)
     const now = this.d.now()
     const warm = now.getTime() - this.d.startedAt.getTime() < WARMUP_MS
     let started = 0
@@ -547,7 +558,8 @@ export class TaskRuntime {
     if (ok && r.events.length) this.onEvents(taskId, r.events)
   }
 
-  // What a watcher printed. Stale lines are dropped; the rest wait for a run.
+  // What a watcher printed. Stale lines are dropped, the rule keeps what passes it,
+  // and the rest goes to the AI filter if the task has one, or else waits for a run.
   onEvents(taskId: string, events: WatchEvent[]): void {
     const t = this.store.getTask(taskId)
     if (!t || t.state !== 'active' || !events.length) return
@@ -558,8 +570,77 @@ export class TaskRuntime {
     const fresh = events.filter(e => now - Date.parse(e.at) <= lim.staleMs)
     if (fresh.length < events.length) this.d.log(`[tasks] ${t.id}: ${events.length - fresh.length} stale event(s) dropped`)
     if (!fresh.length) return
-    this.store.addEvents(t.id, fresh)
+    let passed = fresh
+    if (t.rule) {
+      const st = this.store.getRuleState(t.id)
+      passed = []
+      for (const e of fresh) {
+        const r = applyRule(t.rule, st, e)
+        if (r.pass) passed.push({ ...e, value: r.value, why: r.why })
+      }
+      this.store.setRuleState(t.id, st)
+      if (!passed.length) return
+    }
+    if (t.ai) {
+      this.store.addEvents(t.id, passed, 'candidate')
+      this.scheduleFilter(t.id)
+      return
+    }
+    this.store.addEvents(t.id, passed)
     this.fireEvents(t.id)
+  }
+
+  // The AI filter's next batch: once a batch interval after the last, and only when
+  // there are candidates.
+  private scheduleFilter(taskId: string): void {
+    const key = `${taskId}:filter`
+    if (this.later.has(key) || this.filtering.has(taskId)) return
+    const t = this.store.getTask(taskId)
+    if (!t?.ai || t.state !== 'active') { this.store.dropEvents(taskId); return }
+    const wait = (t.lastFilterAt ? Date.parse(t.lastFilterAt) + t.ai.everyMs : 0) - this.d.now().getTime()
+    this.soon(key, wait, () => this.track(this.runFilter(taskId)))
+  }
+
+  // One batch: the model is asked which candidates answer the task's question; those
+  // that do, with why, wait for a run. Every decision is logged, and counted on the
+  // card. If it couldn't answer, the batch is asked about again next time.
+  private async runFilter(taskId: string): Promise<void> {
+    const t = this.store.getTask(taskId)
+    if (!t?.ai || t.state !== 'active') { this.store.dropEvents(taskId); return }
+    if (this.filtering.has(taskId) || !this.d.filter) return
+    const lim = eventLimits(t)
+    const now = this.d.now()
+    const all = this.store.takeEvents(t.id, 'candidate').filter(e => now.getTime() - Date.parse(e.at) <= lim.staleMs)
+    if (!all.length) return
+    // The newest, if a flood came: the ones left out are counted as not passed.
+    const batch = all.slice(-FILTER_BATCH)
+    this.filtering.add(taskId)
+    let v: FilterVerdict | undefined
+    try {
+      v = await this.d.filter(t, t.ai.question, batch.map(e => e.text))
+    } catch (e) {
+      this.d.log(`[tasks] ${t.id}: the filter failed: ${e}`)
+    } finally {
+      this.filtering.delete(taskId)
+    }
+    const cur = this.store.getTask(taskId)
+    if (!cur || cur.state !== 'active') return
+    if (!v) {
+      this.store.addEvents(t.id, batch, 'candidate')
+      this.store.updateTask(t.id, { lastFilterAt: now.toISOString(), filterError: 'the AI filter did not answer; it asks again at its next batch' })
+      this.d.cardChanged(this.store.getTask(t.id)!)
+      this.scheduleFilter(t.id)
+      return
+    }
+    const passed = v.pass.map(p => ({ ...batch[p.n - 1], why: p.why || batch[p.n - 1].why }))
+    this.d.log(`[tasks] ${t.id}: the AI filter (${v.by}) passed ${passed.length} of ${all.length}${passed.length ? `: ${passed.map(e => e.why).join(' | ')}` : ''}`)
+    this.store.updateTask(t.id, {
+      lastFilterAt: now.toISOString(), filterError: undefined,
+      filterSeen: (cur.filterSeen ?? 0) + all.length, filterPassed: (cur.filterPassed ?? 0) + passed.length,
+    })
+    if (cur.filterError) this.d.cardChanged(this.store.getTask(t.id)!)
+    if (passed.length) { this.store.addEvents(t.id, passed); this.fireEvents(t.id) }
+    if (this.store.countEvents(t.id, 'candidate')) this.scheduleFilter(t.id)
   }
 
   // A run for the events waiting, if the task may run now: not while one is going,
@@ -580,7 +661,7 @@ export class TaskRuntime {
     const all = this.store.takeEvents(t.id).filter(e => now - Date.parse(e.at) <= lim.staleMs)
     if (!all.length) return
     const run: Run = {
-      id: `${t.id}@event-${now.toString(36)}.${(this.eventSeq++).toString(36)}`, task: t.id, trigger: 'event', state: 'queued',
+      id: `${t.id}@event-${now.toString(36)}.${randomBytes(3).toString('hex')}`, task: t.id, trigger: 'event', state: 'queued',
       events: all.slice(-LIMITS.eventsPerRun), folded: all.length,
     }
     // Never lose them: back they go if the run can't be recorded.
@@ -670,12 +751,15 @@ export class TaskRuntime {
   }
 }
 
-// A watcher's message for its run: {event} is the newest line, and events folded into
-// the run are counted. Without {event}, the line follows the text.
+// A watcher's message for its run: {event} is the newest line, {value} what its rule
+// looked at, {why} why it passed; events folded into the run are counted. Without any
+// of them, the line follows the text.
 export function eventText(template: string, run: Run): string {
   const evs = run.events ?? []
-  const last = evs[evs.length - 1]?.text ?? ''
+  const last = evs[evs.length - 1]
   const more = (run.folded ?? evs.length) - 1
-  const body = template.includes('{event}') ? template.split('{event}').join(last) : last ? `${template}\n${last}` : template
+  const fill: Record<string, string> = { '{event}': last?.text ?? '', '{value}': last?.value ?? last?.text ?? '', '{why}': last?.why ?? '' }
+  const used = Object.keys(fill).some(k => template.includes(k))
+  const body = used ? template.replace(/\{event\}|\{value\}|\{why\}/g, k => fill[k]) : last ? `${template}\n${last.text}` : template
   return more > 0 ? `${body}\n(+${more} more since)` : body
 }
