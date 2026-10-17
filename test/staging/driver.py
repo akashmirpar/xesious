@@ -1209,6 +1209,17 @@ def combined_answer(msgs, tokens, after_id=0, not_in=()):
     return None
 
 
+def _reply_to(msg):
+    """The id of the message this one replies to, or None."""
+    return getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None)
+
+
+# The bot's sends in a group wait behind Telegram's limit of about 20 a minute per
+# group (the bridge's throttler counts edits and deletions too), so after a busy case
+# a menu, or its next screen, can take most of a minute to arrive. Not a failure.
+GROUP_SEND_WAIT = 60
+
+
 async def _until(fn, secs):
     """Poll a predicate once a second; hand back its first truthy value, or None."""
     for _ in range(int(secs)):
@@ -2975,9 +2986,17 @@ async def feature_voice_cancel_and_tidy(client, bot):
     if not full:
         problems.append("no full file arrived for the tidy case")
     else:
-        notes = [m for m in seen[mark2:] if (m.voice or m.audio) and not is_full_file(m)]
+        # This answer's parts reply to the same message as its full file. A voice note
+        # of an earlier answer that lands meanwhile is not one of them, and the bot is
+        # right to leave it.
+        voiced = [m for m in seen[mark2:] if (m.voice or m.audio) and not is_full_file(m)]
+        ans = _reply_to(full)
+        notes = [m for m in voiced if ans is None or _reply_to(m) == ans]
+        others = [m for m in voiced if m not in notes]
         tbtn = [b for row in (full.reply_markup.rows if full.reply_markup else []) for b in row.buttons]
-        print(f"    {len(notes)} note(s); full file offers: {[b.text for b in tbtn]}")
+        print(f"    {len(notes)} note(s) of this answer"
+              + (f", and {len(others)} of another ({[(m.id, _reply_to(m)) for m in others]})" if others else "")
+              + f"; full file offers: {[b.text for b in tbtn]}")
         if len(notes) < 2:
             problems.append(f"the answer produced {len(notes)} note(s) — too short to exercise tidying")
         elif not any("Remove" in b.text for b in tbtn):
@@ -2990,7 +3009,15 @@ async def feature_voice_cancel_and_tidy(client, bot):
             alive = [m for m in still if m is not None and not isinstance(m, type(None)) and getattr(m, "id", None)]
             print(f"    of {len(ids)} notes, {len(alive)} still exist after tidying")
             if alive:
-                problems.append(f"{len(alive)} of {len(ids)} notes survived the tidy")
+                # What the bridge says it did, and why a deletion failed, if it did.
+                said = []
+                try:
+                    with open(os.path.join("state", "staging", "bridge.log"), encoding="utf-8", errors="replace") as fh:
+                        said = [l.strip() for l in fh if "[voice] tidied" in l or "[voice] tidy:" in l][-6:]
+                except OSError:
+                    pass
+                problems.append(f"{len(alive)} of {len(ids)} notes survived the tidy (ids {[m.id for m in alive]}"
+                                + (f"; the bridge: {said}" if said else "") + ")")
             # …and the full file itself must NOT have been removed.
             again = await client.get_messages(bot, ids=[full.id])
             if not again or again[0] is None:
@@ -3052,9 +3079,11 @@ async def feature_config_menu(client, bot):
     log_from = os.path.getsize(log) if os.path.exists(log) else 0
     text_of = lambda m: getattr(m, "message", "") or ""
     try:
-        await client.send_message(group, "/config", reply_to=tid)
-        is_menu = lambda m: m.reply_markup and "Settings" in text_of(m)
-        menu = await _until(lambda: next((m for m in reversed(eph + seen) if is_menu(m)), None), 20)
+        sent = await client.send_message(group, "/config", reply_to=tid)
+        # The menu for THIS /config: it replies to it. One a previous case asked for
+        # that arrives late is not this one.
+        is_menu = lambda m: m.reply_markup and "Settings" in text_of(m) and _reply_to(m) == sent.id
+        menu = await _until(lambda: next((m for m in reversed(eph + seen) if is_menu(m)), None), GROUP_SEND_WAIT)
         try:
             with open(log, encoding="utf-8", errors="replace") as fh:
                 fh.seek(log_from)
@@ -3087,7 +3116,7 @@ async def feature_config_menu(client, bot):
             # Wait for THIS menu's next version: reading its buttons before the edit
             # lands means tapping a button from the previous screen, which Telegram
             # rejects for an ephemeral message (DATA_INVALID).
-            await _until(lambda: sum(1 for m in pool if m.id == menu.id) > n, 15)
+            await _until(lambda: sum(1 for m in pool if m.id == menu.id) > n, GROUP_SEND_WAIT)
             return ans, None
 
         me = await client.get_permissions(group, "me")
@@ -3149,7 +3178,10 @@ async def feature_config_menu_in_general(client, bot):
 
     try:
         sent = await client.send_message(group, "/config")
-        menu = await _until(lambda: next((m for m in eph if m.reply_markup and "Settings" in (m.message or "")), None), 20)
+        # Not a menu an earlier case asked for that arrives late: that one replies to
+        # an earlier message. An unplaced menu (no reply at all) still counts, and fails.
+        mine = lambda m: _reply_to(m) is None or _reply_to(m) >= sent.id
+        menu = await _until(lambda: next((m for m in eph if m.reply_markup and "Settings" in (m.message or "") and mine(m)), None), GROUP_SEND_WAIT)
         try:
             await client.delete_messages(group, [sent.id])
         except Exception:                                       # noqa: BLE001

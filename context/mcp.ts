@@ -170,13 +170,18 @@ async function call(name: string, a: any): Promise<string> {
   throw new Error(`unknown tool ${name}`)
 }
 
+// Versions this server implements: tools only, which every one of them has. Answer
+// with one of these, never by echoing whatever a newer client asks for.
+const SUPPORTED = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']
+const negotiate = (asked?: string) => (asked && SUPPORTED.includes(asked) ? asked : SUPPORTED[0])
+
 const send = (o: unknown) => process.stdout.write(JSON.stringify(o) + '\n')
 async function handle(msg: any): Promise<void> {
   const { id, method, params } = msg
   if (id === undefined) return            // a notification; nothing to answer
   try {
     if (method === 'initialize') {
-      send({ jsonrpc: '2.0', id, result: { protocolVersion: params?.protocolVersion ?? '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'xesious-history', version: '1.0.0' } } })
+      send({ jsonrpc: '2.0', id, result: { protocolVersion: negotiate(params?.protocolVersion), capabilities: { tools: {} }, serverInfo: { name: 'xesious-history', version: '1.0.0' } } })
     } else if (method === 'tools/list') {
       send({ jsonrpc: '2.0', id, result: { tools: TOOLS } })
     } else if (method === 'tools/call') {
