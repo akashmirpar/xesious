@@ -4808,8 +4808,10 @@ async function tidySpeech(ctx: Context, task: SpeechTask): Promise<number> {
   let gone = 0
   for (const id of task.chunkIds) {
     // A bot may only delete its own messages, and only within 48 hours. Both hold
-    // for a note minutes old, but a failure here is not worth reporting.
-    if (await ctx.api.deleteMessage(ctx.chat!.id, id).then(() => true).catch(() => false)) gone++
+    // for a note minutes old, so a failure isn't said in the chat; it is logged.
+    const failed = await ctx.api.deleteMessage(ctx.chat!.id, id).then(() => undefined, e => String(e))
+    if (failed === undefined) gone++
+    else console.error(`[voice] tidy: note ${id} not removed: ${failed}`)
   }
   task.chunkIds = []
   return gone
