@@ -10,6 +10,9 @@
  *   EMPTY  → init + a successful result with empty text  → bridge reports "no answer"
  *   NORESP → init + a result whose whole text is "No response requested." — the CLI
  *            queue-layer artefact that used to be posted verbatim as the reply
+ *   NOTIFIED→ init + an answer and its result, then a second turn (as a background-task
+ *            notification starts) whose result is empty — the run answered, then
+ *            ended in silence
  *   ERROR  → init + result with is_error:true            → bridge marks the turn failed
  *   HANG   → init, then sleep past the test's timeout     → exercises the watchdog path
  *   BGPROC → init + a REAL backgrounded child process, then sleeps → exercises whether
@@ -37,7 +40,7 @@
  *                            instructions from /config
  *   topicInstr / noTopicInstr — …and a topic's own, on top of the group's
  */
-import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, rmSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 
@@ -207,7 +210,17 @@ async function main() {
     setTimeout(() => process.exit(0), 60_000)
     return
   }
+  // A test that needs one turn to come back empty, and the next to answer, creates
+  // this file; the empty turn removes it.
+  const once = process.env.XESIOUS_STUB_EMPTY_ONCE
+  if (once && existsSync(once)) { rmSync(once); result({ result: '' }); return }
   if (scenario === 'EMPTY') { result({ result: '' }); return }
+  if (scenario === 'NOTIFIED') {
+    emit({ type: 'assistant', message: { content: [{ type: 'text', text: 'answeredBeforeNotice' }] } })
+    result({ result: 'answeredBeforeNotice' })
+    result({ result: '' })
+    return
+  }
   if (scenario === 'NORESP') { result({ result: 'No response requested.' }); return }
   if (scenario === 'ERROR') {
     emit({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: sessionId, result: 'boom' })

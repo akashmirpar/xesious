@@ -31,7 +31,7 @@ import {
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
   EFFORT_LEVELS, EFFORT_DEFAULT, normalizeEffort,
-  parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, promoteBlock, stalenessNote,
+  parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, lastAnswerBlock, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
   speechUnits, speechChunkSeconds, SPEAKERS, SPEAKER_PAGE, SPEAKER_DEFAULT, kokoroLang, isSpeakerId, speakerLabel,
   speechToc, fullAudioCaption, readAlongHtml, fmtDurationWords, speechEstimateSeconds, type SpeechUnit, type UnitTiming,
@@ -1556,9 +1556,18 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
         // A turn that produced no answer is a failed turn, not a reply. Both the
         // empty result and the CLI queue layer's "No response requested." land
         // here; delivering either verbatim is what made questions look ignored.
-        const noAnswer = !isError && isNonAnswer(finalText)
+        //
+        // But only when the run said nothing at all. A run that waits on background
+        // work goes on after it has answered: each task notification starts a turn
+        // with a result of its own, and the last one may say nothing. That empty
+        // result used to stand for the whole run, so a written answer was reported
+        // as none and kept only in the run record. Found in production.
+        const lastSaid = !isError && isNonAnswer(finalText) ? lastAnswerBlock(textBlocks) : undefined
+        if (lastSaid) console.log(`[claude] ${key}: the last result was ${JSON.stringify(finalText.slice(0, 60))}; delivering the last thing it said`)
+        const text = lastSaid ?? finalText
+        const noAnswer = !isError && isNonAnswer(text)
         if (noAnswer) console.error(`[warn] no answer for ${key}: ${JSON.stringify(finalText.slice(0, 60))}`)
-        void finish({ text: finalText || (isError ? '(claude error)' : ''), sessionId, isError, noAnswer, blocks: textBlocks })
+        void finish({ text: text || (isError ? '(claude error)' : ''), sessionId, isError, noAnswer, blocks: textBlocks })
       }
       else if (stalled) void finish({
         text: `⚠️ The run stalled — nothing came back for ${Math.round(IDLE_TIMEOUT_MS / 60000)} minutes, so I stopped it. Nothing was delivered. Try again, or send /stop if it happens repeatedly.`,
@@ -4909,14 +4918,19 @@ async function speakAnswer(ctx: Context, threadId: number | undefined, key: stri
 // Prompts kept so a "no answer" can be retried with one tap. In memory only and
 // capped: a retry after a restart is not worth persisting state for, and the
 // button says so rather than silently doing nothing.
-const retryPrompts = new Map<string, { key: string; threadId?: number; prompt: string; replyTo?: number; forwarded?: Forwarded }>()
+//
+// The turn is kept whole, not just its words. In a group the request is often in
+// the message the mention replies to, and a bare "@bot" retried without that
+// conversation reached the model as an empty message. Found in production.
+type RetryTurn = Pick<PromptKind, 'conv' | 'forwarded' | 'asker'>
+const retryPrompts = new Map<string, { key: string; threadId?: number; prompt: string; replyTo?: number } & RetryTurn>()
 const RETRY_MAX = 50
 
 // A turn that came back with nothing is reported as such, with the offer to run it
 // again. Deliberately a button rather than an automatic resend: the turn may
 // already have edited files or run commands, and repeating those without being
 // asked is worse than the missing answer.
-async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: string, prompt: string, replyTo?: number, forwarded?: Forwarded): Promise<void> {
+async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: string, prompt: string, replyTo: number | undefined, turn: RetryTurn): Promise<void> {
   const opts: any = destOpts({ threadId, replyTo })
   const msg = await ctx.api.sendMessage(ctx.chat!.id,
     '⚠️ No answer came back for that message. Nothing was lost — tap to send it again.',
@@ -4924,7 +4938,7 @@ async function sendNoAnswer(ctx: Context, threadId: number | undefined, key: str
   ).catch(() => null)
   if (!msg) return
   if (retryPrompts.size >= RETRY_MAX) retryPrompts.delete(retryPrompts.keys().next().value as string)
-  retryPrompts.set(String(msg.message_id), { key, threadId, prompt, replyTo, ...(forwarded ? { forwarded } : {}) })
+  retryPrompts.set(String(msg.message_id), { key, threadId, prompt, replyTo, ...turn })
   await ctx.api.editMessageReplyMarkup(ctx.chat!.id, msg.message_id, {
     reply_markup: { inline_keyboard: [[{ text: '🔁 Retry', callback_data: `retry:${msg.message_id}` }]] },
   }).catch(() => {})
@@ -5286,6 +5300,9 @@ type PromptKind = {
   // Messages the person forwarded: a forwardedPreamble block, handed over before their
   // own message, and the forwarded words themselves for the status and the search.
   forwarded?: Forwarded
+  // Who asked, when it is not who this update is from: a retry is tapped by anyone,
+  // but the request is still the asker's.
+  asker?: Context['from']
 }
 type Forwarded = { block: string; text: string }
 // A person's message the way the model must see it to act on it: behind the marker
@@ -5297,10 +5314,10 @@ function forwardedOf(ctx: Context, msg: any, text: string): Forwarded | undefine
   if (!from) return undefined
   return { block: forwardedPreamble(BRIDGE_NONCE, userName(ctx.from!), [{ from, date: msg.forward_origin.date, text }]), text }
 }
-const frameFrom = (ctx: Context, text: string) => frameUserMessage(text, {
+const frameFrom = (ctx: Context, text: string, from = ctx.from) => frameUserMessage(text, {
   nonce: BRIDGE_NONCE,
-  name: [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || ctx.from?.username,
-  id: ctx.from?.id,
+  name: [from?.first_name, from?.last_name].filter(Boolean).join(' ') || from?.username,
+  id: from?.id,
 })
 // Put a turn's status up now, Interrupt and all, as a job with no process yet (see
 // handlePrompt). Undefined when Telegram refuses: the run then posts its own, as it
@@ -5421,7 +5438,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   // Landed before the run shows what the recall found, so it can never overwrite it.
   await early?.edit
   const framed = shareNote + filesPreamble(BRIDGE_NONCE, arrived) + preamble + convBlock + (kind.auto ? autoFrame(kind.auto.reason)
-    : (kind.forwarded?.block ?? '') + frameFrom(ctx, prompt || (kind.forwarded ? '(nothing of their own: only the forwarded messages above)' : '')))
+    : (kind.forwarded?.block ?? '') + frameFrom(ctx, prompt || (kind.forwarded ? '(nothing of their own: only the forwarded messages above)' : ''), kind.asker ?? ctx.from))
   // If this topic has a live link, the shared link is the source of truth for the
   // session id, so a conversation held over the live web call continues here (and
   // vice-versa). Otherwise use the topic's own stored id.
@@ -5508,7 +5525,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
       return
     }
     if (res.noAnswer) {
-      await sendNoAnswer(ctx, threadId, key, prompt, replyLink(), kind.forwarded)
+      await sendNoAnswer(ctx, threadId, key, prompt, replyLink(), { conv: kind.conv, forwarded: kind.forwarded, asker: kind.asker ?? ctx.from })
       return
     }
     if (!background && !res.isError && res.text.trim()) rememberAsked(key, said)
@@ -7636,7 +7653,7 @@ bot.on('callback_query:data', async ctx => {
     retryPrompts.delete(data.slice(6))
     await ctx.answerCallbackQuery({ text: 'Retrying…' }).catch(() => {})
     await ctx.editMessageReplyMarkup(undefined).catch(() => {})   // one tap only
-    void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo, { forceReplyLink: true, forwarded: rec.forwarded }))
+    void enqueue(rec.key, () => handlePrompt(ctx, rec.threadId, rec.key, rec.prompt, undefined, rec.replyTo, { forceReplyLink: true, conv: rec.conv, forwarded: rec.forwarded, asker: rec.asker }))
       .catch(e => console.error(`[error] retry ${rec.key}: ${e}`))
     return
   }

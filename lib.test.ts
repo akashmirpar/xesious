@@ -20,7 +20,7 @@ import {
   speechToc, fullAudioCaption, readAlongHtml, fmtDuration, fmtDurationWords,
   parseFanoutPlan, renderFanoutProposal, buildSynthesisPreamble, fanoutPlanPrompt,
   FANOUT_MARK, fanoutTopicName, topicLink, topicTag, messageLink, forkTopicName, filesPreamble,
-  sanitizeProse, PROSE_RULES, isNonAnswer,
+  sanitizeProse, PROSE_RULES, isNonAnswer, lastAnswerBlock,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
 } from './lib'
@@ -993,6 +993,16 @@ describe('regression: the reported strikethrough incidents', () => {
     for (const t of ['~25,300', '(~July 2026)', '~24.5m', '~18.3%', '~22×', '~40m', '~$120bn']) {
       expect(sanitizeProse(`about ${t} total`, 'markdownv2')).toContain('\\~')
     }
+  })
+})
+
+describe('lastAnswerBlock', () => {
+  test('the last block that says something, past any non-answers', () => {
+    expect(lastAnswerBlock(['still working', 'the answer', '', 'No response requested.'])).toBe('the answer')
+  })
+  test('nothing when the run never said anything', () => {
+    expect(lastAnswerBlock([])).toBeUndefined()
+    expect(lastAnswerBlock(['  ', 'No response requested.'])).toBeUndefined()
   })
 })
 

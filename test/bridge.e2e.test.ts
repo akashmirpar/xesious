@@ -40,6 +40,9 @@ process.env.XESIOUS_STUB_QUERY_LOG = QUERY_LOG
 // While this file exists the query writer takes a second and a half.
 const SLOW_QUERY = join(TMP, 'slow-query')
 process.env.XESIOUS_STUB_QUERY_SLOW = SLOW_QUERY
+// While this file exists the next turn comes back empty (and removes it).
+const EMPTY_ONCE = join(TMP, 'empty-once')
+process.env.XESIOUS_STUB_EMPTY_ONCE = EMPTY_ONCE
 process.env.TG_AUTO_QUIET_MS = '300'
 // Each message runs at once, as before bursts; the burst cases turn it on (_setBurst).
 process.env.TG_BURST_QUIET_MS = '0'
@@ -323,6 +326,14 @@ describe('degenerate CLI outputs', () => {
     // Deliberately a button, not an automatic resend: an agentic turn may already
     // have edited files, and repeating that unasked is worse than the lost answer.
     expect(String(btn.callback_data)).toStartWith('retry:')
+  })
+  test('an answer followed by a silent notification turn is delivered, not reported as none', async () => {
+    // Found in production: a run waiting on background subagents answered, then a
+    // last task notification started a turn that said nothing. Its empty result
+    // stood for the whole run, and the answer only survived in the run record.
+    const cs = await incoming(1010, 'NOTIFIED')
+    expect(finalReply(cs)).toContain('answeredBeforeNotice')
+    expect(sends(cs).some(c => String(c.payload.text ?? '').includes('No answer came back'))).toBe(false)
   })
   test('is_error result is still delivered (the error text)', async () => {
     const cs = await incoming(1004, 'ERROR')
@@ -3437,6 +3448,34 @@ describe('conversation mode', () => {
     expect(p).toContain('may have nothing to do with it')
     // The whole recorded topic is also a file Claude can read.
     expect(p).toMatch(/whole recorded conversation of this topic \(3 messages\) is in \.\/inbox\/conversation\.md/)
+  })
+
+  test('a retried "no answer" keeps the conversation and the asker, whoever taps it', async () => {
+    // Found in production: the request was the message a bare "@bot" replied to.
+    // The retry kept only the words of the mention, so the model was handed an
+    // empty message — from whoever tapped — and asked what was wanted.
+    setMode(`${C}:809`, 'conversation')
+    const target = (await say(809, 'please check why these three payments bounced')).id
+    writeFileSync(EMPTY_ONCE, '')
+    const { cs } = await say(809, '@testbot', ADA,
+      { reply_to_message: { message_id: target, date: 0, chat: { id: C, type: 'supergroup' }, from: SARA, text: 'please check why these three payments bounced' } })
+    const warn = sends(cs).find(c => String(c.payload.text ?? '').includes('No answer came back'))
+    expect(warn).toBeTruthy()
+    // The button is posted as retry:pending and then given the warning's own id.
+    const armed = cs.find(c => c.method === 'editMessageReplyMarkup' && String(c.payload.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data ?? '').startsWith('retry:'))
+    const data = String(armed!.payload.reply_markup.inline_keyboard[0][0].callback_data)
+    const warnId = Number(data.slice(6))
+    expect(warnId).toBeGreaterThan(0)
+    const before = calls.length
+    await bridge.bot.handleUpdate({ update_id: updateId++, callback_query: { id: 'rt1', chat_instance: 'x', data,
+      from: person(3, 'Bea'),
+      message: { message_id: warnId, date: 0, chat: { id: C, type: 'supergroup', is_forum: true }, message_thread_id: 809, is_topic_message: true } } })
+    await bridge._drainQueue(`${C}:809`)
+    expect(replied(calls.slice(before))).toBe(true)
+    const p = handed()
+    expect(p).toContain('please check why these three payments bounced')
+    expect(p).toMatch(/message from Ada, id 1:/)
+    expect(p).not.toMatch(/message from Bea/)
   })
 
   test('in a topic the BOT created, ordinary messages are not replies to the bot', async () => {

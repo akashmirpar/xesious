@@ -1336,6 +1336,14 @@ export function isNonAnswer(text: string): boolean {
   return NON_ANSWERS.includes(t.toLowerCase())
 }
 
+// The last thing a run actually said, for when its final result is a non-answer:
+// a run's later turns (one per background-task notification) can end in silence
+// after an earlier one answered.
+export function lastAnswerBlock(blocks: string[]): string | undefined {
+  for (let i = blocks.length - 1; i >= 0; i--) if (!isNonAnswer(blocks[i])) return blocks[i]
+  return undefined
+}
+
 // ---------------------------------------------------------------------------
 // polling conflicts (409)
 // ---------------------------------------------------------------------------
