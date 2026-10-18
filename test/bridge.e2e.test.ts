@@ -124,6 +124,8 @@ let nextMessageId = 1000
 // because the fallback to merely closing is the interesting half — a fallback that
 // no test ever reaches is a fallback nobody knows is broken.
 let denyDelete = false
+// createForumTopic refused, as for a bot that may not manage topics.
+let denyCreateTopic = false
 // A media group is all-or-nothing, so the fallback to two individual sends is the
 // half that keeps a failure cosmetic instead of losing the answer. A fallback no
 // test ever reaches is a fallback nobody knows is broken.
@@ -199,6 +201,9 @@ bridge.bot.api.config.use(async (_prev: any, method: string, payload: any) => {
   }
   if (method === 'deleteForumTopic' && denyDelete) {
     return { ok: false, error_code: 400, description: 'Bad Request: not enough rights to delete messages' }
+  }
+  if (method === 'createForumTopic' && denyCreateTopic) {
+    return { ok: false, error_code: 400, description: 'Bad Request: not enough rights to create a topic' }
   }
   if (method === 'createForumTopic') {
     // The real API returns a thread id, and the fan-out code depends on it: without
@@ -5542,6 +5547,40 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
       await settleCards()
       expect(calls.slice(before).some(c => c.method === 'createForumTopic')).toBe(false)
     } finally { delete bridge._groupSettings()[String(G)].activityTopic }
+  })
+
+  test('a group whose first task could not make the activity topic gets it once the bot may manage topics', async () => {
+    const G = -100555
+    denyCreateTopic = true
+    try {
+      make({ name: 'Early bird', prompt: 'E', cron: '7 5 * * *' }, scopeOf(G, 611))
+      await settleCards()
+    } finally { denyCreateTopic = false }
+    expect(T().store.getMeta(`activity:${G}`)).toBe('none')
+    // Told once; a later task does not try again.
+    const before = calls.length
+    make({ name: 'Second', prompt: 'S', cron: '7 6 * * *' }, scopeOf(G, 612))
+    await settleCards()
+    expect(calls.slice(before).some(c => c.method === 'createForumTopic')).toBe(false)
+    // Promoted without that right: still nothing.
+    const promote = (can_manage_topics: boolean) => bridge.bot.handleUpdate({ update_id: updateId++, my_chat_member: {
+      chat: { id: G, type: 'supergroup', title: 'Ops', is_forum: true }, from: ADA, date: 0,
+      old_chat_member: { status: 'member', user: { id: 42, is_bot: true, first_name: 'TestBot' } },
+      new_chat_member: { status: 'administrator', user: { id: 42, is_bot: true, first_name: 'TestBot' }, can_manage_topics,
+        can_be_edited: false, is_anonymous: false, can_manage_chat: true, can_delete_messages: true, can_manage_video_chats: false,
+        can_restrict_members: false, can_promote_members: false, can_change_info: true, can_invite_users: true,
+        can_post_stories: false, can_edit_stories: false, can_delete_stories: false } } } as any)
+    const before2 = calls.length
+    await promote(false)
+    await settleCards()
+    expect(calls.slice(before2).some(c => c.method === 'createForumTopic')).toBe(false)
+    expect(T().store.getMeta(`activity:${G}`)).toBe('none')
+    // With it, the topic is made at once, without waiting for another task.
+    const before3 = calls.length
+    await promote(true)
+    await settleCards()
+    expect(calls.slice(before3).some(c => c.method === 'createForumTopic' && c.payload.chat_id === G && c.payload.name === '🗂 Tasks')).toBe(true)
+    expect(Number(T().store.getMeta(`activity:${G}`))).toBeGreaterThan(0)
   })
 
   test("a task set up in a forum's General is logged too; a group without topics has no activity topic", async () => {

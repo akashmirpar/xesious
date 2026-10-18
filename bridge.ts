@@ -2314,6 +2314,7 @@ async function applySetting(m: ConfigMenu, i: number, ci: string, scope: 'g' | '
   const g = (groupSettings[String(m.chatId)] ??= {})
   if (value === undefined) delete g[d.id]; else g[d.id] = value
   noteGroupChange(m, d.id)
+  if (d.id === 'activityTopic') retryActivityTopic(String(m.chatId))
   let cleared = 0
   const kept = overrideCount(m.chatId, d.id)
   if (scope === 'e') {
@@ -7480,8 +7481,10 @@ bot.on('edited_message', ctx => {
 // point where it's actually possible, so retry there rather than making the user
 // restart the bridge to pick it up.
 bot.on('my_chat_member', async ctx => {
-  const status = ctx.myChatMember.new_chat_member.status
-  if (status !== 'administrator') return
+  const member = ctx.myChatMember.new_chat_member
+  if (member.status !== 'administrator') return
+  // Likewise the 🗂 Tasks topic a first task could not make.
+  if (member.can_manage_topics) retryActivityTopic(String(ctx.chat.id))
   await ensureGroupLogo(ctx.chat.id)
 })
 
@@ -9387,6 +9390,18 @@ function activityThread(t: Task): Promise<number | undefined> {
   })()
   activityMaking.set(t.chat, p)
   return p
+}
+
+// A refusal is remembered ('none') so the group is told once, not with every task.
+// It is forgotten when the bot is given the right to manage topics, or /config sets
+// the activity topic again; the topic is then made at once if the group has tasks,
+// otherwise with its next one.
+function retryActivityTopic(chat: string): void {
+  if (!taskStore || taskStore.getMeta(`activity:${chat}`) !== 'none') return
+  taskStore.setMeta(`activity:${chat}`, undefined)
+  console.log(`[tasks] retrying the activity topic in ${chat}`)
+  const t = taskStore.listTasks({ chat, states: ['active', 'paused'] })[0]
+  if (t) void activityThread(t).catch(e => console.error(`[tasks] activity: ${e}`))
 }
 
 const CHANGE_TEXT: Record<string, (t: Task) => string> = {
