@@ -49,6 +49,13 @@ PULLED=0
 #    live/server.ts is its own process — so restoring bridge.ts alone puts back a
 #    file that imports a still-broken module and calls it a rollback.
 BEFORE="$(git rev-parse HEAD 2>/dev/null || echo '')"
+# This run's own logs, in a fresh directory only this user can open. They used to
+# be fixed names in /tmp, so on a host shared with another user's bridge the first
+# run to write one owned it: the second got "Permission denied" from its redirect,
+# never ran the build, and reported that as "does not compile". A log that cannot
+# be written is said as that, never as a failed build. Kept when the run fails.
+LOGS="$(mktemp -d "${TMPDIR:-/tmp}/xesious-update-XXXXXX")" && [ -w "$LOGS" ] || {
+  fail "could not create a log directory under ${TMPDIR:-/tmp} — NOT restarting. Nothing changed."; exit 1; }
 BAK="$(mktemp -d /tmp/xesious-bak-XXXX)"
 snapshot_tree "$BAK" || { fail "could not snapshot the working tree"; exit 1; }
 say "backup: $BAK/tree.tar ($(tar -tf "$BAK/tree.tar" 2>/dev/null | wc -l) files)"
@@ -67,11 +74,11 @@ say "typechecking…"
 # never checks a type. tsc is the actual typecheck. (Neither catches a reference to
 # a `const` declared later in the same scope from inside an async callback; that is
 # a runtime TDZ error, and only a test that exercises the path will find it.)
-bun build bridge.ts --target=node >/dev/null 2>/tmp/update-build.err || {
-  fail "bridge.ts does not compile — NOT restarting. Nothing changed."; cat /tmp/update-build.err >&2; exit 1; }
+bun build bridge.ts --target=node >/dev/null 2>"$LOGS/build.err" || {
+  fail "bridge.ts does not compile — NOT restarting. Nothing changed. (log: $LOGS/build.err)"; cat "$LOGS/build.err" >&2; exit 1; }
 if [ -x node_modules/.bin/tsc ]; then
-  node_modules/.bin/tsc --noEmit >/tmp/update-tsc.err 2>&1 || {
-    fail "typecheck failed — NOT restarting. Nothing changed."; head -30 /tmp/update-tsc.err >&2; exit 1; }
+  node_modules/.bin/tsc --noEmit >"$LOGS/tsc.err" 2>&1 || {
+    fail "typecheck failed — NOT restarting. Nothing changed. (log: $LOGS/tsc.err)"; head -30 "$LOGS/tsc.err" >&2; exit 1; }
 else
   say "  (no local tsc — skipping the type pass; bun add -d typescript to enable)"
 fi
@@ -84,13 +91,13 @@ if [ "${UPDATE_SKIP_TESTS:-0}" = 1 ]; then
   say "SKIPPING tests (UPDATE_SKIP_TESTS=1)"
 else
   say "running tests…"
-  bun --env-file=/dev/null test >/tmp/update-test.err 2>&1 || {
-    fail "tests failed — NOT restarting. Nothing changed. See below:"; tail -40 /tmp/update-test.err >&2; exit 1; }
+  bun --env-file=/dev/null test >"$LOGS/test.err" 2>&1 || {
+    fail "tests failed — NOT restarting. Nothing changed. See below (log: $LOGS/test.err):"; tail -40 "$LOGS/test.err" >&2; exit 1; }
   # The shell tier covers this script's own process-selection logic, which is
   # exactly the code that can take down someone else's bridge. Gate on it too.
   say "running shell tests…"
-  bash test/shell/run.sh >/tmp/update-shelltest.err 2>&1 || {
-    fail "shell tests failed — NOT restarting. Nothing changed. See below:"; tail -30 /tmp/update-shelltest.err >&2; exit 1; }
+  bash test/shell/run.sh >"$LOGS/shelltest.err" 2>&1 || {
+    fail "shell tests failed — NOT restarting. Nothing changed. See below (log: $LOGS/shelltest.err):"; tail -30 "$LOGS/shelltest.err" >&2; exit 1; }
 fi
 
 # 5. Wait for idle so we never cut off a reply in flight — but bounded.
@@ -132,7 +139,7 @@ restart() {
   # so a redeploy here tore down a same-user deployment in another directory.
   tmux_kill_own "$DIR" || true
   : > bridge.log
-  ./start.sh >/tmp/update-start.log 2>&1
+  ./start.sh >"$LOGS/start.log" 2>&1
   sleep 3
 }
 
@@ -169,7 +176,7 @@ healthy() {
 say "restarting…"; restart
 if wait_healthy 60; then
   say "OK — up and serving. $(git rev-parse --short HEAD 2>/dev/null)"
-  rm -rf "$BAK"
+  rm -rf "$BAK" "$LOGS"
   exit 0
 fi
 

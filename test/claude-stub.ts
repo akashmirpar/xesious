@@ -10,6 +10,9 @@
  *   EMPTY  → init + a successful result with empty text  → bridge reports "no answer"
  *   NORESP → init + a result whose whole text is "No response requested." — the CLI
  *            queue-layer artefact that used to be posted verbatim as the reply
+ *   NOTIFIED→ init + an answer and its result, then a second turn (as a background-task
+ *            notification starts) whose result is empty — the run answered, then
+ *            ended in silence
  *   ERROR  → init + result with is_error:true            → bridge marks the turn failed
  *   HANG   → init, then sleep past the test's timeout     → exercises the watchdog path
  *   BGPROC → init + a REAL backgrounded child process, then sleeps → exercises whether
@@ -21,6 +24,11 @@
  *   MIDTEXT→ init + a substantive text block + a tool_use + a closing sign-off,
  *            i.e. the shape where the answer is written mid-turn and the bridge
  *            used to deliver only the sign-off
+ *   TICKING→ init + a tool step every 300 ms until stopped → a long run the idle
+ *            watchdog leaves alone, for stopping it by hand
+ *   MCPTASK <tool> <json args> → starts the bot's own MCP server from --mcp-config,
+ *            as Claude Code would, and calls that tool over stdio; the call and its
+ *            answer are appended to $XESIOUS_STUB_MCP_LOG
  *   (else) → init + one Bash tool_use + success
  *
  * Every successful result echoes what the stub was invoked with, in letters-only
@@ -32,7 +40,7 @@
  *                            instructions from /config
  *   topicInstr / noTopicInstr — …and a topic's own, on top of the group's
  */
-import { mkdirSync, writeFileSync, appendFileSync, existsSync } from 'node:fs'
+import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, rmSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 
@@ -49,6 +57,18 @@ if (process.env.XESIOUS_STUB_LAST_PROMPT) writeFileSync(process.env.XESIOUS_STUB
 // …and the whole command line, for what the bridge passes besides the prompt
 // (the history tools' --mcp-config, the allowed tools).
 if (process.env.XESIOUS_STUB_LAST_ARGS) writeFileSync(process.env.XESIOUS_STUB_LAST_ARGS, JSON.stringify(argv))
+// Group memory: whether the CLI was told to read CLAUDE.md from added dirs, and what
+// the added dir held while the run was going (a read-only copy is gone afterwards).
+if (process.env.XESIOUS_STUB_LAST_ENV) {
+  const i = argv.indexOf('--add-dir')
+  const dir = i >= 0 ? argv[i + 1] : undefined
+  let claudeMd: string | undefined
+  try { claudeMd = dir ? readFileSync(dir + '/CLAUDE.md', 'utf8') : undefined } catch {}
+  writeFileSync(process.env.XESIOUS_STUB_LAST_ENV, JSON.stringify({
+    addDirClaudeMd: process.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD ?? null, dir, claudeMd,
+    disableCron: process.env.CLAUDE_CODE_DISABLE_CRON ?? null,
+  }))
+}
 // The bridge wraps a user message in an attribution frame whose first line carries
 // a per-process nonce. Strip it the way the real CLI's model would look past it,
 // or every scenario token below would be shadowed by the marker.
@@ -118,6 +138,13 @@ async function main() {
     result({ result: `${msg} stubQueryWords` })
     return
   }
+  // A watcher's AI filter: the items with stubPASS in them pass; every call is logged.
+  if (/You screen items from an automated feed/.test(val('--system-prompt') ?? '')) {
+    if (process.env.XESIOUS_STUB_FILTER_LOG) appendFileSync(process.env.XESIOUS_STUB_FILTER_LOG, JSON.stringify({ model, prompt: rawPrompt }) + '\n')
+    const pass = [...rawPrompt.matchAll(/^(\d+)\. (.*)$/gm)].filter(m => /stubPASS/.test(m[2])).map(m => ({ n: Number(m[1]), why: 'the stub says so' }))
+    result({ result: JSON.stringify({ pass }) })
+    return
+  }
   if (/Rewrite the line below so a speech synthesiser/.test(rawPrompt)) {
     const line = (rawPrompt.match(/<line>\n([\s\S]*)\n<\/line>/)?.[1] ?? '').trim()
     result({ result: `SPOKEN(${line})` })
@@ -133,6 +160,20 @@ async function main() {
     return
   }
 
+  if (scenario === 'TICKING') {
+    const tick = setInterval(() => emit({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'sleep 1' } }] } }), 300)
+    setTimeout(() => { clearInterval(tick); result({ result: 'tickedToTheEnd' }) }, 30_000)
+    return
+  }
+  if (scenario === 'MCPTASK') {
+    const m = prompt.trim().match(/^MCPTASK\s+(\S+)\s*(\{[^\n]*\})?/)
+    const server = JSON.parse(val('--mcp-config') ?? '{}').mcpServers?.xesious
+    if (!m || !server) { result({ result: 'mcpNoServer' }); return }
+    const r = await callMcpTool(server, m[1], m[2] ? JSON.parse(m[2]) : {})
+    if (process.env.XESIOUS_STUB_MCP_LOG) appendFileSync(process.env.XESIOUS_STUB_MCP_LOG, JSON.stringify({ tool: m[1], ...r }) + '\n')
+    result({ result: r.isError ? 'mcpToolRefused' : 'mcpToolDone' })
+    return
+  }
   if (scenario === 'HANG') {
     // Stay genuinely alive (a real timer — a bare pending promise wouldn't keep the
     // event loop up, and Bun would exit immediately) so the bridge's
@@ -169,7 +210,17 @@ async function main() {
     setTimeout(() => process.exit(0), 60_000)
     return
   }
+  // A test that needs one turn to come back empty, and the next to answer, creates
+  // this file; the empty turn removes it.
+  const once = process.env.XESIOUS_STUB_EMPTY_ONCE
+  if (once && existsSync(once)) { rmSync(once); result({ result: '' }); return }
   if (scenario === 'EMPTY') { result({ result: '' }); return }
+  if (scenario === 'NOTIFIED') {
+    emit({ type: 'assistant', message: { content: [{ type: 'text', text: 'answeredBeforeNotice' }] } })
+    result({ result: 'answeredBeforeNotice' })
+    result({ result: '' })
+    return
+  }
   if (scenario === 'NORESP') { result({ result: 'No response requested.' }); return }
   if (scenario === 'ERROR') {
     emit({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: sessionId, result: 'boom' })
@@ -267,6 +318,44 @@ async function main() {
   // default: one tool step, then a success that echoes the invocation facts.
   emit({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'true' } }] } })
   result({ result: `okReply ${tag}` })
+}
+
+// One tool of an MCP server, called the way Claude Code calls it: the server started
+// as its config says, the handshake, then tools/call, newline-delimited over stdio.
+async function callMcpTool(server: { command: string; args?: string[]; env?: Record<string, string> }, name: string, args: unknown): Promise<{ text: string; isError: boolean }> {
+  const child = spawn(server.command, server.args ?? [], { env: { ...process.env, ...server.env }, stdio: ['pipe', 'pipe', 'inherit'] })
+  const waiting = new Map<number, (m: any) => void>()
+  let buf = ''
+  child.stdout!.setEncoding('utf8')
+  child.stdout!.on('data', (d: string) => {
+    buf += d
+    let nl: number
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim()
+      buf = buf.slice(nl + 1)
+      let m: any
+      try { m = JSON.parse(line) } catch { continue }
+      waiting.get(m.id)?.(m)
+    }
+  })
+  const write = (o: unknown) => child.stdin!.write(JSON.stringify({ jsonrpc: '2.0', ...(o as object) }) + '\n')
+  // Each call's time limit goes once it is answered: an armed timer would keep this
+  // process, and so the run, alive for its whole length after the result.
+  const ask = (id: number, method: string, params: unknown) => new Promise<any>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no answer to ${method}`)), 10_000)
+    waiting.set(id, m => { clearTimeout(timer); resolve(m) })
+    write({ id, method, params })
+  })
+  try {
+    await ask(1, 'initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'claude-stub', version: '0' } })
+    write({ method: 'notifications/initialized' })
+    const r = await ask(2, 'tools/call', { name, arguments: args })
+    return { text: (r.result?.content ?? []).map((c: any) => c.text ?? '').join('\n'), isError: !!r.result?.isError || !!r.error }
+  } catch (e) {
+    return { text: String(e), isError: true }
+  } finally {
+    child.kill()
+  }
 }
 
 main()

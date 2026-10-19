@@ -78,19 +78,21 @@ off is now a **hard startup error**, not a warning.
 
 ## Commands
 
+In a group, the commands that only inform the person asking — `/status`, `/jobs`, `/tasks`, `/usage` `/cost` `/context`, `/recall`, `/whoami`, `/help` and `/live` — are answered to that person alone: picked from the command menu, neither the command nor the reply is seen by the rest of the group. A slower one shows a private "checking" first and turns it into the answer. Typed by hand, the reply is private only where the bot is an admin (Telegram's rule), and otherwise visible as before — except `/live`, whose link is a key to the session: it then goes to your DM, and never into the group. Commands that change the topic for everyone (`/new`, `/mode`, `/model`, `/stop`, …) stay visible.
+
 | Command | Effect |
 | --- | --- |
 | *(any text)* | Send a prompt to this topic's Claude session |
 | *(any file)* | Upload it into this topic's `inbox/` (a caption runs as a prompt) |
 | `/whoami` | Show your user/chat/topic ids (for the allowlist) — works for anyone |
-| `/new` (or `/clear`) | Start a fresh session in this topic. The old session id is **kept** (nothing deleted) — `/resume` to undo. Like Claude's own `/clear`, this resets context without deleting the session. |
+| `/new [request]` (or `/clear`) | Start a fresh session in this topic. The old session id is **kept** (nothing deleted) — `/resume` to undo. Like Claude's own `/clear`, this resets context without deleting the session. With a request after it, the request is the fresh session's first message (`/new what should we ship next?`); a file captioned that way works the same. |
 | `/resume [id]` | Restore the previous session (undo `/new`), or bind this topic to a specific past session — the 8-character prefix `/sessions` prints is enough, and an ambiguous one is refused rather than guessed |
 | `/compact [focus]` | Summarize this topic's session history to free up context (memory kept) |
-| `/stop` | Cancel the task currently running in this topic |
+| `/stop` | Cancel the turn currently running in this topic. A `/bg` run or a task's run there goes on: those stop from `/jobs` (or a task's card), and `/stop` says they are still running |
 | `/voice [on\|off\|parts on\|off]` | Voice mode: transcribe voice notes and speak answers back (eyes-free). Default from `TG_VOICE`. `parts` decides whether the progressive notes are sent or only the full file. |
 | `/interrupt [on\|off]` | Toggle interrupt mode: a new message cancels the running task and starts immediately (its reply comes as a new message) instead of queueing. Default from `TG_INTERRUPT`. |
 | `/mode [plan\|acceptEdits\|auto\|bypass]` | Show or set this topic's permission mode. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_PERMISSION_MODE`. |
-| `/plan <task>` | One read-only turn: Claude researches and proposes without editing. Doesn't change the topic's mode, so "go ahead" carries the plan out. |
+| `/plan <task>` | One read-only turn: Claude researches and proposes without editing. Doesn't change the topic's mode, so "go ahead" carries the plan out; the plan comes with a ✅ Go ahead button that does just that. |
 | `/model [opus\|sonnet\|haiku\|fable]` | Show or set this topic's model — an alias, a full id, or `default` to clear. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_MODEL`. |
 | `/config` | This group's settings as a button menu: model, reasoning effort, voice, **topic mode**, and who may change settings. **More settings** holds the rest: instructions for Claude (the group's, plus any a topic adds), what topic mode presets (answers, records messages), how long recorded messages are kept, topics that differ from the group, default permission mode (never bypass), interrupt, voice parts, tool details and run records in the status, long-reply files, fan-out limits. In a group only you see the menu (an ephemeral message); each change is announced in the room with one line. Changes apply at once — no restart. See [Group settings](#group-settings). |
 | `/usage` `/cost` `/context` | Claude's own commands, forwarded to the CLI as-is. They report rather than prompt the model, so they're free and take no turn. Each answer carries a **🔄 Refresh** button that re-reads the numbers into the same message, so checking twice doesn't leave two. |
@@ -98,10 +100,12 @@ off is now a **hard startup error**, not a warning.
 | `/get <path>` | Send a file from this topic's directory back to you |
 | `/cwd <abs-path>` | Set this topic's working directory (resets its session) |
 | `/status` | Show this topic's session id, cwd and permission mode |
+| `/tasks` | What the bot does here on its own: this topic's tasks (in General and the 🗂 Tasks topic, the whole group's, under their topics; in a DM, yours), numbered, to you alone; tap a number for that task's card; under it, 🔀 Flows (what the runs set going) and 📊 Usage (what they used). `/tasks pause all` (admins) pauses every task in the group. See [Tasks](#tasks). |
 | `/sessions <dir…>` | List the Claude sessions stored for one or more directories (what the IDE/CLI picker shows), as a **tappable picker** — tap one to bind this topic to it, page through with `‹ Prev` / `Next ›` |
 | `/import <dir…>` | Make a topic for each session in the given directories — bound + recent history backfilled |
 | `/history [N]` | Re-post the last N turns of this topic's bound session |
 | `/recall <question>` | What each context engine finds in this group's history for a question, side by side (no answer from Claude) |
+| `/private [question]` | Ask about this topic privately. **With a question**, the answer appears right there in the topic, visible to you alone (an ephemeral message; nobody sees the question or the answer), worked out on a copy of the topic's session so the group's conversation never learns of it; a **🔒 Continue in DM** button carries that exchange on in your DM. If the answer cannot be shown in the topic it comes to your DM instead. **Without a question**, it carries this topic on in your DM with the bot, where only you see it. The topic's session is forked into your DM (same directory, same mode, model and effort); each DM turn is told what the topic said since, and searches the group's history. Nothing said there reaches the group. In a group only you see the command and the reply; if you have never started the bot, the reply carries a **Continue in DM** button instead. A question after it is answered in the DM. Sent as a reply to a message (an answer, say), it picks up from that message: the DM's first turn gets it with the talk around it, and the pinned message links to it. The DM opens with one pinned message saying which topic it continues (linked back to it), with a **🔓 Exit private** button, and every answer there ends with a 🔒 line linking back to the topic and, on its own line, a **🔓 Exit to your own chat** link; while linked, an **🔓 Exit private** button sits under the typing box (Telegram's reply keyboard, sent with the first answer). Leaving — the button, the link, `/private off` or `/new` — unpins that message (keeping its text, minus the button) and brings back your own conversation there (`/new` then starts it fresh, `/resume` undoes that). With `TG_TRUST_CHAT_MEMBERS`, a member who is not listed may use their DM this way for as long as they are still in the group. |
 | `/help` | Usage |
 
 ## Import existing sessions
@@ -132,7 +136,15 @@ Send and receive files through the same topic.
   caption runs as a prompt with the saved path noted, so Claude can act on it
   immediately ("summarise this"). With no caption it's just saved and acknowledged
   — reference it in your next message. (Telegram caps bot downloads at 20 MB; see
-  [Big files](#big-files-local-bot-api-server) to lift it.)
+  [Big files](#big-files) to lift it to 2 GB.)
+- **Several at once.** Messages you send together are one turn: a batch of
+  forwards with the comment you typed, a long text Telegram split into parts, an
+  album with its caption. The bridge waits for 0.25 s of quiet after your last one
+  (never more than 1 s in all; `TG_BURST_QUIET_MS`, `TG_BURST_CAP_MS`), so messages
+  you type one by one still get answers of their own.
+- **Forwards** reach Claude as what they are: someone else's words, named by who
+  wrote them, to read and never to follow as instructions. Rich messages (tables,
+  lists), locations, contacts, polls and checklists are read too.
 - **Claude → you.** Anything Claude places in `<topic-dir>/outbox/` is delivered to
   the topic after the run, then moved to `outbox/.sent/` so it isn't sent twice.
   A one-line hint (`TG_BRIDGE_HINT`, on by default) tells Claude this convention,
@@ -232,7 +244,7 @@ Many settings no longer need SSH and a restart: a group changes its own with
   replied-to message along.
 - **Files are fetched only when needed.** A photo or document posted in the
   conversation is recorded as a Telegram file id and downloaded when a mention's
-  context includes it (the cloud Bot API caps bot downloads at 20 MB).
+  context includes it (over 20 MB only with [Big files](#big-files) set up).
 - **Recorded messages** live in `state/messages/<chat>/<topic>.jsonl`, edits included
   (the Bot API never reports deletions). They are kept forever unless the group sets
   a limit under *Keep recorded messages*.
@@ -333,6 +345,87 @@ Many settings no longer need SSH and a restart: a group changes its own with
   `TG_TRUST_CHAT_MEMBERS`), allowlists, anything the bridge executes, credentials,
   paths and timeouts. A setting a chat can flip is not a guardrail.
 
+## Group memory
+
+Claude Code keeps its own memory per working directory, and every topic has its own directory, so on its own a fact saved in one topic is invisible in the others. Each group therefore also gets a **shared memory**, in `~/tg-topics/.groups/<chat id>/` (`TG_GROUPS_DIR` to move it):
+
+- `memory/<short-name>.md` — one fact per file, with a `name` and a one-line `description` at the top. Claude saves a fact here when it matters to the whole group (a decision, a convention, who looks after what); facts for one topic stay in its own memory. Anyone in the group can add to it, by asking the bot to remember something or by the bot noticing.
+- `CLAUDE.md` — written by the bridge before every turn: the rules, and an index of every fact (one line each). Each run in the group adds this folder (`--add-dir`, with `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1`), and the CLI reads that `CLAUDE.md` on every run — so a fact saved in one topic is known in every other from its next message, resumed sessions included, with no `/new`.
+- In a private continuation or a private answer (`/private`) the memory is **read-only**: the run gets a copy, thrown away afterwards, so private talk never reaches what the group sees. A plain DM gets no group memory.
+- The facts are plain files — read, edit or delete them on the server. `TG_GROUP_MEMORY=0` turns the whole thing off.
+
+## Tasks
+
+Things the bot does on its own, later, again and again, or when something happens, reporting where they were set up. Ask for one in plain words, in a topic or a DM:
+
+- "remind me in two hours to take the pills" — a 🔔 **reminder**: the message at its time, naming whoever asked, with ✅ Done and ⏰ +15 min.
+- "every weekday at 9, summarize what changed in the repo" — a ⏰ **scheduled** Claude run: a fresh session each time (or one session it keeps, if asked), in the topic's folder with its model, effort and permission mode, acting for the person who set it up.
+- "every evening, check the news and only tell us if something big happened" — a run that speaks only when it found something. A task can post its progress as it goes, its result (the default), only what's worth telling, only problems, or nothing; its history keeps every run either way. It can post to your DM instead, stop after a number of runs or at a date.
+- "tell me when this product's price drops below 300", "when the share price moves more than 1% in 3 minutes, find out why", "keep the sync loop running" — a 👀 **watcher**: see [Watchers](#watchers).
+- "every night, back up the database; only tell me if it fails" — a **script**: a command, with no AI. Its status decides; what it prints is posted as the task says (its output; only when it printed something; only when it fails, every failure, loud).
+- "every evening, list what my tasks did" — a 📋 **digest**, made without Claude; "each morning, check the backup and sync tasks and tell me only if something is off" — a **watchdog**, a Claude run handed what those tasks did since its last run.
+- "every morning make the short video; when it's ready the Posting topic publishes it" — a task whose result is **handed on** to another topic; "every weekend take the issue, have Codex implement it, push only if the tests pass, try to fix once" — a 🪜 **plan**, steps whose gates the bot keeps; "when the nightly report is done, translate it" — a task that runs **after** another. See [Hand-offs and plans](#hand-offs-and-plans).
+
+Claude makes them with the bot's own `task_create` tool, passing the time as it was said (at a time, in N minutes, every N minutes, or a cron expression) and the time zone; the bridge does the date arithmetic, daylight saving included. Claude Code's own schedulers are switched off in the bot's runs: a session cron dies with its run, and a cloud trigger would report to claude.ai instead of here.
+
+What you see:
+
+- **A card** in the topic, posted silently when the task is made and edited as it changes: what it does, when it runs next, how its last runs went, with ▶️ Run now, ⏸ Pause or ▶️ Resume, 📜 History (sent to you alone) and 🗑 (which asks first). While a run is going: ⏹ Stop.
+- **The results.** In a group a result is silent unless the task was asked to be loud; reminders, finds, problems and repeated failures notify. The topic's next turn is told what the task posted, so Claude knows.
+- **`/tasks`**, the list, numbered: tap a number for that task's card, privately. Under it, **🔀 Flows**: the last week's [flows](#hand-offs-and-plans); and **📊 Usage**: what each task used the last week (its Claude runs, a plan's steps included, and the hand-offs' runs: tokens and Claude Code's cost estimate).
+- **The 🗂 Tasks topic**, made with a group's first task: where every topic's tasks are seen and managed. A board pinned at its top lists every task in the group under its topic, kept up to date, with a number to tap for each one's card, and 🔀 Flows and 📊 Usage for the whole group; `/tasks` there lists the whole group; ask there to change any task, or to set one up in another topic. Below, every task created, changed, paused, failing or finished is logged silently, with a link to its topic. `/config` turns it off.
+
+The rules:
+
+- Anyone who may use the bot in a chat may run, pause or stop a task there; changing or deleting one is for the person who set it up, the group's admins and the bot's own users. In `/config`, *Tasks: who may create them* can limit creating to admins.
+- A task acts for the person who set it up. If they can no longer use that chat, it pauses.
+- After the bot was down, a task runs once for the slot it missed if that slot is still recent (half its period, between 2 minutes and 2 hours; 12 hours for a reminder), never a backlog. A run cut off by a restart isn't run again by itself; its topic gets a ▶️ Run again button. After a start, Claude runs wait two minutes, then go a few at a time.
+- Two failures in a row raise an alert, edited in place rather than repeated; five pause the task. A run the account's usage limit stopped waits for the reset and doesn't count as a failure.
+- At most `TG_TASKS_MAX_CLAUDE` (2) scheduled Claude runs at once, 2 scripts at once, 20 tasks per topic, at most one run a minute. Each run's model, tokens, cost and time are kept in its history.
+- A task runs until it's paused, deleted or finished, or until an end it was given ("for the next two weeks"); when it reaches that end it says so in its topic, with ▶️ Keep it running.
+
+In a forum group Claude can also make a topic for a new piece of work (with its own folder, or one you name, and another topic's settings), rename a topic, or move one to another folder: `topic_create`, `topic_rename`, `topic_set_cwd`. Moving the topic you're talking in happens when the turn ends.
+
+Scripts on the server reach the bot through a Unix socket, `state/xesious.sock`, open only to the bot's user, with the operator token in `state/xesious.token`:
+
+```
+bun tasks/cli.ts send --chat -1001234567890 --topic Builds --silent "Nightly build finished"
+bun tasks/cli.ts ask --chat -1001234567890 --topic Deploys --options yes,no "Deploy to production?"   # exit 0 for yes, 1 for no
+bun tasks/cli.ts run --chat -1001234567890 --topic Research "Summarize today's papers"              # prints the result
+bun tasks/cli.ts fire <task id> "v1.2 is out"                                                      # runs that task now, given the payload
+bun tasks/cli.ts tasks list
+bun tasks/cli.ts tasks pause <task id>
+```
+
+A task can be one that runs only when fired (🔗): by `fire`, or, if the bot serves webhooks (`TG_TASKS_WEBHOOK_PORT`), by `POST /hook/<task id>/<secret>`, whose body is the payload; ask Claude for the path.
+
+Each Claude run talks to it with a token of its own, scoped to its chat, topic and person, that dies with the run; so does a task's script, which can post in its topic with `bun "$XESIOUS_CLI" notify "…"`. `TG_TASKS=0` turns tasks off. Hand-offs also go to other xesious bots in the group ([Hand-offs and plans](#hand-offs-and-plans)); the design is in [research/tasks/REPORT.md](research/tasks/REPORT.md).
+
+### Questions and approvals
+
+- **A task's run can ask** when it can't go on without someone: a choice, a missing detail, a go-ahead. The question goes into its topic, naming whoever set the task up, with its options as buttons; a reply in your own words counts too. The run waits a few minutes for the answer. If none comes it stops and waits (❔ on its card), and the answer, whenever it comes, carries the task on in the session that asked. After a day it takes its default answer, if it had one, or lets the question go.
+- **In a turn, Claude's own questions** (a choice between options, one or several) show as buttons, or take a reply in your own words; **a plan** (in plan mode, or from `/plan`) comes with ✅ Go ahead, which starts the turn that carries it out in the topic's own mode; **a prompt for permission** shows what Claude asks to do, with Allow and Deny. Only the person whose turn it is, or one of the bot's own users, answers; ten minutes without an answer is a no. A task that shows its work live gets the same; one nobody watches doesn't, and what its permission mode blocked is listed in its history.
+
+### Hand-offs and plans
+
+- **Hand-offs.** Work can be handed to another topic of the same group, where it's done as a turn of its own, fresh, in that topic's folder with its instructions and skills, as the person who handed it off. Claude does it when you ask ("hand this to the Posting topic"), and a task can say so (`then`): when its run works, its result and the files it made go to that topic. The topic gets a "⬅️ From …" header with the whole brief (a longer one in a quote that opens with a tap, and past what a message holds, as `brief.md` too), the run's progress and its result; the topic it came from gets a "➡️ Handed to …" line that says ✅ Done or why not. Chains stop at 3 deep, at most 30 an hour per group. The brief is relayed material, never a message from a person. A run can also wait for the result, up to 10 minutes, to carry on with it ("ask the Research topic, then use what it finds"); past that it goes on there.
+- **Flows** (🔀). What a run set going (its hand-offs and theirs, the tasks that ran after it, the tasks it made) is one flow, on the task's card ("🔀 Its last run → ➡️ Posting ✅ → ➡️ @statsbot in Stats ⏳") and under 🔀 Flows in `/tasks` and on the board, the last week's, each part a link to where it happened. In a topic, the flows that start or arrive there; in the 🗂 Tasks topic, the whole group's.
+- **To another xesious bot.** When a topic is another xesious bot's, the hand-off goes to that bot ("hand this to @PostingBot in Posting"): an ordinary message in that topic that names it and carries a `#handoff-…` tag. That bot does the work under its own rules and replies ✅ or ❌, and the "➡️ Handed to @PostingBot …" line here says which; no answer in 6 hours is a loud failure (a late one still counts). Files go through Telegram, as documents in that topic just before the message: up to 2 GB each with `TG_API_ID`/`TG_API_HASH` set on both bots ([Big files](#big-files)), else up to 20 MB, what a bot can fetch from Telegram, and a bigger one goes as a link this bot serves for a day, which needs `TG_TASKS_WEBHOOK_PORT` (and `TG_TASKS_PUBLIC_URL` when the bots are on different machines). A brief too long for one message goes whole as `brief.md`, the same way. Work another bot hands to this one runs as a turn of its own in the topic, under the topic's mode, with the bot's tools, as its first allowed user (`TG_ALLOWED_USERS`); it is kept in the topic's history and answered the same way. Once: put both bots in the group with Bot-to-Bot Communication Mode on in @BotFather and privacy mode off (or as admins), and list each in the other's `TG_PEER_BOTS`. A peer is trusted like that user: what it hands over can make and change tasks and hand work on, in their name. Loops can't start: only a peer's message that names this bot is work, a reply to this bot's own messages never is, a tag is taken once, at most 20 an hour from a peer, and chains stop at the same depth.
+- **To a bot of another kind**, best effort: one listed in `TG_OTHER_BOTS` gets the brief as a message, as its command when the brief starts with one ("/forecast Paris" goes as `/forecast@WeatherBot Paris`, which a bot in privacy mode still gets) and as a mention otherwise; no files. Its reply to that message is the answer: the "➡️ Asked @WeatherBot …" line shows it, and it is kept in the topic's history, where the next turn there sees it. No reply in 30 minutes marks it failed, without an alarm. That bot needs Bot-to-Bot Communication Mode on too, which only its owner can switch on.
+- **Plans** (🪜): a short list of steps for work whose gates mustn't depend on a model following a prompt. A step is a message, a command (it passes when it exits 0), a Claude run, a **Codex** run (`codex exec` in the topic's folder, on the owner's ChatGPT plan), a question, or a hand-off. Each says where to go when it passes or fails, and how many times to try again, told how it failed; Claude and Codex steps get what the steps before gave. One progress line is edited as the steps go by (✅ fetch · ✅ scope · ❌ tests ×2 · ⏳ fix), then the result is posted; a failure is loud and names the step. Each step's result is saved, so a restart carries on at the step it was at.
+- **After another task** (↪️): a task can run when another one's run works, posts something, or fails, given what that run gave ("when the backup fails, find out why").
+- **Child tasks.** A task's own run can set up tasks of its own ("look again in two hours"): at most 3 at a time, 2 levels deep, ending when it does or within a week. One meant to last is posted as a 💡 proposal, made only when someone taps Create.
+
+### Watchers
+
+A watcher is a small program in the topic's folder that Claude writes for the task and runs once to show it works. Every line it prints is an event. It is either **polled**, run every few minutes, printing what it found and exiting (a page, an API), or **streaming**, kept running (a websocket, a feed). The bot runs it itself; nothing needs setting up on the server.
+
+- Each event can send a message (`{event}` is the line, `{value}` and `{why}` what the rule saw), or start a Claude run that gets the lines as material, or run a script. A watcher can also be kept running for its own sake, its failures the only thing said.
+- **Rules**, exact and free, decide which events count: a value above or below a number, crossing it (once, and again only after it came back), a move of X% within a window, a change, words, a pattern; on the line or a field of its JSON. Their state outlasts a restart.
+- An **AI filter**, for what no rule can decide ("does this suggest a major outage is starting?"): what passes the rule waits, and every few minutes the topic's judge (as Auto mode has it: Haiku, Sonnet or the local model) is asked which items answer the question, and why. One small call per batch, only when something came; the card counts what it considered and let through.
+- At most one run per cooldown (5 minutes for Claude, 1 for a message) and so many an hour (6, 20); what comes meanwhile is folded into the next run. Events older than 10 minutes are dropped: a price move from an hour ago isn't news.
+- A streaming watcher runs detached, at low priority, in its own process group, and outlives a restart: the next start picks it up, by its pid and start time, and reads what it printed meanwhile. It ends itself an hour after the bot is gone for good. One that dies starts again after a backoff; two failures in a row alert the topic, five pause the task. At most `TG_TASKS_MAX_WATCHERS` (8) run at once.
+
 ## Config
 
 All keys live in `.env` (see [.env.example](.env.example)). Several are only
@@ -345,7 +438,7 @@ defaults now — a group can override them with `/config` (see above). Highlight
 - `TG_AUTO_JUDGE` / `TG_AUTO_EAGERNESS` — defaults for Auto mode's judge (`haiku`, `sonnet`, `local`) and eagerness (`reserved`, `balanced`, `chatty`); `/config` overrides both.
 - `TG_AUTO_LOCAL_URL` / `TG_AUTO_LOCAL_MODEL` — the OpenAI-compatible server (e.g. `http://127.0.0.1:8090`) and model name for the *local* judge. It is scored from the first token's logprobs, so the server must return them (llama-server does).
 - `TG_AUTO_MAX_LOOKS_PER_HOUR` — a ceiling on judge calls per topic per hour (default 40).
-- `TG_CONTEXT` — the context engine (default on; `0` turns it off entirely). `state/context-engines.json` (written by `context/setup.sh`; `TG_CONTEXT_ENGINES` for another path) lists the search engines — see `context/ENGINES.md`. Without it, `TG_CONTEXT_EMBED=1` adds meaning search with bge-m3 on the local server `context/setup.sh` runs, or `TG_CONTEXT_EMBED_URL` (+ `TG_CONTEXT_EMBED`, the model name) another one; `TG_CONTEXT_DIGEST=haiku` adds summaries (see Group settings), `TG_CONTEXT_OCR_URL` reads the text in photos (or `"ocr"` in `context-engines.json`), `TG_CONTEXT_QUERY=haiku|typed` has Haiku write the recall's search words, or searches with the message as typed, instead of Sonnet, `TG_CONTEXT_DB` moves the index.
+- `TG_CONTEXT` — the context engine (default off; `1` turns it on: until then nothing is indexed, recalled or read from photos). `state/context-engines.json` (written by `context/setup.sh`; `TG_CONTEXT_ENGINES` for another path) lists the search engines — see `context/ENGINES.md`. Without it, `TG_CONTEXT_EMBED=1` adds meaning search with bge-m3 on the local server `context/setup.sh` runs, or `TG_CONTEXT_EMBED_URL` (+ `TG_CONTEXT_EMBED`, the model name) another one; `TG_CONTEXT_DIGEST=haiku` adds summaries (see Group settings), `TG_CONTEXT_OCR_URL` reads the text in photos (or `"ocr"` in `context-engines.json`), `TG_CONTEXT_QUERY=haiku|typed` has Haiku write the recall's search words, or searches with the message as typed, instead of Sonnet, `TG_CONTEXT_DB` moves the index.
 - `TG_PROGRESS_DETAIL` — show the real command/path/query in the status message (default on).
 - `TG_BOT_LOGO` / `TG_SET_LOGO` — avatar to set on startup **if the bot has none**.
 - `TG_GROUP_LOGO` / `TG_SET_GROUP_LOGO` — group photo to set **if the group has none**
@@ -353,7 +446,9 @@ defaults now — a group can override them with `/config` (see above). Highlight
   whenever the bot is promoted to admin — not when it's added, since it has no rights
   at that point. Neither photo is ever replaced automatically; `/logo bot|group` does
   that on purpose.
-- `TG_API_ROOT` — a local Bot API server, for files over 20 MB (see below).
+- `TG_API_ID` / `TG_API_HASH` — files over 20 MB in and 50 MB out, up to 2 GB (see [Big files](#big-files)).
+- `TG_API_ROOT` — a local Bot API server, the heavier way to the same (see below).
+- `TG_TASKS` — [tasks](#tasks) (default on; `0` turns them off). `TG_TASKS_MAX_CLAUDE` caps the scheduled Claude runs at once (2), `TG_TASKS_MAX_WATCHERS` the streaming watchers kept running (8); `TG_TASK_CREATORS` (`everyone`|`admins`) and `TG_TASKS_ACTIVITY` (`1`|`0`) are the defaults for the two task settings in `/config`; `TG_API_SOCKET` moves the local API's socket; `TG_TASKS_WEBHOOK_PORT` (and `TG_TASKS_WEBHOOK_HOST`, default `127.0.0.1`) serves the tasks' webhooks; `TG_CODEX_BIN` names the Codex CLI for plans' Codex steps; `TG_PEER_BOTS` lists the other xesious bots this one hands work to and takes it from, `TG_OTHER_BOTS` the other bots it may ask, and `TG_TASKS_PUBLIC_URL` is where they reach the files it serves them.
 
 ## Permission modes
 
@@ -378,10 +473,27 @@ repo can't grant itself permissions. See
 A typical loop from the phone: `/plan refactor the parser` → read it → "go ahead"
 (runs in the topic's normal mode).
 
-## Big files (local Bot API server)
+## Big files
 
 The cloud Bot API caps bot **downloads at 20 MB** and **uploads at 50 MB** — a
-hard limit of Telegram's, not this bridge's. Running a
+hard limit of Telegram's, not this bridge's.
+
+**Up to 2 GB both ways: set `TG_API_ID` and `TG_API_HASH`.** Get the pair at
+[my.telegram.org/apps](https://my.telegram.org/apps), put both in `.env` and
+restart; the startup banner's `big files` line says it took. Everything still goes
+through the cloud Bot API, except that a file over 20 MB is fetched, and one over
+50 MB sent, over MTProto, Telegram's own client protocol; a file is fetched by the
+message it came on. One that looks like taking more than 20 seconds gets a
+progress bar in a message under it, which goes away when it is done. The bot logs in there with its own token the first time
+and keeps that login in `state/mtproto-<bot id>.session`; that session takes no
+updates, so polling is unaffected. Nothing to migrate, nothing to run beside the
+bridge. Files handed to another xesious bot go through Telegram at any size too, so
+set the pair on both bots.
+
+### Local Bot API server
+
+The heavier way to the same, for a deployment that would rather run a server than
+log in over MTProto. Running a
 [local Bot API server](https://github.com/tdlib/telegram-bot-api) removes the
 download cap and raises uploads to 2000 MB. `./local-api.sh up` starts one in
 Docker (needs `TG_API_ID`/`TG_API_HASH` from [my.telegram.org](https://my.telegram.org/apps)),
