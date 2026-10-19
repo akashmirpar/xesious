@@ -870,6 +870,56 @@ async def feature_fanout_guard(client, bot):
             "; ".join(problems) if problems else "refused with the reason and the alternative")
 
 
+async def feature_big_file_over_mtproto(client, bot):
+    """A file over the cloud Bot API's 20 MB cap still lands in the inbox, whole.
+
+    getFile refuses anything over 20 MB ("file is too big"). With TG_API_ID and
+    TG_API_HASH set, the bridge fetches such a file over MTProto by its message
+    instead (mtproto.ts). 25 MB of random bytes, sent with no caption, must arrive in
+    this DM's inbox byte for byte, and no "couldn't save" may come back.
+    """
+    import hashlib
+    name = "a 25 MB upload is fetched over MTProto"
+    if not (os.environ.get("TG_API_ID") and os.environ.get("TG_API_HASH")):
+        return (name, False, "TG_API_ID/TG_API_HASH are not set, so the MTProto path was never exercised")
+    inbox = os.path.join(topic_cwd() or "", "inbox")
+    data = os.urandom(25 * 1024 * 1024)
+    want = hashlib.sha256(data).hexdigest()
+    up = os.path.join(os.environ.get("TG_SESSIONS_BASE") or "/tmp", "big-probe.bin")
+    os.makedirs(os.path.dirname(up), exist_ok=True)
+    with open(up, "wb") as fh:
+        fh.write(data)
+    seen = []
+
+    @client.on(events.NewMessage(chats=bot))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    def landed():
+        if not os.path.isdir(inbox):
+            return None
+        for f in os.listdir(inbox):
+            p = os.path.join(inbox, f)
+            if f.startswith("big-probe") and os.path.getsize(p) == len(data):
+                with open(p, "rb") as fh:
+                    return p if hashlib.sha256(fh.read()).hexdigest() == want else None
+        return None
+
+    print("  → sending 25 MB with no caption")
+    await client.send_file(bot, up, force_document=True)
+    got = await _until(landed, 300)
+    client.remove_event_handler(handler)
+    os.remove(up)
+    refused = next((reply_text(m) for m in seen if "couldn't save" in (reply_text(m) or "")), None)
+    print(f"    inbox: {got or 'nothing whole in ' + inbox}")
+    problems = []
+    if refused:
+        problems.append(f"the bridge refused it: {refused[:200]!r}")
+    if not got:
+        problems.append("no byte-identical copy reached the DM's inbox")
+    return (name, not problems, "; ".join(problems) if problems else "25 MB arrived whole over MTProto")
+
+
 async def feature_files_in_and_out(client, bot):
     """A NORMAL topic — not a fork, not a fan-out parent: files in, files out.
 
@@ -3531,7 +3581,8 @@ FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_pro
                  # Straight after it: the promoted run only exists once run_alongside
                  # passes, and stealing the binding is what it does next.
                  feature_promoted_run_keeps_the_topics_session,
-                 feature_files_in_and_out, feature_fork_carries_the_conversation,
+                 feature_files_in_and_out, feature_big_file_over_mtproto,
+                 feature_fork_carries_the_conversation,
                  # After the other DM cases: it rebinds this DM's session to a past one
                  # and puts it back afterwards, so anything running between the two would
                  # be talking to the wrong conversation.

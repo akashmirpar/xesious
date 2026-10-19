@@ -136,7 +136,7 @@ Send and receive files through the same topic.
   caption runs as a prompt with the saved path noted, so Claude can act on it
   immediately ("summarise this"). With no caption it's just saved and acknowledged
   — reference it in your next message. (Telegram caps bot downloads at 20 MB; see
-  [Big files](#big-files-local-bot-api-server) to lift it.)
+  [Big files](#big-files) to lift it to 2 GB.)
 - **Several at once.** Messages you send together are one turn: a batch of
   forwards with the comment you typed, a long text Telegram split into parts, an
   album with its caption. The bridge waits for 0.25 s of quiet after your last one
@@ -244,7 +244,7 @@ Many settings no longer need SSH and a restart: a group changes its own with
   replied-to message along.
 - **Files are fetched only when needed.** A photo or document posted in the
   conversation is recorded as a Telegram file id and downloaded when a mention's
-  context includes it (the cloud Bot API caps bot downloads at 20 MB).
+  context includes it (over 20 MB only with [Big files](#big-files) set up).
 - **Recorded messages** live in `state/messages/<chat>/<topic>.jsonl`, edits included
   (the Bot API never reports deletions). They are kept forever unless the group sets
   a limit under *Keep recorded messages*.
@@ -446,7 +446,8 @@ defaults now — a group can override them with `/config` (see above). Highlight
   whenever the bot is promoted to admin — not when it's added, since it has no rights
   at that point. Neither photo is ever replaced automatically; `/logo bot|group` does
   that on purpose.
-- `TG_API_ROOT` — a local Bot API server, for files over 20 MB (see below).
+- `TG_API_ID` / `TG_API_HASH` — fetch files over 20 MB, up to 2 GB (see [Big files](#big-files)).
+- `TG_API_ROOT` — a local Bot API server, the heavier way to the same (see below).
 - `TG_TASKS` — [tasks](#tasks) (default on; `0` turns them off). `TG_TASKS_MAX_CLAUDE` caps the scheduled Claude runs at once (2), `TG_TASKS_MAX_WATCHERS` the streaming watchers kept running (8); `TG_TASK_CREATORS` (`everyone`|`admins`) and `TG_TASKS_ACTIVITY` (`1`|`0`) are the defaults for the two task settings in `/config`; `TG_API_SOCKET` moves the local API's socket; `TG_TASKS_WEBHOOK_PORT` (and `TG_TASKS_WEBHOOK_HOST`, default `127.0.0.1`) serves the tasks' webhooks; `TG_CODEX_BIN` names the Codex CLI for plans' Codex steps; `TG_PEER_BOTS` lists the other xesious bots this one hands work to and takes it from, `TG_OTHER_BOTS` the other bots it may ask, and `TG_TASKS_PUBLIC_URL` is where they reach the files it serves them.
 
 ## Permission modes
@@ -472,10 +473,24 @@ repo can't grant itself permissions. See
 A typical loop from the phone: `/plan refactor the parser` → read it → "go ahead"
 (runs in the topic's normal mode).
 
-## Big files (local Bot API server)
+## Big files
 
 The cloud Bot API caps bot **downloads at 20 MB** and **uploads at 50 MB** — a
-hard limit of Telegram's, not this bridge's. Running a
+hard limit of Telegram's, not this bridge's.
+
+**Downloads up to 2 GB: set `TG_API_ID` and `TG_API_HASH`.** Get the pair at
+[my.telegram.org/apps](https://my.telegram.org/apps), put both in `.env` and
+restart; the startup banner's `big files` line says it took. Everything still goes
+through the cloud Bot API, except that a file over 20 MB is fetched over MTProto,
+Telegram's own client protocol, by the message it came on. The bot logs in there
+with its own token the first time one arrives and keeps that login in
+`state/mtproto-<bot id>.session`; that session takes no updates, so polling is
+unaffected. Nothing to migrate, nothing to run beside the bridge. Uploads stay at
+50 MB.
+
+### Local Bot API server
+
+The heavier way, for uploads over 50 MB too. Running a
 [local Bot API server](https://github.com/tdlib/telegram-bot-api) removes the
 download cap and raises uploads to 2000 MB. `./local-api.sh up` starts one in
 Docker (needs `TG_API_ID`/`TG_API_HASH` from [my.telegram.org](https://my.telegram.org/apps)),

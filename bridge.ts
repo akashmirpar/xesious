@@ -64,6 +64,7 @@ import { TaskStore } from './tasks/store'
 import { TaskRuntime, activityOf, type ClaudeOutcome, type FilterVerdict, type PostKind, type PostOpts, type StepCall } from './tasks/runtime'
 import { FILTER_SYSTEM, filterUser, parseFilterAnswer } from './tasks/filters'
 import { runCommand, runScript, type ScriptOutcome } from './tasks/scripts'
+import { bigFiles, MTPROTO_MAX } from './mtproto'
 import { Watchers } from './tasks/watchers'
 import { TaskService, type Action as TaskAction } from './tasks/service'
 import { taskRoutes, type BridgeHandlers } from './tasks/routes'
@@ -251,6 +252,12 @@ const LOCAL_API = Boolean(API_ROOT)
 const LOCAL_API_DATA = resolve(process.env.TG_LOCAL_API_DATA || join(HERE, 'state', 'bot-api'))
 const TG_DOWNLOAD_LIMIT = LOCAL_API ? Infinity : 20 * 1024 * 1024      // cloud getFile cap
 const TG_UPLOAD_LIMIT = (LOCAL_API ? 2000 : 50) * 1024 * 1024          // sendDocument cap
+// The lighter way past the download cap: with an api_id/api_hash (my.telegram.org)
+// a file over 20 MB is fetched over MTProto instead, up to 2 GB, while everything
+// else stays on the cloud Bot API (mtproto.ts). A local server needs neither.
+const API_ID = Number(process.env.TG_API_ID || 0), API_HASH = (process.env.TG_API_HASH || '').trim()
+const BIG_FILES = !LOCAL_API && API_ID && API_HASH
+  ? bigFiles({ apiId: API_ID, apiHash: API_HASH, token: TOKEN, stateDir: dirname(STATE_FILE) }) : null
 
 // The bot's own avatar. On startup, if the bot has no profile photo, set this one.
 // (setMyProfilePhoto is a real Bot API method — BotFather is not required.)
@@ -3289,7 +3296,7 @@ async function conversationContext(ctx: Context, key: string, threadId: number |
     const done = convFetched.get(r.file.id)
     if (done && existsSync(done)) { saved.set(r.id, `./${relative(cwd, done)}`); continue }
     try {
-      const abs = await receiveFile(ctx, { fileId: r.file.id, name: r.file.name, size: r.file.size }, cwd, key)
+      const abs = await receiveFile(ctx, { fileId: r.file.id, name: r.file.name, size: r.file.size, chat: chatId, msgId: r.id }, cwd, key)
       convFetched.set(r.file.id, abs)
       saved.set(r.id, `./${relative(cwd, abs)}`)
       fetched++
@@ -3751,9 +3758,14 @@ function uniquePath(dir: string, name: string): string {
   for (let i = 1; ; i++) { const p = join(dir, `${stem}-${i}${ext}`); if (!existsSync(p)) return p }
 }
 
-// The downloadable attachment on a message, if any (largest size for photos).
-type Attachment = { fileId: string; name: string; size: number }
+// The downloadable attachment on a message, if any (largest size for photos). It
+// keeps the message it came on: a file over 20 MB is fetched by that, not its id.
+type Attachment = { fileId: string; name: string; size: number; chat?: number; msgId?: number }
 function pickAttachment(msg: any): Attachment | null {
+  const att = pickFile(msg)
+  return att && { ...att, chat: msg.chat?.id, msgId: msg.message_id }
+}
+function pickFile(msg: any): Attachment | null {
   const d = msg.document; if (d) return { fileId: d.file_id, name: d.file_name || 'document', size: d.file_size || 0 }
   if (msg.photo?.length) { const p = msg.photo[msg.photo.length - 1]; return { fileId: p.file_id, name: `photo-${p.file_unique_id}.jpg`, size: p.file_size || 0 } }
   const v = msg.video; if (v) return { fileId: v.file_id, name: v.file_name || `video-${v.file_unique_id}.mp4`, size: v.file_size || 0 }
@@ -3765,12 +3777,27 @@ function pickAttachment(msg: any): Attachment | null {
 }
 
 // Download a Telegram file into a topic's inbox. Returns the saved absolute path.
-async function receiveFile(ctx: Context, att: { fileId: string; name: string; size: number }, cwd: string, key: string): Promise<string> {
-  if (att.size && att.size > TG_DOWNLOAD_LIMIT)
+async function receiveFile(ctx: Context, att: Attachment, cwd: string, key: string): Promise<string> {
+  const destFor = (ext: string) => uniquePath(ensureDir(boxDir(cwd, key, INBOX_DIR)), safeName(att.name, ext))
+  // Over the cap, or a size Telegram didn't give and getFile refused: over MTProto.
+  const viaMtproto = BIG_FILES && att.chat && att.msgId ? async () => {
+    if (att.size > MTPROTO_MAX) throw new Error(`file is ${fmtBytes(att.size)}, over the ${fmtBytes(MTPROTO_MAX)} a bot can fetch from Telegram.`)
+    const dest = destFor(extname(att.name))
+    const t0 = Date.now()
+    await BIG_FILES.download(att.chat!, att.msgId!, dest)
+    console.log(`[file<-] over MTProto in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+    return dest
+  } : null
+  if (att.size > TG_DOWNLOAD_LIMIT && !viaMtproto)
     throw new Error(
       `file is ${fmtBytes(att.size)}, over the ${fmtBytes(TG_DOWNLOAD_LIMIT)} the cloud Bot API lets bots fetch.\n` +
-      `To lift this, run a local Bot API server and set TG_API_ROOT (see README) — or copy the file to ${cwd}/${INBOX_DIR}/ directly.`)
-  const dest = await fetchTelegramFile(ctx.api, att.fileId, ext => uniquePath(ensureDir(boxDir(cwd, key, INBOX_DIR)), safeName(att.name, ext)))
+      `To fetch files up to 2 GB, set TG_API_ID and TG_API_HASH (see README) — or copy the file to ${cwd}/${INBOX_DIR}/ directly.`)
+  let dest: string
+  if (att.size > TG_DOWNLOAD_LIMIT) dest = await viaMtproto!()
+  else {
+    try { dest = await fetchTelegramFile(ctx.api, att.fileId, destFor) }
+    catch (e) { if (!viaMtproto || !/file is too big/i.test(String(e))) throw e; dest = await viaMtproto() }
+  }
   console.log(`[file<-] ${dest} (${fmtBytes(statSync(dest).size)})`)
   return dest
 }
@@ -9834,6 +9861,7 @@ async function main() {
   console.log(`     default cwd    : ${DEFAULT_WORKDIR}`)
   console.log(`     permission     : ${PERMISSION_MODE}`)
   console.log(`     api            : ${API_ROOT || 'https://api.telegram.org (cloud)'}`)
+  console.log(`     big files      : ${LOCAL_API ? 'local server' : BIG_FILES ? 'over MTProto, up to 2 GB' : '20 MB cap (set TG_API_ID/TG_API_HASH to lift it)'}`)
   console.log(`     allowed users  : ${[...ALLOWED_USERS].join(', ') || '(none — set TG_ALLOWED_USERS!)'}`)
   console.log(`     allowed chats  : ${[...ALLOWED_CHATS].join(', ') || '(none)'}`)
   console.log(`     trust chat mem : ${TRUST_CHAT_MEMBERS ? 'yes (any member of an allowed chat)' : 'no'}`)
