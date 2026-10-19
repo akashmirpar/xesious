@@ -28,7 +28,7 @@ import { dirname, join, isAbsolute, basename, extname, resolve, relative } from 
 import { homedir, tmpdir, freemem as osFreemem } from 'node:os'
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto'
 import {
-  parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg,
+  parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg, transferText, transferWorthShowing,
   MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
   EFFORT_LEVELS, EFFORT_DEFAULT, normalizeEffort,
   parseStreamLine, type Step, THINKING, RUN_RECORD, conflictAdvice, isNonAnswer, lastAnswerBlock, promoteBlock, stalenessNote,
@@ -3296,7 +3296,7 @@ async function conversationContext(ctx: Context, key: string, threadId: number |
     const done = convFetched.get(r.file.id)
     if (done && existsSync(done)) { saved.set(r.id, `./${relative(cwd, done)}`); continue }
     try {
-      const abs = await receiveFile(ctx, { fileId: r.file.id, name: r.file.name, size: r.file.size, chat: chatId, msgId: r.id }, cwd, key)
+      const abs = await receiveFile(ctx, { fileId: r.file.id, name: r.file.name, size: r.file.size, chat: chatId, msgId: r.id }, cwd, key, threadId)
       convFetched.set(r.file.id, abs)
       saved.set(r.id, `./${relative(cwd, abs)}`)
       fetched++
@@ -3776,15 +3776,50 @@ function pickFile(msg: any): Attachment | null {
   return null
 }
 
+// A big file's status message (transferText): posted once the transfer looks like
+// taking over 20 s (transferWorthShowing), edited as it moves, deleted when it ends
+// however it ends. Its speed is timed from the first bytes, not from the start: the
+// first big file after a restart also waits for the MTProto login, which would make
+// a quick one look slow. Edits are at least 3 s apart, as Telegram rate-limits edits
+// per chat; a status that can't be posted is just skipped.
+function transferStatus(chat: number, threadId: number | undefined, replyTo: number | undefined, up: boolean, name: string, total: number) {
+  let t0 = 0, done0 = 0
+  const text = (done: number) => transferText({ up, name, done, total, ms: Date.now() - t0 })
+  let posted: Promise<number | undefined> | undefined
+  let last = 0, shown = ''
+  return {
+    progress(done: number) {
+      if (!t0) { t0 = Date.now(); done0 = done; return }
+      if (!posted) {
+        if (!transferWorthShowing(done - done0, total - done0, Date.now() - t0)) return
+        shown = text(done)
+        last = Date.now()
+        posted = bot.api.sendMessage(chat, shown, { ...destOpts({ threadId, replyTo }), disable_notification: true })
+          .then(m => m.message_id, () => undefined)
+        return
+      }
+      if (Date.now() - last < 3000) return
+      last = Date.now()
+      const s = text(done)
+      if (s !== shown) { shown = s; void posted.then(id => id && bot.api.editMessageText(chat, id, s).catch(() => {})) }
+    },
+    async end() {
+      const id = await posted
+      if (id) await bot.api.deleteMessage(chat, id).catch(() => {})
+    },
+  }
+}
+
 // Download a Telegram file into a topic's inbox. Returns the saved absolute path.
-async function receiveFile(ctx: Context, att: Attachment, cwd: string, key: string): Promise<string> {
+async function receiveFile(ctx: Context, att: Attachment, cwd: string, key: string, threadId: number | undefined): Promise<string> {
   const destFor = (ext: string) => uniquePath(ensureDir(boxDir(cwd, key, INBOX_DIR)), safeName(att.name, ext))
   // Over the cap, or a size Telegram didn't give and getFile refused: over MTProto.
   const viaMtproto = BIG_FILES && att.chat && att.msgId ? async () => {
     if (att.size > MTPROTO_MAX) throw new Error(`file is ${fmtBytes(att.size)}, over the ${fmtBytes(MTPROTO_MAX)} a bot can fetch from Telegram.`)
     const dest = destFor(extname(att.name))
     const t0 = Date.now()
-    await BIG_FILES.download(att.chat!, att.msgId!, dest)
+    const bar = transferStatus(att.chat!, threadId, att.msgId, false, basename(dest), att.size)
+    try { await BIG_FILES.download(att.chat!, att.msgId!, dest, bar.progress) } finally { await bar.end() }
     console.log(`[file<-] over MTProto in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
     return dest
   } : null
@@ -3825,11 +3860,13 @@ async function fetchTelegramFile(api: Context['api'], fileId: string, destFor: (
 
 // A file that is too big to send, described the way the user needs to hear it.
 // Returns '' when the file is fine.
+// Past the Bot API's 50 MB it goes over MTProto when that is set up (sendFile).
 function tooBig(path: string): string {
   const size = statSync(path).size
-  if (size <= TG_UPLOAD_LIMIT) return ''
-  return `${basename(path)} is ${fmtBytes(size)} — over the ${fmtBytes(TG_UPLOAD_LIMIT)} bot upload limit.` +
-    (LOCAL_API ? '' : `\nA local Bot API server raises this to 2000 MB (set TG_API_ROOT — see README).`)
+  const limit = BIG_FILES ? MTPROTO_MAX : TG_UPLOAD_LIMIT
+  if (size <= limit) return ''
+  return `${basename(path)} is ${fmtBytes(size)} — over the ${fmtBytes(limit)} bot upload limit.` +
+    (LOCAL_API || BIG_FILES ? '' : `\nSet TG_API_ID and TG_API_HASH to send files up to 2 GB (see README).`)
 }
 
 // Send one file from disk to the chat/topic. Returns true on success.
@@ -3851,6 +3888,17 @@ async function sendFile(ctx: Context, threadId: number | undefined, path: string
   if (big) { await send(ctx, threadId, big); return false }
   const size = statSync(path).size
   noteBotMessage(keyFor(ctx.chat!.id, threadId))
+  if (size > TG_UPLOAD_LIMIT && BIG_FILES) {
+    // Over MTProto, the caption as plain text: it takes neither Markdown nor HTML.
+    const plain = caption && (captionMode ? plainCaption ?? stripMd(caption) : caption).slice(0, CAPTION_MAX)
+    const bar = transferStatus(ctx.chat!.id, threadId, replyTo, true, basename(path), size)
+    try {
+      await BIG_FILES.upload(ctx.chat!.id, path, { threadId, replyTo, caption: plain || undefined, onProgress: bar.progress })
+      console.log(`[file->] ${path} (${fmtBytes(size)}, over MTProto)`)
+      return true
+    } catch (e) { await send(ctx, threadId, `⚠️ could not send ${basename(path)}: ${e}`); return false }
+    finally { await bar.end() }
+  }
   const opts: any = destOpts({ threadId, replyTo })
   if (caption) {
     opts.caption = caption.slice(0, 1024)
@@ -3896,7 +3944,15 @@ async function sendFileGroup(ctx: Context, threadId: number | undefined, paths: 
   if (usable.length === 0) return undefined
   const oversized = usable.map(tooBig).filter(Boolean)
   if (oversized.length) { await send(ctx, threadId, oversized.join('\n\n')); return undefined }
-  if (usable.length === 1) { await sendFile(ctx, threadId, usable[0], caption, replyTo, captionMode, plainCaption); return undefined }
+  // A file past the Bot API's 50 MB goes over MTProto, which a group can't mix with.
+  if (usable.length === 1 || usable.some(p => statSync(p).size > TG_UPLOAD_LIMIT)) {
+    let first = true
+    for (const p of usable) {
+      await sendFile(ctx, threadId, p, first ? caption : undefined, replyTo, captionMode, first ? plainCaption : undefined)
+      first = false
+    }
+    return undefined
+  }
 
   const one = (p: string, i: number) => {
     const extra: any = {}
@@ -6547,7 +6603,7 @@ bot.on('message', async ctx => {
     enqueue(vKey, async () => {
       const cwd = resolveCwd(ctx, threadId)
       let saved: string
-      try { saved = await receiveFile(ctx, att, cwd, vKey) }
+      try { saved = await receiveFile(ctx, att, cwd, vKey, threadId) }
       catch (e) { await send(ctx, threadId, `⚠️ couldn't save the voice note: ${e}`); return }
       const heard = await transcribe(saved)
       if (!heard) { await send(ctx, threadId, '🎙 Sorry — I couldn’t make out that voice note. Try again, a bit closer to the mic.'); return }
@@ -7342,7 +7398,7 @@ function takeAttachment(ctx: Context, key: string, threadId: number | undefined,
   enqueue(key, async () => {
     const cwd = resolveCwd(ctx, threadId)
     let saved: string
-    try { saved = await receiveFile(ctx, attachment, cwd, key) }
+    try { saved = await receiveFile(ctx, attachment, cwd, key, threadId) }
     catch (e) { await send(ctx, threadId, `⚠️ couldn't save file: ${e}`); return }
     const forwarded = caption ? forwardedOf(ctx, msg, caption) : undefined
     if (caption) {
@@ -7491,7 +7547,7 @@ async function runBurst(b: Burst): Promise<void> {
     const rels: string[] = []
     for (const p of files) {
       try {
-        const abs = await receiveFile(ctx, p.att!, cwd, key)
+        const abs = await receiveFile(ctx, p.att!, cwd, key, threadId)
         const rel = `./${relative(cwd, abs)}`
         ;(pendingFiles[key] ??= []).push({ abs, rel })
         rels.push(rel)
@@ -8572,11 +8628,14 @@ const OTHER_BOTS = (process.env.TG_OTHER_BOTS || '').split(',').map(s => s.trim(
 const isOtherBot = (u: { id: number; username?: string } | undefined) => !!u?.username && OTHER_BOTS.includes(u.username.toLowerCase())
 const SERVED_DIR = join(TASKS_STATE, 'served')
 const SERVE_MS = 24 * 3600_000
-const PEER_FILE_MAX = 50 * 1024 * 1024
-// What a bot on Telegram's cloud Bot API can download (getFile): bigger goes as a link.
-const PEER_TG_MAX = 20 * 1024 * 1024
+// With TG_API_ID/TG_API_HASH a file goes through Telegram whatever its size, up to
+// 2 GB: sent over MTProto past 50 MB, and fetched that way past 20 MB by the other
+// bot, which is taken to be set up the same. Without them, what a bot on the cloud
+// Bot API can download (getFile, 20 MB) goes through Telegram and bigger as a link.
+const PEER_FILE_MAX = BIG_FILES ? MTPROTO_MAX : 50 * 1024 * 1024
+const PEER_TG_MAX = BIG_FILES ? MTPROTO_MAX : 20 * 1024 * 1024
 // Documents a peer sent ahead of its hand-off message, by chat, peer and tag.
-const peerFiles = new Map<string, { fileId: string; name: string; size: number; at: number }[]>()
+const peerFiles = new Map<string, (Attachment & { at: number })[]>()
 // A Telegram message is at most 4096 characters; a longer brief goes as a file too.
 const PEER_TEXT_MAX = 4000
 
@@ -8616,7 +8675,7 @@ async function startPeerHandoff(a: HandoffAsk & { peer: string }): Promise<{ han
     const p = isAbsolute(f) ? f : join(cwdFrom, f)
     if (!existsSync(p) || !statSync(p).isFile()) return { error: `no file ${f}` }
     const size = statSync(p).size
-    if (size > PEER_FILE_MAX) return { error: `${f} is over 50 MB` }
+    if (size > PEER_FILE_MAX) return { error: `${f} is over ${fmtBytes(PEER_FILE_MAX)}` }
     if (size > PEER_TG_MAX && !hookServer) return { error: `${f} is ${fmtBytes(size)}, more than a bot can fetch from Telegram (20 MB); a file that big goes as a link this bot serves, which needs its webhook server: TG_TASKS_WEBHOOK_PORT, and TG_TASKS_PUBLIC_URL when the bots are on different machines` }
     paths.push(p)
   }
@@ -8639,12 +8698,15 @@ async function startPeerHandoff(a: HandoffAsk & { peer: string }): Promise<{ han
     deadline: new Date(taskNow().getTime() + LIMITS.peerAnswerMs).toISOString() })
   h = store.updateHandoff(h.id, { peerTag: h.id })!
   // The files first, each captioned with the tag, so they are there when the message is.
-  const docs: { file: InputFile; name: string }[] = [
-    ...paths.filter(p => !viaLink.includes(p)).map(p => ({ file: new InputFile(p, basename(p)), name: basename(p) })),
+  const docs: { file: InputFile; name: string; path?: string }[] = [
+    ...paths.filter(p => !viaLink.includes(p)).map(p => ({ file: new InputFile(p, basename(p)), name: basename(p), path: p })),
     ...(long ? [{ file: new InputFile(Buffer.from(a.brief), 'brief.md'), name: 'brief.md' }] : []),
   ]
   for (const d of docs) {
-    const sent = await bot.api.sendDocument(chatId, d.file, { ...destOpts({ threadId: a.toThread }), caption: `📎 #handoff-${h.id}`, disable_notification: true })
+    const caption = `📎 #handoff-${h.id}`
+    const sent = await (d.path && BIG_FILES && statSync(d.path).size > TG_UPLOAD_LIMIT
+      ? BIG_FILES.upload(chatId, d.path, { threadId: a.toThread, caption, silent: true })
+      : bot.api.sendDocument(chatId, d.file, { ...destOpts({ threadId: a.toThread }), caption, disable_notification: true }))
       .then(() => true, e => { console.error(`[handoff] ${d.name} to @${a.peer}: ${e}`); return false })
     if (!sent) { store.updateHandoff(h.id, { state: 'failed', error: `Telegram didn't take ${d.name}`, endedAt: new Date().toISOString() }); return { error: `Telegram didn't take ${d.name}` } }
   }
@@ -8843,13 +8905,15 @@ async function handlePeerMessage(ctx: Context): Promise<void> {
     // handled side by side, so one may still be on its way: a few seconds for it.
     const want = basename(l.slice('📎 '.length).trim())
     if (!want) continue
-    let got: { fileId: string; name: string; size: number } | undefined
+    let got: Attachment | undefined
     for (const end = Date.now() + 15_000; !(got = peerFiles.get(sentAhead)?.find(f => f.name === want)) && Date.now() < end;) await Bun.sleep(250)
     if (!got) { missed.push(want); continue }
     peerFiles.set(sentAhead, (peerFiles.get(sentAhead) ?? []).filter(f => f !== got))
     try {
-      if (got.size > TG_DOWNLOAD_LIMIT) throw new Error(`it is ${fmtBytes(got.size)}, more than this bot can fetch`)
-      const dest = await fetchTelegramFile(bot.api, got.fileId, ext => uniquePath(ensureDir(inbox), safeName(want, ext)))
+      let dest: string
+      if (got.size <= TG_DOWNLOAD_LIMIT) dest = await fetchTelegramFile(bot.api, got.fileId, ext => uniquePath(ensureDir(inbox), safeName(want, ext)))
+      else if (BIG_FILES && got.chat && got.msgId) await BIG_FILES.download(got.chat, got.msgId, dest = uniquePath(ensureDir(inbox), safeName(want, extname(want))))
+      else throw new Error(`it is ${fmtBytes(got.size)}, more than this bot can fetch without TG_API_ID/TG_API_HASH`)
       landed.push(basename(dest))
     } catch (e) { console.error(`[handoff] from @${peer}: fetching ${want}: ${e}`); missed.push(want) }
   }

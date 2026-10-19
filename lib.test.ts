@@ -10,7 +10,7 @@ import { test, expect, describe } from 'bun:test'
 import {
   effectiveAnswers, effectiveRecords, modeAnswers, foldRecords, sinceMark, replyWindow, contextParts, fitNewest, convLine, conversationPreamble, type ConvRecord,
   SETTINGS, settingDef, resolveSetting, choiceLabel, normalizeUsername, canEditSettings, pinPendingEditor, type EditorPolicy,
-  parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg,
+  parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg, transferText, transferWorthShowing,
   allowedModes, normalizeMode, permissionArgs,
   normalizeModel, MODEL_DEFAULT,
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
@@ -34,6 +34,42 @@ describe('parseIdList', () => {
     expect(parseIdList('').size).toBe(0)
     expect(parseIdList(undefined).size).toBe(0)
     expect(parseIdList(',,').size).toBe(0)
+  })
+})
+
+describe('transferText — a big file\'s progress message', () => {
+  const MB = 1048576
+  test('the bar, percent, sizes, speed and time left', () => {
+    expect(transferText({ up: false, name: 'report.zip', done: 131 * MB, total: 312 * MB, ms: 18_450 }))
+      .toBe('⬇️ Downloading report.zip\n▰▰▰▰▰▱▱▱▱▱▱▱ 41%\n131 / 312 MB · 7.1 MB/s · ~26 s left')
+  })
+  test('at the start: an empty bar and no speed to guess from', () => {
+    expect(transferText({ up: true, name: 'big.bin', done: 0, total: 60 * MB, ms: 200 }))
+      .toBe('⬆️ Uploading big.bin\n▱▱▱▱▱▱▱▱▱▱▱▱ 0%\n0.0 / 60 MB')
+  })
+  test('long waits read in minutes, and a finished one has no time left', () => {
+    expect(transferText({ up: false, name: 'a', done: 100 * MB, total: 2000 * MB, ms: 50_000 })).toContain('· 2.0 MB/s · ~16 min left')
+    expect(transferText({ up: false, name: 'a', done: 50 * MB, total: 50 * MB, ms: 7_000 })).toBe('⬇️ Downloading a\n▰▰▰▰▰▰▰▰▰▰▰▰ 100%\n50 / 50 MB · 7.1 MB/s')
+  })
+  test('a progress report past the total never overflows the bar', () => {
+    expect(transferText({ up: false, name: 'a', done: 70 * MB, total: 60 * MB, ms: 0 }).split('\n')[1]).toBe('▰▰▰▰▰▰▰▰▰▰▰▰ 100%')
+  })
+})
+
+describe('transferWorthShowing — a bar only for a slow transfer', () => {
+  const MB = 1048576
+  test('nothing is judged in the first 2 s', () => {
+    expect(transferWorthShowing(1 * MB, 2000 * MB, 1500)).toBe(false)
+  })
+  test('a file done in a few seconds gets no bar', () => {
+    expect(transferWorthShowing(15 * MB, 100 * MB, 2000)).toBe(false)   // 7.5 MB/s: ~13 s in all
+  })
+  test('one that looks like taking over 20 s does', () => {
+    expect(transferWorthShowing(15 * MB, 300 * MB, 2000)).toBe(true)    // ~40 s in all
+    expect(transferWorthShowing(2 * MB, 60 * MB, 3000)).toBe(true)      // a slow link: ~90 s
+  })
+  test('no progress yet is no estimate', () => {
+    expect(transferWorthShowing(0, 300 * MB, 5000)).toBe(false)
   })
 })
 

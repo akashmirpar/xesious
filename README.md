@@ -410,7 +410,7 @@ Each Claude run talks to it with a token of its own, scoped to its chat, topic a
 
 - **Hand-offs.** Work can be handed to another topic of the same group, where it's done as a turn of its own, fresh, in that topic's folder with its instructions and skills, as the person who handed it off. Claude does it when you ask ("hand this to the Posting topic"), and a task can say so (`then`): when its run works, its result and the files it made go to that topic. The topic gets a "⬅️ From …" header with the whole brief (a longer one in a quote that opens with a tap, and past what a message holds, as `brief.md` too), the run's progress and its result; the topic it came from gets a "➡️ Handed to …" line that says ✅ Done or why not. Chains stop at 3 deep, at most 30 an hour per group. The brief is relayed material, never a message from a person. A run can also wait for the result, up to 10 minutes, to carry on with it ("ask the Research topic, then use what it finds"); past that it goes on there.
 - **Flows** (🔀). What a run set going (its hand-offs and theirs, the tasks that ran after it, the tasks it made) is one flow, on the task's card ("🔀 Its last run → ➡️ Posting ✅ → ➡️ @statsbot in Stats ⏳") and under 🔀 Flows in `/tasks` and on the board, the last week's, each part a link to where it happened. In a topic, the flows that start or arrive there; in the 🗂 Tasks topic, the whole group's.
-- **To another xesious bot.** When a topic is another xesious bot's, the hand-off goes to that bot ("hand this to @PostingBot in Posting"): an ordinary message in that topic that names it and carries a `#handoff-…` tag. That bot does the work under its own rules and replies ✅ or ❌, and the "➡️ Handed to @PostingBot …" line here says which; no answer in 6 hours is a loud failure (a late one still counts). Files go through Telegram, as documents in that topic just before the message (up to 20 MB each, what a bot can fetch from Telegram); a bigger one goes as a link this bot serves for a day, which needs `TG_TASKS_WEBHOOK_PORT` (and `TG_TASKS_PUBLIC_URL` when the bots are on different machines). A brief too long for one message goes whole as `brief.md`, the same way. Work another bot hands to this one runs as a turn of its own in the topic, under the topic's mode, with the bot's tools, as its first allowed user (`TG_ALLOWED_USERS`); it is kept in the topic's history and answered the same way. Once: put both bots in the group with Bot-to-Bot Communication Mode on in @BotFather and privacy mode off (or as admins), and list each in the other's `TG_PEER_BOTS`. A peer is trusted like that user: what it hands over can make and change tasks and hand work on, in their name. Loops can't start: only a peer's message that names this bot is work, a reply to this bot's own messages never is, a tag is taken once, at most 20 an hour from a peer, and chains stop at the same depth.
+- **To another xesious bot.** When a topic is another xesious bot's, the hand-off goes to that bot ("hand this to @PostingBot in Posting"): an ordinary message in that topic that names it and carries a `#handoff-…` tag. That bot does the work under its own rules and replies ✅ or ❌, and the "➡️ Handed to @PostingBot …" line here says which; no answer in 6 hours is a loud failure (a late one still counts). Files go through Telegram, as documents in that topic just before the message: up to 2 GB each with `TG_API_ID`/`TG_API_HASH` set on both bots ([Big files](#big-files)), else up to 20 MB, what a bot can fetch from Telegram, and a bigger one goes as a link this bot serves for a day, which needs `TG_TASKS_WEBHOOK_PORT` (and `TG_TASKS_PUBLIC_URL` when the bots are on different machines). A brief too long for one message goes whole as `brief.md`, the same way. Work another bot hands to this one runs as a turn of its own in the topic, under the topic's mode, with the bot's tools, as its first allowed user (`TG_ALLOWED_USERS`); it is kept in the topic's history and answered the same way. Once: put both bots in the group with Bot-to-Bot Communication Mode on in @BotFather and privacy mode off (or as admins), and list each in the other's `TG_PEER_BOTS`. A peer is trusted like that user: what it hands over can make and change tasks and hand work on, in their name. Loops can't start: only a peer's message that names this bot is work, a reply to this bot's own messages never is, a tag is taken once, at most 20 an hour from a peer, and chains stop at the same depth.
 - **To a bot of another kind**, best effort: one listed in `TG_OTHER_BOTS` gets the brief as a message, as its command when the brief starts with one ("/forecast Paris" goes as `/forecast@WeatherBot Paris`, which a bot in privacy mode still gets) and as a mention otherwise; no files. Its reply to that message is the answer: the "➡️ Asked @WeatherBot …" line shows it, and it is kept in the topic's history, where the next turn there sees it. No reply in 30 minutes marks it failed, without an alarm. That bot needs Bot-to-Bot Communication Mode on too, which only its owner can switch on.
 - **Plans** (🪜): a short list of steps for work whose gates mustn't depend on a model following a prompt. A step is a message, a command (it passes when it exits 0), a Claude run, a **Codex** run (`codex exec` in the topic's folder, on the owner's ChatGPT plan), a question, or a hand-off. Each says where to go when it passes or fails, and how many times to try again, told how it failed; Claude and Codex steps get what the steps before gave. One progress line is edited as the steps go by (✅ fetch · ✅ scope · ❌ tests ×2 · ⏳ fix), then the result is posted; a failure is loud and names the step. Each step's result is saved, so a restart carries on at the step it was at.
 - **After another task** (↪️): a task can run when another one's run works, posts something, or fails, given what that run gave ("when the backup fails, find out why").
@@ -446,7 +446,7 @@ defaults now — a group can override them with `/config` (see above). Highlight
   whenever the bot is promoted to admin — not when it's added, since it has no rights
   at that point. Neither photo is ever replaced automatically; `/logo bot|group` does
   that on purpose.
-- `TG_API_ID` / `TG_API_HASH` — fetch files over 20 MB, up to 2 GB (see [Big files](#big-files)).
+- `TG_API_ID` / `TG_API_HASH` — files over 20 MB in and 50 MB out, up to 2 GB (see [Big files](#big-files)).
 - `TG_API_ROOT` — a local Bot API server, the heavier way to the same (see below).
 - `TG_TASKS` — [tasks](#tasks) (default on; `0` turns them off). `TG_TASKS_MAX_CLAUDE` caps the scheduled Claude runs at once (2), `TG_TASKS_MAX_WATCHERS` the streaming watchers kept running (8); `TG_TASK_CREATORS` (`everyone`|`admins`) and `TG_TASKS_ACTIVITY` (`1`|`0`) are the defaults for the two task settings in `/config`; `TG_API_SOCKET` moves the local API's socket; `TG_TASKS_WEBHOOK_PORT` (and `TG_TASKS_WEBHOOK_HOST`, default `127.0.0.1`) serves the tasks' webhooks; `TG_CODEX_BIN` names the Codex CLI for plans' Codex steps; `TG_PEER_BOTS` lists the other xesious bots this one hands work to and takes it from, `TG_OTHER_BOTS` the other bots it may ask, and `TG_TASKS_PUBLIC_URL` is where they reach the files it serves them.
 
@@ -478,19 +478,22 @@ A typical loop from the phone: `/plan refactor the parser` → read it → "go a
 The cloud Bot API caps bot **downloads at 20 MB** and **uploads at 50 MB** — a
 hard limit of Telegram's, not this bridge's.
 
-**Downloads up to 2 GB: set `TG_API_ID` and `TG_API_HASH`.** Get the pair at
+**Up to 2 GB both ways: set `TG_API_ID` and `TG_API_HASH`.** Get the pair at
 [my.telegram.org/apps](https://my.telegram.org/apps), put both in `.env` and
 restart; the startup banner's `big files` line says it took. Everything still goes
-through the cloud Bot API, except that a file over 20 MB is fetched over MTProto,
-Telegram's own client protocol, by the message it came on. The bot logs in there
-with its own token the first time one arrives and keeps that login in
-`state/mtproto-<bot id>.session`; that session takes no updates, so polling is
-unaffected. Nothing to migrate, nothing to run beside the bridge. Uploads stay at
-50 MB.
+through the cloud Bot API, except that a file over 20 MB is fetched, and one over
+50 MB sent, over MTProto, Telegram's own client protocol; a file is fetched by the
+message it came on. One that looks like taking more than 20 seconds gets a
+progress bar in a message under it, which goes away when it is done. The bot logs in there with its own token the first time
+and keeps that login in `state/mtproto-<bot id>.session`; that session takes no
+updates, so polling is unaffected. Nothing to migrate, nothing to run beside the
+bridge. Files handed to another xesious bot go through Telegram at any size too, so
+set the pair on both bots.
 
 ### Local Bot API server
 
-The heavier way, for uploads over 50 MB too. Running a
+The heavier way to the same, for a deployment that would rather run a server than
+log in over MTProto. Running a
 [local Bot API server](https://github.com/tdlib/telegram-bot-api) removes the
 download cap and raises uploads to 2000 MB. `./local-api.sh up` starts one in
 Docker (needs `TG_API_ID`/`TG_API_HASH` from [my.telegram.org](https://my.telegram.org/apps)),

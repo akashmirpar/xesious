@@ -179,6 +179,29 @@ async def main():
                 elif open(got[0]).read() != "MANGO42\n":
                     ok, d = False, f"the other bridge's copy holds {open(got[0]).read()!r}"
         results.append(("a file handed along goes through Telegram and lands in the other bridge's inbox", ok, d))
+
+        # Past the Bot API's caps (50 MB up, 20 MB down): with TG_API_ID/TG_API_HASH it
+        # still goes through Telegram as a document, over MTProto both ways.
+        if os.environ.get("TG_API_ID") and os.environ.get("TG_API_HASH"):
+            import hashlib
+            print("[peers] case: a 60 MB file goes along")
+            big = os.urandom(60 * 1024 * 1024)
+            path = os.path.join(BASE, "peer-big.bin")
+            with open(path, "wb") as fh:
+                fh.write(big)
+            start = len(seen)
+            ok, d = await hand_off(client, ids, A, B, x, y, "Say how big peer-big.bin is.", files=[path])
+            if ok:
+                doc = next((m for m in seen[start:] if m.sender_id == ids[A] and topic_of(m) == y and m.file
+                            and m.file.name == "peer-big.bin"), None)
+                got = glob.glob(os.path.join(BASE, "b", "sessions", "**", "inbox", "peer-big*.bin"), recursive=True)
+                if not doc:
+                    ok, d = False, f"@{A} sent no peer-big.bin document in topic {y} (a link instead?)"
+                elif not got:
+                    ok, d = False, "the 60 MB file never reached the other bridge's inbox"
+                elif hashlib.sha256(open(got[0], "rb").read()).digest() != hashlib.sha256(big).digest():
+                    ok, d = False, f"the other bridge's copy differs ({os.path.getsize(got[0])} bytes)"
+            results.append(("a 60 MB file handed along goes through Telegram over MTProto, whole", ok, d))
     finally:
         if created and not KEEP:
             peer = await client.get_input_entity(GROUP)

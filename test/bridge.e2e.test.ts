@@ -81,6 +81,9 @@ process.env.TG_TASKS_WEBHOOK_PORT = String(HOOK_PORT)
 process.env.TG_PEER_BOTS = '@PostingBot'
 // …and a bot of another kind, asked best effort.
 process.env.TG_OTHER_BOTS = 'WeatherBot'
+// The cloud Bot API's file caps, whatever the .env Bun loads says: past them is
+// MTProto (mtproto.ts), which only the staging tier can reach.
+process.env.TG_API_ID = process.env.TG_API_HASH = ''
 // Tasks are on by default; off here, so every other test sees the command line it
 // always did. The task tests switch them on.
 process.env.TG_TASKS = '0'
