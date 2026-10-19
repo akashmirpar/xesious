@@ -85,7 +85,7 @@ In a group, the commands that only inform the person asking — `/status`, `/job
 | *(any text)* | Send a prompt to this topic's Claude session |
 | *(any file)* | Upload it into this topic's `inbox/` (a caption runs as a prompt) |
 | `/whoami` | Show your user/chat/topic ids (for the allowlist) — works for anyone |
-| `/new` (or `/clear`) | Start a fresh session in this topic. The old session id is **kept** (nothing deleted) — `/resume` to undo. Like Claude's own `/clear`, this resets context without deleting the session. |
+| `/new [request]` (or `/clear`) | Start a fresh session in this topic. The old session id is **kept** (nothing deleted) — `/resume` to undo. Like Claude's own `/clear`, this resets context without deleting the session. With a request after it, the request is the fresh session's first message (`/new what should we ship next?`); a file captioned that way works the same. |
 | `/resume [id]` | Restore the previous session (undo `/new`), or bind this topic to a specific past session — the 8-character prefix `/sessions` prints is enough, and an ambiguous one is refused rather than guessed |
 | `/compact [focus]` | Summarize this topic's session history to free up context (memory kept) |
 | `/stop` | Cancel the turn currently running in this topic. A `/bg` run or a task's run there goes on: those stop from `/jobs` (or a task's card), and `/stop` says they are still running |

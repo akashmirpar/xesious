@@ -6617,7 +6617,10 @@ bot.on('message', async ctx => {
   if (attachment) {
     if (!isAllowed(ctx)) return
     console.log(`[in] chat=${chatId} topic=${threadId ?? '-'} from=${ctx.from.id} file=${attachment.name} (${fmtBytes(attachment.size)})`)
-    await gather(ctx, keyFor(chatId, threadId), threadId, { msg, text: msg.caption?.trim() ?? '', att: attachment })
+    let caption = msg.caption?.trim() ?? ''
+    const fresh = (msg as any).forward_origin ? undefined : freshCaption(caption)
+    if (fresh) { await startFresh(ctx, keyFor(chatId, threadId), threadId); caption = fresh.rest }
+    await gather(ctx, keyFor(chatId, threadId), threadId, { msg, text: caption, att: attachment })
     return
   }
 
@@ -7023,18 +7026,11 @@ bot.on('message', async ctx => {
       .catch(e => console.error(`[error] plan task ${key}: ${e}`))
     return
   }
-  if (cmd === '/new' || cmd === '/reset' || cmd === '/clear') {
-    // In a private continuation, a fresh start is a fresh start of your OWN chat: it
-    // leaves the topic first, and the fresh session is in your own directory.
-    const left = ctx.chat.type === 'private' ? await leavePrivate(key) : undefined
-    // A record even when there is none yet: its stamp is what outranks a live link.
-    const e = sessions[key] ?? (sessions[key] = { cwd: resolveCwd(ctx, threadId) })
-    if (e?.sessionId) { e.prevSessionId = e.sessionId; delete e.sessionId }
-    topicSessionChanged(key)
-    const fresh = (left ? `🔓 Left "${left.topic}". ` : '') + (e?.prevSessionId
-      ? `🧹 Fresh session started. The old one is kept (${e.prevSessionId.slice(0, 8)}) — send /resume to restore it. Nothing was deleted.`
-      : '🧹 Fresh session for this topic.')
-    if (left) await sayRemovingKeyboard(chatId, fresh); else await send(ctx, threadId, fresh)
+  if (FRESH_COMMANDS.has(cmd)) {
+    await startFresh(ctx, key, threadId)
+    // `/new <request>`: what follows the command is the fresh session's first message.
+    const rest = typed.slice(typed.split(/\s+/)[0].length).trim()
+    if (rest) await gather(ctx, key, threadId, { msg, text: rest })
     return
   }
   if (cmd === '/resume') {
@@ -7392,9 +7388,31 @@ bot.on('message', async ctx => {
   await gather(ctx, key, threadId, { msg, text })
 })
 
+// /new, /reset and /clear: a fresh session for the topic, the old one kept for /resume.
+// Followed by a request, in a message or a file's caption, that request is the fresh
+// session's first message.
+const FRESH_COMMANDS = new Set(['/new', '/reset', '/clear'])
+async function startFresh(ctx: Context, key: string, threadId: number | undefined): Promise<void> {
+  // In a private continuation, a fresh start is a fresh start of your OWN chat: it
+  // leaves the topic first, and the fresh session is in your own directory.
+  const left = ctx.chat!.type === 'private' ? await leavePrivate(key) : undefined
+  // A record even when there is none yet: its stamp is what outranks a live link.
+  const e = sessions[key] ?? (sessions[key] = { cwd: resolveCwd(ctx, threadId) })
+  if (e?.sessionId) { e.prevSessionId = e.sessionId; delete e.sessionId }
+  topicSessionChanged(key)
+  const fresh = (left ? `🔓 Left "${left.topic}". ` : '') + (e?.prevSessionId
+    ? `🧹 Fresh session started. The old one is kept (${e.prevSessionId.slice(0, 8)}) — send /resume to restore it. Nothing was deleted.`
+    : '🧹 Fresh session for this topic.')
+  if (left) await sayRemovingKeyboard(ctx.chat!.id, fresh); else await send(ctx, threadId, fresh)
+}
+// A caption that starts with one of them: the command, and what follows it.
+function freshCaption(caption: string): { rest: string } | undefined {
+  const m = caption.match(/^(\/[a-z]+)(?:@\w+)?(?:\s+([\s\S]*))?$/i)
+  return m && FRESH_COMMANDS.has(m[1].toLowerCase()) ? { rest: (m[2] ?? '').trim() } : undefined
+}
+
 // One file, on its own: saved, and its caption (if any) run as the prompt.
-function takeAttachment(ctx: Context, key: string, threadId: number | undefined, msg: any, attachment: Attachment): void {
-  const caption = msg.caption?.trim()
+function takeAttachment(ctx: Context, key: string, threadId: number | undefined, msg: any, attachment: Attachment, caption: string): void {
   enqueue(key, async () => {
     const cwd = resolveCwd(ctx, threadId)
     let saved: string
@@ -7527,7 +7545,7 @@ async function runBurst(b: Burst): Promise<void> {
   if (!parts.length) return
   if (parts.length === 1) {
     const [p] = parts
-    if (p.att) return takeAttachment(ctx, key, threadId, p.msg, p.att)
+    if (p.att) return takeAttachment(ctx, key, threadId, p.msg, p.att, p.text)
     const forwarded = forwardedOf(ctx, p.msg, p.text)
     return startTurn(ctx, key, threadId, p.msg, forwarded ? '' : p.text, { forwarded })
   }
@@ -7966,7 +7984,7 @@ const BOT_COMMANDS: { command: string; description: string; is_ephemeral?: boole
   { command: 'config', description: "This group's settings (only you see the menu)", is_ephemeral: true },
   { command: 'private', description: 'Carry this topic on in your DM, where only you see it', is_ephemeral: true },
   { command: 'recall', description: "What each search engine finds in this group's history", is_ephemeral: true },
-  { command: 'new', description: 'Fresh session in this topic (/resume undoes it)' },
+  { command: 'new', description: 'Fresh session in this topic; /new <request> starts it with that (/resume undoes it)' },
   { command: 'stop', description: 'Cancel the running task' },
   { command: 'interrupt', description: 'Stop the running task but keep what it produced' },
   { command: 'bg', description: 'Run a task alongside this topic' },

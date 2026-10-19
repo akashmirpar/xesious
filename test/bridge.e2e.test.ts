@@ -418,6 +418,53 @@ describe('session lifecycle: /new and /resume', () => {
     const cont = await incoming(1021, 'continue')
     expect(finalReply(cont)).toContain('hadResume')           // resuming again
   })
+
+  test('/new <request>: the fresh session\'s first message is the request', async () => {
+    await incoming(1023, 'bind a session')
+    const cs = await incoming(1023, '/new what changed since then')
+    const said = cs.filter(c => c.method === 'sendMessage').map(c => String(c.payload.text))
+    expect(said[0]).toMatch(/Fresh session started/)          // the old one is kept, as with a bare /new
+    expect(finalReply(cs)).toContain('noResume')              // the request ran, in the fresh session
+    expect(readFileSync(LAST_PROMPT, 'utf8')).toMatch(/\nwhat changed since then$/)
+    expect(stateNow().sessions['1023:main'].prevSessionId).toBe('sessTESTAAA')
+  })
+
+  // A file with "/new …" as its caption: fresh, then the file and the rest of the caption.
+  async function fileWithCaption(chatId: number, caption: string): Promise<Call[]> {
+    const before = calls.length
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const m = String(input?.url ?? input).match(/^https:\/\/api\.telegram\.org\/file\/bot[^/]+\/documents\/(.+)$/)
+      const f = m && [...fakeFiles.values()].find(x => x.name === decodeURIComponent(m[1]))
+      return f ? new Response(new Uint8Array(f.data)) : realFetch(input, init)
+    }) as any
+    fakeFiles.set(`notes-${chatId}`, { name: 'notes.txt', data: Buffer.from('some notes') })
+    try {
+      await bridge.bot.handleUpdate({ update_id: updateId++, message: {
+        message_id: updateId + 5000, date: 0, chat: { id: chatId, type: 'private', first_name: 'T' }, from: { id: 1, is_bot: false, first_name: 'T' },
+        document: { file_id: `notes-${chatId}`, file_unique_id: `n${chatId}`, file_name: 'notes.txt', file_size: 10 }, caption } })
+      await bridge._drainQueue(`${chatId}:main`)
+    } finally { globalThis.fetch = realFetch; fakeFiles.clear() }
+    return calls.slice(before)
+  }
+
+  test('a file captioned "/new <request>": a fresh session, and the request runs on the file', async () => {
+    await incoming(1024, 'bind a session')
+    const cs = await fileWithCaption(1024, '/new summarize these notes')
+    expect(cs.find(c => c.method === 'sendMessage')?.payload.text).toMatch(/Fresh session started/)
+    expect(finalReply(cs)).toContain('noResume')
+    const prompt = readFileSync(LAST_PROMPT, 'utf8')
+    expect(prompt).toContain('summarize these notes')
+    expect(prompt).not.toMatch(/\/new/)                        // the command is not part of what Claude reads
+  })
+
+  test('a file captioned only "/new": a fresh session, and the file is just saved', async () => {
+    await incoming(1025, 'bind a session')
+    const cs = await fileWithCaption(1025, '/new')
+    expect(cs.find(c => c.method === 'sendMessage')?.payload.text).toMatch(/Fresh session started/)
+    expect(stateNow().sessions['1025:main'].sessionId).toBeUndefined()   // no turn ran on it
+    expect(JSON.stringify(cs)).toContain('notes.txt')                     // …but it was saved and acknowledged
+  })
 })
 
 describe('/status reports the topic state', () => {
