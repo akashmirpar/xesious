@@ -15,7 +15,8 @@
 //   existing, longer file keeps the old file's tail; the file is opened with 'w' here;
 // - uploading from a file path: a part's number is taken before the lock that orders
 //   the reads, so under load a part is sent as another (1 corrupt file in 6, confirmed
-//   by downloading it with Telethon); parts are read here by their own offset instead;
+//   by downloading it with Telethon); parts are read here by their own offset instead.
+//   Fixed upstream in 0.32.6 (mtcute#182); this loop stays, as it is tested end to end;
 // - one session file for two bot tokens: hence one file per bot id.
 import { basename, join } from 'node:path'
 import { closeSync, openSync, readSync, rmSync, statSync, writeSync } from 'node:fs'
