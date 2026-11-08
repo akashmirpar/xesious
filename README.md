@@ -89,7 +89,7 @@ In a group, the commands that only inform the person asking — `/status`, `/job
 | `/resume [id]` | Restore the previous session (undo `/new`), or bind this topic to a specific past session — the 8-character prefix `/sessions` prints is enough, and an ambiguous one is refused rather than guessed |
 | `/compact [focus]` | Summarize this topic's session history to free up context (memory kept) |
 | `/stop` | Cancel the turn currently running in this topic. A `/bg` run or a task's run there goes on: those stop from `/jobs` (or a task's card), and `/stop` says they are still running |
-| `/voice [on\|off\|parts on\|off]` | Voice mode: transcribe voice notes and speak answers back (eyes-free). Default from `TG_VOICE`. `parts` decides whether the progressive notes are sent or only the full file. |
+| `/voice [on\|off\|parts on\|off\|engine paradee\|kokoro]` | Voice mode: transcribe voice notes and speak answers back (eyes-free). Default from `TG_VOICE`. `parts` decides whether the progressive notes are sent or only the full file; `engine` which voice model speaks here. A bare `/voice` **in reply to any message** (the bot's, yours, anyone's) reads that message out, whatever the voice mode. |
 | `/interrupt [on\|off]` | Toggle interrupt mode: a new message cancels the running task and starts immediately (its reply comes as a new message) instead of queueing. Default from `TG_INTERRUPT`. |
 | `/mode [plan\|acceptEdits\|auto\|bypass]` | Show or set this topic's permission mode. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_PERMISSION_MODE`. |
 | `/plan <task>` | One read-only turn: Claude researches and proposes without editing. Doesn't change the topic's mode, so "go ahead" carries the plan out; the plan comes with a ✅ Go ahead button that does just that. |
@@ -155,13 +155,25 @@ Send and receive files through the same topic.
 ## Voice (eyes-free, turn-based)
 
 Talk to a topic and hear the answer — no reading or typing. It runs **locally, no
-API key**: `faster-whisper` for speech→text, **Kokoro** for text→speech, and a fast
-model (Haiku) to summarize long answers into a few spoken sentences.
+API key**: `faster-whisper` for speech→text, **Paradee** (or Kokoro) for text→speech,
+and a fast model (Haiku) to summarize long answers into a few spoken sentences.
+
+Two voice engines, chosen per topic on the `/voice` keyboard or with `/voice engine`:
+
+| Engine | Voices | Speed on this class of VPS |
+|---|---|---|
+| **Paradee** (default) | 4: `af_heart`, `am_puck`, `bf_isabella`, `bm_fable` | ~20x faster than it plays |
+| Kokoro | 28 English, plus 7 other languages | under 2x |
+
+[Paradee](https://github.com/sahilmahendrakar/paradee) is an 8.5 MB model distilled
+from Kokoro, speaking four of its voices under the same names. A speaker chosen under
+Kokoro is spoken by the Paradee voice of the same accent and gender; naming a voice
+only Kokoro has (`/voice speaker bm_george`) moves the topic to Kokoro.
 
 Setup once — **no root required**:
 
 ```bash
-voice/setup.sh            # faster-whisper + Kokoro (the good voice). ~340 MB of models.
+voice/setup.sh            # faster-whisper + Paradee + Kokoro. ~500 MB to download.
 voice/setup.sh --check    # report what's installed, change nothing
 voice/setup.sh --espeak   # also the robotic espeak-ng fallback (this one needs apt)
 voice/setup.sh --piper    # also Piper + a neural voice
@@ -173,10 +185,13 @@ and never dropping `--user`), and the one native tool — `ffmpeg`, used solely 
 transcode the outgoing WAV to Opus — is taken from the system if present and
 otherwise installed privately into `voice/bin/` from pip. If a step fails the script
 **keeps going and tells you what works**: a missing `ffmpeg` costs you speaking, not
-listening, and neither costs you the install.
+listening, and neither costs you the install. Paradee is the exception to `--user`: it
+gets its own venv, `voice/paradee/.venv` (made with `uv` when present), because its
+phonemiser installs a `phonemizer` that replaces the one Kokoro imports.
 
-No configuration follows: `voice/tts.sh` selects Kokoro whenever its model is on
-disk. `TG_TTS_ENGINE` (`kokoro|piper|espeak`) and `TG_KOKORO_VOICE` are overrides.
+No configuration follows: the bridge and `voice/tts.sh` select Paradee, then Kokoro,
+whichever is on disk. `TG_TTS_ENGINE` (`paradee|kokoro|piper|espeak`) sets the server's
+default and `TG_KOKORO_VOICE` its speaker; a topic's own choice wins over both.
 
 A long answer is **spoken as it is made** rather than after it — but by default it is
 **sent quietly**: one status bubble while it speaks, then the finished audio.

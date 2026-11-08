@@ -23,6 +23,7 @@ import {
   sanitizeProse, PROSE_RULES, isNonAnswer, lastAnswerBlock,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
+  paradeeVoice, PARADEE_SPEAKERS, isTtsEngine, findAnswer, SPEAKERS,
 } from './lib'
 
 describe('parseIdList', () => {
@@ -2021,5 +2022,43 @@ describe('group memory', () => {
   test('a very long index is cut, saying how many more there are', () => {
     const facts = Array.from({ length: L.GROUP_MEMORY_INDEX_MAX + 5 }, (_, i) => ({ file: `f${i}.md`, name: `f${String(i).padStart(3, '0')}`, description: '' }))
     expect(L.groupMemoryClaudeMd({ group: 'T', dir: '/g', facts, readOnly: false })).toContain('…and 5 more in /g/memory/')
+  })
+})
+
+describe('Paradee voices', () => {
+  test('its own voices are kept, and every other English speaker gets the one of its kind', () => {
+    for (const v of PARADEE_SPEAKERS) expect(paradeeVoice(v)).toBe(v)
+    expect(paradeeVoice('bm_george')).toBe('bm_fable')
+    expect(paradeeVoice('bf_emma')).toBe('bf_isabella')
+    expect(paradeeVoice('am_adam')).toBe('am_puck')
+    expect(paradeeVoice('af_jessica')).toBe('af_heart')
+    // Every speaker on the keyboard lands on a Paradee voice of the same accent and gender.
+    for (const s of SPEAKERS) expect(paradeeVoice(s.id).slice(0, 2)).toBe(s.id.slice(0, 2))
+  })
+  test('a voice in another language falls back to af_heart rather than failing', () => {
+    expect(paradeeVoice('jf_alpha')).toBe('af_heart')
+    expect(paradeeVoice('ef_dora')).toBe('af_heart')
+  })
+  test('only the two engines speak.py has are engines', () => {
+    expect(isTtsEngine('paradee')).toBe(true)
+    expect(isTtsEngine('kokoro')).toBe(true)
+    expect(isTtsEngine('piper')).toBe(false)
+    expect(isTtsEngine('')).toBe(false)
+  })
+})
+
+describe('findAnswer', () => {
+  const line = (ids: number[], text: string) => JSON.stringify({ t: 0, ids, text })
+  test('finds an answer by any message it went out as', () => {
+    const raw = [line([10], 'first'), line([11, 12], '## Long\n\nsecond')].join('\n') + '\n'
+    expect(findAnswer(raw, 10)).toBe('first')
+    expect(findAnswer(raw, 12)).toBe('## Long\n\nsecond')
+    expect(findAnswer(raw, 13)).toBeUndefined()
+  })
+  test('the newest wins, and a torn line is skipped', () => {
+    const raw = [line([5], 'old'), '{"t":0,"ids":[5],"te', line([5], 'new')].join('\n')
+    expect(findAnswer(raw, 5)).toBe('new')
+    expect(findAnswer('{"t":0,"ids":[6],"te\n' + line([6], 'ok'), 6)).toBe('ok')
+    expect(findAnswer('', 1)).toBeUndefined()
   })
 })

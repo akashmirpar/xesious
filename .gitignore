@@ -14,6 +14,9 @@ voice/piper/
 voice/kokoro/*.onnx
 voice/kokoro/*.bin
 
+# Paradee: its model, its config and the venv it runs in (voice/setup.sh)
+voice/paradee/
+
 # Installed locally by voice/setup.sh when the system has neither: a private static
 # ffmpeg from pip, and a venv when the box has no usable --user pip.
 voice/bin/
