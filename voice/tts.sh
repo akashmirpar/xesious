@@ -3,7 +3,9 @@
 #
 #   echo "hello" | tts.sh /path/out.ogg
 #
-# Engine chosen by TG_TTS_ENGINE (default: kokoro if its model is present, else piper):
+# Engine chosen by TG_TTS_ENGINE (default: the first of paradee, kokoro that is
+# installed, else piper):
+#   paradee — Paradee-8M, distilled from Kokoro: four of its voices, ~20x realtime
 #   kokoro  — Kokoro-82M neural voice (natural; ~1x realtime on CPU)
 #   piper   — Piper neural voice (fast, more mechanical); needs TG_PIPER_VOICE
 #   espeak  — espeak-ng (robotic, always-available fallback)
@@ -14,8 +16,12 @@ TEXT="$(cat)"
 [ -n "${TEXT//[[:space:]]/}" ] || { echo "tts.sh: empty text" >&2; exit 2; }
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Default engine: kokoro when its model is on disk, otherwise piper.
+# Paradee runs in its own venv (setup.sh says why), so it needs that interpreter.
+PARADEE_PY="${TG_PARADEE_PYTHON:-$DIR/paradee/.venv/bin/python3}"
+
+# Default engine: paradee, then kokoro, whichever is on disk first, otherwise piper.
 if [ -n "${TG_TTS_ENGINE:-}" ]; then ENGINE="$TG_TTS_ENGINE"
+elif [ -x "$PARADEE_PY" ] && [ -f "${TG_PARADEE_MODEL:-$DIR/paradee/paradee_int8.onnx}" ]; then ENGINE=paradee
 elif [ -f "${TG_KOKORO_MODEL:-$DIR/kokoro/kokoro-v1.0.onnx}" ]; then ENGINE=kokoro
 else ENGINE=piper; fi
 
@@ -44,15 +50,16 @@ tmp="$(mktemp /tmp/tts-XXXXXXXXXX.wav)"
 trap 'rm -f "$tmp"' EXIT
 
 case "$ENGINE" in
-  kokoro)
-    # Delegated to speak.py, which is the ONE Kokoro implementation in the tree.
-    # There used to be a second one in kokoro_tts.py reading the same nine env vars;
-    # two ways to load the same model is two places for them to drift apart.
+  kokoro|paradee)
+    # Delegated to speak.py, which is the ONE place in the tree that loads a voice
+    # model. There used to be a second Kokoro in kokoro_tts.py reading the same nine
+    # env vars; two ways to load the same model is two places for them to drift apart.
     # speak.py encodes the Opus itself, so there is nothing left to do afterwards.
+    SPY="$PY"; [ "$ENGINE" = paradee ] && SPY="$PARADEE_PY"
     printf '%s' "$TEXT" | "$PY" -c '
 import json,sys
 sys.stdout.write(json.dumps({"units":[{"text":sys.stdin.read(),"gap":0.0}],"out":sys.argv[1]}))
-' "$OUT" | "$PY" "$DIR/speak.py" >/dev/null
+' "$OUT" | TG_TTS_ENGINE="$ENGINE" "$SPY" "$DIR/speak.py" >/dev/null
     exit $? ;;
   piper)
     if command -v "$PIPER" >/dev/null 2>&1 && [ -n "${TG_PIPER_VOICE:-}" ] && [ -f "${TG_PIPER_VOICE}" ]; then

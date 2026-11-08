@@ -562,6 +562,24 @@ export function speakerLabel(id: string): string {
   return SPEAKERS.find(s => s.id === id)?.label || id
 }
 
+// The engines that speak an answer progressively. Paradee is the default: distilled
+// from Kokoro, it speaks four of Kokoro's voices ~20x faster than it plays, where
+// Kokoro manages under 2x (measured on a 2-core VPS, 2026-11-08).
+// Kokoro stays for its other 24 English voices and its other languages.
+export type TtsEngine = 'paradee' | 'kokoro'
+export const isTtsEngine = (v: string): v is TtsEngine => v === 'paradee' || v === 'kokoro'
+export const engineLabel = (e: string) => e === 'paradee' ? 'Paradee' : e === 'kokoro' ? 'Kokoro' : e
+// Under Kokoro's ids, and one for each accent and gender, so any English speaker has a
+// Paradee voice of the same kind.
+export const PARADEE_SPEAKERS = ['af_heart', 'am_puck', 'bf_isabella', 'bm_fable']
+// The voice Paradee speaks for a chosen speaker: that one if Paradee has it, else the
+// one of the same accent and gender (bm_george -> bm_fable), else af_heart — a voice
+// chosen under Kokoro, or one in another language, carries over instead of failing.
+export function paradeeVoice(id: string): string {
+  if (PARADEE_SPEAKERS.includes(id)) return id
+  return PARADEE_SPEAKERS.find(v => v.slice(0, 2) === id.slice(0, 2)) ?? 'af_heart'
+}
+
 export type SpeechBlock = { kind: 'heading' | 'para' | 'item' | 'skip'; text: string }
 
 // A short spoken stand-in for something that should not be read aloud. Reading a
@@ -2596,6 +2614,21 @@ function richBlocks(b: any): string {
 }
 export function richMessageText(rm: { blocks?: unknown[] } | undefined): string {
   return richBlocks(rm?.blocks ?? []).trim()
+}
+
+// The answer kept for a message (bridge.ts keepAnswer): one JSON line per answer,
+// {t, ids, text}, `ids` being every message it went out as. Read from the end, so the
+// newest wins should an id ever appear twice; a torn line is skipped, not fatal.
+export function findAnswer(raw: string, id: number): string | undefined {
+  const lines = raw.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i]) continue
+    try {
+      const a = JSON.parse(lines[i])
+      if (Array.isArray(a.ids) && a.ids.includes(id) && typeof a.text === 'string') return a.text
+    } catch {}
+  }
+  return undefined
 }
 
 // What a person's message says, whatever form it came in: text, a caption, a rich

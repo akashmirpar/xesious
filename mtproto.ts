@@ -7,23 +7,20 @@
 // two staging bots 2026-10-19: 15-60 MB files both ways at ~7.5 MB/s, and a 10-minute
 // run beside Bot API polling on the same token lost no update.
 //
-// Things in mtcute 0.32.5 that look like they should work and don't, all found on the
-// staging bots 2026-10-19:
+// Things in mtcute that look like they should work and don't, found on the staging
+// bots 2026-10-19 and still so in 0.32.7:
 // - handing it the Bot API file_id: it can't decode the current format ("Unsupported
 //   file ID v3 subversion"), so a file is fetched by its message instead;
-// - downloadToFile on Bun: Bun's file writer doesn't truncate, so a download over an
-//   existing, longer file keeps the old file's tail; the file is opened with 'w' here;
-// - uploading from a file path: a part's number is taken before the lock that orders
-//   the reads, so under load a part is sent as another (1 corrupt file in 6, confirmed
-//   by downloading it with Telethon); parts are read here by their own offset instead;
 // - one session file for two bot tokens: hence one file per bot id.
+// Two more were worked around here until 0.32.7 fixed them upstream: uploads from a
+// path could send a part under another part's number (mtcute#182), and downloadToFile
+// on Bun kept an older, longer file's tail. Both now go through mtcute's own methods.
 import { basename, join } from 'node:path'
-import { closeSync, openSync, readSync, rmSync, statSync, writeSync } from 'node:fs'
+import { rmSync, statSync } from 'node:fs'
 import type { TelegramClient } from '@mtcute/bun'
 
 export const MTPROTO_MAX = 2000 * 1024 * 1024   // what a bot can move over MTProto, either way
-const PART = 512 * 1024                          // 4000 parts at most: 2000 MB
-const BIG_FILE_MIN = 10 * 1024 * 1024            // smaller files are sent by saveFilePart, not this way
+const PART_KB = 512                              // the largest part: twice the speed of the default, 4000 parts for 2000 MB
 
 type Progress = (done: number, total: number) => void
 export type SendOpts = { threadId?: number; replyTo?: number; caption?: string; silent?: boolean; onProgress?: Progress }
@@ -54,36 +51,17 @@ export function bigFiles(o: { apiId: number; apiHash: string; token: string; sta
       const [m] = await tg.getMessages(chat, msgId)
       const media = m?.media as any
       if (!media || typeof media.fileSize !== 'number') throw new Error('the message or its file is gone')
-      // 512 KB parts: twice the speed of the default.
-      const fd = openSync(dest, 'w')
+      // A failed download leaves a partial file behind; mtcute doesn't remove it.
       try {
-        for await (const chunk of tg.downloadAsIterable(media, { partSize: PART / 1024, progressCallback: onProgress })) writeSync(fd, chunk)
-      } catch (e) { closeSync(fd); rmSync(dest, { force: true }); throw e }
-      closeSync(fd)
+        await tg.downloadToFile(dest, media, { partSize: PART_KB, progressCallback: onProgress })
+      } catch (e) { rmSync(dest, { force: true }); throw e }
     },
     async upload(chat, path, o = {}) {
       const tg = await connected()
-      const { InputMedia, Long } = await import('@mtcute/bun')
+      const { InputMedia } = await import('@mtcute/bun')
       const size = statSync(path).size, name = basename(path)
-      if (size <= BIG_FILE_MIN) throw new Error(`${name} is too small to send this way`)
-      const parts = Math.ceil(size / PART)
-      const [lo, hi] = crypto.getRandomValues(new Int32Array(2))
-      const id = Long.fromBits(lo, hi)
-      // Four parts in flight; each worker takes the next number and reads that part's
-      // bytes by offset, so a part's number and its bytes can't come apart.
-      const fd = openSync(path, 'r')
-      let next = 0, sent = 0
-      const worker = async () => {
-        for (let i = next++; i < parts; i = next++) {
-          const bytes = new Uint8Array(Math.min(PART, size - i * PART))
-          readSync(fd, bytes, 0, bytes.length, i * PART)
-          await tg.call({ _: 'upload.saveBigFilePart', fileId: id, filePart: i, fileTotalParts: parts, bytes },
-            { kind: 'upload', maxRetryCount: Infinity, floodSleepThreshold: Infinity })
-          o.onProgress?.(sent += bytes.length, size)
-        }
-      }
-      try { await Promise.all(Array.from({ length: Math.min(4, parts) }, worker)) } finally { closeSync(fd) }
-      const m = await tg.sendMedia(chat, InputMedia.document({ _: 'inputFileBig', id, parts, name }, { fileName: name, fileSize: size }), {
+      const file = await tg.uploadFile({ file: path, fileName: name, fileSize: size, partSize: PART_KB, progressCallback: o.onProgress })
+      const m = await tg.sendMedia(chat, InputMedia.document(file, { fileName: name, fileSize: size }), {
         threadId: o.threadId, replyTo: o.replyTo, caption: o.caption, silent: o.silent,
       })
       return m.id
