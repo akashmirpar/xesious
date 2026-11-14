@@ -86,7 +86,7 @@ function drainSentences(buf: string): { done: string[]; rest: string } {
   return { done, rest: buf.slice(last) }
 }
 
-type Conn = { authed: boolean; uuid?: string; cwd: string; model?: string; sessionId?: string; run?: ChildProcess; gen: number }
+type Conn = { authed: boolean; uuid?: string; key?: string; cwd: string; model?: string; sessionId?: string; run?: ChildProcess; gen: number }
 
 // Run one turn of text through claude, streaming events + spoken audio to the client.
 async function runTurn(ws: any, text: string) {
@@ -97,6 +97,10 @@ async function runTurn(ws: any, text: string) {
   const model = ws.data.model || DEFAULT_MODEL
   const args = ['-p', text, '--output-format', 'stream-json', '--verbose', '--model', model, '--permission-mode', PERM, '--append-system-prompt', PROFILE]
   if (ws.data.sessionId) args.push('--resume', ws.data.sessionId)
+  // For the ledger, as the bridge records it: whether this run started its session,
+  // and the model it resolved to (usage.ts, costOf).
+  const resumed = !!ws.data.sessionId
+  let runModel: string | undefined, recorded = false
   const child = spawn(CLAUDE_BIN, args, { cwd: ws.data.cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
   ws.data.run = child
   let jsonBuf = '', textBuf = ''
@@ -123,10 +127,18 @@ async function runTurn(ws: any, text: string) {
             pump()
           }
         }
+      } else if (ev.type === 'system' && ev.subtype === 'init') {
+        if (ev.model) runModel = String(ev.model)
       } else if (ev.type === 'result') {
         if (ev.session_id) { ws.data.sessionId = ev.session_id; if (ws.data.uuid) syncSession(ws.data.uuid, ev.session_id) }
         const u = usageOf(ev)
-        if (u) ledger?.record({ ...u, kind: 'live', chat: typeof ws.data.key === 'string' ? ws.data.key.split(':')[0] : undefined, ok: !ev.is_error })
+        if (u) {
+          // The link's key is the topic's, chat:thread — so a call counts toward its topic.
+          const [chat, thread] = typeof ws.data.key === 'string' ? ws.data.key.split(':') : []
+          ledger?.record({ ...u, model: runModel ?? u.model, kind: 'live', chat, thread: Number(thread) || undefined,
+            ok: !ev.is_error, session: ev.session_id, fresh: !resumed && !recorded })
+          recorded = true
+        }
       }
     }
   })
@@ -157,7 +169,7 @@ const server = Bun.serve<Conn>({
       if (msg.type === 'auth') {
         const link = msg.uuid ? loadLinks()[msg.uuid] : null
         if (link) {
-          ws.data.authed = true; ws.data.uuid = msg.uuid; ws.data.cwd = link.cwd; ws.data.model = link.model; ws.data.sessionId = link.sessionId
+          ws.data.authed = true; ws.data.uuid = msg.uuid; ws.data.key = link.key; ws.data.cwd = link.cwd; ws.data.model = link.model; ws.data.sessionId = link.sessionId
           ws.send(JSON.stringify({ type: 'ready', where: link.cwd, model: link.model || DEFAULT_MODEL }))
         } else { ws.send(JSON.stringify({ type: 'denied' })); ws.close() }
         return

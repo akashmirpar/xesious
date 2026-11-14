@@ -6004,3 +6004,18 @@ describe('the usage ledger', () => {
     expect(r).toContain('Claude usage')
   })
 })
+
+describe('the usage ledger prices runs, not sessions', () => {
+  test('a turn carries the model its run resolved to, and a run that started its session owns its total', async () => {
+    const { Database } = await import('bun:sqlite')
+    await incoming(1965, 'which model?')
+    const db = new Database(join(TMP, 'usage.db'), { readonly: true })
+    const row = db.query("SELECT model, cost FROM usage WHERE chat = '1965' ORDER BY id DESC LIMIT 1").get() as any
+    db.close()
+    expect(row).toBeTruthy()
+    expect(row.model).toBeTruthy()
+    // 'claude-stub' is the result's modelUsage key — the session's history, not this run.
+    expect(row.model).not.toBe('claude-stub')
+    expect(row.cost).toBeCloseTo(0.0123, 6)
+  })
+})

@@ -25,6 +25,11 @@ export interface UsageEvent extends RunUsage {
   chat?: string
   thread?: number
   ok?: boolean
+  // The CLI session the run belongs to, and whether this run STARTED it. Needed
+  // because costUsd is the session's running total, not the run's (see costOf). A
+  // one-shot that never resumes passes neither: its total is its own.
+  session?: string
+  fresh?: boolean
 }
 
 export interface UsageTotals {
@@ -34,6 +39,8 @@ export interface UsageTotals {
   cacheRead: number
   cacheWrite: number
   costUsd: number
+  // Runs whose cost could not be told apart from their session's history.
+  unpriced: number
   durationMs: number
 }
 
@@ -46,12 +53,20 @@ export class UsageLedger {
     mkdirSync(dirname(path), { recursive: true })
     this.db = new Database(path, { create: true })
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=3000;')
+    // A ledger written before costOf existed charged each resumed run its session's
+    // whole history. Its rows carry no session, so the true costs cannot be recovered:
+    // they are cleared once, and those runs stay — tokens intact — as unpriced.
+    // One-shot kinds never resume, and were right.
+    const has = (t: string) => !!this.db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(t)
+    const legacy = has('usage') && !has('session_cost')
     this.db.exec(`CREATE TABLE IF NOT EXISTS usage (
       id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, kind TEXT NOT NULL, chat TEXT, thread INTEGER, model TEXT,
       input INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0,
       cache_read INTEGER NOT NULL DEFAULT 0, cache_write INTEGER NOT NULL DEFAULT 0,
       cost REAL, turns INTEGER, duration_ms INTEGER, ok INTEGER NOT NULL DEFAULT 1);
-      CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts);`)
+      CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts);
+      CREATE TABLE IF NOT EXISTS session_cost (session TEXT PRIMARY KEY, cum REAL NOT NULL, ts INTEGER NOT NULL);`)
+    if (legacy) this.db.run(`UPDATE usage SET cost = NULL WHERE kind NOT IN ('judge', 'filter', 'recall', 'digest', 'voice', 'chore')`)
   }
 
   // Never throws: a ledger that cannot write must not cost anyone their answer. A
@@ -60,18 +75,37 @@ export class UsageLedger {
     const n = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : 0)
     const opt = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
     try {
+      const cost = this.costOf(e)
       this.db.run(`INSERT INTO usage (ts, kind, chat, thread, model, input, output, cache_read, cache_write, cost, turns, duration_ms, ok)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [at, e.kind, e.chat ?? null, e.thread ?? null, e.model ?? null,
           n(e.inputTokens), n(e.outputTokens), n(e.cacheReadTokens), n(e.cacheWriteTokens),
-          opt(e.costUsd), opt(e.turns), opt(e.durationMs), e.ok === false ? 0 : 1])
+          cost, opt(e.turns), opt(e.durationMs), e.ok === false ? 0 : 1])
     } catch (err) { console.error(`[usage] record: ${err}`) }
+  }
+
+  // What this run cost. The CLI's total_cost_usd — and modelUsage — are the SESSION's
+  // running totals: resumed, a session reports everything it has ever cost (measured
+  // 2026-11-14: a resumed call reported the first call's cost plus its own, while its
+  // `usage` tokens were its own alone). So a run is charged the difference from what
+  // its session reported last, and a run that started its session owns the whole
+  // total. A session first met mid-life — resumed from before the ledger existed, or
+  // forked — has no baseline: that one run is left unpriced rather than charged the
+  // whole history, and the session is priced from its next run on.
+  private costOf(e: UsageEvent): number | null {
+    const cum = typeof e.costUsd === 'number' && Number.isFinite(e.costUsd) ? e.costUsd : null
+    if (cum === null || !e.session) return cum
+    const prev = this.db.query('SELECT cum FROM session_cost WHERE session = ?').get(e.session) as { cum: number } | null
+    this.db.run(`INSERT INTO session_cost (session, cum, ts) VALUES (?, ?, ?)
+      ON CONFLICT(session) DO UPDATE SET cum = excluded.cum, ts = excluded.ts`, [e.session, cum, Date.now()])
+    if (e.fresh) return cum
+    return prev && cum >= prev.cum ? cum - prev.cum : null
   }
 
   totals(sinceMs = 0): UsageTotals {
     const r = this.db.query(`SELECT COUNT(*) runs, COALESCE(SUM(input),0) input, COALESCE(SUM(output),0) output,
       COALESCE(SUM(cache_read),0) cacheRead, COALESCE(SUM(cache_write),0) cacheWrite,
-      COALESCE(SUM(cost),0) costUsd, COALESCE(SUM(duration_ms),0) durationMs FROM usage WHERE ts >= ?`).get(sinceMs) as UsageTotals
+      COALESCE(SUM(cost),0) costUsd, COUNT(*) - COUNT(cost) unpriced, COALESCE(SUM(duration_ms),0) durationMs FROM usage WHERE ts >= ?`).get(sinceMs) as UsageTotals
     return r
   }
 
@@ -79,7 +113,7 @@ export class UsageLedger {
   byKind(sinceMs = 0): { kind: string; totals: UsageTotals }[] {
     const rows = this.db.query(`SELECT kind, COUNT(*) runs, COALESCE(SUM(input),0) input, COALESCE(SUM(output),0) output,
       COALESCE(SUM(cache_read),0) cacheRead, COALESCE(SUM(cache_write),0) cacheWrite,
-      COALESCE(SUM(cost),0) costUsd, COALESCE(SUM(duration_ms),0) durationMs FROM usage WHERE ts >= ? GROUP BY kind`).all(sinceMs) as (UsageTotals & { kind: string })[]
+      COALESCE(SUM(cost),0) costUsd, COUNT(*) - COUNT(cost) unpriced, COALESCE(SUM(duration_ms),0) durationMs FROM usage WHERE ts >= ? GROUP BY kind`).all(sinceMs) as (UsageTotals & { kind: string })[]
     return rows.map(({ kind, ...totals }) => ({ kind, totals })).sort((a, b) => tokensOf(b.totals) - tokensOf(a.totals))
   }
 
@@ -87,7 +121,7 @@ export class UsageLedger {
   top(sinceMs = 0, n = 5): { chat: string; thread: number | null; totals: UsageTotals }[] {
     const rows = this.db.query(`SELECT chat, thread, COUNT(*) runs, COALESCE(SUM(input),0) input, COALESCE(SUM(output),0) output,
       COALESCE(SUM(cache_read),0) cacheRead, COALESCE(SUM(cache_write),0) cacheWrite,
-      COALESCE(SUM(cost),0) costUsd, COALESCE(SUM(duration_ms),0) durationMs FROM usage
+      COALESCE(SUM(cost),0) costUsd, COUNT(*) - COUNT(cost) unpriced, COALESCE(SUM(duration_ms),0) durationMs FROM usage
       WHERE ts >= ? AND chat IS NOT NULL GROUP BY chat, thread`).all(sinceMs) as (UsageTotals & { chat: string; thread: number | null })[]
     return rows.map(({ chat, thread, ...totals }) => ({ chat, thread, totals })).sort((a, b) => tokensOf(b.totals) - tokensOf(a.totals)).slice(0, n)
   }
@@ -100,7 +134,9 @@ export class UsageLedger {
   // Rows older than this are gone; the totals of a long-running bot still fit in a
   // few megabytes, so the default (TG_USAGE_KEEP_DAYS) is generous.
   prune(keepDays: number): number {
-    return this.db.run('DELETE FROM usage WHERE ts < ?', [Date.now() - keepDays * DAY]).changes
+    const cut = Date.now() - keepDays * DAY
+    this.db.run('DELETE FROM session_cost WHERE ts < ?', [cut])
+    return this.db.run('DELETE FROM usage WHERE ts < ?', [cut]).changes
   }
 
   close(): void { this.db.close() }
@@ -118,8 +154,13 @@ export function monthLine(l: UsageLedger, now = Date.now()): string {
   return `this month: ${line(l.totals(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)))}`
 }
 
-// The /stats report: what this bot has used across all its topics. Plain text.
-export function usageReport(l: UsageLedger, instance: string, now = Date.now()): string {
+const TOPICS_SHOWN = 10
+
+// The /stats report: what this bot has used across all its topics — each topic by
+// name, and what ran outside any topic (judges, recall, digests, voice passes), so
+// the topic lines add up to the total. Plain text.
+export function usageReport(l: UsageLedger, instance: string, now = Date.now(),
+  nameOf: (chat: string, thread: number | null) => string | undefined = () => undefined): string {
   const since = (days: number) => now - days * DAY
   const d = new Date(now)
   const today = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
@@ -136,9 +177,23 @@ export function usageReport(l: UsageLedger, instance: string, now = Date.now()):
     out.push('', `30 days: in ${fmtTokens(t30.input)} · out ${fmtTokens(t30.output)} · cache read ${fmtTokens(t30.cacheRead)} · cache written ${fmtTokens(t30.cacheWrite)}`)
     const kinds = l.byKind(since(30))
     if (kinds.length) out.push(`by kind: ${kinds.map(k => `${k.kind} ${fmtTokens(tokensOf(k.totals))}`).join(' · ')}`)
-    const top = l.top(since(30), 5)
-    if (top.length > 1) out.push(`busiest: ${top.map(t => `${t.chat}${t.thread != null ? `:${t.thread}` : ''} ${fmtTokens(tokensOf(t.totals))}`).join(' · ')}`)
   }
+  const all = rows[rows.length - 1][1]
+  const topics = l.top(0, Number.MAX_SAFE_INTEGER)
+  if (topics.length) {
+    const runs = (n: number) => `${n} run${n === 1 ? '' : 's'}`
+    const sum = (ts: typeof topics) => ({ runs: ts.reduce((n, t) => n + t.totals.runs, 0), tokens: ts.reduce((n, t) => n + tokensOf(t.totals), 0) })
+    out.push('', 'by topic, all time:')
+    for (const t of topics.slice(0, TOPICS_SHOWN))
+      out.push(`• ${nameOf(t.chat, t.thread) ?? `${t.chat}${t.thread != null ? `:${t.thread}` : ''}`} — ${runs(t.totals.runs)} · ${fmtTokens(tokensOf(t.totals))} tokens`)
+    const rest = sum(topics.slice(TOPICS_SHOWN))
+    if (rest.runs) out.push(`• ${topics.length - TOPICS_SHOWN} more topic${topics.length - TOPICS_SHOWN === 1 ? '' : 's'} — ${runs(rest.runs)} · ${fmtTokens(rest.tokens)} tokens`)
+    const inTopics = sum(topics)
+    if (all.runs > inTopics.runs)
+      out.push(`• outside any topic (judges, recall, digests, voice) — ${runs(all.runs - inTopics.runs)} · ${fmtTokens(tokensOf(all) - inTopics.tokens)} tokens`)
+  }
+  const unpriced = all.unpriced
+  if (unpriced) out.push('', `${unpriced} run${unpriced === 1 ? '' : 's'} unpriced (the first the ledger saw of a session already under way); their tokens are counted.`)
   out.push('', 'tokens = input + output + cache. $ is the CLI\'s own list-price estimate, not a bill.')
   return out.join('\n')
 }
