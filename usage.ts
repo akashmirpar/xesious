@@ -154,8 +154,13 @@ export function monthLine(l: UsageLedger, now = Date.now()): string {
   return `this month: ${line(l.totals(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)))}`
 }
 
-// The /stats report: what this bot has used across all its topics. Plain text.
-export function usageReport(l: UsageLedger, instance: string, now = Date.now()): string {
+const TOPICS_SHOWN = 10
+
+// The /stats report: what this bot has used across all its topics — each topic by
+// name, and what ran outside any topic (judges, recall, digests, voice passes), so
+// the topic lines add up to the total. Plain text.
+export function usageReport(l: UsageLedger, instance: string, now = Date.now(),
+  nameOf: (chat: string, thread: number | null) => string | undefined = () => undefined): string {
   const since = (days: number) => now - days * DAY
   const d = new Date(now)
   const today = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
@@ -172,10 +177,22 @@ export function usageReport(l: UsageLedger, instance: string, now = Date.now()):
     out.push('', `30 days: in ${fmtTokens(t30.input)} · out ${fmtTokens(t30.output)} · cache read ${fmtTokens(t30.cacheRead)} · cache written ${fmtTokens(t30.cacheWrite)}`)
     const kinds = l.byKind(since(30))
     if (kinds.length) out.push(`by kind: ${kinds.map(k => `${k.kind} ${fmtTokens(tokensOf(k.totals))}`).join(' · ')}`)
-    const top = l.top(since(30), 5)
-    if (top.length > 1) out.push(`busiest: ${top.map(t => `${t.chat}${t.thread != null ? `:${t.thread}` : ''} ${fmtTokens(tokensOf(t.totals))}`).join(' · ')}`)
   }
-  const unpriced = rows[rows.length - 1][1].unpriced
+  const all = rows[rows.length - 1][1]
+  const topics = l.top(0, Number.MAX_SAFE_INTEGER)
+  if (topics.length) {
+    const runs = (n: number) => `${n} run${n === 1 ? '' : 's'}`
+    const sum = (ts: typeof topics) => ({ runs: ts.reduce((n, t) => n + t.totals.runs, 0), tokens: ts.reduce((n, t) => n + tokensOf(t.totals), 0) })
+    out.push('', 'by topic, all time:')
+    for (const t of topics.slice(0, TOPICS_SHOWN))
+      out.push(`• ${nameOf(t.chat, t.thread) ?? `${t.chat}${t.thread != null ? `:${t.thread}` : ''}`} — ${runs(t.totals.runs)} · ${fmtTokens(tokensOf(t.totals))} tokens`)
+    const rest = sum(topics.slice(TOPICS_SHOWN))
+    if (rest.runs) out.push(`• ${topics.length - TOPICS_SHOWN} more topic${topics.length - TOPICS_SHOWN === 1 ? '' : 's'} — ${runs(rest.runs)} · ${fmtTokens(rest.tokens)} tokens`)
+    const inTopics = sum(topics)
+    if (all.runs > inTopics.runs)
+      out.push(`• outside any topic (judges, recall, digests, voice) — ${runs(all.runs - inTopics.runs)} · ${fmtTokens(tokensOf(all) - inTopics.tokens)} tokens`)
+  }
+  const unpriced = all.unpriced
   if (unpriced) out.push('', `${unpriced} run${unpriced === 1 ? '' : 's'} unpriced (the first the ledger saw of a session already under way); their tokens are counted.`)
   out.push('', 'tokens = input + output + cache. $ is the CLI\'s own list-price estimate, not a bill.')
   return out.join('\n')

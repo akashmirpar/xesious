@@ -7274,7 +7274,9 @@ bot.on('message', async ctx => {
   if (cmd === '/stats') {
     if (!ALLOWED_USERS.has(String(ctx.from!.id))) { await answer("Only the bot's own users can see its usage."); return }
     const l = usageLedger()
-    await answer(l ? usageReport(l, `@${botUsername}`) : 'The usage ledger is off on this server (TG_USAGE=0).')
+    // Topics by their names; a DM by whose it is.
+    const nameOf = (chat: string, thread: number | null) => chat.startsWith('-') ? topicTitle(`${chat}:${thread ?? 'main'}`) : `DM ${chat}`
+    await answer(l ? usageReport(l, `@${botUsername}`, Date.now(), nameOf) : 'The usage ledger is off on this server (TG_USAGE=0).')
     return
   }
   if (cmd === '/status') {

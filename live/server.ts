@@ -86,7 +86,7 @@ function drainSentences(buf: string): { done: string[]; rest: string } {
   return { done, rest: buf.slice(last) }
 }
 
-type Conn = { authed: boolean; uuid?: string; cwd: string; model?: string; sessionId?: string; run?: ChildProcess; gen: number }
+type Conn = { authed: boolean; uuid?: string; key?: string; cwd: string; model?: string; sessionId?: string; run?: ChildProcess; gen: number }
 
 // Run one turn of text through claude, streaming events + spoken audio to the client.
 async function runTurn(ws: any, text: string) {
@@ -133,7 +133,9 @@ async function runTurn(ws: any, text: string) {
         if (ev.session_id) { ws.data.sessionId = ev.session_id; if (ws.data.uuid) syncSession(ws.data.uuid, ev.session_id) }
         const u = usageOf(ev)
         if (u) {
-          ledger?.record({ ...u, model: runModel ?? u.model, kind: 'live', chat: typeof ws.data.key === 'string' ? ws.data.key.split(':')[0] : undefined,
+          // The link's key is the topic's, chat:thread — so a call counts toward its topic.
+          const [chat, thread] = typeof ws.data.key === 'string' ? ws.data.key.split(':') : []
+          ledger?.record({ ...u, model: runModel ?? u.model, kind: 'live', chat, thread: Number(thread) || undefined,
             ok: !ev.is_error, session: ev.session_id, fresh: !resumed && !recorded })
           recorded = true
         }
@@ -167,7 +169,7 @@ const server = Bun.serve<Conn>({
       if (msg.type === 'auth') {
         const link = msg.uuid ? loadLinks()[msg.uuid] : null
         if (link) {
-          ws.data.authed = true; ws.data.uuid = msg.uuid; ws.data.cwd = link.cwd; ws.data.model = link.model; ws.data.sessionId = link.sessionId
+          ws.data.authed = true; ws.data.uuid = msg.uuid; ws.data.key = link.key; ws.data.cwd = link.cwd; ws.data.model = link.model; ws.data.sessionId = link.sessionId
           ws.send(JSON.stringify({ type: 'ready', where: link.cwd, model: link.model || DEFAULT_MODEL }))
         } else { ws.send(JSON.stringify({ type: 'denied' })); ws.close() }
         return

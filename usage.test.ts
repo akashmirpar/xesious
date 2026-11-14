@@ -130,9 +130,23 @@ describe('the usage ledger', () => {
     expect(r).toMatch(/all time\s+2 runs/)
     expect(r).toContain('(since 2026-11-11)')
     expect(r).toContain('by kind: turn 1.3M · task 20k')
-    expect(r).toContain('busiest: -100:7 1.3M · -100:9 20k')
+    expect(r).toContain('by topic, all time:')
+    expect(r).toContain('• -100:7 — 1 run · 1.3M tokens')
+    expect(r).toContain('• -100:9 — 1 run · 20k tokens')
     expect(r).toContain('not a bill')
     expect(monthLine(l, now)).toBe('this month: 2 runs · 1.3M tokens · ~$4.60')
+    l.close(); rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('the topic list names each topic and, with what ran outside any topic, adds up to the total', () => {
+    const { l, dir } = fresh()
+    for (let i = 1; i <= 12; i++) l.record({ kind: 'turn', chat: '-100', thread: i, inputTokens: i * 1000 })
+    l.record({ kind: 'judge', inputTokens: 500 })
+    const r = usageReport(l, '@b', Date.now(), (_c, t) => `Topic ${t}`)
+    expect(r).toContain('• Topic 12 — 1 run · 12k tokens') // biggest first, by name
+    expect(r).not.toContain('• Topic 1 —')                  // past the first ten…
+    expect(r).toContain('• 2 more topics — 2 runs · 3.0k tokens') // …summed: topics 1 and 2
+    expect(r).toContain('• outside any topic (judges, recall, digests, voice) — 1 run · 500 tokens')
     l.close(); rmSync(dir, { recursive: true, force: true })
   })
 
