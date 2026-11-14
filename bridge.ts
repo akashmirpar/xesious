@@ -1455,6 +1455,10 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
   return await new Promise<ClaudeResult>(resolve => {
     let buf = '', err = '', finalText = '', sessionId: string | undefined, isError = false, got = false
     let usage: RunUsage | undefined, denials: string[] | undefined, usageLimited = false, resetsAt: number | undefined
+    // For the ledger: the model THIS run resolved to (modelUsage lists every model the
+    // session ever used), and whether a result has been recorded yet — only the first
+    // one of a run that started its session may own the session's whole total.
+    let runModel: string | undefined, recorded = false
     const textBlocks: string[] = []
     console.log(`[claude] stream in ${cwd}${resumeId ? ` (resume ${resumeId.slice(0, 8)})` : ' (new)'}`)
     // stdin = 'ignore' (/dev/null) so claude gets immediate EOF instead of waiting
@@ -1514,10 +1518,15 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
             if (ev.usageLimited) usageLimited = true
             // One row per result event: a run that waits on background work answers
             // more than once, and each answer was paid for.
-            if (ev.usage) recordUsage({ ...ev.usage, kind: ro.kind ?? 'turn', chat: chatOfKey(key), thread: threadId, ok: !ev.isError })
+            if (ev.usage) {
+              recordUsage({ ...ev.usage, model: runModel ?? ev.usage.model, kind: ro.kind ?? 'turn', chat: chatOfKey(key), thread: threadId,
+                ok: !ev.isError, session: ev.sessionId, fresh: !resumeId && !recorded })
+              recorded = true
+            }
           }
           else if (ev.kind === 'limit') { usageLimited = true; resetsAt = ev.resetsAt ?? resetsAt }
           else if (ev.kind === 'init') {
+            if (ev.model) runModel = ev.model
             if (ev.model || ev.cliVersion) {
               const prev = sessions[key]?.lastModel
               sessions[key] = { ...(sessions[key] ?? { cwd }), lastModel: ev.model ?? sessions[key]?.lastModel, lastCliVersion: ev.cliVersion ?? sessions[key]?.lastCliVersion }

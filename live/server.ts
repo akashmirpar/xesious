@@ -97,6 +97,10 @@ async function runTurn(ws: any, text: string) {
   const model = ws.data.model || DEFAULT_MODEL
   const args = ['-p', text, '--output-format', 'stream-json', '--verbose', '--model', model, '--permission-mode', PERM, '--append-system-prompt', PROFILE]
   if (ws.data.sessionId) args.push('--resume', ws.data.sessionId)
+  // For the ledger, as the bridge records it: whether this run started its session,
+  // and the model it resolved to (usage.ts, costOf).
+  const resumed = !!ws.data.sessionId
+  let runModel: string | undefined, recorded = false
   const child = spawn(CLAUDE_BIN, args, { cwd: ws.data.cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
   ws.data.run = child
   let jsonBuf = '', textBuf = ''
@@ -123,10 +127,16 @@ async function runTurn(ws: any, text: string) {
             pump()
           }
         }
+      } else if (ev.type === 'system' && ev.subtype === 'init') {
+        if (ev.model) runModel = String(ev.model)
       } else if (ev.type === 'result') {
         if (ev.session_id) { ws.data.sessionId = ev.session_id; if (ws.data.uuid) syncSession(ws.data.uuid, ev.session_id) }
         const u = usageOf(ev)
-        if (u) ledger?.record({ ...u, kind: 'live', chat: typeof ws.data.key === 'string' ? ws.data.key.split(':')[0] : undefined, ok: !ev.is_error })
+        if (u) {
+          ledger?.record({ ...u, model: runModel ?? u.model, kind: 'live', chat: typeof ws.data.key === 'string' ? ws.data.key.split(':')[0] : undefined,
+            ok: !ev.is_error, session: ev.session_id, fresh: !resumed && !recorded })
+          recorded = true
+        }
       }
     }
   })

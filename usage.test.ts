@@ -71,6 +71,53 @@ describe('the usage ledger', () => {
     l.close(); rmSync(dir, { recursive: true, force: true })
   })
 
+  test('a resumed session is charged only what the run added — the CLI reports the session\'s running total', () => {
+    const { l, dir } = fresh()
+    // A session the bot started: the whole total is this run's.
+    l.record({ kind: 'turn', costUsd: 0.5, session: 'a', fresh: true })
+    // Resumed: the CLI says 0.8 — the session's total — so this run added 0.3.
+    l.record({ kind: 'turn', costUsd: 0.8, session: 'a' })
+    // A session already under way when the ledger first met it: unpriced, not
+    // charged its whole history (a real turn here once read ~$192)…
+    l.record({ kind: 'turn', costUsd: 192, session: 'b', inputTokens: 34 })
+    // …and priced from its next run on.
+    l.record({ kind: 'turn', costUsd: 192.5, session: 'b' })
+    // A one-shot that never resumes: its total is its own.
+    l.record({ kind: 'judge', costUsd: 0.01 })
+    const t = l.totals()
+    expect(t.runs).toBe(5)
+    expect(t.costUsd).toBeCloseTo(1.31, 6)
+    expect(t.unpriced).toBe(1)
+    expect(t.input).toBe(34) // the unpriced run's tokens still count in full
+    expect(usageReport(l, '@b')).toContain('1 run unpriced')
+    l.close(); rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('a ledger from before session pricing has its resumed-run costs cleared once, tokens kept', async () => {
+    const { Database } = await import('bun:sqlite')
+    const dir = mkdtempSync(join(tmpdir(), 'xesious-usage-'))
+    const path = join(dir, 'usage.db')
+    // The table exactly as the first release wrote it, with the row that gave it away.
+    const old = new Database(path, { create: true })
+    old.exec(`CREATE TABLE usage (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, kind TEXT NOT NULL, chat TEXT, thread INTEGER, model TEXT,
+      input INTEGER NOT NULL DEFAULT 0, output INTEGER NOT NULL DEFAULT 0, cache_read INTEGER NOT NULL DEFAULT 0, cache_write INTEGER NOT NULL DEFAULT 0,
+      cost REAL, turns INTEGER, duration_ms INTEGER, ok INTEGER NOT NULL DEFAULT 1)`)
+    old.run(`INSERT INTO usage (ts, kind, input, output, cache_read, cost) VALUES (1, 'turn', 34, 2100, 1230000, 192.21), (2, 'judge', 900, 1, 0, 0.002)`)
+    old.close()
+    const l = new UsageLedger(path)
+    const t = l.totals()
+    expect(t.runs).toBe(2)
+    expect(t.costUsd).toBeCloseTo(0.002, 6) // the judge was right; the resumed turn's history is gone
+    expect(t.unpriced).toBe(1)
+    expect(t.cacheRead).toBe(1_230_000)     // its tokens are kept
+    l.record({ kind: 'turn', costUsd: 0.4, session: 's', fresh: true })
+    l.close()
+    // Opening it again is no longer a legacy ledger: new costs are kept.
+    const again = new UsageLedger(path)
+    expect(again.totals().costUsd).toBeCloseTo(0.402, 6)
+    again.close(); rmSync(dir, { recursive: true, force: true })
+  })
+
   test('the report names the instance, every window, and says what the dollars are', () => {
     const { l, dir } = fresh()
     const now = Date.UTC(2026, 10, 14, 12)
