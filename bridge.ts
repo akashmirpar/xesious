@@ -74,6 +74,8 @@ import { usageListHtml, kindIcon, type UsageLine } from './tasks/render'
 import { whenText, elapsedText, cardHtml, historyHtml, scheduleText, watchedText, taskListHtml, kindLabel, actionText, type TaskSection } from './tasks/render'
 import { LIMITS, sumUsage, type Handoff, type Task, type Run, type Wait } from './tasks/model'
 import type { RunUsage } from './lib'
+import { usageOf } from './lib'
+import { UsageLedger, monthLine, usageReport, type UsageEvent } from './usage'
 
 // ---------------------------------------------------------------------------
 // Config
@@ -113,6 +115,22 @@ const DEFAULT_WORKDIR = process.env.TG_WORKDIR || process.cwd()
 // Root under which each topic gets its own directory (named after the topic).
 const SESSIONS_BASE = process.env.TG_SESSIONS_BASE || join(homedir(), 'tg-topics')
 const STATE_FILE = process.env.TG_STATE_FILE || join(HERE, 'state', 'sessions.json')
+// One ledger per instance: what every claude run cost, across all its topics
+// (usage.ts). On by default; TG_USAGE=0 turns it off. Numbers and ids only, never
+// prompt text. Opened on first use and never fatal: a ledger that cannot open costs
+// the report, not the bot.
+const USAGE_ON = !/^(0|false|no|off)$/i.test(process.env.TG_USAGE || '1')
+const USAGE_DB = process.env.TG_USAGE_DB || join(dirname(STATE_FILE), 'usage.db')
+const USAGE_KEEP_DAYS = Number(process.env.TG_USAGE_KEEP_DAYS || 400)
+let usageLedgerInst: UsageLedger | undefined, usageFailed = false
+function usageLedger(): UsageLedger | undefined {
+  if (!USAGE_ON || usageFailed) return undefined
+  if (usageLedgerInst) return usageLedgerInst
+  try { usageLedgerInst = new UsageLedger(USAGE_DB) }
+  catch (e) { usageFailed = true; console.error(`[usage] could not open ${USAGE_DB}, the ledger is off: ${e}`) }
+  return usageLedgerInst
+}
+const recordUsage = (e: UsageEvent): void => usageLedger()?.record(e)
 // Default posture per topic (override with /mode). `auto` over `acceptEdits`: the
 // classifier still blocks destructive and irreversible calls, where acceptEdits
 // waves through everything in TG_ALLOWED_TOOLS — Bash included — unexamined.
@@ -1254,6 +1272,9 @@ type RunOpts = {
   // a "turn": /usage and friends take no model time, so the status flashed for two
   // seconds offering an Interrupt button for a run that does nothing.
   silent?: boolean
+  // What kind of run this is, for the usage ledger: turn (the default), bg, auto,
+  // private, passthrough, compact, fanout, task, handoff.
+  kind?: string
   // A status message and job the caller already put up, because the turn had work to
   // do before its run could start (see handlePrompt). The run takes both over
   // instead of posting its own.
@@ -1491,6 +1512,9 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
             got = true; sessionId = ev.sessionId; isError = ev.isError; finalText = ev.text
             usage = ev.usage; denials = ev.denials
             if (ev.usageLimited) usageLimited = true
+            // One row per result event: a run that waits on background work answers
+            // more than once, and each answer was paid for.
+            if (ev.usage) recordUsage({ ...ev.usage, kind: ro.kind ?? 'turn', chat: chatOfKey(key), thread: threadId, ok: !ev.isError })
           }
           else if (ev.kind === 'limit') { usageLimited = true; resetsAt = ev.resetsAt ?? resetsAt }
           else if (ev.kind === 'init') {
@@ -2943,7 +2967,7 @@ async function contextTick(): Promise<void> {
       .filter(e => e.chat.startsWith('-') && setting('summaries', `${e.chat}:${e.topic}`) !== false).slice(0, DIGEST_PER_TICK)
     if (due.length) {
       const reply = model === 'local' ? await localComplete(DIGEST_BATCH_SYSTEM, digestBatchUser(due), 160 * due.length)
-        : await cliComplete(model, DIGEST_BATCH_SYSTEM, digestBatchUser(due))
+        : await cliComplete(model, DIGEST_BATCH_SYSTEM, digestBatchUser(due), 120_000, 'digest')
       const got = splitDigests(reply)
       // A stretch the reply left out is stored as a dash, so one bad stretch is not
       // retried forever; a reply with nothing in it is tried again next time.
@@ -3013,7 +3037,7 @@ async function localComplete(system: string, user: string, maxTokens = 300): Pro
 
 // One short completion through the CLI, for background chores: no tools, no MCP, no
 // session file, from a directory outside any repository.
-function cliComplete(model: string, system: string, user: string, timeoutMs = 120_000): Promise<string> {
+function cliComplete(model: string, system: string, user: string, timeoutMs = 120_000, kind = 'chore'): Promise<string> {
   const dir = join(tmpdir(), `xesious-ctx-${process.getuid?.() ?? 'user'}`)
   mkdirSync(dir, { recursive: true })
   const args = ['-p', user, '--model', model, '--system-prompt', system, '--tools', '', '--strict-mcp-config',
@@ -3024,7 +3048,14 @@ function cliComplete(model: string, system: string, user: string, timeoutMs = 12
     const kill = setTimeout(() => child.kill('SIGKILL'), timeoutMs)
     child.stdout.on('data', d => { out += d })
     child.on('error', () => { clearTimeout(kill); resolve('') })
-    child.on('close', () => { clearTimeout(kill); try { resolve(String(JSON.parse(out).result ?? '')) } catch { resolve('') } })
+    child.on('close', () => {
+      clearTimeout(kill)
+      try {
+        const d = JSON.parse(out)
+        const u = usageOf(d); if (u) recordUsage({ ...u, kind, ok: !d.is_error })
+        resolve(String(d.result ?? ''))
+      } catch { resolve('') }
+    })
   })
 }
 
@@ -3124,7 +3155,7 @@ async function recallQuery(key: string, text: string, recent?: string): Promise<
   // comes out spelled the way that history spells it.
   const hchat = historyOf(key)
   const terms = storeFor(hchat)?.vocabulary(hchat, 400)
-  const q = parseQuery(await cliComplete(model, QUERY_SYSTEM, queryUser(text, recent, languageNote(`${recent ?? ''}\n${text}`), terms), 60_000))
+  const q = parseQuery(await cliComplete(model, QUERY_SYSTEM, queryUser(text, recent, languageNote(`${recent ?? ''}\n${text}`), terms), 60_000, 'recall'))
   if (!q) { console.error(`[ctx] ${key}: no search words from ${model}; searching the message as typed`); return { q: text, by: 'typed' } }
   if (queryCache.size > 200) queryCache.delete(queryCache.keys().next().value!)
   queryCache.set(ck, { q, at: Date.now() })
@@ -3595,7 +3626,7 @@ function claudeJudge(model: string, system: string, user: string): Promise<AutoV
 
 // One small question to Claude with no tools, no MCP servers and no session, from a
 // directory outside any repository: Auto mode's judge, a watcher's AI filter.
-function claudeOneShot(model: string, system: string, user: string): Promise<{ text?: string; error?: string }> {
+function claudeOneShot(model: string, system: string, user: string, kind = 'judge'): Promise<{ text?: string; error?: string }> {
   mkdirSync(TRIAGE_DIR, { recursive: true })
   const args = ['-p', user, '--model', model, '--system-prompt', system, '--tools', '', '--strict-mcp-config',
     '--no-session-persistence', '--disable-slash-commands', '--output-format', 'json', '--settings', '{"alwaysThinkingEnabled":false}']
@@ -3610,6 +3641,7 @@ function claudeOneShot(model: string, system: string, user: string): Promise<{ t
       clearTimeout(kill)
       try {
         const d = JSON.parse(out)
+        const u = usageOf(d); if (u) recordUsage({ ...u, kind, ok: !d.is_error })
         resolve({ text: String(d.result ?? '') })
       } catch { resolve({ error: `unreadable: ${(err || out).slice(0, 120)}` }) }
     })
@@ -3639,7 +3671,7 @@ async function filterTaskEvents(t: Task, question: string, items: string[]): Pro
     } catch (e) { console.error(`[tasks] ${t.id}: the AI filter failed: ${e}`); return undefined }
   }
   const model = judge === 'sonnet' ? 'sonnet' : 'haiku'
-  const r = await claudeOneShot(model, FILTER_SYSTEM, user)
+  const r = await claudeOneShot(model, FILTER_SYSTEM, user, 'filter')
   if (r.error !== undefined) { console.error(`[tasks] ${t.id}: the AI filter (${model}) ${r.error}`); return undefined }
   const pass = parseFilterAnswer(r.text!, items.length)
   if (!pass) console.error(`[tasks] ${t.id}: the AI filter (${model}) gave an answer that can't be read: ${r.text!.slice(0, 120)}`)
@@ -4165,7 +4197,13 @@ function summarizeForSpeech(answer: string): Promise<string> {
     let out = ''
     child.stdout.on('data', d => (out += d))
     child.on('error', () => resolve(''))
-    child.on('close', () => { try { resolve(String(JSON.parse(out).result ?? '').trim()) } catch { resolve('') } })
+    child.on('close', () => {
+      try {
+        const d = JSON.parse(out)
+        const u = usageOf(d); if (u) recordUsage({ ...u, kind: 'voice', ok: !d.is_error })
+        resolve(String(d.result ?? '').trim())
+      } catch { resolve('') }
+    })
   })
 }
 
@@ -4309,7 +4347,11 @@ function normaliseUnit(text: string): Promise<string> {
     child.on('error', () => done(text))
     child.on('close', () => {
       let v = ''
-      try { v = String(JSON.parse(out).result ?? '').trim() } catch {
+      try {
+        const d = JSON.parse(out)
+        const u = usageOf(d); if (u) recordUsage({ ...u, kind: 'voice', ok: !d.is_error })
+        v = String(d.result ?? '').trim()
+      } catch {
         if (errTail.trim()) console.error(`[voice] normaliser: ${errTail.trim()}`)
       }
       // The delimiters are a frame, not content: an echoed `</line>` would be READ
@@ -5571,7 +5613,7 @@ async function handlePrompt(ctx: Context, threadId: number | undefined, key: str
   const jobKey = detached ? `${key}#bg-${replyTo ?? newJobId()}` : undefined
   try {
     const res = early?.job.outcome ? await endEarly(ctx, early)
-      : await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), { onInit: background ? undefined : bindSession, effort: effortFor(key), askedBy: replyTo, fork: background, silent: !!kind.auto, early, jobKey, tasksTools: !kind.auto })
+      : await runStreaming(ctx, threadId, key, framed, cwd, resumeId, mode ?? modeFor(key), modelFor(key), { onInit: background ? undefined : bindSession, effort: effortFor(key), askedBy: replyTo, fork: background, silent: !!kind.auto, early, jobKey, tasksTools: !kind.auto, kind: kind.auto ? 'auto' : background ? 'bg' : 'turn' })
     if (stopped.has(jobKey ?? key)) {
       stopped.delete(jobKey ?? key)
       // Interrupting a part is not the same as the part finishing. It means you are
@@ -5761,7 +5803,7 @@ const refreshing = new Set<string>()
 const passthroughCommand = (text: string) => text.trim().split(/\s+/)[0].toLowerCase().replace(/@\S+$/, '')
 async function runPassthrough(ctx: Context, threadId: number | undefined, key: string, text: string): Promise<string> {
   const cwd = resolveCwd(ctx, threadId)
-  const res = await runStreaming(ctx, threadId, key, passthroughCommand(text), cwd, sessions[key]?.sessionId, modeFor(key), modelFor(key), { silent: true, tasksTools: false })
+  const res = await runStreaming(ctx, threadId, key, passthroughCommand(text), cwd, sessions[key]?.sessionId, modeFor(key), modelFor(key), { silent: true, tasksTools: false, kind: 'passthrough' })
   return res.text
 }
 
@@ -6082,7 +6124,7 @@ const privateInvites = new PrivateInvites()
 // Commands whose reply only informs the person asking: in a group they are answered
 // to that person alone (and registered hidden, so the room does not see the command
 // either). Those that change the topic for everyone stay visible.
-const HIDDEN_REPLIES = new Set(['/whoami', '/id', '/help', '/status', '/jobs', '/ps', '/tasks', '/live', '/recall', '/usage', '/cost', '/context'])
+const HIDDEN_REPLIES = new Set(['/whoami', '/id', '/help', '/status', '/stats', '/jobs', '/ps', '/tasks', '/live', '/recall', '/usage', '/cost', '/context'])
 type PrivateSource = { chat: number; thread?: number; cwd: string; topic: string; group: string; origin?: string; reply?: ConvRecord }
 type DmSettings = { mode?: string; model?: string; effort?: string }
 
@@ -6398,7 +6440,7 @@ async function runPrivateAsk(ctx: Context, threadId: number | undefined, token: 
   try {
     const block = await privateContext(ctx, askKey, link, question, src.cwd, undefined, true).catch(e => { console.error(`[private] ${askKey}: ${e}`); return '' })
     const res = await runStreaming(ctx, threadId, askKey, block + frameFrom(ctx, question), src.cwd, sessions[gKey]?.sessionId,
-      modeFor(gKey), modelFor(gKey), { fork: true, silent: true, effort: effortFor(gKey), tasksTools: false })
+      modeFor(gKey), modelFor(gKey), { fork: true, silent: true, effort: effortFor(gKey), tasksTools: false, kind: 'private' })
     const promoted = res.isError ? undefined : promoteBlock(res.blocks ?? [], res.text)
     const text = res.isError ? `⚠️ ${res.text || 'Something went wrong.'}`
       : res.noAnswer || !res.text.trim() ? 'No answer came back. Ask again, or carry it on in the DM.'
@@ -6707,7 +6749,7 @@ bot.on('message', async ctx => {
       `/plan <task> — one read-only turn: propose without editing\n` +
       `/logo bot|group — set the bot's avatar / this group's photo\n` +
       `/get <path> — send a file from this topic's directory back to you\n` +
-      `/cwd <abs-path> — set this topic's working directory\n/status — session id + directory + mode\n\n` +
+      `/cwd <abs-path> — set this topic's working directory\n/status — session id + directory + mode\n/stats — what this bot has used across all its topics (tokens, runs, cost estimate)\n\n` +
       `Claude's own commands, forwarded as-is:\n${[...PASSTHROUGH].join(' · ')}\n\n` +
       `Bring existing Claude sessions in from the IDE/CLI:\n` +
       `/sessions <dir…> — list the sessions stored for one or more directories\n` +
@@ -7068,7 +7110,7 @@ bot.on('message', async ctx => {
     if (!e?.sessionId) { await send(ctx, threadId, 'No session in this topic yet — nothing to compact.'); return }
     const instr = text.replace(/^\/compact(@\S+)?\s*/i, '').trim()  // optional focus instructions
     enqueue(key, async () => {
-      const res = await runStreaming(ctx, threadId, key, `/compact${instr ? ' ' + instr : ''}`, e.cwd, e.sessionId, undefined, undefined, { tasksTools: false })
+      const res = await runStreaming(ctx, threadId, key, `/compact${instr ? ' ' + instr : ''}`, e.cwd, e.sessionId, undefined, undefined, { tasksTools: false, kind: 'compact' })
       if (stopped.has(key)) { stopped.delete(key); return }
       if (res.sessionId) { sessions[key] = { cwd: e.cwd, sessionId: res.sessionId, updated: new Date().toISOString() }; saveState() }
       await send(ctx, threadId, res.isError
@@ -7102,7 +7144,7 @@ bot.on('message', async ctx => {
       // plan at all: "This message doesn't start with your verification marker"
       // (Tier 3, 2026-09-27).
       const res = await runStreaming(ctx, threadId, key, frameFrom(ctx, fanoutPlanPrompt(task, setting('fanoutMax', key) as number)), cwd,
-        sessions[key]?.sessionId, 'plan', modelFor(key), { effort: effortFor(key), fork: true, tasksTools: false })
+        sessions[key]?.sessionId, 'plan', modelFor(key), { effort: effortFor(key), fork: true, tasksTools: false, kind: 'fanout' })
       const items = parseFanoutPlan(res.text, { max: setting('fanoutMax', key) as number })
       if (thinking) await ctx.api.deleteMessage(ctx.chat!.id, thinking.message_id).catch(() => {})
       if (!items.length) {
@@ -7215,6 +7257,15 @@ bot.on('message', async ctx => {
     for (const pid of alive) { try { process.kill(pid, 'SIGTERM') } catch {} }
     leftBehind.delete(pgid)
     await send(ctx, threadId, `Sent SIGTERM to ${alive.length} process${alive.length === 1 ? '' : 'es'} left by job ${v.id}.`)
+    return
+  }
+  // What this bot has used across ALL its topics, from its own ledger (usage.ts) —
+  // not the account's limits, which /usage asks the CLI for. To the bot's own users:
+  // the sum names every topic in the group, which a guest has no business seeing.
+  if (cmd === '/stats') {
+    if (!ALLOWED_USERS.has(String(ctx.from!.id))) { await answer("Only the bot's own users can see its usage."); return }
+    const l = usageLedger()
+    await answer(l ? usageReport(l, `@${botUsername}`) : 'The usage ledger is off on this server (TG_USAGE=0).')
     return
   }
   if (cmd === '/status') {
@@ -8004,6 +8055,7 @@ const BOT_COMMANDS: { command: string; description: string; is_ephemeral?: boole
   { command: 'history', description: 'Re-post the last turns of this session' },
   { command: 'get', description: "Send a file from this topic's directory" },
   { command: 'usage', description: 'Claude usage (free, no turn)', is_ephemeral: true },
+  { command: 'stats', description: "This bot's Claude usage across all its topics", is_ephemeral: true },
   { command: 'live', description: 'A private link to a live voice call on this session', is_ephemeral: true },
   { command: 'whoami', description: 'Your user, chat and topic ids', is_ephemeral: true },
   { command: 'help', description: 'Everything the bot can do', is_ephemeral: true },
@@ -8166,7 +8218,7 @@ async function runTaskClaude(t: Task, run: Run, step?: StepCall): Promise<Claude
   const resumeId = step ? undefined : wait?.sessionId ?? (own ? t.sessionId : undefined)
   const prompt = step ? stepFrame(t, step) : wait ? answerFrame(t, wait) : taskFrame(t, run)
   const res = await runStreaming(ctx, t.thread, key, prompt, cwd, resumeId, modeFor(key), modelFor(key), {
-    effort: effortFor(key), silent: t.says !== 'live', host: t.says === 'live', jobKey: `${key}#task-${t.id}`, task: { taskId: t.id, runId: run.id },
+    effort: effortFor(key), silent: t.says !== 'live', host: t.says === 'live', jobKey: `${key}#task-${t.id}`, task: { taskId: t.id, runId: run.id }, kind: 'task',
     // A changed topic instruction reaches a task that keeps its own session.
     ...(own && !step ? { extraArgs: ['--system-prompt-snapshot', 'off'] } : {}),
   })
@@ -8545,7 +8597,7 @@ async function runHandoff(id: string): Promise<void> {
   let res: ClaudeResult
   try {
     res = await runStreaming(ctx, h.toThread, key, handoffFrame(h), cwd, undefined, modeFor(key), modelFor(key), {
-      effort: effortFor(key), askedBy: h.dstMsg, jobKey: `${key}#handoff-${h.id}`, handoff: { id: h.id, depth: h.depth },
+      effort: effortFor(key), askedBy: h.dstMsg, jobKey: `${key}#handoff-${h.id}`, handoff: { id: h.id, depth: h.depth }, kind: 'handoff',
       ...(h.direction === 'in' && !ALLOWED_USERS.has(h.by) ? { tasksTools: false } : {}),
     })
   } catch (e) {
@@ -9934,6 +9986,8 @@ async function main() {
   // outlives its group's limit by a few hours is not worth a rewrite per message.
   pruneConversations()
   setInterval(pruneConversations, 24 * 60 * 60 * 1000).unref?.()
+  usageLedger()?.prune(USAGE_KEEP_DAYS)
+  setInterval(() => usageLedger()?.prune(USAGE_KEEP_DAYS), 24 * 60 * 60 * 1000).unref?.()
   await contextStart()
   await ensureBotLogo(me.id)
   await ensureGroupLogos()
@@ -9944,6 +9998,7 @@ async function main() {
   console.log(`     permission     : ${PERMISSION_MODE}`)
   console.log(`     api            : ${API_ROOT || 'https://api.telegram.org (cloud)'}`)
   console.log(`     big files      : ${LOCAL_API ? 'local server' : BIG_FILES ? 'over MTProto, up to 2 GB' : '20 MB cap (set TG_API_ID/TG_API_HASH to lift it)'}`)
+  console.log(`     usage ledger   : ${usageLedger() ? `${USAGE_DB} (${monthLine(usageLedger()!)})` : 'off (TG_USAGE=0)'}`)
   console.log(`     allowed users  : ${[...ALLOWED_USERS].join(', ') || '(none — set TG_ALLOWED_USERS!)'}`)
   console.log(`     allowed chats  : ${[...ALLOWED_CHATS].join(', ') || '(none)'}`)
   console.log(`     trust chat mem : ${TRUST_CHAT_MEMBERS ? 'yes (any member of an allowed chat)' : 'no'}`)

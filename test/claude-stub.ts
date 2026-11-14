@@ -101,7 +101,10 @@ const sessionId = forked && resumeId ? `fork-of-${resumeId}` : (resumeId ?? 'ses
 const emit = (o: unknown) => process.stdout.write(JSON.stringify(o) + '\n')
 const initLine = () => emit({ type: 'system', subtype: 'init', session_id: sessionId, model: model ?? 'claude-opus-5[1m]', claude_code_version: '2.1.219' })
 const result = (extra: Record<string, unknown>) =>
-  emit({ type: 'result', subtype: 'success', is_error: false, session_id: sessionId, ...extra })
+  // With what a real result carries, so the bridge's usage ledger has something to keep.
+  emit({ type: 'result', subtype: 'success', is_error: false, session_id: sessionId,
+    usage: { input_tokens: 1200, output_tokens: 80, cache_read_input_tokens: 300, cache_creation_input_tokens: 20 },
+    total_cost_usd: 0.0123, num_turns: 1, duration_ms: 1500, modelUsage: { 'claude-stub': {} }, ...extra })
 
 const tag = `${resumeId ? 'hadResume' : 'noResume'} ${model ? 'modelSet' : 'modelDefault'} ${framed ? 'framed' : 'unframed'} ${effort ? 'effort' + effort : 'effortDefault'} ${forked ? 'forked' : 'notForked'} ${carriedBg ? 'sawBgResult' : 'noBgResult'} ${model ? 'modelIs' + model.replace(/[^A-Za-z]/g, '') : 'modelIsNone'} ${groupInstr ? 'groupInstr' : 'noGroupInstr'} ${topicInstr ? 'topicInstr' : 'noTopicInstr'}`
 

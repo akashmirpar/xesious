@@ -1821,6 +1821,21 @@ export interface RunUsage {
   durationMs?: number
 }
 
+// The usage a result carries — the streaming `result` event, or the one object that
+// `--output-format json` prints; the same fields either way — or undefined when it
+// carries none, so a caller never mistakes "no result" for "free".
+export function usageOf(o: any): RunUsage | undefined {
+  const u = o?.usage ?? {}
+  const models = Object.keys(o?.modelUsage ?? {})
+  const usage: RunUsage = {
+    model: models.length ? models[0] : undefined,
+    inputTokens: num(u.input_tokens), outputTokens: num(u.output_tokens),
+    cacheReadTokens: num(u.cache_read_input_tokens), cacheWriteTokens: num(u.cache_creation_input_tokens),
+    costUsd: num(o?.total_cost_usd), turns: num(o?.num_turns), durationMs: num(o?.duration_ms),
+  }
+  return Object.values(usage).some(v => v !== undefined) ? usage : undefined
+}
+
 // "You've hit your session limit · resets 1:40am (UTC)" and its weekly kin.
 const LIMIT_TEXT = /^you'?ve hit your [a-z ]*limit\b/i
 
@@ -1868,21 +1883,14 @@ export function parseStreamLine(line: string, opts: { progressDetail: boolean })
     }
   } else if (o.type === 'result') {
     const text = String(o.result ?? '').trim()
-    const u = o.usage ?? {}
-    const models = Object.keys(o.modelUsage ?? {})
-    const usage: RunUsage = {
-      model: models.length ? models[0] : undefined,
-      inputTokens: num(u.input_tokens), outputTokens: num(u.output_tokens),
-      cacheReadTokens: num(u.cache_read_input_tokens), cacheWriteTokens: num(u.cache_creation_input_tokens),
-      costUsd: num(o.total_cost_usd), turns: num(o.num_turns), durationMs: num(o.duration_ms),
-    }
+    const usage = usageOf(o)
     const denials = Array.isArray(o.permission_denials) ? o.permission_denials.map(denialLine) : []
     out.push({
       kind: 'result',
       text,
       sessionId: o.session_id,
       isError: Boolean(o.is_error) || o.subtype !== 'success',
-      ...(Object.values(usage).some(v => v !== undefined) ? { usage } : {}),
+      ...(usage ? { usage } : {}),
       ...(denials.length ? { denials } : {}),
       ...(o.api_error_status === 429 || LIMIT_TEXT.test(text) ? { usageLimited: true } : {}),
     })

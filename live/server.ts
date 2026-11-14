@@ -15,6 +15,8 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'no
 import { join, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
+import { usageOf } from '../lib'
+import { UsageLedger } from '../usage'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PORT = Number(process.env.LIVE_PORT || 3060)
@@ -22,6 +24,11 @@ const DEFAULT_MODEL = process.env.LIVE_MODEL || 'haiku'
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude'
 const PERM = process.env.LIVE_PERMISSION_MODE || 'plan' // read-only by default; the web mouth shouldn't edit unasked
 const LINKS_FILE = process.env.LIVE_LINKS_FILE || join(HERE, '..', 'state', 'live-links.json')
+// The bridge's usage ledger (usage.ts), shared on disk like the links: a call's turns
+// count toward the same instance total. Off with TG_USAGE=0; never fatal.
+let ledger: UsageLedger | undefined
+try { if (!/^(0|false|no|off)$/i.test(process.env.TG_USAGE || '1')) ledger = new UsageLedger(process.env.TG_USAGE_DB || join(HERE, '..', 'state', 'usage.db')) }
+catch (e) { console.error(`[live] usage ledger: ${e}`) }
 const PROFILE = process.env.LIVE_PROFILE ||
   'You are on a live VOICE call. Answer in one or two short spoken sentences — plain words, no markdown, no code, no lists, no URLs read aloud. Be direct and conversational.'
 
@@ -118,6 +125,8 @@ async function runTurn(ws: any, text: string) {
         }
       } else if (ev.type === 'result') {
         if (ev.session_id) { ws.data.sessionId = ev.session_id; if (ws.data.uuid) syncSession(ws.data.uuid, ev.session_id) }
+        const u = usageOf(ev)
+        if (u) ledger?.record({ ...u, kind: 'live', chat: typeof ws.data.key === 'string' ? ws.data.key.split(':')[0] : undefined, ok: !ev.is_error })
       }
     }
   })
