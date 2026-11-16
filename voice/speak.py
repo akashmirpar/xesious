@@ -17,8 +17,14 @@ of the read-along page. Computing it costs nothing; it used to be thrown away.
 
 Pass {"out":"/path/one.ogg"} instead of "outdir" for the single-file case — one
 utterance, one file, no chunking. That mode exists so this is the ONLY place in the
-tree that loads Kokoro: voice/tts.sh delegates to it rather than carrying a second
-implementation that reads the same nine environment variables.
+tree that loads a voice model: voice/tts.sh delegates to it rather than carrying a
+second implementation that reads the same environment variables.
+
+Two engines, chosen by TG_TTS_ENGINE: paradee (the default the bridge picks when it
+is installed) and kokoro. Paradee is an 8.5 MB model distilled from Kokoro that
+speaks four of its voices and, measured here, makes speech ~20x faster than it plays
+on one thread, where Kokoro manages under 2x. It lives in its own venv (voice/paradee/.venv,
+see setup.sh), so the caller runs this file with that interpreter for it.
 
 Why this exists rather than another call to tts.sh:
 
@@ -34,9 +40,12 @@ Why this exists rather than another call to tts.sh:
   * The full file at the end costs nothing here: the samples are already in hand,
     so it is a concatenate and one encode, not a second synthesis.
 
-Env: TG_KOKORO_MODEL / TG_KOKORO_VOICES / TG_KOKORO_VOICE / TG_KOKORO_SPEED /
-     TG_KOKORO_LANG, and TG_FFMPEG to override the encoder.
+Env: TG_TTS_ENGINE (paradee | kokoro, default kokoro),
+     TG_KOKORO_MODEL / TG_KOKORO_VOICES / TG_KOKORO_VOICE / TG_KOKORO_LANG,
+     TG_PARADEE_MODEL / TG_PARADEE_CONFIG / TG_PARADEE_VOICE / TG_PARADEE_THREADS,
+     TG_KOKORO_SPEED for either engine, and TG_FFMPEG to override the encoder.
 """
+import contextlib
 import json
 import os
 import queue
@@ -65,6 +74,34 @@ def find_ffmpeg():
         return local
     from shutil import which
     return which("ffmpeg")
+
+
+def load_engine(engine):
+    """synth(text) -> (float32 samples, sample rate), with the model loaded once for
+    the whole answer."""
+    speed = float(os.environ.get("TG_KOKORO_SPEED", "1.0") or "1.0")
+    if engine == "paradee":
+        from paradee import Paradee, SAMPLE_RATE
+        d = os.path.join(HERE, "paradee")
+        voice = os.environ.get("TG_PARADEE_VOICE", "af_heart").strip() or "af_heart"
+        # stdout is this script's protocol, and spaCy and misaki are not ours: whatever
+        # they print while loading must not land between two JSON lines.
+        with contextlib.redirect_stdout(sys.stderr):
+            p = Paradee(model_path=os.environ.get("TG_PARADEE_MODEL", os.path.join(d, "paradee_int8.onnx")),
+                        config_path=os.environ.get("TG_PARADEE_CONFIG", os.path.join(d, "config.json")),
+                        threads=int(os.environ.get("TG_PARADEE_THREADS", "1") or "1"))
+            p.check_voice(voice)
+            # The phonemiser (and spaCy under it) loads lazily on the first sentence;
+            # loaded here instead, inside the redirect.
+            p.g2p(british=voice.startswith("b"))
+        return lambda text: (p(text, voice=voice, speed=speed), SAMPLE_RATE)
+    from kokoro_onnx import Kokoro
+    model = os.environ.get("TG_KOKORO_MODEL", os.path.join(HERE, "kokoro", "kokoro-v1.0.onnx"))
+    voices = os.environ.get("TG_KOKORO_VOICES", os.path.join(HERE, "kokoro", "voices-v1.0.bin"))
+    voice = os.environ.get("TG_KOKORO_VOICE", "af_heart").strip() or "af_heart"
+    lang = os.environ.get("TG_KOKORO_LANG", "en-us").strip() or "en-us"
+    k = Kokoro(model, voices)
+    return lambda text: k.create(text, voice=voice, speed=speed, lang=lang)
 
 
 def main() -> int:
@@ -109,21 +146,14 @@ def main() -> int:
     if not ff:
         sys.stderr.write("speak.py: no ffmpeg — cannot encode Opus. Run voice/setup.sh.\n")
         return 4
+    engine = (os.environ.get("TG_TTS_ENGINE", "") or "kokoro").strip().lower()
     try:
         import numpy as np
         import soundfile as sf
-        from kokoro_onnx import Kokoro
+        synth = load_engine(engine)    # once, for the whole answer
     except Exception as e:
-        sys.stderr.write(f"speak.py: kokoro not installed ({e}); run voice/setup.sh\n")
+        sys.stderr.write(f"speak.py: {engine} not installed ({e}); run voice/setup.sh\n")
         return 3
-
-    model = os.environ.get("TG_KOKORO_MODEL", os.path.join(HERE, "kokoro", "kokoro-v1.0.onnx"))
-    voices = os.environ.get("TG_KOKORO_VOICES", os.path.join(HERE, "kokoro", "voices-v1.0.bin"))
-    voice = os.environ.get("TG_KOKORO_VOICE", "af_heart").strip() or "af_heart"
-    speed = float(os.environ.get("TG_KOKORO_SPEED", "1.0") or "1.0")
-    lang = os.environ.get("TG_KOKORO_LANG", "en-us").strip() or "en-us"
-
-    k = Kokoro(model, voices)          # once, for the whole answer
 
     def encode(samples, sr, path):
         wav = path + ".wav"
@@ -228,7 +258,7 @@ def main() -> int:
             continue
         spoke[0] += 1
         try:
-            samples, sr = k.create(text, voice=voice, speed=speed, lang=lang)
+            samples, sr = synth(text)
         except Exception as e:                                  # noqa: BLE001
             # One unspeakable unit must not lose the whole answer.
             sys.stderr.write(f"speak.py: unit failed ({e})\n")

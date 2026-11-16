@@ -67,6 +67,10 @@ def main() -> int:
         # at all is the difference the kill switch is supposed to make.
         with open(dump.replace(".json", "-req.json"), "w", encoding="utf-8") as fh:
             json.dump({k: v for k, v in req.items() if k != "units"}, fh)
+        # …and the voice it was asked to speak in: which engine and which speaker
+        # reach speak.py is the bridge's whole say in how the answer sounds.
+        with open(dump.replace(".json", "-env.json"), "w", encoding="utf-8") as fh:
+            json.dump({k: os.environ.get(k) for k in ("TG_TTS_ENGINE", "TG_KOKORO_VOICE", "TG_PARADEE_VOICE")}, fh)
 
     def make(path, seconds=0.4):
         subprocess.run([ff, "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",

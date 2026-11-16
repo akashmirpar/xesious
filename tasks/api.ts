@@ -65,8 +65,12 @@ export interface ApiRequest {
   params: Record<string, string>
   query: URLSearchParams
   body: any
+  // Aborted when the caller goes away: a streamed reply (below) stops its work.
+  signal?: AbortSignal
 }
-export interface ApiReply { status: number; body: unknown }
+// `stream`: a reply sent as it is made (newline-delimited JSON), for work the caller
+// follows live, such as a call turn on the live page. `body` is then unused.
+export interface ApiReply { status: number; body: unknown; stream?: ReadableStream<Uint8Array> }
 export type ApiHandler = (scope: Scope, req: ApiRequest) => Promise<ApiReply> | ApiReply
 
 export interface Route {
@@ -124,7 +128,8 @@ export function startApi(opts: { socket: string; tokens: TokenRegistry; routes: 
       const params: Record<string, string> = {}
       hit.r.names.forEach((n, i) => { params[n] = decodeURIComponent(hit.m![i + 1]) })
       try {
-        const out = await hit.r.route.handler(scope, { method: req.method, path: url.pathname, params, query: url.searchParams, body: body ?? {} })
+        const out = await hit.r.route.handler(scope, { method: req.method, path: url.pathname, params, query: url.searchParams, body: body ?? {}, signal: req.signal })
+        if (out.stream) return new Response(out.stream, { status: out.status, headers: { 'content-type': 'application/x-ndjson' } })
         return Response.json(out.body ?? {}, { status: out.status })
       } catch (e) {
         opts.log?.(`[api] ${req.method} ${url.pathname} failed: ${e}`)

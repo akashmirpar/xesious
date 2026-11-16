@@ -3,156 +3,1013 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
 <title>Live · Claude</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Vazirmatn:wght@400;500;600&display=swap" rel="stylesheet">
+<!-- Markdown in the topics' messages: rendered, then cleaned of anything unsafe
+     (marked 12.0.2, DOMPurify 3.1.6, kept in live/vendor). -->
+<script src="/vendor/marked.min.js"></script>
+<script src="/vendor/purify.min.js"></script>
 <style>
   :root{
-    color-scheme: dark light;
-    /* Telegram theme variables — real ones override these when in Telegram. */
-    --tg-theme-bg-color:#17212b; --tg-theme-secondary-bg-color:#232e3c;
-    --tg-theme-text-color:#f5f5f5; --tg-theme-hint-color:#7d8b99;
-    --tg-theme-button-color:#3390ec; --tg-theme-button-text-color:#ffffff;
-    --tg-theme-link-color:#6ab7ff; --tg-theme-header-bg-color:#17212b;
-    --out:#2b5278;
+    color-scheme: dark;
+    --bg:#17212b; --bg2:#232e3c; --text:#f5f5f5; --hint:#7d8b99; --accent:#3390ec;
+    --out:#2b5278; --other:#1e2935; --ok:#4dcb5f; --warn:#e8a23d; --bad:#e0554e; --violet:#8774e1; --off:#3a4654;
   }
   *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
-  body{margin:0;height:100dvh;display:flex;flex-direction:column;
-    font:15px/1.4 -apple-system,"SF Pro Text",Roboto,system-ui,sans-serif;
-    background:var(--tg-theme-bg-color); color:var(--tg-theme-text-color)}
-  header{padding:10px 14px;display:flex;gap:9px;align-items:center;
-    background:var(--tg-theme-header-bg-color); border-bottom:1px solid rgba(128,128,128,.14)}
+  body{margin:0;height:100dvh;
+    font:15px/1.45 "Inter","Vazirmatn",-apple-system,"SF Pro Text",Roboto,system-ui,sans-serif;
+    background:var(--bg); color:var(--text)}
+  #app{display:flex;height:100dvh}
+  /* Scrollbars as in Telegram: a thin handle, no track. */
+  *{scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.18) transparent}
+  ::-webkit-scrollbar{width:6px;height:6px} ::-webkit-scrollbar-track{background:transparent}
+  ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.18);border-radius:3px} ::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.3)}
+  ::-webkit-scrollbar-corner{background:transparent}
+  /* Live stays on top of the list, marked, to get back to the call. */
+  #tlive{border-bottom:1px solid rgba(128,128,128,.14)}
+  #tlive .trow{border-left:3px solid var(--accent);background:rgba(51,144,236,.10)}
+  #tlive .trow.open{background:rgba(51,144,236,.22)}
+  .trow .ic img, .trow .ic svg{width:34px;height:34px;display:block}
+  .trow .ic.img{background:none} .trow .ic.gen{background:#4a5866;font-size:17px}
+  /* Markdown in messages. */
+  .md p{margin:0 0 .45em} .md p:last-child{margin-bottom:0}
+  .md h1,.md h2,.md h3,.md h4{margin:.5em 0 .3em;font-size:1.05em;font-weight:600}
+  .md ul,.md ol{margin:.2em 0 .45em;padding-inline-start:1.3em}
+  .md li{margin:.1em 0}
+  .md code{font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;background:rgba(0,0,0,.25);border-radius:4px;padding:1px 4px}
+  .md pre{background:rgba(0,0,0,.28);border-radius:8px;padding:8px 10px;overflow-x:auto;margin:.3em 0;direction:ltr;text-align:left}
+  .md pre code{background:none;padding:0;white-space:pre}
+  .md a{color:#71b7f5}
+  .md blockquote{margin:.3em 0;padding:0 10px;border-inline-start:3px solid var(--accent);color:#c9d3dd}
+  .md .tw{overflow-x:auto;margin:.3em 0}
+  .md table{border-collapse:collapse;font-size:13.5px}
+  .md th,.md td{border:1px solid rgba(128,128,128,.35);padding:4px 8px;text-align:start;vertical-align:top}
+  .md th{background:rgba(255,255,255,.06);font-weight:600}
+  .md hr{border:none;border-top:1px solid rgba(128,128,128,.3);margin:.5em 0}
+  .tm img.photo{display:block;max-width:100%;max-height:340px;border-radius:10px;margin:2px 0 4px;cursor:zoom-in}
+  .tm.md-msg{white-space:normal}
+  #main{flex:1;min-width:0;display:flex;flex-direction:column}
+  /* The group's topics (a call with a front desk): beside the call on a wide screen,
+     a screen of its own on a phone. */
+  #side{display:none;flex-direction:column;width:300px;flex:none;background:var(--bg);border-right:1px solid rgba(128,128,128,.14)}
+  body.desk #side{display:flex}
+  #side .top{padding:12px 14px;display:flex;align-items:center;gap:8px;border-bottom:1px solid rgba(128,128,128,.14)}
+  #side .top b{font-size:16px;font-weight:600;flex:1}
+  #side .close{display:none;background:none;border:none;color:var(--hint);font-size:22px;line-height:1;padding:2px 6px}
+  #tlist{overflow-y:auto;flex:1}
+  .trow{display:flex;gap:10px;align-items:center;padding:9px 14px;cursor:pointer;border-bottom:1px solid rgba(128,128,128,.07)}
+  .trow:hover{background:rgba(128,128,128,.08)} .trow.open{background:var(--bg2)}
+  .trow .ic{width:34px;height:34px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;background:var(--off);font-size:15px;font-weight:600}
+  .trow.live .ic{background:var(--accent)}
+  .trow .tx{min-width:0;flex:1}
+  .trow .tn{display:flex;gap:6px;align-items:center;font-weight:600;font-size:14.5px}
+  .trow .tn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;unicode-bidi:plaintext}
+  .trow .tl{font-size:12.5px;color:var(--hint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;unicode-bidi:plaintext}
+  .trow.working .tl{color:var(--warn)} .trow.waiting .tl{color:var(--bad)} .trow.done .tl{color:var(--ok)}
+  .trow .new{width:9px;height:9px;border-radius:50%;background:var(--accent);flex:none;display:none} .trow.unread .new{display:block}
+  #topicsBtn{display:none;background:none;border:none;color:var(--text);font-size:20px;padding:0 4px 0 0;line-height:1;position:relative}
+  #topicsBtn.alert::after{content:'';position:absolute;top:0;right:0;width:8px;height:8px;border-radius:50%;background:var(--bad)}
+  @media (max-width:799px){
+    body.desk #side{display:none;position:fixed;inset:0;width:auto;z-index:5}
+    body.desk.list #side{display:flex}
+    body.desk #side .close{display:block}
+    body.desk #topicsBtn{display:block}
+    body.desk #sub{display:none !important}
+    header b{white-space:nowrap}
+  }
+  /* A topic opened from the list: its messages in place of the call's. */
+  #tview{display:none;flex:1;flex-direction:column;min-height:0}
+  body.intopic #tview{display:flex} body.intopic #log{display:none}
+  #thead{padding:8px 16px;border-bottom:1px solid rgba(128,128,128,.14);display:flex;gap:8px;align-items:center}
+  #thead .nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;unicode-bidi:plaintext}
+  #thead .st{font-size:12px;color:var(--hint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #tmsgs{flex:1;overflow-y:auto;padding:12px 16px 4px;display:flex;flex-direction:column;gap:5px}
+  .tm{max-width:84%;padding:6px 10px;border-radius:14px;white-space:pre-wrap;overflow-wrap:anywhere;unicode-bidi:plaintext;font-size:14.5px;align-self:flex-start;background:var(--bg2);border-bottom-left-radius:5px}
+  .tm.mine{align-self:flex-end;background:var(--out);color:#fff;border-bottom-left-radius:14px;border-bottom-right-radius:5px}
+  .tm .by{display:block;font-size:11.5px;font-weight:600;color:var(--accent);margin-bottom:1px}
+  .tm .at{display:block;font-size:10.5px;color:var(--hint);text-align:right;margin-top:2px} .tm.mine .at{color:#b9d3ee}
+  .trun{align-self:flex-start;font-size:12.5px;color:var(--warn);padding:2px 4px;display:flex;gap:10px;align-items:center}
+  .trun button{font:600 12px/1 inherit;font-family:inherit;padding:5px 10px;border-radius:12px;border:1px solid rgba(224,85,78,.6);background:transparent;color:var(--bad)}
+  .trun button.sure{background:var(--bad);color:#fff}
+  /* What waits on you in the open topic: answer it here. */
+  .wcard{align-self:stretch;max-width:560px;background:var(--bg2);border:1px solid rgba(224,85,78,.45);border-radius:14px;padding:9px 11px;display:flex;flex-direction:column;gap:7px;font-size:14px}
+  .wcard .wq{unicode-bidi:plaintext;white-space:pre-wrap;overflow-wrap:anywhere}
+  .wcard .wq b{font-weight:600}
+  .wcard .wd{font-size:12px;color:var(--hint)}
+  .wcard .wb{display:flex;flex-wrap:wrap;gap:6px}
+  .wcard button{font:14px/1.2 inherit;font-family:inherit;padding:7px 11px;border-radius:10px;border:none;background:rgba(128,128,128,.2);color:var(--text);text-align:start;unicode-bidi:plaintext}
+  .wcard button.yes{background:var(--accent);color:#fff} .wcard button.on{outline:2px solid var(--accent)}
+  .wcard button:disabled{opacity:.5}
+  .wcard .own{display:flex;gap:6px} .wcard .own input{flex:1;min-width:0;padding:7px 10px;border-radius:10px;border:1px solid rgba(128,128,128,.3);background:var(--bg);color:var(--text);font:14px inherit;font-family:inherit}
+  .wcard .wdone{font-size:12.5px;color:var(--ok)}
+  .msg.sys.askline{cursor:pointer;color:var(--text)}
+  /* While a topic is open, the call's latest line, to keep up with the call. */
+  #callstrip{display:none;margin:0 16px 4px;padding:5px 10px;border-left:2px solid var(--accent);font-size:12.5px;color:var(--hint);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;unicode-bidi:plaintext}
+  body.intopic #callstrip.has{display:block}
+  /* Typing: into the open topic, or to the front desk when Live is open. */
+  #compose{display:none;width:100%;gap:8px;align-items:flex-end}
+  body.desk #compose{display:flex}
+  #compose textarea{flex:1;resize:none;max-height:30vh;min-height:40px;padding:9px 12px;border-radius:18px;border:1px solid rgba(128,128,128,.3);background:var(--bg2);color:var(--text);font:15px/1.35 inherit;font-family:inherit;unicode-bidi:plaintext}
+  #compose button{width:40px;height:40px;border-radius:50%;border:none;background:var(--accent);color:#fff;flex:none;font-size:17px}
+  #compose button:disabled{opacity:.45}
+  @keyframes flash{0%,100%{background:transparent} 30%{background:rgba(51,144,236,.35)}}
+  .trow.flash{animation:flash 1.2s ease 2}
+  /* On a wide screen the list shows what runs; the strip under the call would repeat it. */
+  @media (min-width:800px){ body.desk #work{display:none !important} }
+  header{padding:10px 16px;display:flex;gap:9px;align-items:center;background:var(--bg);border-bottom:1px solid rgba(128,128,128,.14)}
   header b{font-weight:600;font-size:16px}
   #dot{width:8px;height:8px;border-radius:50%;background:#8a99a8;flex:none}
-  #dot.on{background:#4dcb5f} #dot.busy{background:#e8a23d} #dot.err{background:#e0554e}
-  #sub{margin-left:auto;color:var(--tg-theme-hint-color);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:52%}
-  #log{flex:1;overflow-y:auto;padding:12px 12px 4px;display:flex;flex-direction:column;gap:3px}
-  .msg{max-width:82%;padding:7px 11px;border-radius:15px;white-space:pre-wrap;word-wrap:break-word;box-shadow:0 1px 1px rgba(0,0,0,.14)}
+  #dot.on{background:var(--ok)} #dot.busy{background:var(--warn)} #dot.err{background:var(--bad)}
+  .chip{font-size:12px;color:var(--hint);border:1px solid rgba(128,128,128,.3);border-radius:10px;padding:1px 8px;display:none;white-space:nowrap}
+  #sub{margin-left:auto;color:var(--hint);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40%}
+  #log{flex:1;overflow-y:auto;padding:12px 16px 4px;display:flex;flex-direction:column;gap:4px}
+  .msg{max-width:84%;padding:7px 11px;border-radius:15px;white-space:pre-wrap;overflow-wrap:anywhere;unicode-bidi:plaintext}
   .you{align-self:flex-end;background:var(--out);color:#fff;border-bottom-right-radius:5px}
-  .bot{align-self:flex-start;background:var(--tg-theme-secondary-bg-color);border-bottom-left-radius:5px}
-  .think{align-self:flex-start;color:var(--tg-theme-hint-color);font-style:italic;font-size:13px;padding:2px 10px;box-shadow:none}
-  .tool{align-self:flex-start;color:#6cc17d;font-size:12px;padding:2px 10px;box-shadow:none}
-  .sys{align-self:center;color:var(--tg-theme-hint-color);font-size:12px;padding:4px}
-  #interim{align-self:flex-end;max-width:82%;margin:0 12px 4px;padding:7px 11px;border-radius:15px;
-    background:color-mix(in srgb, var(--out) 50%, transparent);color:#e8eef5;font-style:italic;display:none}
-  .typing{align-self:flex-start;background:var(--tg-theme-secondary-bg-color);border-radius:15px;border-bottom-left-radius:5px;padding:10px 14px;display:none}
-  .typing i{display:inline-block;width:6px;height:6px;margin:0 2px;border-radius:50%;background:var(--tg-theme-hint-color);animation:blink 1.2s infinite}
+  .other{align-self:flex-end;background:var(--other);color:#c9d3dd;border-bottom-right-radius:5px;font-size:14px}
+  .heard{cursor:pointer}
+  .unclear{opacity:.5;font-style:italic}
+  .who{display:block;font-size:11px;color:var(--hint);margin-bottom:1px}
+  .you .who{color:#b9d3ee}
+  .state{font-size:11px;opacity:.75;margin-left:6px}
+  .answer{align-self:flex-start;max-width:88%;display:flex;flex-direction:column;gap:3px;margin-top:2px}
+  .quote{font-size:12px;color:var(--hint);border-left:2px solid var(--accent);padding:1px 8px;max-height:2.9em;overflow:hidden;unicode-bidi:plaintext}
+  .bot{background:var(--bg2);border-bottom-left-radius:5px;max-width:100%}
+  .think{color:var(--hint);font-style:italic;font-size:13px;padding:0 10px}
+  .tool{color:#6cc17d;font-size:12px;padding:0 10px}
+  .sys{align-self:center;color:var(--hint);font-size:12px;padding:4px;text-align:center}
+  #interim{margin:0 16px 4px;padding:6px 11px;border-radius:12px;background:rgba(43,82,120,.35);color:#e8eef5;font-style:italic;display:none;unicode-bidi:plaintext;font-size:14px}
+  .typing{display:inline-block;padding:8px 12px;background:var(--bg2);border-radius:15px;border-bottom-left-radius:5px;width:max-content}
+  .typing i{display:inline-block;width:6px;height:6px;margin:0 2px;border-radius:50%;background:var(--hint);animation:blink 1.2s infinite}
   .typing i:nth-child(2){animation-delay:.2s} .typing i:nth-child(3){animation-delay:.4s}
   @keyframes blink{0%,60%,100%{opacity:.25} 30%{opacity:1}}
-  footer{padding:10px 14px calc(12px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:9px;align-items:center;
-    background:var(--tg-theme-header-bg-color);border-top:1px solid rgba(128,128,128,.14)}
-  #talk{width:66px;height:66px;border-radius:50%;border:none;color:var(--tg-theme-button-text-color);
-    background:var(--tg-theme-button-color);font-size:26px;display:flex;align-items:center;justify-content:center;
-    touch-action:none;user-select:none;transition:transform .08s, background .2s}
-  #talk:active{transform:scale(.92)} #talk.rec{background:#e0554e; box-shadow:0 0 0 7px rgba(224,85,78,.16)} #talk.speaking{background:#8774e1}
-  .row{display:flex;gap:6px;align-items:center;color:var(--tg-theme-hint-color);font-size:13px}
-  .row input{accent-color:var(--tg-theme-button-color)}
+  footer{padding:12px 16px calc(12px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:7px;align-items:center;background:var(--bg);border-top:1px solid rgba(128,128,128,.14)}
+  .controls{display:flex;gap:22px;align-items:center;justify-content:center;width:100%}
+  /* The mic button shows your voice: it glows and swells with the level (--lvl, 0–1).
+     It glows in its own colour: on, blue. Held: red. Off but you are talking: amber — a hint
+     that nothing is being sent. */
+  #mic{width:68px;height:68px;border-radius:50%;border:none;color:#fff;background:var(--off);
+    display:flex;align-items:center;justify-content:center;touch-action:none;user-select:none;-webkit-user-select:none;
+    --lvl:0; --glow:122,184,255;
+    transform:scale(calc(1 + var(--lvl) * .08));
+    box-shadow:0 0 calc(var(--lvl) * 34px) calc(var(--lvl) * 10px) rgba(var(--glow), calc(.15 + var(--lvl) * .5));
+    transition:background .2s, transform .07s linear, box-shadow .07s linear}
+  #mic svg{width:28px;height:28px}
+  #mic .slash{display:block} #mic.on .slash, #mic.talking .slash{display:none}
+  #mic.on{background:var(--accent);--glow:122,184,255} #mic.on.called{background:#27a567;--glow:110,225,160} #mic.talking{background:var(--bad);--glow:255,150,140} #mic.speaking{background:var(--violet);--glow:180,165,255}
+  #mic.muted-talk{background:#8a6a2a;--glow:232,162,61}
+  #mic:not(.on):not(.talking):not(.muted-talk){box-shadow:none;transform:none}
+  #hint.warn{color:var(--warn)}
+  /* The side buttons are drawn like the mic: a filled circle, a white line icon. */
+  .side{width:48px;height:48px;border-radius:50%;border:none;background:var(--off);color:#fff;
+    display:flex;align-items:center;justify-content:center;padding:0;transition:background .15s, transform .08s}
+  .side svg{width:22px;height:22px}
+  .side:active{transform:scale(.92)}
+  #stop{visibility:hidden} #stop.show{visibility:visible}
+  #answers .i{display:none} #answers[data-mode=voice] .voice, #answers[data-mode=sound] .sound, #answers[data-mode=silent] .silent{display:block}
+  #stop svg{width:16px;height:16px}
+  #hint{color:var(--hint);font-size:12px;text-align:center}
+  #lag{color:#e0645a;font-size:12px;text-align:center;font-weight:600}
+  /* What is running in the group's topics, from the bot: one line each, done ones fade. */
+  #work{display:none;flex-direction:column;gap:3px;padding:6px 16px;border-top:1px solid rgba(128,128,128,.14);font-size:12.5px;color:var(--hint);max-height:30vh;overflow-y:auto}
+  #work .job{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;unicode-bidi:plaintext;transition:opacity .6s}
+  #work .job b{color:var(--text);font-weight:600}
+  #work .job::before{content:'⏳ '} #work .job.ok::before{content:'✅ '} #work .job.bad::before{content:'❌ '}
+  #work .job.ok, #work .job.bad{opacity:.6}
+  .msg.notice{color:var(--text)}
+  #start{position:fixed;inset:0;background:rgba(10,15,20,.82);display:none;align-items:center;justify-content:center;flex-direction:column;gap:14px;padding:16px;text-align:center}
+  #start .modes{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;max-width:520px}
+  #start button{font:600 17px/1.2 system-ui;padding:16px 20px;border-radius:14px;border:2px solid transparent;background:rgba(128,128,128,.28);color:#fff;display:flex;flex-direction:column;gap:6px;align-items:center;width:230px;max-width:100%;position:relative}
+  #start button small{font:400 13px/1.3 system-ui;opacity:.8}
+  #start button.last{background:var(--accent);border-color:rgba(255,255,255,.55)}
+  #start button.last::after{content:'last used';position:absolute;top:-9px;right:10px;font:600 10px/1 system-ui;background:#fff;color:#123;padding:3px 6px;border-radius:7px}
+  #callmode{font:12px/1 system-ui;color:var(--text);background:rgba(128,128,128,.18);border:none;border-radius:10px;padding:3px 9px;display:none;white-space:nowrap;cursor:pointer}
+  /* How the call listens: opened from the mode chip (or the hint under the mic). A
+     dropdown under the header on a wide screen, a bottom sheet on a phone. */
+  #listenBack{position:fixed;inset:0;display:none;z-index:40}
+  #listen{position:fixed;top:54px;left:50%;transform:translateX(-50%);width:min(360px,calc(100vw - 32px));z-index:41;display:none;flex-direction:column;gap:12px;
+    background:var(--bg2);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:14px 16px 16px;box-shadow:0 12px 32px rgba(0,0,0,.45)}
+  #listen.open,#listenBack.open{display:flex}
+  #listen .lh{display:flex;align-items:center;justify-content:space-between;font-size:15px}
+  #listen .lh button{background:none;border:none;color:var(--hint);font-size:22px;line-height:1;padding:0 2px;cursor:pointer}
+  #listen .seg{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:rgba(0,0,0,.18);padding:4px;border-radius:12px}
+  #listen .seg button{display:flex;flex-direction:column;align-items:flex-start;gap:2px;padding:9px 10px;border:none;border-radius:9px;background:none;color:var(--text);font:600 14px/1.2 inherit;font-family:inherit;text-align:left;cursor:pointer}
+  #listen .seg button small{font:400 12px/1.3 inherit;font-family:inherit;color:var(--hint)}
+  #listen .seg button.on{background:var(--accent)} #listen .seg button.on small{color:rgba(255,255,255,.82)}
+  #listen .as{display:flex;flex-direction:column;gap:12px}
+  #listen .as[hidden]{display:none}
+  #listen .field{display:flex;flex-direction:column;gap:5px;font-size:13px;color:var(--hint)}
+  #listen .field input{font:15px/1.3 inherit;font-family:inherit;color:var(--text);background:rgba(0,0,0,.2);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:9px 11px;outline:none;unicode-bidi:plaintext}
+  #listen .field input:focus{border-color:var(--accent)}
+  #listen .field small{font-size:12px}
+  #hint.tap{cursor:pointer}
+  /* Others on the call may call it (Assistant mode): its own icon in the header, red
+     while on, since then anyone in the room can ask it things with your rights. */
+  #othersBtn{display:none;align-items:center;justify-content:center;width:28px;height:24px;padding:0;border:none;border-radius:10px;background:rgba(128,128,128,.18);color:var(--hint);cursor:pointer;flex:none}
+  #othersBtn svg{width:17px;height:17px}
+  #othersBtn.on{background:var(--bad);color:#fff}
+  /* A tooltip for what has data-tip, shown at once on hover (the browser's title is slow). */
+  #tip{position:fixed;z-index:60;max-width:270px;background:#0b1117;color:#fff;font-size:12.5px;line-height:1.4;padding:7px 10px;border-radius:9px;
+    border:1px solid rgba(255,255,255,.1);box-shadow:0 6px 18px rgba(0,0,0,.45);pointer-events:none;opacity:0;transition:opacity .12s}
+  #tip.on{opacity:1}
+  @media (max-width:700px){
+    #listen{top:auto;bottom:0;left:0;right:0;transform:none;width:auto;border-radius:16px 16px 0 0;padding-bottom:calc(18px + env(safe-area-inset-bottom))}
+    #listenBack.open{background:rgba(0,0,0,.35)}
+  }
+  .vplay{display:inline-block;margin:6px 0 0;font:13px/1 system-ui;padding:5px 10px;border-radius:12px;border:none;background:rgba(128,128,128,.18);color:var(--text);cursor:pointer}
+  #start p{color:var(--hint);font-size:13px;max-width:320px;margin:0}
+  #sheet{position:fixed;left:0;right:0;bottom:0;background:var(--bg2);border-radius:16px 16px 0 0;padding:14px 16px calc(16px + env(safe-area-inset-bottom));display:none;flex-direction:column;gap:8px;box-shadow:0 -6px 24px rgba(0,0,0,.4)}
+  #sheet .q{color:var(--hint);font-size:13px;max-height:5.6em;overflow:hidden;unicode-bidi:plaintext}
+  #sheet button{font:15px/1.2 system-ui;padding:13px;border-radius:11px;border:none;background:rgba(128,128,128,.18);color:var(--text);text-align:left}
+  #sheet button.primary{background:var(--accent);color:#fff}
+  #sheet button:disabled{opacity:.45}
 </style>
 </head>
 <body>
-<header><span id="dot"></span><b>Live · Claude</b><span id="sub"></span></header>
+<div id="app">
+<aside id="side"><div class="top"><b>Topics</b><button class="close" id="sideClose" aria-label="close the topics">×</button></div><div id="tlive"></div><div id="tlist"></div></aside>
+<div id="main">
+<header><button id="topicsBtn" aria-label="topics">☰</button><span id="dot"></span><b>Live · Claude</b><span class="chip" id="me"></span><span class="chip" id="mode"></span><button id="callmode" data-tip="How the call listens: Interactive or Assistant, and the wake word. Tap to change."></button><button id="othersBtn" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.2"/><path d="M3 20c0-3.3 2.7-5.6 6-5.6s6 2.3 6 5.6"/><circle cx="17" cy="9" r="2.6"/><path d="M16.5 14.6c2.6.2 4.5 2.2 4.5 4.9"/></svg></button><span id="sub"></span></header>
 <div id="log"></div>
+<div id="tview"><div id="thead"><div style="min-width:0;flex:1"><div class="nm" id="tname"></div><div class="st" id="tstatus"></div></div></div><div id="tmsgs"></div></div>
+<div id="callstrip"></div>
 <div id="interim"></div>
+<div id="work"></div>
 <footer>
-  <button id="talk" aria-label="hold to talk">🎤</button>
-  <label class="row"><input type="checkbox" id="auto"> hands-free&nbsp;·&nbsp;<span style="opacity:.75">headphones recommended</span></label>
+  <div id="compose"><textarea id="ctext" rows="1" placeholder="Message"></textarea><button id="csend" aria-label="send">➤</button></div>
+  <div class="controls">
+    <button id="answers" class="side" data-mode="voice">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <g class="i voice"><path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></g>
+        <g class="i sound"><path d="M6 16v-5a6 6 0 0 1 12 0v5l2 2H4z"/><path d="M10 21h4"/></g>
+        <g class="i silent"><path d="M6 16v-5a6 6 0 0 1 12 0v5l2 2H4z"/><path d="M10 21h4"/><path d="M3 3l18 18"/></g>
+      </svg>
+    </button>
+    <button id="mic" aria-label="microphone: tap to turn on or off, hold to talk">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/><path class="slash" d="M4 4l16 16"/>
+      </svg>
+    </button>
+    <button id="stop" class="side" aria-label="stop the answer" title="Stop the answer"><svg viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2.5" fill="currentColor"/></svg></button>
+  </div>
+  <div id="hint">Tap to turn the mic on or off · hold (or hold Space) to talk</div>
+  <div id="lag" role="status" hidden></div>
 </footer>
+</div>
+</div>
+<div id="start"><div class="modes">
+  <button id="go" data-mode="interactive"><span>🎙 Interactive</span><small>It answers everything you say</small></button>
+  <button id="goA" data-mode="assistant"><span>🧑‍💼 Assistant</span><small>You talk with people; it acts when you call it by name</small></button>
+</div><p>The page needs the microphone. It is sent to this server for speech recognition and kept for a week for debugging.</p></div>
+<div id="listenBack"></div>
+<div id="listen" role="dialog" aria-label="How the call listens">
+  <div class="lh"><b>How the call listens</b><button id="listenClose" aria-label="close">×</button></div>
+  <div class="seg">
+    <button data-mode="interactive"><span>🎙 Interactive</span><small>Answers everything you say</small></button>
+    <button data-mode="assistant"><span>🧑‍💼 Assistant</span><small>Acts when you call it by name</small></button>
+  </div>
+  <div class="as" id="asOnly">
+    <label class="field">Wake word<input id="wakeIn" dir="auto" autocomplete="off" spellcheck="false" enterkeyhint="done"><small>Said at the start of a sentence. Several spellings, separated by commas.</small></label>
+  </div>
+</div>
+<div id="sheet"><div class="q" id="quote"></div><button class="primary" id="isme">This is me</button><button id="sendit">Send this to Claude</button><button id="cancel">Cancel</button></div>
 <script>
-const $=s=>document.querySelector(s), log=$('#log'), dot=$('#dot'), interim=$('#interim')
-let ws, actx, rec, recActive=false, autoMode=false, holding=false
-let playQueue=[], curSource=null, botSpeaking=false
+'use strict'
+const $=s=>document.querySelector(s), log=$('#log'), dot=$('#dot'), interim=$('#interim'), mic=$('#mic')
 const uuid = location.pathname.replace(/^\/+/,'').split('/')[0]
+let ws, actx, stt='browser', mainSpeaker=null
+let micOn=false, talking=false            // mic on (hands-free) / talk held (button or Space)
+let micStream=null, micNode=null, micSrc=null, workletReady=false
+let botSpeaking=false
+const running=new Set()   // requests Claude is working on
+const lines=new Map()     // line id -> {el, speaker, text, role, state}
+const answers=new Map()   // request id -> {wrap, bubble, typing}
 
-// ---- Telegram look & feel (theme vars, expand, haptics) when available ----
-const tg = window.Telegram && window.Telegram.WebApp
-if(tg){
-  try{ tg.ready(); tg.expand() }catch{}
-  const p = tg.themeParams||{}, S=document.documentElement.style
-  const map={bg_color:'--tg-theme-bg-color',secondary_bg_color:'--tg-theme-secondary-bg-color',text_color:'--tg-theme-text-color',hint_color:'--tg-theme-hint-color',button_color:'--tg-theme-button-color',button_text_color:'--tg-theme-button-text-color',link_color:'--tg-theme-link-color',header_bg_color:'--tg-theme-header-bg-color'}
-  for(const k in map) if(p[k]) S.setProperty(map[k], p[k])
-  if(p.button_color) S.setProperty('--out', p.button_color)
+function deviceToken(){
+  const k='xesious-live-device'
+  try{ let t=localStorage.getItem(k); if(!t){ t=crypto.randomUUID()+crypto.randomUUID(); localStorage.setItem(k,t) } return t }
+  catch{ return (window.__dev ||= crypto.randomUUID()+crypto.randomUUID()) }
 }
-function haptic(t){ try{ tg && tg.HapticFeedback && tg.HapticFeedback.impactOccurred(t) }catch{} }
-
-let awaitingReply=false, turnEnded=false
-const typingEl=document.createElement('div'); typingEl.className='msg typing'; typingEl.innerHTML='<i></i><i></i><i></i>'
-function line(cls,text){ const d=document.createElement('div'); d.className='msg '+cls; d.textContent=text; log.appendChild(d); if(typingEl.parentNode) log.appendChild(typingEl); log.scrollTop=log.scrollHeight; return d }
-function sys(t){ line('sys',t) }
+const atBottom=()=>log.scrollHeight-log.scrollTop-log.clientHeight<80
+function add(el){ const stick=atBottom(); log.appendChild(el); if(stick) log.scrollTop=log.scrollHeight; return el }
+function el(tag,cls,text){ const e=document.createElement(tag); if(cls) e.className=cls; if(text!=null) e.textContent=text; return e }
+function sys(t){ return add(el('div','msg sys',t)) }
+// "connecting…" / "reconnecting…" are only true until the connection is up: then they go.
+let pending=null
+function pendingSys(t){ if(pending) pending.textContent=t; else pending=sys(t) }
+function clearPending(){ pending?.remove(); pending=null }
 function setDot(c){ dot.className=c||'' }
-function showInterim(t){ interim.textContent=t; interim.style.display=t?'block':'none'; log.scrollTop=log.scrollHeight }
-// "Claude is working" dots — shown from send until the answer starts/finishes.
-function showTyping(on){ if(on){ log.appendChild(typingEl); typingEl.style.display='block'; log.scrollTop=log.scrollHeight } else { typingEl.style.display='none'; if(typingEl.parentNode) typingEl.remove() } }
-// Called when the whole answer (text + audio) is done: resume listening in hands-free.
-function replyDone(){ awaitingReply=false; showTyping(false); if(autoMode) restartRec() }
-function restartRec(){ if(!autoMode||botSpeaking||awaitingReply||recActive) return; setTimeout(()=>{ if(autoMode&&!botSpeaking&&!awaitingReply&&!recActive) startRec() }, 300) }
+function trace(msg, extra){ try{ if(ws?.readyState===1) ws.send(JSON.stringify({type:'trace', msg, extra})) }catch{} }
+function vibrate(ms){ try{ navigator.vibrate?.(ms) }catch{} }
+function who(sp, role){ return role==='me' ? 'you' : (sp==null ? 'someone' : 'speaker '+sp) }
+function chip(id, text){ const c=$(id); c.textContent=text||''; c.style.display=text?'inline':'none' }
 
-// ---- connect (uuid from URL is the key; no password) ----
+// ---- heard lines: anyone's; tap one for "this is me" / "send this" ----
+function heardLine(l){
+  const d=el('div','msg heard '+(l.role==='me'?'you':'other')+(l.unclear?' unclear':''))
+  const w=el('span','who',who(l.speaker,l.role)+(l.unclear?' · unclear, not sent':'')), t=el('span',null,l.text), s=el('span','state')
+  d.append(w,t,s); d.onclick=()=>openSheet(l.id); add(d)
+  lines.set(l.id,{el:d, speaker:l.speaker, text:l.text, role:l.role, unclear:l.unclear})
+}
+function lineState(id, text){ const l=lines.get(id); if(l) l.el.querySelector('.state').textContent=text }
+function restyle(){
+  for(const [,l] of lines){ l.role = l.speaker===mainSpeaker ? 'me' : 'other'
+    l.el.classList.toggle('you', l.role==='me'); l.el.classList.toggle('other', l.role!=='me')
+    l.el.querySelector('.who').textContent=who(l.speaker,l.role)+(l.unclear?' · unclear, not sent':'') }
+}
+let sheetId=null
+function openSheet(id){ const l=lines.get(id); if(!l) return; sheetId=id; $('#quote').textContent=who(l.speaker,l.role)+': '+l.text
+  $('#isme').textContent = l.speaker==null ? 'This is me' : (l.speaker===mainSpeaker ? 'This is me (already)' : 'This is me (speaker '+l.speaker+')')
+  $('#isme').disabled = l.speaker==null || l.speaker===mainSpeaker; $('#sheet').style.display='flex' }
+function closeSheet(){ $('#sheet').style.display='none'; sheetId=null }
+$('#isme').onclick=()=>{ if(sheetId!=null) ws?.send(JSON.stringify({type:'me', id:sheetId})); closeSheet() }
+$('#sendit').onclick=()=>{ if(sheetId!=null) ws?.send(JSON.stringify({type:'send', id:sheetId})); closeSheet() }
+$('#cancel').onclick=closeSheet
+
+// ---- answers: one block per request, under a quote of what it answers ----
+// An answer quotes what it answers — unless it comes straight after that message,
+// where the quote would only repeat it.
+function answerFor(req, said, ids){
+  let a=answers.get(req); if(a) return a
+  const last=log.lastElementChild
+  const rightUnder = ids?.length ? last===lines.get(ids[ids.length-1])?.el
+    : !!last && last.classList.contains('you') && last.textContent===said
+  const wrap=el('div','answer'); if(said && !rightUnder) wrap.append(el('div','quote','↩ '+said))
+  const typing=el('div','typing'); typing.innerHTML='<i></i><i></i><i></i>'; wrap.append(typing)
+  a={wrap, bubble:null, typing}; answers.set(req,a); add(wrap); return a
+}
+function answerAdd(req, node){ const a=answerFor(req); const stick=atBottom(); a.wrap.insertBefore(node, a.typing.parentNode? a.typing : null); if(stick) log.scrollTop=log.scrollHeight }
+function answerText(req, text){ const a=answerFor(req)
+  if(!a.bubble){ a.bubble=el('div','msg bot',''); answerAdd(req, a.bubble) }
+  a.bubble.textContent += (a.bubble.textContent?' ':'')+text; if(atBottom()) log.scrollTop=log.scrollHeight }
+function answerDone(req, stopped){ const a=answers.get(req); if(!a || !a.typing.parentNode) return; a.typing.remove()
+  if(stopped) a.wrap.append(el('div','think','stopped')); else if(!a.bubble && !a.wrap.querySelector('.think,.tool')) a.wrap.append(el('div','msg sys','(no answer)')) }
+function showStop(){ $('#stop').classList.toggle('show', running.size>0 || botSpeaking) }
+
+// ---- connection ----
+// The connection comes back by itself: a phone switching networks, the screen going
+// off, or the server restarting all close it. Only a refused link stops it.
+let started=false, final=false, retry=0, retryTimer=null, everReady=false
 function connect(){
   if(!uuid){ sys('No session link. Get one with /live in your Telegram topic.'); setDot('err'); return }
-  const proto = location.protocol==='https:'?'wss':'ws'
-  ws = new WebSocket(`${proto}://${location.host}/ws`); ws.binaryType='arraybuffer'
-  setDot('busy'); sys('connecting…')
-  ws.onopen = ()=> ws.send(JSON.stringify({type:'auth', uuid}))
-  ws.onclose= ()=>{ setDot('err'); sys('disconnected') }
+  clearTimeout(retryTimer)
+  ws = new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws`); ws.binaryType='arraybuffer'
+  setDot('busy'); if(!everReady) pendingSys('connecting…')
+  ws.onopen = ()=> ws.send(JSON.stringify({type:'auth', uuid, device:deviceToken(), agent:navigator.userAgent, answers:answersMode, mode:callMode}))
+  ws.onclose= ()=>{
+    callReady=false; lagShow(0)
+    setDot('err'); running.clear(); showStop(); hush()
+    if(final) return
+    const wait=Math.min(10000, 500*2**retry++)
+    if(retry===1) pendingSys('connection lost — reconnecting…')
+    retryTimer=setTimeout(connect, wait)
+  }
   ws.onerror= ()=> setDot('err')
-  ws.onmessage = async ev=>{
+  ws.onmessage = ev=>{
     if(typeof ev.data!=='string') return playChunk(ev.data)
     const m=JSON.parse(ev.data)
-    if(m.type==='ready'){ setDot('on'); $('#sub').textContent=(m.model||'')+(m.where?'  ·  '+m.where:''); sys('connected — talk to Claude'); ensureMic() }
-    else if(m.type==='denied'){ setDot('err'); sys('link not recognized — get a fresh one with /live') }
-    else if(m.type==='thinking'){ showTyping(false); line('think', m.text) }
-    else if(m.type==='tool'){ showTyping(false); line('tool', '🔧 '+m.name) }
-    else if(m.type==='bot'){ showTyping(false); line('bot', m.text); haptic('soft') }
-    else if(m.type==='turn_end'){ turnEnded=true; if(!botSpeaking) replyDone() }
+    switch(m.type){
+      case 'ready': if(Array.isArray(m.wake)) wake=m.wake; othersOn=!!m.others; paintMode(); clearPending(); callReady=true; sentBytes=0; heardS=0; stt=m.stt; document.body.classList.toggle('desk', !!m.desk); me=m.me??null; photoKey=m.pk||''
+        if(m.desk && viewing!==null) ws.send(JSON.stringify({type:'view', topic:viewing}))
+        $('#sub').textContent=(m.model||'')+(m.where && !m.desk?'  ·  '+m.where:''); chip('#mode', m.mode); setDot('on')
+        if(retry){
+          sys('reconnected')
+          // a new call on the server: its lines and requests are numbered afresh
+          for(const [,l] of lines){ l.el.onclick=null; l.el.classList.remove('heard') }
+          lines.clear(); for(const [r] of answers) answerDone(r, true); answers.clear()
+          mainSpeaker=null; chip('#me','')
+          if(started && stt==='soniox') startMic()
+        }
+        else if(!everReady) sys(stt==='soniox' ? 'connected — Farsi and English; the first voice heard is you (tap any line to change)' : 'connected — browser speech recognition (English)')
+        retry=0; everReady=true
+        if(!started) $('#start').style.display='flex'
+        break
+      case 'denied': clearPending(); final=true; setDot('err'); sys('link not recognized — get a fresh one with /live'); break
+      case 'expired': clearPending(); final=true; setDot('err'); sys('this link has expired — send /live for a new one'); break
+      case 'other_device': clearPending(); final=true; setDot('err'); sys('this link is already in use on another device — send /live for a new one'); break
+      case 'status': sys(m.text); break
+      case 'work': if(m.run && m.run.thread!=null) flashTopic(m.run.thread)
+        if(m.runs){ for(const [id] of work) dropWork(id); for(const r of m.runs) workRow(r) } else workRow(m.run); break
+      case 'work_step': { const w=work.get(m.id); if(w){ w.step=m.step; paintWork(w) } break }
+      case 'work_end': workEnd(m.id, m.ok, m.stopped); break
+      case 'notice': if(answersMode!=='silent') chime(); vibrate([30,60,30]); add(el('div','msg sys notice','🔔 '+m.topic+(m.ok?' — done':' — did not finish')+(m.line?': '+m.line:''))); break
+      case 'live': { const t=(m.turns||[]).map(x=>(x.role==='me'?'':who(x.speaker,x.role)+': ')+x.text).join('  ·  '); interim.textContent=t; interim.style.display=t?'block':'none'; break }
+      case 'lines': interim.style.display='none'; for(const l of m.lines){ heardLine(l); if(l.role==='me') callLine('you: '+l.text) } break
+      case 'main': mainSpeaker=m.speaker; chip('#me', mainSpeaker==null?'':'you = speaker '+mainSpeaker); restyle(); break
+      case 'waiting': for(const id of m.ids) lineState(id,'…'); break
+      case 'heard': heardS=m.s; break
+      case 'call_mode': if(m.byVoice && MODES[m.mode] && m.mode!==callMode){ callMode=m.mode; try{ localStorage.setItem(modeKey, m.mode) }catch{}; paintMode(); sys(MODES[m.mode].label+' mode, switched by voice') } break
+      case 'others': othersOn=!!m.on; paintMode(); if(tipFor===$('#othersBtn')) showTip(tipFor); break
+      case 'called': listening(m.ms||8000); break
+      case 'wake': if(Array.isArray(m.words)) wake=m.words; paintMode(); if(m.error) sys('wake word not changed: '+m.error); break
+      case 'sent': endListening(); for(const id of m.ids) lineState(id, m.queued?'⏳ queued':'✓'); break
+      case 'working':
+        // only one request runs at a time: anything still showing as running has ended
+        for(const r of running) if(r!==m.req){ running.delete(r); answerDone(r) }
+        if(m.notice) noticeReqs.add(m.req)
+        running.add(m.req); showStop(); setDot('busy'); answerFor(m.req, m.said, m.ids); for(const id of m.ids||[]) lineState(id,'✓'); break
+      case 'thinking': answerAdd(m.req, el('div','think',m.text)); break
+      case 'tool': answerAdd(m.req, el('div','tool', m.label || '🔧 '+m.name)); break
+      case 'bot': answerText(m.req, m.text); vibrate(8); callLine('🎙 '+m.text); break
+      case 'hush': hush(); break
+      // asked again whole, because you went on talking: this answer is gone
+      case 'retract': { const a=answers.get(m.req); if(a){ a.wrap.remove(); answers.delete(m.req) } running.delete(m.req); showStop(); for(const id of m.ids||[]) lineState(id,'…'); break }
+      case 'turn_end': running.delete(m.req)
+        // 🔔: a sound when an answer is ready (a notice chimed when it came)
+        if(answersMode==='sound' && !m.stopped && answers.get(m.req)?.bubble && !noticeReqs.has(m.req)) ding()
+        answerDone(m.req, m.stopped); showStop(); if(!running.size) setDot('on'); break
+      case 'dropped': for(const id of m.ids||[]) lineState(id,'✕'); break
+      case 'audio': audioRate=m.rate; break
+      case 'topics': paintTopics(m); break
+      case 'show': openTopic(m.topic); break
+      case 'play': playVoice(m.topic, m.id, m.text||''); break
+      case 'ask': if(answersMode!=='silent') chime(); vibrate([30,60,30])
+        { const d=add(el('div','msg sys askline','❗ '+m.topic+': '+(m.what==='permission'?'asks for your permission':m.what==='plan'?'a plan is ready':'asks you something')+' — tap to answer')); d.onclick=()=>openTopic(m.thread) }
+        callLine('❗ '+m.topic+' waits on you'); break
+      case 'answered': answeredWait(m); break
+      case 'stopped_run': if(!m.ok) tnote('not stopped: '+m.error); break
+      case 'messages': paintMessages(m); break
+      case 'typed': $('#csend').disabled=false; if(m.ok){ if(String(m.topic)===String(viewing)) $('#ctext').value='' } else (String(m.topic)===String(viewing) ? tnote('not sent: '+m.error) : sys('not sent: '+m.error)); break
+    }
   }
 }
 
-// ---- speech-to-text in the browser (Web Speech API) ----
+// ---- the mic: streamed to the server as 16 kHz mono 16-bit PCM ----
+const WORKLET = `class P extends AudioWorkletProcessor{
+  constructor(){super();this.r=sampleRate/16000;this.p=0;this.buf=new Int16Array(1600);this.n=0;this.sq=0}
+  process(inputs){const ch=inputs[0]&&inputs[0][0]; if(!ch) return true; let p=this.p
+    while(p<ch.length){const i=Math.floor(p),f=p-i,a=ch[i],b=i+1<ch.length?ch[i+1]:a; let s=a+(b-a)*f; s=s<-1?-1:s>1?1:s
+      this.sq+=s*s; this.buf[this.n++]=s<0?s*32768:s*32767
+      if(this.n===1600){this.port.postMessage({pcm:this.buf.buffer,rms:Math.sqrt(this.sq/1600)},[this.buf.buffer]);this.buf=new Int16Array(1600);this.n=0;this.sq=0}
+      p+=this.r}
+    this.p=p-ch.length; return true}}
+registerProcessor('pcm16k',P)`
+// The answer plays on the loudspeaker, and the mic is kept from hearing it by
+// Chrome's echo cancellation on everything the device plays (echoCancellation:'all',
+// Chrome 141+), our answer audio included. A browser without it gets none, and the
+// server drops words that match the answer.
+// There used to be a button for the earpiece (call mode, plain echo cancellation),
+// but whether Android routes the sound there is up to the phone and Chrome, not the
+// page: asked for and applied, it still played on the loudspeaker.
+let echo='all'
+const ECHO = { all:{ ec:'all' }, off:{ ec:false } }
+const PHONE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || navigator.userAgentData?.mobile === true
+async function getMic(ec){
+  return navigator.mediaDevices.getUserMedia({audio:{echoCancellation:ec, noiseSuppression:true, autoGainControl:true, channelCount:1}})
+}
+// One opening at a time: everyone who asks while one is under way waits for it.
+let opening=null
+function startMic(){ return opening ||= openMic().finally(()=>{ opening=null }) }
+async function openMic(){
+  if(micStream) return true
+  try{ micStream = await getMic(ECHO[echo].ec) }
+  catch(e){
+    if(e.name==='NotAllowedError'||e.name==='SecurityError'){ sys('microphone blocked — allow it in the browser and reload'); trace('mic refused: '+e.name); return false }
+    // a browser without echoCancellation:'all' — loudspeaker without it
+    trace('echo setting '+echo+' refused ('+e.name+'), using off')
+    if(echo!=='all'){ sys('microphone failed: '+e.name); return false }
+    echo='off'; sys("This browser can't cancel the answer's echo on the loudspeaker; using the loudspeaker without it")
+    try{ micStream = await getMic(false) }catch(e2){ sys('microphone failed: '+e2.name); trace('mic failed: '+e2.name); return false }
+  }
+  if(!workletReady){ await actx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET],{type:'application/javascript'}))); workletReady=true }
+  try{ micSrc?.disconnect() }catch{}; try{ micNode?.disconnect() }catch{}
+  const src=micSrc=actx.createMediaStreamSource(micStream); micNode=new AudioWorkletNode(actx,'pcm16k')
+  const sink=actx.createGain(); sink.gain.value=0; src.connect(micNode); micNode.connect(sink); sink.connect(actx.destination)
+  micNode.port.onmessage=e=>{
+    const live = micOn || talking
+    // a smoothed 0–1 level: quick to rise, slow to fall
+    const v=Math.min(1, Math.sqrt(e.data.rms)*2.2); level = v>level ? v : level*0.82+v*0.18
+    mic.style.setProperty('--lvl', level.toFixed(3))
+    mutedTalk(!live && level>0.35)
+    health.made++
+    if(live && ws?.readyState===1){ ws.send(e.data.pcm); health.sent++; if(callReady) sentBytes+=e.data.pcm.byteLength }
+  }
+  const st=micStream.getAudioTracks()[0]?.getSettings?.()||{}
+  const caps=micStream.getAudioTracks()[0]?.getCapabilities?.()||{}
+  trace('mic started', {rate:actx.sampleRate, speaker:echo, echoCancellationAsked:String(ECHO[echo].ec), echoCancellationCaps:caps.echoCancellation, echoCancellation:st.echoCancellation, noiseSuppression:st.noiseSuppression, autoGainControl:st.autoGainControl})
+  return true
+}
+function stopMic(){
+  try{ micStream?.getTracks().forEach(t=>t.stop()) }catch{}; micStream=null
+  try{ micSrc?.disconnect() }catch{}; try{ micNode?.disconnect() }catch{}; micSrc=null
+}
+// How the audio is getting out, every 10 s into the call's trace: pieces the mic made
+// (100 ms each), pieces sent, what waits in the socket, the tab and the audio clock.
+const health={made:0, sent:0, at:performance.now(), clock:0}
+setInterval(()=>{
+  if(!micStream || ws?.readyState!==1) return
+  const now=performance.now(), wall=(now-health.at)/1000, clock=actx?(actx.currentTime-health.clock):0
+  trace('audio health', {made:health.made, sent:health.sent, wall_s:+wall.toFixed(1), audio_clock_s:+clock.toFixed(1), buffered_kb:Math.round(ws.bufferedAmount/1024), hidden:document.hidden, ctx:actx?.state, mic:micOn, talking})
+  health.made=0; health.sent=0; health.at=now; health.clock=actx?actx.currentTime:0
+}, 10000)
+// Audio that isn't arriving. The server says how much it has got (heard, each second
+// of it); far less than was sent means the upload has stalled somewhere on the way, and
+// the call would just go quiet. Said at once, and past LAG_RECONNECT_S the connection
+// is made again.
+const LAG_WARN_S=4, LAG_RECONNECT_S=12
+let callReady=false, sentBytes=0, heardS=0
+function lagShow(behind){
+  const l=$('#lag'); if(!l) return
+  if(behind<LAG_WARN_S){ l.hidden=true; return }
+  l.hidden=false; l.textContent=`⚠️ Your audio isn't reaching the server (${Math.round(behind)} s behind). Check your connection.`
+}
+setInterval(()=>{
+  if(!callReady || ws?.readyState!==1) return lagShow(0)
+  const behind=sentBytes/32000-heardS
+  lagShow(behind)
+  if(behind>=LAG_RECONNECT_S){
+    trace('audio not arriving: reconnecting', {sent_s:+(sentBytes/32000).toFixed(1), heard_s:heardS})
+    sys(`your audio stopped reaching the server (${Math.round(behind)} s behind) — reconnecting`)
+    callReady=false; try{ ws.close() }catch{}
+  }
+}, 1000)
+// Talking with the mic off: the button turns amber, and the hint says so.
+let level=0, loudSince=0, mutedOn=false
+// "hold Space" only where there is a keyboard.
+const HINT='Tap to turn the mic on or off · hold '+(PHONE?'':'(or hold Space) ')+'to talk'
+// Interactive or Assistant: how the call takes what the caller says (live/call.ts). Picked with
+// the start buttons, switched with the header chip; kept on this device for every link.
+const MODES={interactive:{label:'🎙 Interactive'}, assistant:{label:'🧑‍💼 Assistant'}}
+const modeKey='xesious-live-mode'
+let callMode='interactive', wake=['Lucy'], othersOn=false
+try{ const v=localStorage.getItem(modeKey); if(MODES[v]) callMode=v }catch{}
+const hintNow=()=> callMode==='assistant' ? `Assistant: say “${wake[0]||'its name'} …” or hold the mic to ask` : HINT
+function paintMode(){
+  const b=$('#callmode'); b.textContent=MODES[callMode].label+' ▾'; b.style.display=started?'inline':'none'
+  for(const g of document.querySelectorAll('#listen .seg button')) g.classList.toggle('on', g.dataset.mode===callMode)
+  $('#asOnly').hidden=callMode!=='assistant'
+  if(document.activeElement!==$('#wakeIn')) $('#wakeIn').value=wake.join(', ')
+  $('#hint').classList.toggle('tap', started)
+  const o=$('#othersBtn'); o.style.display=started && callMode==='assistant' ? 'inline-flex' : 'none'
+  o.classList.toggle('on', othersOn); o.setAttribute('aria-pressed', String(othersOn))
+  o.dataset.tip=othersOn
+    ? `On: anyone on the call can ask it things by saying “${wake[0]} …”, with your rights. Tap to make it only you.`
+    : `Others on the call: off. Only your voice can call it (“${wake[0]} …”). Tap to let others on the call call it too.`
+  o.setAttribute('aria-label', o.dataset.tip)
+  for(const g of document.querySelectorAll('#start .modes button')) g.classList.toggle('last', g.dataset.mode===callMode)
+  if(!mutedOn) $('#hint').textContent=hintNow()
+}
+function setCallMode(m){
+  if(!MODES[m]) return
+  callMode=m; try{ localStorage.setItem(modeKey, m) }catch{}
+  try{ if(ws?.readyState===1) ws.send(JSON.stringify({type:'mode', mode:m})) }catch{}
+  paintMode()
+}
+function openListen(on){
+  const p=$('#listen')
+  // Under the chip that opens it, on a wide screen (a bottom sheet on a phone: CSS).
+  if(on && innerWidth>700){ const r=$('#callmode').getBoundingClientRect(), w=Math.min(360, innerWidth-32)
+    p.style.left=Math.max(16, Math.min(r.left, innerWidth-w-16))+'px'; p.style.top=(r.bottom+8)+'px'; p.style.transform='none' }
+  else { p.style.left=p.style.top=p.style.transform='' }
+  p.classList.toggle('open', on); $('#listenBack').classList.toggle('open', on)
+}
+$('#callmode').onclick=()=>openListen(!$('#listen').classList.contains('open'))
+$('#hint').addEventListener('click', ()=>{ if(started) openListen(true) })
+$('#listenClose').onclick=$('#listenBack').onclick=()=>openListen(false)
+addEventListener('keydown', e=>{ if(e.key==='Escape') openListen(false) })
+for(const g of document.querySelectorAll('#listen .seg button')) g.onclick=()=>{
+  if(g.dataset.mode===callMode) return
+  setCallMode(g.dataset.mode)
+  sys(callMode==='assistant' ? `Assistant mode: I act only when you say “${wake[0]}” or hold the mic` : 'Interactive mode: I answer everything you say')
+}
+// The tooltip: what is under the pointer and has data-tip, placed under it, kept on screen.
+const tip=document.createElement('div'); tip.id='tip'; tip.setAttribute('role','tooltip'); document.body.append(tip)
+let tipFor=null
+function showTip(t){
+  tipFor=t; tip.textContent=t.dataset.tip; tip.classList.add('on')
+  const r=t.getBoundingClientRect(), w=tip.offsetWidth, h=tip.offsetHeight
+  tip.style.left=Math.max(8, Math.min(r.left+r.width/2-w/2, innerWidth-w-8))+'px'
+  tip.style.top=(r.bottom+8+h>innerHeight ? r.top-h-8 : r.bottom+8)+'px'
+}
+function hideTip(){ tipFor=null; tip.classList.remove('on') }
+document.addEventListener('mouseover', e=>{ const t=e.target.closest?.('[data-tip]'); if(t){ if(t!==tipFor) showTip(t) } else if(tipFor) hideTip() })
+document.addEventListener('focusin', e=>{ const t=e.target.closest?.('[data-tip]'); if(t) showTip(t) })
+document.addEventListener('focusout', hideTip)
+addEventListener('scroll', hideTip, true)
+$('#othersBtn').onclick=()=>{
+  try{ ws?.send(JSON.stringify({type:'others', on:!othersOn})) }catch{}
+  sys(!othersOn ? `Others on the call can now call it by name (“${wake[0]} …”)` : 'Only your voice can call it now')
+}
+// The wake word: saved when you leave the field or press Enter; empty puts it back.
+$('#wakeIn').addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); e.target.blur() } })
+$('#wakeIn').addEventListener('change', e=>{
+  const v=e.target.value.trim()
+  if(!v || v===wake.join(', ')){ e.target.value=wake.join(', '); return }
+  try{ ws?.send(JSON.stringify({type:'wake', words:v})) }catch{}
+})
+function mutedTalk(loud){
+  const now=performance.now()
+  if(loud){ if(!loudSince) loudSince=now } else if(level<0.15) loudSince=0
+  const on = !!loudSince && now-loudSince>400
+  if(on===mutedOn) return; mutedOn=on
+  mic.classList.toggle('muted-talk', on)
+  const h=$('#hint'); h.textContent = on ? 'You are talking with the mic off — tap it to turn it on' : hintNow(); h.classList.toggle('warn', on)
+}
+function paint(){ mic.classList.toggle('on', micOn && !talking); mic.classList.toggle('talking', talking); mic.classList.toggle('speaking', botSpeaking && !talking && micOn) }
+
+// One button, like a video call: tap = mic on/off; hold = talking (what you say is
+// yours, pauses don't cut it, letting go sends it). Space does the same as holding.
+function setMic(on){ if(micOn===on) return; micOn=on; paint(); trace(on?'mic on':'mic off'); if(stt==='browser'){ on?startRec():stopRec() } }
+function talk(on){
+  if(talking===on) return; talking=on; paint(); vibrate(on?12:6)
+  if(stt==='soniox') ws?.send(JSON.stringify({type:'hold', on}))
+  else { on ? startRec() : (micOn ? null : stopRec()) }
+}
+let pressTimer=null, pressHeld=false
+mic.addEventListener('pointerdown', e=>{ e.preventDefault(); if(!actx) return; if(actx.state==='suspended') actx.resume()
+  pressHeld=false; mic.setPointerCapture?.(e.pointerId); pressTimer=setTimeout(()=>{ pressHeld=true; talk(true) }, 280) })
+const up=e=>{ e.preventDefault(); if(pressTimer===null) return; clearTimeout(pressTimer); pressTimer=null
+  if(pressHeld) talk(false); else setMic(!micOn) }
+mic.addEventListener('pointerup', up); mic.addEventListener('pointercancel', up)
+mic.addEventListener('contextmenu', e=>e.preventDefault())
+const typing=t=>t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))
+addEventListener('keydown', e=>{ if(e.code!=='Space' || typing(e.target)) return; e.preventDefault(); if(!e.repeat && actx) talk(true) })
+addEventListener('keyup', e=>{ if(e.code!=='Space' || typing(e.target)) return; e.preventDefault(); talk(false) })
+addEventListener('blur', ()=>talk(false))
+$('#stop').onclick=()=>{ hush(); ws?.send(JSON.stringify({type:'interrupt'})) }
+
+setInterval(()=>{ if(ws?.readyState===1) ws.send(JSON.stringify({type:'ping'})) }, 20000)
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden && ws?.readyState===3 && !final){ retry=0; connect() } })
+
+for(const g of document.querySelectorAll('#start .modes button')) g.onclick=()=>startCall(g.dataset.mode)
+async function startCall(m){
+  $('#start').style.display='none'; started=true; setCallMode(m)
+  actx = actx || new (window.AudioContext||window.webkitAudioContext)()
+  if(actx.state==='suspended') await actx.resume()
+  if(stt==='soniox'){ if(await startMic()) setMic(true) } else { browserStt(); setMic(true) }
+}
+
+// ---- fallback: the browser's own speech recognition (no Soniox key on the server) ----
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition
-let finalBuf=''
-function ensureMic(){
-  if(!SR){ sys('This browser has no speech recognition — use Chrome (Android/desktop).'); return }
-  // continuous=false → one utterance per session; send it ONCE on end, so the growing
-  // partials Android emits ("hi", "hi how"…) never post as separate lines.
+let rec, recActive=false, finalBuf=''
+function browserStt(){
+  if(!SR){ sys('This browser has no speech recognition — use Chrome.'); return }
   rec = new SR(); rec.lang='en-US'; rec.continuous=false; rec.interimResults=true
-  rec.onresult = e=>{
-    let itv='', fin=''
+  rec.onresult = e=>{ let itv='', fin=''
     for(let i=0;i<e.results.length;i++){ const r=e.results[i]; if(r.isFinal) fin+=r[0].transcript+' '; else itv+=r[0].transcript }
-    finalBuf=fin.trim(); showInterim((finalBuf+' '+itv).trim())
-    if(itv && botSpeaking) bargeIn()
-  }
+    finalBuf=fin.trim(); const t=(finalBuf+' '+itv).trim(); interim.textContent=t; interim.style.display=t?'block':'none'
+    if(itv && botSpeaking){ hush(); ws?.send(JSON.stringify({type:'interrupt'})) } }
   rec.onerror = ev=>{ if(ev.error==='not-allowed') sys('microphone blocked — allow it and reload') }
-  rec.onend = ()=>{
-    recActive=false; $('#talk').classList.remove('rec')
-    const t=finalBuf.trim(); finalBuf=''
-    if(t){ sendText(t); awaitingReply=true }   // sent → wait for the answer before listening again
-    else restartRec()                          // silence / false stop → keep listening (hands-free only)
+  rec.onend = ()=>{ recActive=false
+    const t=finalBuf.trim(); finalBuf=''; interim.style.display='none'
+    if(t){ add(el('div','msg you',t)); ws?.send(JSON.stringify({type:'text', text:t})) }
+    if(micOn||talking) setTimeout(startRec, 300) }
+}
+function startRec(){ if(!rec||recActive) return; try{ rec.start(); recActive=true }catch{} }
+function stopRec(){ if(!rec) return; try{ rec.stop() }catch{} }
+
+// ---- what is running in the group's topics ----
+const work=new Map()   // run id -> {el, topic, what, at, step, end}
+function workRow(r){
+  let w=work.get(r.id)
+  if(!w){ w={el:el('div','job'), topic:r.topic, what:r.what, at:r.at}; work.set(r.id,w); $('#work').appendChild(w.el) }
+  if(r.step) w.step=r.step
+  paintWork(w); showWork()
+}
+function paintWork(w){
+  const mins=Math.floor((Date.now()-w.at)/60000), secs=Math.floor((Date.now()-w.at)/1000)%60
+  w.el.textContent=''
+  w.el.append(el('b','',w.topic), document.createTextNode(' · '+w.what+(w.end ? ' · '+w.end : (w.step?' · '+w.step:'')+' · '+mins+':'+String(secs).padStart(2,'0'))))
+}
+function workEnd(id, ok, stopped){
+  const w=work.get(id); if(!w) return
+  w.end = stopped ? 'stopped' : ok ? 'done' : 'failed'; w.el.classList.add(ok && !stopped ? 'ok' : 'bad'); paintWork(w)
+  setTimeout(()=>dropWork(id), 10000)
+}
+function dropWork(id){ const w=work.get(id); if(!w) return; w.el.remove(); work.delete(id); showWork() }
+function showWork(){ $('#work').style.display = work.size ? 'flex' : 'none' }
+setInterval(()=>{ for(const [,w] of work) if(!w.end) paintWork(w) }, 1000)
+// A soft two-note chime: something finished. Heard over talk, without words.
+function chime(){
+  try{
+    actx = actx || new (window.AudioContext||window.webkitAudioContext)()
+    const t=actx.currentTime
+    for(const [i,f] of [[0,880],[1,1320]]){
+      const o=actx.createOscillator(), g=actx.createGain(); o.frequency.value=f; o.type='sine'
+      g.gain.setValueAtTime(0,t+i*.16); g.gain.linearRampToValueAtTime(.18,t+i*.16+.02); g.gain.exponentialRampToValueAtTime(.001,t+i*.16+.35)
+      o.connect(g); g.connect(actx.destination); o.start(t+i*.16); o.stop(t+i*.16+.4)
+    }
+  }catch{}
+}
+
+// A single soft note: an answer is ready (🔔), unlike the two-note chime of a notice.
+// Its name alone was heard (Assistant mode): it shows, and sounds, that it is
+// listening for the request, until the request goes or the wait runs out; with no
+// reaction to its name alone it would look deaf.
+let calledTimer=null
+function listening(ms){
+  clearTimeout(calledTimer); mic.classList.add('called'); vibrate(25)
+  $('#hint').textContent='👂 Listening — say your request'
+  if(answersMode!=='silent') listenTone()
+  calledTimer=setTimeout(endListening, ms+1500)
+}
+function endListening(){
+  clearTimeout(calledTimer); calledTimer=null
+  if(!mic.classList.contains('called')) return
+  mic.classList.remove('called'); if(!mutedOn) $('#hint').textContent=hintNow()
+}
+function listenTone(){
+  try{
+    actx = actx || new (window.AudioContext||window.webkitAudioContext)()
+    const t=actx.currentTime
+    for(const [i,f] of [[0,660],[1,990]]){
+      const o=actx.createOscillator(), g=actx.createGain(); o.frequency.value=f; o.type='sine'
+      g.gain.setValueAtTime(0,t+i*.09); g.gain.linearRampToValueAtTime(.14,t+i*.09+.015); g.gain.exponentialRampToValueAtTime(.001,t+i*.09+.18)
+      o.connect(g); g.connect(actx.destination); o.start(t+i*.09); o.stop(t+i*.09+.2)
+    }
+  }catch{}
+}
+function ding(){
+  try{
+    actx = actx || new (window.AudioContext||window.webkitAudioContext)()
+    const t=actx.currentTime, o=actx.createOscillator(), g=actx.createGain(); o.frequency.value=988; o.type='sine'
+    g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(.16,t+.015); g.gain.exponentialRampToValueAtTime(.001,t+.45)
+    o.connect(g); g.connect(actx.destination); o.start(t); o.stop(t+.5)
+  }catch{}
+}
+
+// ---- how answers arrive: 🔊 spoken · 🔔 a sound when ready · 🔕 silent ----
+// The text is on the page in every mode. Remembered per link, on this device.
+const ANSWERS={ voice:'Answers are spoken', sound:'A sound when an answer is ready', silent:'Answers are silent' }
+const answersKey='xesious-live-answers:'+uuid
+let answersMode='voice'
+try{ const v=localStorage.getItem(answersKey); if(ANSWERS[v]) answersMode=v }catch{}
+const noticeReqs=new Set()
+let hintTimer=null
+function paintAnswers(){ const b=$('#answers'); b.dataset.mode=answersMode; b.title=ANSWERS[answersMode]+' — tap to change'; b.setAttribute('aria-label', b.title) }
+paintAnswers()
+$('#answers').onclick=()=>{
+  const order=Object.keys(ANSWERS); answersMode=order[(order.indexOf(answersMode)+1)%order.length]
+  try{ localStorage.setItem(answersKey, answersMode) }catch{}
+  paintAnswers(); vibrate(8)
+  if(answersMode!=='voice') hush()
+  try{ if(ws?.readyState===1) ws.send(JSON.stringify({type:'answers', mode:answersMode})) }catch{}
+  const h=$('#hint'); h.textContent=ANSWERS[answersMode]; clearTimeout(hintTimer); hintTimer=setTimeout(()=>{ if(!mutedOn) h.textContent=hintNow() }, 2500)
+}
+
+// ---- the group's topics: what each is doing; the one open is where "this" points ----
+// viewing: the topic picked (its id, or "General"); null until the list first comes,
+// then the topic /live came from.
+let viewing=null, topicsNow=null
+const tstate=new Map()   // id -> {was, done, seen}
+const tkey=id=>String(id)
+function ago(ms){ ms=Math.max(0,ms); return ms<90e3?'just now':ms<60*60e3?Math.round(ms/60e3)+' min ago':ms<36*3600e3?Math.round(ms/3600e3)+' h ago':Math.round(ms/86400e3)+' days ago' }
+function paintTopics(m){
+  topicsNow=m
+  if(viewing===null){ viewing=m.origin; try{ ws.send(JSON.stringify({type:'view', topic:viewing})) }catch{} }
+  const rank=t=> String(t.id)===String(m.live) ? 0 : t.waiting_for_person ? 1 : t.working ? 2 : t.queued ? 3 : 4
+  for(const t of m.topics){
+    const st=tstate.get(tkey(t.id)) || {seen:m.now}
+    // Working before, not now: done, until it is opened.
+    if(st.was && !t.working && !t.queued) st.done=true
+    if(t.working) st.done=false
+    st.was=!!(t.working||t.queued); tstate.set(tkey(t.id), st)
   }
-  if(autoMode) startRec()
+  const list=[...m.topics].sort((a,b)=> rank(a)-rank(b) || (tstate.get(tkey(b.id)).done?1:0)-(tstate.get(tkey(a.id)).done?1:0) || (b.lastAt||0)-(a.lastAt||0))
+  const box=$('#tlist'), liveBox=$('#tlive'); box.textContent=''; liveBox.textContent=''
+  let alert=false
+  for(const t of list){
+    const st=tstate.get(tkey(t.id)), live=String(t.id)===String(m.live), open=String(t.id)===String(viewing)
+    const unread=!open && !live && (t.lastAt||0)>st.seen
+    const w=t.working&&t.working[0]
+    const line = t.waiting_for_person ? '❗ waiting for you: '+t.waiting_for_person[0]
+      : w ? '⏳ '+(w.step||w.on)+' · '+w.for+(t.queued?' · '+t.queued+' queued':'')
+      : t.queued ? '⏳ '+t.queued+' queued'
+      : st.done ? '✅ done' : live ? 'the front desk · this call' : t.lastAt ? ago(m.now-t.lastAt) : ''
+    if(t.waiting_for_person || unread) alert=true
+    const row=el('div','trow'+(st.flashUntil>Date.now()?' flash':'')+(live?' live':'')+(open?' open':'')+(t.waiting_for_person?' waiting':w||t.queued?' working':st.done?' done':'')+(unread?' unread':''))
+    row.dataset.id=tkey(t.id)
+    const ic=topicIcon(t, live)
+    const tx=el('div','tx'), tn=el('div','tn'); tn.append(el('span',null,t.name)); tx.append(tn, el('div','tl',line))
+    row.append(ic, tx, el('span','new')); row.onclick=()=>openTopic(t.id)
+    row.onpointerenter=()=>prefetch(t.id)
+    ;(live?liveBox:box).append(row)
+  }
+  // The topics most likely to be opened next, ahead of time.
+  if(!prefetched){ prefetched=true; list.filter(t=>!isLive(t.id) && String(t.id)!==String(viewing)).slice(0,8).forEach(t=>prefetch(t.id)) }
+  $('#topicsBtn').classList.toggle('alert', alert)
+  const cur=m.topics.find(t=>String(t.id)===String(viewing))
+  showView()
 }
-function startRec(){ if(!rec||recActive) return; try{ rec.start(); recActive=true; $('#talk').classList.add('rec') }catch{} }
-function stopRec(){ if(!rec) return; holding=false; try{ rec.stop() }catch{}; $('#talk').classList.remove('rec') }
-function sendText(t){ showInterim(''); line('you', t); haptic('light'); turnEnded=false; showTyping(true); if(ws?.readyState===1){ ws.send(JSON.stringify({type:'text', text:t})); setDot('busy') } }
-
-$('#auto').onchange = e=>{ autoMode=e.target.checked; if(autoMode) startRec(); else stopRec() }
-const talk=$('#talk')
-talk.addEventListener('pointerdown', e=>{ e.preventDefault(); if(autoMode) return; if(actx?.state==='suspended') actx.resume(); holding=true; startRec() })
-const release=e=>{ e.preventDefault(); if(autoMode) return; stopRec() }
-talk.addEventListener('pointerup', release); talk.addEventListener('pointercancel', release); talk.addEventListener('pointerleave', release)
-
-// ---- playback of the bot's voice, with barge-in ----
-async function playChunk(arrayBuffer){
-  if(!actx) actx=new (window.AudioContext||window.webkitAudioContext)()
-  try{ const b=await actx.decodeAudioData(arrayBuffer.slice(0)); playQueue.push(b); if(!botSpeaking) playNext() }catch(e){}
+// A topic's icon as Telegram draws it: its custom emoji, or a bubble in its colour
+// with its first letter; General is a #.
+function topicIcon(t, live){
+  const ic=el('div','ic')
+  if(live){ ic.textContent='🎙'; return ic }
+  if(t.id==='General'){ ic.classList.add('gen'); ic.textContent='#'; return ic }
+  if(t.icon){ ic.classList.add('img'); const im=new Image(); im.src='/icon/'+t.icon; im.alt=''; im.onerror=()=>{ im.remove(); ic.append(bubble(t)) }; ic.append(im); return ic }
+  ic.classList.add('img'); ic.append(bubble(t)); return ic
 }
-function playNext(){
-  const b=playQueue.shift()
-  if(!b){ botSpeaking=false; setDot('on'); $('#talk').classList.remove('speaking'); if(turnEnded) replyDone(); return }
-  botSpeaking=true; setDot('busy'); $('#talk').classList.add('speaking')
-  const s=actx.createBufferSource(); s.buffer=b; s.connect(actx.destination); curSource=s
-  s.onended=()=>{ curSource=null; playNext() }; s.start()
+function bubble(t){
+  const c='#'+((t.color||0x6FB9F0)>>>0).toString(16).padStart(6,'0')
+  const ns='http://www.w3.org/2000/svg', svg=document.createElementNS(ns,'svg'); svg.setAttribute('viewBox','0 0 34 34')
+  const p=document.createElementNS(ns,'path'); p.setAttribute('d','M17 5C9.8 5 4 10.2 4 16.6c0 3.6 1.8 6.8 4.7 8.9-.3 1.6-1.1 3.2-2.4 4.3 2.6.1 5-.8 6.7-2.2 1.3.4 2.6.6 4 .6 7.2 0 13-5.2 13-11.6S24.2 5 17 5z')
+  p.setAttribute('fill', c); svg.append(p)
+  const tx=document.createElementNS(ns,'text'); tx.setAttribute('x','17'); tx.setAttribute('y','21'); tx.setAttribute('text-anchor','middle')
+  tx.setAttribute('font-size','13'); tx.setAttribute('font-weight','600'); tx.setAttribute('fill','#fff'); tx.setAttribute('font-family','Inter,Vazirmatn,sans-serif')
+  tx.textContent=[...t.name.trim()][0]?.toUpperCase()||'#'; svg.append(tx); return svg
 }
-function bargeIn(){ playQueue=[]; try{curSource?.stop()}catch{}; curSource=null; botSpeaking=false; if(ws?.readyState===1) ws.send(JSON.stringify({type:'interrupt'})) }
+// Messages kept per topic, so opening one shows it at once; the server's copy follows.
+const msgCache=new Map()
+let prefetched=false
+function prefetch(id){ if(isLive(id) || msgCache.has(tkey(id))) return; msgCache.set(tkey(id), null); try{ ws?.send(JSON.stringify({type:'fetch', topic:id})) }catch{} }
+// A picture from elsewhere would be fetched as soon as it is shown, carrying out
+// whatever its address holds: its address is taken off while the Markdown is cleaned
+// (before anything reaches the page), and it is shown as a link. The page's policy
+// blocks such pictures too.
+window.DOMPurify?.addHook('afterSanitizeAttributes', n=>{
+  if(n.tagName!=='IMG') return
+  const u=n.getAttribute('src')||''
+  if(!u.startsWith('/') || u.startsWith('//')){ n.removeAttribute('src'); n.setAttribute('data-ext', u) }
+})
+// Markdown, made safe; plain text when the libraries didn't load.
+function mdNode(text){
+  const d=el('div','md')
+  if(!window.marked || !window.DOMPurify){ d.textContent=text; d.style.whiteSpace='pre-wrap'; return d }
+  d.innerHTML=DOMPurify.sanitize(marked.parse(text, {gfm:true, breaks:true}))
+  for(const im of d.querySelectorAll('img[data-ext]')){ const u=im.dataset.ext; const a=el('a',null,im.alt||u); a.href=u; im.replaceWith(a) }
+  for(const a of d.querySelectorAll('a')){ a.target='_blank'; a.rel='noopener noreferrer' }
+  for(const t of d.querySelectorAll('table')){ const w=el('div','tw'); t.replaceWith(w); w.append(t) }
+  for(const b of d.querySelectorAll('p,li,h1,h2,h3,h4,h5,h6,table,td,th,blockquote,ul,ol')) b.dir='auto'
+  return d
+}
 
+// The right side: the call (Live open), or the open topic with its messages.
+let me=null, shownTopic=null, photoKey=''
+function isLive(id){ return topicsNow && String(id)===String(topicsNow.live) }
+function showView(){
+  const inTopic = viewing!==null && topicsNow && !isLive(viewing)
+  document.body.classList.toggle('intopic', !!inTopic)
+  const cur=topicsNow?.topics.find(t=>String(t.id)===String(viewing))
+  $('#ctext').placeholder = inTopic ? 'Message '+(cur?.name||'the topic') : 'Message the front desk'
+  if(!inTopic) return
+  $('#tname').textContent=cur?.name||''
+  const w=cur?.working?.[0]
+  $('#tstatus').textContent = cur?.waiting_for_person ? '❗ waiting for you: '+cur.waiting_for_person[0] : w ? '⏳ '+(w.step||w.on)+' · '+w.for : cur?.queued ? '⏳ queued' : cur?.lastAt ? 'active '+ago(topicsNow.now-cur.lastAt) : ''
+  if(String(shownTopic)!==String(viewing)){
+    shownTopic=viewing; const cached=msgCache.get(tkey(viewing))
+    if(cached) paintMessages(cached, true); else { $('#tmsgs').textContent=''; $('#tmsgs').append(el('div','msg sys','loading…')) }
+  }
+  paintRun()
+}
+// Under the messages: what waits on you (kept as they are while they wait, so a
+// choice half made survives a refresh), then the run going on, with Stop.
+const cards=new Map()   // wait id -> its card
+function paintRun(){
+  const box=$('#tmsgs'), stick=box.scrollHeight-box.scrollTop-box.clientHeight<80
+  box.querySelector('.trun')?.remove()
+  const cur=topicsNow?.topics.find(t=>String(t.id)===String(viewing))
+  const waits=cur?.waits||[], ids=new Set(waits.map(w=>w.id))
+  for(const [id,c] of cards) if(!ids.has(id) || c.dataset.topic!==tkey(viewing)){ c.remove(); cards.delete(id) }
+  for(const w of waits){ let c=cards.get(w.id); if(!c){ c=waitCard(w); c.dataset.topic=tkey(viewing); cards.set(w.id,c) } box.append(c) }
+  const w=cur?.working?.[0]
+  if(w){
+    const row=el('div','trun'); row.append(el('span',null,'⏳ '+(w.step||w.on)+' · '+w.for))
+    if(w.run){ const b=el('button',null,'■ Stop'); let armed=0
+      b.onclick=()=>{ if(Date.now()-armed>3000){ armed=Date.now(); b.textContent='Stop it? Tap again'; b.classList.add('sure'); setTimeout(()=>{ if(b.isConnected){ b.textContent='■ Stop'; b.classList.remove('sure') } },3000); return }
+        b.disabled=true; b.textContent='Stopping…'; ws?.send(JSON.stringify({type:'stop_run', run:w.run})) }
+      row.append(b) }
+    box.append(row)
+  }
+  if(stick) box.scrollTop=box.scrollHeight
+}
+function waitCard(w){
+  const c=el('div','wcard'); c.dataset.id=w.id
+  const send=(o, busy)=>{ for(const b of c.querySelectorAll('button')) b.disabled=true; if(busy) busy.textContent+=' …'; ws?.send(JSON.stringify({type:'answer', id:w.id, ...o})) }
+  if(w.kind==='permission'){
+    c.append(el('div','wq','🔐 '+w.text))
+    const bs=el('div','wb'), y=el('button','yes','✅ Allow'), n=el('button',null,'🚫 Deny')
+    y.onclick=()=>send({allow:true}); n.onclick=()=>send({allow:false}); bs.append(y,n); c.append(bs)
+  } else if(w.kind==='plan'){
+    c.append(el('div','wq','📋 '+w.text))
+    const bs=el('div','wb'), g=el('button','yes','✅ Go ahead'); g.onclick=()=>send({go:true}); bs.append(g); c.append(bs)
+  } else {
+    (w.questions||[]).forEach((q,qi)=>{
+      const at=a=>{ const arr=[]; arr[qi]=a; return arr }
+      const wq=el('div','wq'); wq.append('❓ '); if(q.header){ wq.append(el('b',null,q.header)); wq.append(' · ') } wq.append(q.question); c.append(wq)
+      if(q.answer!==undefined){ c.append(el('div','wdone','✅ '+q.answer)); return }
+      const bs=el('div','wb'), picked=new Set()
+      q.options.forEach((o,oi)=>{
+        const b=el('button',null,o.label); if(o.description) b.title=o.description
+        b.onclick=()=>{ if(q.multi){ picked.has(oi+1)?picked.delete(oi+1):picked.add(oi+1); b.classList.toggle('on') } else send({answers:at(oi+1)}) }
+        bs.append(b)
+      })
+      if(q.multi){ const d=el('button','yes','✔️ Done'); d.onclick=()=>{ if(picked.size) send({answers:at([...picked].sort((a,b)=>a-b))}) }; bs.append(d) }
+      c.append(bs)
+      const own=el('div','own'), inp=el('input'); inp.placeholder='or in your own words'; inp.dir='auto'
+      const ob=el('button',null,'➤'); ob.onclick=()=>{ const t=inp.value.trim(); if(t) send({answers:at(t)}) }
+      inp.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); ob.click() } })
+      own.append(inp, ob); c.append(own)
+    })
+  }
+  c.append(el('div','wd','for '+w.for+' · also answerable in Telegram'))
+  return c
+}
+function answeredWait(m){
+  const c=cards.get(m.id); if(!c) return
+  if(m.ok){ for(const b of c.querySelectorAll('button')) b.disabled=true; c.append(el('div','wdone',m.message||'✅ answered')) }
+  else { for(const b of c.querySelectorAll('button')) b.disabled=false; c.append(el('div','wd','not answered: '+m.error)) }
+}
+function paintMessages(m, fresh){
+  const k=tkey(m.topic), had=msgCache.get(k)
+  msgCache.set(k, m)
+  if(String(m.topic)!==String(viewing)) return
+  const box=$('#tmsgs')
+  // The same as shown: nothing to do.
+  if(!fresh && had && box.dataset.topic===k && box.dataset.sig===sig(m)) { paintRun(); return }
+  const stick=fresh || box.scrollHeight-box.scrollTop-box.clientHeight<80 || box.querySelector('.sys')
+  box.dataset.topic=k; box.dataset.sig=sig(m)
+  for(const c of box.querySelectorAll('.wcard')) c.remove()   // put back after the messages, as they are
+  box.textContent=''
+  if(!m.messages.length) box.append(el('div','msg sys','No messages recorded here yet.'))
+  for(const x of m.messages){
+    x.topicRef=m.topic
+    const mine = me!=null && x.fromId===me
+    const b=el('div','tm'+(mine?' mine':''))
+    if(!mine) b.append(el('span','by', x.bot?'🤖 '+x.from.replace(/^the bot$/,'Claude'):x.from))
+    let text=x.text
+    if(x.kind){ text=text.replace(/^\[[^\]]*\]\s?/, '') }
+    if(x.kind==='photo'){ const im=new Image(); im.className='photo'; im.loading='lazy'; im.alt='photo'; im.src='/photo/'+photoKey+'/'+x.topicRef+'/'+x.id
+      im.onerror=()=>{ im.replaceWith(el('span','think','[photo]')) }; im.onclick=()=>open(im.src,'_blank'); b.append(im) }
+    else if(x.kind) b.append(el('span','think','['+x.kind+']'))
+    if(x.bot){ b.classList.add('md-msg'); b.append(mdNode(text)) } else if(text) b.append(document.createTextNode(text))
+    if(x.bot && x.voice){ const key=x.topicRef+':'+x.id, p=el('button','vplay', voiceKey===key?'⏹ Stop':'▶️ Listen'); p.dataset.key=key
+      p.onclick=()=> voiceKey===key ? stopVoice() : playVoice(x.topicRef, x.id, x.text); b.append(p) }
+    b.append(el('span','at', new Date(x.t*1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})))
+    box.append(b)
+  }
+  paintRun()
+  if(stick) box.scrollTop=box.scrollHeight
+}
+function sig(m){ const l=m.messages[m.messages.length-1]; return m.messages.length+':'+(l?l.id+':'+l.text.length:'') }
+function tnote(t){ const box=$('#tmsgs'); box.append(el('div','msg sys',t)); box.scrollTop=box.scrollHeight }
+function callLine(t){ const c=$('#callstrip'); c.textContent=t; c.classList.add('has') }
+$('#callstrip').onclick=()=>{ if(topicsNow) openTopic(topicsNow.live) }
+// Work starting in a topic: its row lights up for a moment.
+function flashTopic(id){
+  const st=tstate.get(tkey(id)) || {seen:topicsNow?.now||Date.now()}; st.flashUntil=Date.now()+2500; tstate.set(tkey(id), st)
+  const row=document.querySelector('.trow[data-id="'+CSS.escape(tkey(id))+'"]'); if(row){ row.classList.remove('flash'); void row.offsetWidth; row.classList.add('flash') }
+}
+// Sending what is typed: into the open topic, or to the front desk on the call.
+function sendTyped(){
+  const ta=$('#ctext'), t=ta.value.trim(); if(!t || ws?.readyState!==1) return
+  if(viewing===null || isLive(viewing)){ add(el('div','msg you',t)); ws.send(JSON.stringify({type:'text', text:t})); ta.value=''; return }
+  $('#csend').disabled=true; ws.send(JSON.stringify({type:'type', topic:viewing, text:t}))
+}
+$('#csend').onclick=sendTyped
+$('#ctext').addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey && !e.isComposing){ e.preventDefault(); sendTyped() } })
+$('#ctext').addEventListener('input', e=>{ const t=e.target; t.style.height='auto'; t.style.height=Math.min(t.scrollHeight, innerHeight*0.3)+'px' })
+function openTopic(id){
+  // What came in the topic left while it was open has been seen.
+  const left=viewing!==null && tstate.get(tkey(viewing)); if(left && topicsNow) left.seen=topicsNow.now
+  viewing=id; const st=tstate.get(tkey(id)); if(st){ st.done=false; if(topicsNow) st.seen=topicsNow.now }
+  try{ ws?.send(JSON.stringify({type:'view', topic:id})) }catch{}
+  document.body.classList.remove('list'); if(topicsNow) paintTopics(topicsNow)
+}
+$('#topicsBtn').onclick=()=>document.body.classList.add('list')
+$('#sideClose').onclick=()=>document.body.classList.remove('list')
+
+// ---- playing the answer: 16-bit PCM pieces, played back to back as they arrive ----
+let audioRate=24000, nextAt=0
+const sources=new Set()
+function playChunk(buf){
+  actx = actx || new (window.AudioContext||window.webkitAudioContext)()
+  const n=buf.byteLength>>1; if(!n) return
+  const v=new DataView(buf), b=actx.createBuffer(1, n, audioRate), d=b.getChannelData(0)
+  for(let i=0;i<n;i++) d[i]=v.getInt16(i*2,true)/32768
+  const s=actx.createBufferSource(); s.buffer=b; s.connect(actx.destination)
+  // a small lead the first time, so a slow network doesn't make it stutter
+  const t=Math.max(nextAt, actx.currentTime + (sources.size ? 0.02 : 0.12))
+  s.start(t); nextAt=t+b.duration; sources.add(s); setPlaying(true)
+  s.onended=()=>{ sources.delete(s); if(!sources.size) setPlaying(false) }
+}
+function setPlaying(on){ if(botSpeaking===on) return; botSpeaking=on; paint(); showStop(); try{ ws?.send(JSON.stringify({type:'playing', on})) }catch{} }
+function hush(){ stopVoice(); for(const s of sources){ s.onended=null; try{ s.stop() }catch{} } sources.clear(); nextAt=0; setPlaying(false) }
+// An answer's voice note, played here: ▶️ on the answer, or the front desk's play_answer
+// ("play Research's last answer"). Its words go to the server first, so the mic hearing
+// it through the speaker is taken for the answer's echo, not for a request. Telegram's
+// Opus, or MP3 where the browser can't play that.
+let voiceEl=null, voiceKey=''
+const OPUS_OK=(()=>{ try{ return !!new Audio().canPlayType('audio/ogg; codecs=opus') }catch{ return false } })()
+function playVoice(topic, id, text){
+  stopVoice()
+  try{ if(text) ws?.send(JSON.stringify({type:'echo', text:String(text).slice(0,8000)})) }catch{}
+  const a=new Audio('/voice/'+photoKey+'/'+topic+'/'+id+(OPUS_OK?'':'?as=mp3'))
+  voiceEl=a; voiceKey=topic+':'+id; paintVoiceButtons(); setPlaying(true); trace('playing an answer\'s voice', {topic, id})
+  const failed=()=>{ if(voiceEl===a){ stopVoice(); sys('could not play that voice note') } }
+  a.onended=()=>{ if(voiceEl===a) stopVoice() }
+  a.onerror=failed
+  a.play().catch(failed)
+}
+function stopVoice(){
+  const a=voiceEl; voiceEl=null; voiceKey=''
+  if(a){ a.onended=a.onerror=null; try{ a.pause() }catch{}; setPlaying(false) }
+  paintVoiceButtons()
+}
+function paintVoiceButtons(){ for(const b of document.querySelectorAll('.vplay')) b.textContent = b.dataset.key===voiceKey ? '⏹ Stop' : '▶️ Listen' }
+
+paintMode()
 connect()
 </script>
 </body>

@@ -1,3 +1,5 @@
+import { statSync } from 'node:fs'
+import { isAbsolute } from 'node:path'
 /**
  * service.ts — what the API's task endpoints do. Validation, defaults, permissions and
  * the rules of each change live here; the bridge's side effects (posting the card,
@@ -45,6 +47,14 @@ export interface TaskInput extends WhenInput {
   digest?: { of?: string[] } | boolean   // a list of what tasks did, no AI
   rule?: any              // filters.ruleError says what it may be; null removes it
   ai_filter?: { question?: string; every_minutes?: number } | null
+  folder?: string         // the folder it runs in (an existing directory, full path); its topic's when made
+}
+
+// A folder a task may be moved to: a full path to a directory that exists.
+function folderError(f: unknown): string | undefined {
+  if (typeof f !== 'string' || !isAbsolute(f.trim())) return 'folder must be a full path, like /home/me/project'
+  try { if (!statSync(f.trim()).isDirectory()) return `${f.trim()} is not a folder` } catch { return `there is no folder ${f.trim()}` }
+  return undefined
 }
 
 export type Change = 'created' | 'updated' | 'paused' | 'resumed' | 'deleted' | 'done'
@@ -106,7 +116,7 @@ export function taskView(t: Task, runs: Run[] = []) {
     sound: t.sound, deliver_to: t.where === 'dm' ? 'dm' : 'topic',
     ...(t.then ? { then: { handoff_to: t.then.topicName ?? t.then.thread ?? 'General', brief: t.then.brief } } : {}),
     ...(t.trigger.kind === 'webhook' ? { webhook: { fire: `bun tasks/cli.ts fire ${t.id} "<payload>"`, http_path: `/hook/${t.id}/${t.trigger.secret}` } } : {}),
-    topic: t.thread, runs_done: t.runsDone,
+    topic: t.thread, ...(t.cwd ? { folder: t.cwd } : {}), runs_done: t.runsDone,
     last_run: last ? { when: whenText(new Date(last.startedAt ?? last.slot ?? Date.now()), t.tz), result: markOf(last), summary: last.summary, error: last.state === 'failed' ? last.reason : undefined } : undefined,
     // One task asked for: what its runs did lately, for "what did it do this week?" and
     // for a watchdog reading the tasks it watches.
@@ -514,10 +524,12 @@ export class TaskService {
     if (why) return err(403, why)
     const b = this.build(input, v.value, v.value.chat)
     if (!b.ok) return err(b.status, b.error)
+    const folder = input.folder === undefined ? undefined : folderError(input.folder)
+    if (folder) return err(400, folder)
     const t = v.value
     const retimed = JSON.stringify(b.value.trigger) !== JSON.stringify(t.trigger) || b.value.tz !== t.tz
     if (retimed && !b.value.nextDue && !hasNoSlots(b.value)) return err(400, 'that time has already passed')
-    const patch: Partial<Task> = { ...b.value }
+    const patch: Partial<Task> = { ...b.value, ...(input.folder !== undefined ? { cwd: input.folder.trim() } : {}) }
     // A changed schedule replaces the old one; an unchanged one keeps its next slot.
     if (!retimed) patch.nextDue = t.nextDue
     if (retimed && (t.state === 'done' || t.state === 'expired')) { patch.state = 'active'; patch.runsDone = 0 }

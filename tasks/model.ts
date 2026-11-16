@@ -134,6 +134,10 @@ export interface Task {
   runsDone: number
   failStreak: number
   sessionId?: string      // the task's own session, for session 'own'
+  // The folder it runs in: its topic's when it was made, kept when the topic's folder
+  // changes later (a /cwd broke a script task by a relative path, 2026-11-15). Absent
+  // on a task from before: the bridge records its topic's folder at its next run.
+  cwd?: string
   cardMsg?: number        // its card in the home topic, edited in place
   alertMsg?: number       // the failure alert being edited, while one is open
   alertAt?: string
@@ -244,6 +248,7 @@ export interface Handoff {
   usage?: Usage              // what its run here cost
   result?: string
   resultLink?: string
+  logMsg?: number             // its start line in the 🗂 Tasks topic, which the end line replies to
   createdAt: string
   endedAt?: string
   srcMsg?: number            // the line in the source topic, edited when it ends
@@ -297,8 +302,10 @@ export const LIMITS = {
   watchBackoffMs: [5_000, 15_000, 60_000, 5 * 60_000, 15 * 60_000],
   // Hand-offs:
   handoffDepthMax: 3,
-  handoffsPerHour: 30,               // per group
-  handoffRunsAtOnce: 2,
+  // Raised from 30 and 2 for the live call's front desk, which fires work at several
+  // topics; three claude runs at once suit a small host.
+  handoffsPerHour: 60,               // per group
+  handoffRunsAtOnce: 3,
   handoffsPerRun: 5,                 // one run hands off at most this many
   peerHandoffsPerHour: 20,           // from one other bot
   peerAnswerMs: 6 * 60 * 60_000,     // a hand-off to another bot not answered in this long is said to have failed

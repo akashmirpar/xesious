@@ -70,7 +70,7 @@ describe('the tasks MCP server', () => {
   test('a person\'s run gets the task and topic tools; a scheduled run gets report, notify and its own task', async () => {
     const a = server('interactive', { kind: 'run', chat: '-100777', person: '1', runKind: 'interactive' })
     const names = (await a.rpc('tools/list')).result.tools.map((t: any) => t.name)
-    expect(names).toEqual(['task_create', 'task_list', 'task_get', 'task_update', 'task_pause', 'task_resume', 'task_delete', 'task_run_now', 'topic_list', 'topic_create', 'topic_rename', 'topic_set_cwd', 'handoff'])
+    expect(names).toEqual(['task_create', 'task_list', 'task_get', 'task_update', 'task_pause', 'task_resume', 'task_delete', 'task_run_now', 'topic_list', 'topic_peek', 'answer_wait', 'stop_topic', 'show_topic', 'play_answer', 'call_mode', 'topic_create', 'topic_rename', 'topic_set_cwd', 'handoff'])
     a.close()
     expect(toolsFor('scheduled').map(t => t.name)).toEqual(['task_create', 'task_propose', 'report', 'ask', 'notify', 'task_get', 'task_pause', 'task_done', 'handoff'])
     // approve is there only for a run that is the permission host, where Claude Code calls it.
@@ -116,6 +116,8 @@ test('which endpoint each tool calls', () => {
   expect(routeOf('task_update', { id: 'a b', name: 'x' }, 'interactive')).toEqual({ method: 'PATCH', path: '/v1/tasks/a%20b', body: { name: 'x' } })
   expect(routeOf('task_list', { where: 'chat' }, 'interactive')).toEqual({ method: 'GET', path: '/v1/tasks?where=chat' })
   expect(routeOf('topic_set_cwd', { path: '/srv/x' }, 'interactive')).toEqual({ method: 'PATCH', path: '/v1/topics/this', body: { cwd: '/srv/x' } })
+  expect(routeOf('topic_peek', { topic: 'Research notes', messages: 5 }, 'interactive')).toEqual({ method: 'GET', path: '/v1/topics/Research%20notes/peek?messages=5' })
+  expect(routeOf('topic_peek', {}, 'interactive')).toEqual({ method: 'GET', path: '/v1/topics/this/peek' })
   expect(routeOf('task_done', {}, 'scheduled')).toEqual({ method: 'POST', path: '/v1/tasks/self/done', body: {} })
 })
 

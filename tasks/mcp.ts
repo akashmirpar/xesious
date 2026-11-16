@@ -130,10 +130,10 @@ const WATCH_PROPS = {
 const TASK_FIELDS = {
   name: { type: 'string', description: "A short name for the task's card, e.g. 'Nightly news'." },
   message: { type: 'string', description: 'For a reminder: the exact text the bot sends at the time. For a watcher: the text sent for each event: {event} is the line the watcher printed, {value} what its rule looked at, {why} why it passed.' },
-  prompt: { type: 'string', description: "For work Claude does when the task runs: a complete, self-contained instruction. The run starts without this conversation, in this topic's folder and with its instructions. For a watcher, the events that set it off come with the run." },
+  prompt: { type: 'string', description: "For work Claude does when the task runs: a complete, self-contained instruction. The run starts without this conversation, in this topic's folder (the one it has now: the task keeps it if the topic moves) and with its instructions. For a watcher, the events that set it off come with the run." },
   script: {
     type: 'object',
-    description: "Instead of message or prompt: a command the bot runs, with no AI, for work a command does (a backup, a sync, a health check). Run with bash in this topic's folder; status 0 is success. " +
+    description: "Instead of message or prompt: a command the bot runs, with no AI, for work a command does (a backup, a sync, a health check). Run with bash in this topic's folder (the one it has now: the task keeps it if the topic moves later); status 0 is success. " +
       'What it prints is posted as says decides: result (the default) posts its output; noteworthy only when it printed something; problems only when it fails (every failure, loud); never nothing. ' +
       'It gets $XESIOUS_CLI (bun "$XESIOUS_CLI" notify "halfway" posts in this topic) and, set off by a watcher, $XESIOUS_EVENTS, a JSON file of the events.',
     properties: {
@@ -175,7 +175,8 @@ const INTERACTIVE_TOOLS = [
   {
     name: 'task_update',
     description: "Change a task: its id, and only what changes (the same fields as task_create). A new time replaces the old schedule. Use this when the person asks to change a task (\"make it 10:00\", \"make it silent\", \"only tell me if something is wrong\").",
-    inputSchema: { type: 'object', properties: { ...id, ...TASK_FIELDS }, required: ['id'] },
+    inputSchema: { type: 'object', properties: { ...id, ...TASK_FIELDS,
+      folder: { type: 'string', description: "The folder it runs in, a full path to an existing directory. A task keeps the folder its topic had when it was made; change it only when the person asks (\"run it in ~/ops instead\")." } }, required: ['id'] },
   },
   { name: 'task_pause', description: 'Pause a task: it stops running until someone resumes it.', inputSchema: { type: 'object', properties: id, required: ['id'] } },
   { name: 'task_resume', description: 'Resume a paused task. It continues from now; runs it missed while paused are not made up.', inputSchema: { type: 'object', properties: id, required: ['id'] } },
@@ -183,8 +184,46 @@ const INTERACTIVE_TOOLS = [
   { name: 'task_run_now', description: 'Run a task once now, as a test or because the person asked; its schedule is unchanged.', inputSchema: { type: 'object', properties: id, required: ['id'] } },
   {
     name: 'topic_list',
-    description: "List this chat's forum topics that the bot knows: id, name, working folder, permission mode and model.",
+    description: "List this chat's forum topics that the bot knows: id, name, working folder, permission mode and model, and what each is doing now: " +
+      'working (on what, its latest step, for how long), turns queued, waiting for the person (an approval or a question), and when it was last active.',
     inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'topic_peek',
+    description: "Look into a topic of this chat: its latest messages (people's and the bot's answers, oldest first), the run going on there now with its recent steps, " +
+      'and what it is waiting on the person for. For "how is X doing?", "what did X say?", or to see a topic before sending work there.',
+    inputSchema: { type: 'object', properties: { topic: topicRef, messages: { type: 'number', description: 'How many of the latest messages, 1 to 40 (default 12).' } } },
+  },
+  {
+    name: 'answer_wait',
+    description: "Answer for the person something that waits on them in a topic — Claude asking permission, Claude's questions, a plan's Go ahead — when they tell you to (\"yes, allow it\", \"the second one\", \"go ahead with the plan\"). " +
+      'topic_list and topic_peek show what waits, with its id and options. Only on their word: never decide it for them.',
+    inputSchema: { type: 'object', properties: {
+      id: { type: 'string' },
+      allow: { type: 'boolean', description: 'For a permission: true to allow, false to refuse.' },
+      go: { type: 'boolean', description: 'For a plan: true to go ahead.' },
+      answers: { type: 'array', description: "For questions: one per question, in order: an option's number (from 1) or label, a list of numbers where several may be picked, or the person's own words." },
+    }, required: ['id'] },
+  },
+  {
+    name: 'stop_topic',
+    description: 'Stop what is running in a topic of this group (its turn, a hand-off, /bg or a task run there), when the person asks ("stop the Research topic"). Its answer is thrown away.',
+    inputSchema: { type: 'object', properties: { topic: { type: 'string', description: 'The topic: id or name, or "General".' } }, required: ['topic'] },
+  },
+  {
+    name: 'show_topic',
+    description: 'On a live call (/live): open a topic on the person\'s page, when they ask to see it ("show me Research", "open the Posting topic"). Only works while their page is open.',
+    inputSchema: { type: 'object', properties: { topic: { type: 'string', description: 'The topic: id or name, from topic_list, or "General".' } }, required: ['topic'] },
+  },
+  {
+    name: 'play_answer',
+    description: 'On a live call (/live): play a topic\'s answer out loud on the person\'s page, from the voice note made for it in Telegram, when they ask to hear it ("play Research\'s last answer"). Without id: the latest answer there that has one. An answer with no voice note: tell them what it says instead.',
+    inputSchema: { type: 'object', properties: { topic: { type: 'string', description: 'The topic: id or name, from topic_list, or "General".' }, id: { type: 'number', description: 'Optional: the answer\'s message id, from topic_peek.' } }, required: ['topic'] },
+  },
+  {
+    name: 'call_mode',
+    description: 'On a live call (/live): switch how the call listens, when the person asks by voice. interactive: you answer everything they say. assistant: they are talking with people; you act only when they call you by name (or hold the mic). E.g. "just listen" or "I\'m talking with Sara" → assistant; "back to me" → interactive. Say in a few words that you switched.',
+    inputSchema: { type: 'object', properties: { mode: { type: 'string', enum: ['interactive', 'assistant'] } }, required: ['mode'] },
   },
   {
     name: 'topic_create',
@@ -308,6 +347,12 @@ export function routeOf(name: string, a: any, kind: 'interactive' | 'scheduled')
     case 'approve': return { method: 'POST', path: '/v1/approve', body: a }
     case 'handoff': return { method: 'POST', path: '/v1/handoff', body: a }
     case 'topic_list': return { method: 'GET', path: '/v1/topics' }
+    case 'show_topic': return { method: 'POST', path: '/v1/live/show', body: { topic: a?.topic } }
+    case 'call_mode': return { method: 'POST', path: '/v1/live/mode', body: { mode: a?.mode } }
+    case 'play_answer': return { method: 'POST', path: '/v1/live/play', body: { topic: a?.topic, id: a?.id } }
+    case 'answer_wait': return { method: 'POST', path: `/v1/waits/${enc(String(a?.id ?? ''))}/answer`, body: { allow: a?.allow, go: a?.go, answers: a?.answers } }
+    case 'stop_topic': return { method: 'POST', path: `/v1/topics/${enc(String(a?.topic ?? ''))}/stop`, body: {} }
+    case 'topic_peek': return { method: 'GET', path: `/v1/topics/${enc(String(a?.topic ?? 'this'))}/peek${a?.messages ? `?messages=${enc(String(a.messages))}` : ''}` }
     case 'topic_create': return { method: 'POST', path: '/v1/topics', body: a }
     case 'topic_rename': return { method: 'PATCH', path: `/v1/topics/${enc(String(a?.topic ?? 'this'))}`, body: { name: a?.name } }
     case 'topic_set_cwd': return { method: 'PATCH', path: `/v1/topics/${enc(String(a?.topic ?? 'this'))}`, body: { cwd: a?.path } }
