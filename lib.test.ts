@@ -13,7 +13,7 @@ import {
   SETTINGS, settingDef, resolveSetting, choiceLabel, normalizeUsername, canEditSettings, pinPendingEditor, type EditorPolicy,
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg, transferText, transferWorthShowing,
   allowedModes, normalizeMode, permissionArgs,
-  normalizeModel, MODEL_DEFAULT,
+  normalizeModel, MODEL_DEFAULT, cliModel, MODEL_ALIAS_IDS,
   toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step, runTitle,
   needsRich, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
@@ -611,6 +611,20 @@ describe('normalizeModel', () => {
   test('unknown → undefined', () => {
     expect(normalizeModel('gpt-4')).toBeUndefined()
     expect(normalizeModel('turbo')).toBeUndefined()
+  })
+})
+
+describe('cliModel', () => {
+  test('fable is pinned to 5.2 for the CLI, while the stored alias stays "fable"', () => {
+    // The installed CLI maps the bare alias to 5.1; the bridge resolves it itself.
+    expect(cliModel('fable')).toBe('claude-fable-5-2')
+    expect(normalizeModel('Fable')).toBe('fable')           // what a topic stores and shows
+    expect(MODEL_ALIAS_IDS.fable).toBe('claude-fable-5-2')  // one place to move the pin
+  })
+  test('unpinned aliases and full ids go to the CLI as typed', () => {
+    for (const m of ['opus', 'sonnet', 'haiku', 'claude-opus-4-8', 'claude-fable-5-1', '']) {
+      expect(cliModel(m)).toBe(m)
+    }
   })
 })
 
