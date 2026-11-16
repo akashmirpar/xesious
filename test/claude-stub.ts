@@ -24,6 +24,7 @@
  *   MIDTEXT→ init + a substantive text block + a tool_use + a closing sign-off,
  *            i.e. the shape where the answer is written mid-turn and the bridge
  *            used to deliver only the sign-off
+ *   TICKSAY→ like TICKING, saying how far it got first
  *   TICKING→ init + a tool step every 300 ms until stopped → a long run the idle
  *            watchdog leaves alone, for stopping it by hand
  *   MCPTASK <tool> <json args> → starts the bot's own MCP server from --mcp-config,
@@ -48,6 +49,34 @@ const argv = process.argv.slice(2)
 const val = (flag: string): string | undefined => {
   const i = argv.indexOf(flag)
   return i >= 0 ? argv[i + 1] : undefined
+}
+
+// Kept-process mode (`-p --input-format stream-json`, as the live call's front desk
+// runs claude): each user message on stdin is one turn, run as the stub's ordinary
+// one-shot self, its events passed on; it ends when stdin does. Each start is logged
+// to XESIOUS_STUB_KEPT_LOG, so a test can tell one process served several turns.
+if (argv.includes('--input-format')) {
+  if (process.env.XESIOUS_STUB_KEPT_LOG) appendFileSync(process.env.XESIOUS_STUB_KEPT_LOG, JSON.stringify(argv) + '\n')
+  const base = argv.filter((a, i) => a !== '-p' && a !== '--input-format' && argv[i - 1] !== '--input-format')
+  let buf = ''
+  let chain = Promise.resolve()
+  process.stdin.setEncoding('utf8')
+  process.stdin.on('data', d => {
+    buf += d
+    let nl: number
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl); buf = buf.slice(nl + 1)
+      let m: any; try { m = JSON.parse(line) } catch { continue }
+      const text = String(m?.message?.content?.[0]?.text ?? '')
+      chain = chain.then(() => new Promise<void>(res => {
+        const c = spawn(process.execPath, [process.argv[1], ...base, '-p', text], { stdio: ['ignore', 'pipe', 'inherit'] })
+        c.stdout.on('data', x => process.stdout.write(x))
+        c.on('close', () => res())
+      }))
+    }
+  })
+  process.stdin.on('end', () => { void chain.then(() => process.exit(0)) })
+  await new Promise(() => {})
 }
 
 const rawPrompt = val('-p') ?? ''
@@ -99,6 +128,21 @@ const topicInstr = /Instructions for this topic in particular/.test(val('--appen
 const sessionId = forked && resumeId ? `fork-of-${resumeId}` : (resumeId ?? 'sessTESTAAA')
 
 const emit = (o: unknown) => process.stdout.write(JSON.stringify(o) + '\n')
+// A session whose transcript is gone (an id starting "gone-"): what the real CLI does,
+// checked 2026-11-15 — the line, then an error result echoing the id, exit 1.
+if (resumeId?.startsWith('gone-')) {
+  process.stdout.write(`No conversation found with session ID: ${resumeId}\n`)
+  emit({ type: 'result', subtype: 'error_during_execution', is_error: true, num_turns: 0, session_id: resumeId, errors: [`No conversation found with session ID: ${resumeId}`] })
+  process.exit(1)
+}
+// Like the real CLI, a session has a transcript: <config>/projects/<cwd, every
+// non-alphanumeric as ->/<id>.jsonl. The bridge checks it before resuming.
+{
+  const { mkdirSync, appendFileSync } = require('node:fs') as typeof import('node:fs')
+  const { join } = require('node:path') as typeof import('node:path')
+  const dir = join(process.env.CLAUDE_CONFIG_DIR || join(require('node:os').homedir(), '.claude'), 'projects', process.cwd().replace(/[^a-zA-Z0-9]/g, '-'))
+  try { mkdirSync(dir, { recursive: true }); appendFileSync(join(dir, `${sessionId}.jsonl`), '{}\n') } catch {}
+}
 const initLine = () => emit({ type: 'system', subtype: 'init', session_id: sessionId, model: model ?? 'claude-opus-5[1m]', claude_code_version: '2.1.219' })
 const result = (extra: Record<string, unknown>) =>
   // With what a real result carries, so the bridge's usage ledger has something to keep.
@@ -163,6 +207,13 @@ async function main() {
     return
   }
 
+  // TICKSAY: says how far it got, as a long run does between tools, then ticks.
+  if (scenario === 'TICKSAY') {
+    emit({ type: 'assistant', message: { content: [{ type: 'text', text: 'Cut 6 of the 11 parts so far; stubSAIDMID' }] } })
+    const tick = setInterval(() => emit({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'sleep 1' } }] } }), 300)
+    setTimeout(() => { clearInterval(tick); result({ result: 'tickedToTheEnd' }) }, 30_000)
+    return
+  }
   if (scenario === 'TICKING') {
     const tick = setInterval(() => emit({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'sleep 1' } }] } }), 300)
     setTimeout(() => { clearInterval(tick); result({ result: 'tickedToTheEnd' }) }, 30_000)

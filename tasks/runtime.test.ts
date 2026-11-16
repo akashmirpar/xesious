@@ -187,6 +187,38 @@ describe('overlap, limits and order', () => {
     expect([a.id, b.id].every(id => store.getTask(id)!.runsDone === 1)).toBe(true)
   })
 
+  test('a task with a full history still runs: its new run is not trimmed away as it is queued', async () => {
+    // 200 runs kept per task; a queued run has no start yet, and used to sort as the
+    // oldest and be deleted on insert. Its run then threw on run.id, kept its Claude
+    // slot, and stayed "running".
+    const logs: string[] = []
+    rt = new TaskRuntime(deps({ maxClaude: 1, log: l => { logs.push(l) } }))
+    const t = mk({ trigger: { kind: 'every', everyMs: 300_000, anchor: '2026-10-16T19:07:00.000Z' } })
+    for (let i = 0; i < 200; i++) store.insertRun({ id: `old-${i}`, task: t.id, trigger: 'schedule', state: 'succeeded', startedAt: new Date(Date.UTC(2026, 9, 1, 0, i)).toISOString() } as Run)
+    const other = mk({ name: 'Other' })
+    await tick()
+    const runs = store.runsFor(t.id, 999)
+    // 200 finished, plus the new one (trimmed among the finished at the next insert).
+    expect(runs).toHaveLength(201)
+    expect(runs[0]).toMatchObject({ state: 'succeeded', startedAt: now.toISOString() })
+    expect(logs.filter(l => l.includes('failed unexpectedly'))).toEqual([])
+    expect(rt.isRunning(t.id)).toBe(false)
+    // The single Claude slot came back: the other task ran too.
+    expect(store.getTask(other.id)!.runsDone).toBe(1)
+  })
+
+  test('a run whose record is gone is let go, not thrown on', async () => {
+    const logs: string[] = []
+    rt = new TaskRuntime(deps({ log: l => { logs.push(l) } }))
+    const t = mk()
+    const real = store.insertRun.bind(store)
+    store.insertRun = (r: Run) => { const ok = real(r); (store as any).db.query('DELETE FROM runs WHERE id = ?').run(r.id); return ok }
+    await tick()
+    expect(logs.some(l => l.includes('has no record any more'))).toBe(true)
+    expect(logs.filter(l => l.includes('failed unexpectedly'))).toEqual([])
+    expect(rt.isRunning(t.id)).toBe(false)
+  })
+
   test('just after a start, reminders go out but Claude runs wait two minutes', async () => {
     rt = new TaskRuntime(deps({ startedAt: now }))
     const c = mk()

@@ -191,6 +191,7 @@ export function cardHtml(t: Task, runs: Run[], now = new Date(), watch?: WatchSt
   if (t.trigger.kind === 'watch') lines.push(`<code>${esc(clip(t.trigger.command, 200))}</code>`)
   if (t.rule) lines.push(`Only ${esc(ruleText(t.rule))}`)
   if (t.action.kind === 'script') lines.push(`${isWatch ? 'Then runs ' : ''}<code>${esc(clip(t.action.command, 200))}</code>`)
+  if (t.cwd && (t.action.kind === 'script' || t.action.kind === 'steps' || t.trigger.kind === 'watch')) lines.push(`📁 <code>${esc(t.cwd)}</code>`)
   if (related?.length) lines.push(`${t.action.kind === 'digest' ? 'Lists' : 'Watches'}: ${related.map(n => `<b>${esc(n)}</b>`).join(', ')}`)
   if (t.then) lines.push(`Then hands its result to <b>${esc(t.then.topicName ?? (t.then.thread === undefined ? 'General' : `topic ${t.then.thread}`))}</b>`)
   if (t.parent) lines.push(`Made by the task <b>${esc(t.parentName ?? t.parent)}</b>; it ends when that one does`)

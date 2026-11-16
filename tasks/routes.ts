@@ -7,6 +7,7 @@ import { taskView, type Result, type TaskService } from './service'
 
 export interface BridgeHandlers {
   listTopics(scope: Scope): Promise<ApiReply> | ApiReply
+  peekTopic(scope: Scope, topic: string, messages?: number): Promise<ApiReply> | ApiReply
   createTopic(scope: Scope, body: any): Promise<ApiReply> | ApiReply
   updateTopic(scope: Scope, topic: string, body: any): Promise<ApiReply> | ApiReply
   notify(scope: Scope, body: any): Promise<ApiReply> | ApiReply
@@ -16,6 +17,20 @@ export interface BridgeHandlers {
   handoff(scope: Scope, body: any): Promise<ApiReply> | ApiReply
   propose(scope: Scope, body: any): Promise<ApiReply> | ApiReply
   run(scope: Scope, body: any): Promise<ApiReply> | ApiReply
+  liveTurn(scope: Scope, body: any, signal?: AbortSignal): Promise<ApiReply> | ApiReply
+  liveEvents(scope: Scope, query: URLSearchParams, signal?: AbortSignal): Promise<ApiReply> | ApiReply
+  liveTopics(scope: Scope, query: URLSearchParams): Promise<ApiReply> | ApiReply
+  liveMessages(scope: Scope, query: URLSearchParams): Promise<ApiReply> | ApiReply
+  liveSay(scope: Scope, body: any): Promise<ApiReply> | ApiReply
+  livePhoto(scope: Scope, query: URLSearchParams): Promise<ApiReply> | ApiReply
+  showTopic(scope: Scope, body: any): Promise<ApiReply> | ApiReply
+  liveVoice(scope: Scope, query: URLSearchParams): Promise<ApiReply> | ApiReply
+  playAnswer(scope: Scope, body: any): Promise<ApiReply> | ApiReply
+  callMode(scope: Scope, body: any): Promise<ApiReply> | ApiReply
+  liveAnswer(scope: Scope, body: any): Promise<ApiReply> | ApiReply
+  liveStop(scope: Scope, body: any): Promise<ApiReply> | ApiReply
+  answerWaitTool(scope: Scope, id: string, body: any): Promise<ApiReply> | ApiReply
+  stopTopicTool(scope: Scope, topic: string): Promise<ApiReply> | ApiReply
 }
 
 const out = <T>(r: Result<T>, view: (v: T) => unknown = v => v): ApiReply =>
@@ -47,7 +62,29 @@ export function taskRoutes(svc: TaskService, bridge: BridgeHandlers): Route[] {
     { method: 'POST', path: '/v1/tasks/propose', handler: (s, q) => bridge.propose(s, q.body) },
     { method: 'POST', path: '/v1/tasks/:id/fire', handler: (s, q) => out(svc.fire(s, q.params.id, q.body?.payload), v => ({ ...v, message: 'Fired: it runs now, given the payload.' })) },
     { method: 'POST', path: '/v1/run', operatorOnly: true, handler: (s, q) => bridge.run(s, q.body) },
+    // A turn said on a topic's live call, streamed back to the live server as it runs.
+    { method: 'POST', path: '/v1/live/turn', operatorOnly: true, handler: (s, q) => bridge.liveTurn(s, q.body, q.signal) },
+    // What is running in that call's group, streamed while the page is open.
+    { method: 'GET', path: '/v1/live/events', operatorOnly: true, handler: (s, q) => bridge.liveEvents(s, q.query, q.signal) },
+    // That group's topics and what each is doing, for the page's list.
+    { method: 'GET', path: '/v1/live/topics', operatorOnly: true, handler: (s, q) => bridge.liveTopics(s, q.query) },
+    // One topic's latest messages, and typing into it, from the page.
+    { method: 'GET', path: '/v1/live/messages', operatorOnly: true, handler: (s, q) => bridge.liveMessages(s, q.query) },
+    { method: 'POST', path: '/v1/live/say', operatorOnly: true, handler: (s, q) => bridge.liveSay(s, q.body) },
+    { method: 'GET', path: '/v1/live/photo', operatorOnly: true, handler: (s, q) => bridge.livePhoto(s, q.query) },
+    // The front desk opening a topic on the person's live page.
+    { method: 'POST', path: '/v1/live/show', handler: (s, q) => bridge.showTopic(s, q.body) },
+    { method: 'GET', path: '/v1/live/voice', operatorOnly: true, handler: (s, q) => bridge.liveVoice(s, q.query) },
+    { method: 'POST', path: '/v1/live/play', handler: (s, q) => bridge.playAnswer(s, q.body) },
+    { method: 'POST', path: '/v1/live/mode', handler: (s, q) => bridge.callMode(s, q.body) },
+    // Answering what waits on the person, and stopping a run: from the page, and by the
+    // front desk on the call.
+    { method: 'POST', path: '/v1/live/answer', operatorOnly: true, handler: (s, q) => bridge.liveAnswer(s, q.body) },
+    { method: 'POST', path: '/v1/live/stop', operatorOnly: true, handler: (s, q) => bridge.liveStop(s, q.body) },
+    { method: 'POST', path: '/v1/waits/:id/answer', handler: (s, q) => bridge.answerWaitTool(s, q.params.id, q.body) },
+    { method: 'POST', path: '/v1/topics/:topic/stop', handler: (s, q) => bridge.stopTopicTool(s, q.params.topic) },
     { method: 'GET', path: '/v1/topics', handler: s => bridge.listTopics(s) },
+    { method: 'GET', path: '/v1/topics/:topic/peek', handler: (s, q) => bridge.peekTopic(s, q.params.topic, q.query.get('messages') ? Number(q.query.get('messages')) : undefined) },
     { method: 'POST', path: '/v1/topics', handler: (s, q) => bridge.createTopic(s, q.body) },
     { method: 'PATCH', path: '/v1/topics/:topic', handler: (s, q) => bridge.updateTopic(s, q.params.topic, q.body) },
     { method: 'POST', path: '/v1/send', handler: (s, q) => bridge.send(s, q.body) },

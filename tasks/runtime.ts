@@ -353,7 +353,7 @@ export class TaskRuntime {
       this.waiting.push({ task: t.id, run: run.id })
       return
     }
-    this.track(this.exec(t, run))
+    this.track(this.exec(t, run), { task: t.id, run: run.id })
   }
 
   // Room for one more of its kind: Claude runs and scripts have their caps.
@@ -364,6 +364,13 @@ export class TaskRuntime {
   }
 
   private exec(t: Task, run: Run): Promise<void> {
+    // Its record gone (it can't be, since trimRuns keeps unfinished runs; but if it
+    // is): nothing to run it under. Let the task go rather than throw on run.id.
+    if (!this.store.getRun(run.id)) {
+      this.d.log(`[tasks] run ${run.id} of task ${t.id} has no record any more; not running it`)
+      if (this.inFlight.get(t.id) === run.id) this.inFlight.delete(t.id)
+      return Promise.resolve()
+    }
     switch (t.action.kind) {
       case 'message': return this.execMessage(t, run, 0)
       case 'script': return this.execScript(t, run)
@@ -382,7 +389,6 @@ export class TaskRuntime {
   private async execSteps(t: Task, run: Run): Promise<void> {
     if (t.action.kind !== 'steps') return
     const steps = t.action.steps
-    this.claudeActive++
     let results: StepResult[] = run.stepResults ?? []
     let at = run.stepAt ?? 1
     let answered: StepCall['answer']
@@ -412,6 +418,8 @@ export class TaskRuntime {
     let deferred: { retryAt?: Date } | undefined
     let done = 0
     this.stopping.delete(t.id)
+    // Taken here, with the try that gives it back: a throw before it would keep it.
+    this.claudeActive++
     try {
       while (at >= 1 && at <= steps.length) {
         if (this.stopping.has(t.id)) { canceled = true; break }
@@ -603,8 +611,13 @@ export class TaskRuntime {
     this.finishRun(t.id, run)
   }
 
-  private track(p: Promise<void>): void {
-    const q = p.catch(e => this.d.log(`[tasks] run failed unexpectedly: ${e}`)).finally(() => this.pending.delete(q))
+  // A run, poll or filter that throws: logged with where (the stack) and what (the
+  // task and run), and the task let go, so it isn't left "running" for good.
+  private track(p: Promise<void>, what?: { task: string; run?: string }): void {
+    const q = p.catch(e => {
+      this.d.log(`[tasks] run failed unexpectedly${what ? ` (task ${what.task}${what.run ? `, run ${what.run}` : ''})` : ''}: ${(e as Error)?.stack ?? e}`)
+      if (what && this.inFlight.get(what.task) === what.run) this.inFlight.delete(what.task)
+    }).finally(() => this.pending.delete(q))
     this.pending.add(q)
   }
 
@@ -621,7 +634,7 @@ export class TaskRuntime {
       }
       if (!this.free(t)) { i++; continue }
       this.waiting.splice(i, 1)
-      this.track(this.exec(t, run))
+      this.track(this.exec(t, run), { task: t.id, run: run.id })
     }
   }
 
@@ -695,8 +708,8 @@ export class TaskRuntime {
   // --- scripts ------------------------------------------------------------------
 
   private async execScript(t: Task, run: Run): Promise<void> {
-    this.scriptActive++
     run = this.store.updateRun(run.id, { state: 'running', startedAt: this.d.now().toISOString() })!
+    this.scriptActive++
     this.d.cardChanged(this.store.getTask(t.id) ?? t)
     let o: ScriptOutcome
     try {
@@ -795,8 +808,8 @@ export class TaskRuntime {
   // --- Claude runs ------------------------------------------------------------
 
   private async execClaude(t: Task, run: Run): Promise<void> {
-    this.claudeActive++
     run = this.store.updateRun(run.id, { state: 'running', startedAt: this.d.now().toISOString() })!
+    this.claudeActive++
     // Its card shows it running, with a way to stop it.
     this.d.cardChanged(this.store.getTask(t.id) ?? t)
     let o: ClaudeOutcome

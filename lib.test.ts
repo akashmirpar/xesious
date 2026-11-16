@@ -8,12 +8,13 @@
  */
 import { test, expect, describe } from 'bun:test'
 import {
+  carryHear,
   effectiveAnswers, effectiveRecords, modeAnswers, foldRecords, sinceMark, replyWindow, contextParts, fitNewest, convLine, conversationPreamble, type ConvRecord,
   SETTINGS, settingDef, resolveSetting, choiceLabel, normalizeUsername, canEditSettings, pinPendingEditor, type EditorPolicy,
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg, transferText, transferWorthShowing,
   allowedModes, normalizeMode, permissionArgs,
   normalizeModel, MODEL_DEFAULT,
-  toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step,
+  toolStep, renderSteps, renderStepsHtml, parseStreamLine, THINKING, type Step, runTitle,
   needsRich, escapeMoneyDollars, conflictAdvice, normalizeEffort, EFFORT_LEVELS, EFFORT_DEFAULT,
   markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
   speechBlocks, speechify, speechText, speechUnits, speechChunkSeconds, SPEECH_GAPS,
@@ -23,6 +24,7 @@ import {
   sanitizeProse, PROSE_RULES, isNonAnswer, lastAnswerBlock,
   isSignOff, isDanglingReference, promoteBlock, stalenessNote,
   frameUserMessage, attributionProfileLines,
+  paradeeVoice, PARADEE_SPEAKERS, isTtsEngine, findAnswer, SPEAKERS,
 } from './lib'
 
 describe('parseIdList', () => {
@@ -644,6 +646,26 @@ describe('toolStep', () => {
     expect(toolStep({ name: 'mcp__image_studio__generate_image', input: { prompt: 'a cat' } }))
       .toEqual({ label: '🔌 image_studio · generate_image', detail: '{"prompt":"a cat"}' })
     expect(toolStep({ name: 'mcp__srv__ping', input: {} })).toEqual({ label: '🔌 srv · ping', detail: undefined })
+  })
+})
+
+describe('runTitle: which run a status message is', () => {
+  test('a task, work handed over, and /bg each name themselves and who asked', () => {
+    expect(runTitle({ kind: 'task', name: 'Price watch', by: 'Ada' })).toBe('⏰ Task "Price watch" · Ada')
+    expect(runTitle({ kind: 'task', name: 'Weekly plan', step: 2 })).toBe('⏰ Task "Weekly plan", step 2')
+    expect(runTitle({ kind: 'handoff', from: 'Live', what: 'Tidy the release\nnotes', by: 'Ada' })).toBe('⬅️ From Live: "Tidy the release notes" · Ada')
+    expect(runTitle({ kind: 'bg', what: 'summarise the logs' })).toBe('🔀 In the background: "summarise the logs"')
+  })
+  test('a long request is cut to its first words', () => {
+    const t = runTitle({ kind: 'handoff', from: 'Live', what: 'word '.repeat(40) })
+    expect(t.length).toBeLessThan(90)
+    expect(t).toMatch(/…"$/)
+  })
+  test('the title leads the status message, above Thinking, in every form', () => {
+    const steps: Step[] = [{ label: '⚙️ Running a command' }]
+    expect(renderSteps(steps, 1, { progressDetail: false, title: '⏰ Task "A & B"' }).startsWith('**⏰ Task "A &amp; B"**\n\n' + THINKING)).toBe(true)
+    expect(renderStepsHtml(steps, { progressDetail: false, title: '⏰ Task "A & B"' }).startsWith('<b>⏰ Task &quot;A &amp; B&quot;</b>\n' + THINKING)).toBe(true)
+    expect(renderSteps(steps, 1, { progressDetail: false }).startsWith(THINKING)).toBe(true)
   })
 })
 
@@ -2021,5 +2043,67 @@ describe('group memory', () => {
   test('a very long index is cut, saying how many more there are', () => {
     const facts = Array.from({ length: L.GROUP_MEMORY_INDEX_MAX + 5 }, (_, i) => ({ file: `f${i}.md`, name: `f${String(i).padStart(3, '0')}`, description: '' }))
     expect(L.groupMemoryClaudeMd({ group: 'T', dir: '/g', facts, readOnly: false })).toContain('…and 5 more in /g/memory/')
+  })
+})
+
+describe('Paradee voices', () => {
+  test('its own voices are kept, and every other English speaker gets the one of its kind', () => {
+    for (const v of PARADEE_SPEAKERS) expect(paradeeVoice(v)).toBe(v)
+    expect(paradeeVoice('bm_george')).toBe('bm_fable')
+    expect(paradeeVoice('bf_emma')).toBe('bf_isabella')
+    expect(paradeeVoice('am_adam')).toBe('am_puck')
+    expect(paradeeVoice('af_jessica')).toBe('af_heart')
+    // Every speaker on the keyboard lands on a Paradee voice of the same accent and gender.
+    for (const s of SPEAKERS) expect(paradeeVoice(s.id).slice(0, 2)).toBe(s.id.slice(0, 2))
+  })
+  test('a voice in another language falls back to af_heart rather than failing', () => {
+    expect(paradeeVoice('jf_alpha')).toBe('af_heart')
+    expect(paradeeVoice('ef_dora')).toBe('af_heart')
+  })
+  test('only the two engines speak.py has are engines', () => {
+    expect(isTtsEngine('paradee')).toBe(true)
+    expect(isTtsEngine('kokoro')).toBe(true)
+    expect(isTtsEngine('piper')).toBe(false)
+    expect(isTtsEngine('')).toBe(false)
+  })
+})
+
+describe('findAnswer', () => {
+  const line = (ids: number[], text: string) => JSON.stringify({ t: 0, ids, text })
+  test('finds an answer by any message it went out as', () => {
+    const raw = [line([10], 'first'), line([11, 12], '## Long\n\nsecond')].join('\n') + '\n'
+    expect(findAnswer(raw, 10)).toBe('first')
+    expect(findAnswer(raw, 12)).toBe('## Long\n\nsecond')
+    expect(findAnswer(raw, 13)).toBeUndefined()
+  })
+  test('the newest wins, and a torn line is skipped', () => {
+    const raw = [line([5], 'old'), '{"t":0,"ids":[5],"te', line([5], 'new')].join('\n')
+    expect(findAnswer(raw, 5)).toBe('new')
+    expect(findAnswer('{"t":0,"ids":[6],"te\n' + line([6], 'ok'), 6)).toBe('ok')
+    expect(findAnswer('', 1)).toBeUndefined()
+  })
+})
+
+describe('carryHear: topics and groups with voice on keep understanding voice notes', () => {
+  test('voice on → hear on; voice off or unset → left to the default; runs once', () => {
+    const voice = { 'g:1': 'full', 'g:2': 'summary', 'g:3': 'off' }
+    const groups: Record<string, Record<string, any>> = { a: { voice: 'full' }, b: { voice: 'off' }, c: { voice: 'full', hear: false } }
+    const topics: Record<string, Record<string, any>> = {}
+    carryHear(voice, groups, topics)
+    expect(topics.hear).toEqual({ 'g:1': true, 'g:2': true })
+    expect(groups).toEqual({ a: { voice: 'full', hear: true }, b: { voice: 'off' }, c: { voice: 'full', hear: false } })
+    // Turned off afterwards, it stays off on the next start.
+    topics.hear['g:1'] = false
+    carryHear(voice, groups, topics)
+    expect(topics.hear['g:1']).toBe(false)
+  })
+})
+
+describe('a result that failed says why', () => {
+  test('the CLI\'s errors are kept, and "No conversation found" marks the session lost', () => {
+    const [r] = parseStreamLine(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, session_id: 'gone-1', errors: ['No conversation found with session ID: gone-1'] }), { progressDetail: false }) as any[]
+    expect(r).toMatchObject({ kind: 'result', isError: true, errors: ['No conversation found with session ID: gone-1'], lostSession: true })
+    const [ok] = parseStreamLine(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: 's', result: 'hi' }), { progressDetail: false }) as any[]
+    expect(ok.errors).toBeUndefined(); expect(ok.lostSession).toBeUndefined()
   })
 })

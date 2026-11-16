@@ -218,8 +218,14 @@ export class TaskStore {
     return (this.db.query("SELECT * FROM runs WHERE state IN ('queued','running')").all() as any[]).map(runOf)
   }
 
+  // Only finished runs, newest kept: by when they started, or for one that never did
+  // (skipped) its slot. A queued, running, waiting or deferred run is never dropped.
+  // (It used to sort on started_at alone, and SQLite puts NULL last in a DESC order:
+  // once a task had 200 runs, each new queued run, not started yet, counted as the
+  // oldest and was deleted as it was inserted, and its run threw on 'run.id'.)
   private trimRuns(task: string): void {
-    const ids = (this.db.query('SELECT id FROM runs WHERE task = ? ORDER BY started_at DESC, id DESC').all(task) as any[]).map(r => r.id)
+    const ids = (this.db.query(`SELECT id FROM runs WHERE task = ? AND state IN ('succeeded', 'failed', 'timed_out', 'canceled', 'skipped', 'interrupted')
+      ORDER BY COALESCE(started_at, json_extract(doc, '$.slot'), '') DESC, id DESC`).all(task) as any[]).map(r => r.id)
     const drop = ids.slice(LIMITS.historyKept)
     for (const id of drop) this.db.query('DELETE FROM runs WHERE id = ?').run(id)
   }

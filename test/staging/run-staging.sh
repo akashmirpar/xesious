@@ -42,7 +42,7 @@ mkdir -p "$STAGE_DIR"
 # The topics' working directories live OUTSIDE this repository. Claude's auto-memory
 # belongs to the git repository a session runs in, so staging sessions inside the
 # repo read and wrote the developer's own memory for it: the fork case's codeword
-# turned up there as a saved memory (2026-09-25). Outside any repo, a staging
+# turned up there as a saved memory. Outside any repo, a staging
 # session's memory is its own.
 STAGE_SESSIONS="${STAGING_SESSIONS_BASE:-${XDG_STATE_HOME:-$HOME/.local/state}/xesious-staging/sessions}"
 if git -C "$(dirname "$STAGE_SESSIONS")" rev-parse --show-toplevel >/dev/null 2>&1 || \
@@ -61,7 +61,7 @@ rm -f "$STAGE_DIR/state.json"; rm -rf "$STAGE_DIR/sessions" "$STAGE_SESSIONS"
 # while down — right for production, wrong here: whatever reached the staging bot
 # between runs was replayed into this one. A /restart typed from the test account
 # between runs did exactly that, and stopped the bridge before the first case
-# (2026-09-27). Without the marker the bridge drops the backlog at startup.
+#. Without the marker the bridge drops the backlog at startup.
 rm -f "$STAGE_DIR/.clean-exit"
 LOG="$STAGE_DIR/bridge.log"; : > "$LOG"
 
@@ -84,6 +84,15 @@ export TG_AUTO_QUIET_MS=5000
 [ -n "${STAGING_GROUP_ID:-}" ] && export TG_ALLOWED_CHATS="$STAGING_GROUP_ID"
 export TG_SESSIONS_BASE="$STAGE_SESSIONS"
 export TG_STATE_FILE="$STAGE_DIR/state.json"
+# The live call's files, its own: the defaults are production's (state/live-links.json,
+# state/live-tunnel.json), so a staging /live would have adopted production's live
+# server and tunnel and written its link among production's.
+export LIVE_LINKS_FILE="$STAGE_DIR/live-links.json"
+export LIVE_TUNNEL_STATE="$STAGE_DIR/live-tunnel.json"
+export LIVE_CALLS_DIR="$STAGE_DIR/live-calls"
+export LIVE_TTS=off                 # the call cases type; no voice to make
+export LIVE_SUMMARY_AFTER_MS=8000   # a call's summary within seconds of hanging up
+rm -f "$LIVE_LINKS_FILE"
 # Real-Claude mode drives the actual `claude` CLI (real model, real answer);
 # otherwise the deterministic stub. STAGING_CLAUDE_BIN overrides either way.
 if [ -n "${STAGING_REAL_CLAUDE:-}" ] && [ "${STAGING_REAL_CLAUDE}" != 0 ]; then
@@ -101,6 +110,9 @@ echo "[staging] starting bridge (isolated .env)…"
 bun --env-file=/dev/null run "$ROOT/bridge.ts" >"$LOG" 2>&1 &
 BRIDGE_PID=$!
 cleanup() {
+  # The live server and its tunnel outlive a bridge by design; not staging's.
+  [ -f "$LIVE_TUNNEL_STATE" ] && for p in $(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d.get('serverPid',''),d.get('tunnelPid',''))" "$LIVE_TUNNEL_STATE" 2>/dev/null); do kill "$p" 2>/dev/null || true; done
+  rm -f "$LIVE_TUNNEL_STATE"
   pkill -P "$BRIDGE_PID" 2>/dev/null || true   # any child claude run
   kill -TERM "$BRIDGE_PID" 2>/dev/null || true # the bridge (its SIGTERM handler exits cleanly)
   wait "$BRIDGE_PID" 2>/dev/null || true

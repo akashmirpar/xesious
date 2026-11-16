@@ -19,6 +19,7 @@ Env (set by run-staging.sh from .env.staging):
     STAGING_REAL_CLAUDE                         — "1" to test against real claude
 """
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -61,6 +62,8 @@ def selected_by_only(name: str) -> bool:
 # topic so it can be steered, which a DM cannot do — without this the spawning path
 # is untestable, and the case says so rather than passing vacuously.
 GROUP_ID = env("STAGING_GROUP_ID", required=False, default="")
+# The repository, for the helpers the cases run (test/staging/live_call.ts, tasks/cli.ts).
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Stub mode: single-turn (prompt, expected-substring), mirroring claude-stub.ts.
 CASES = [
@@ -69,6 +72,535 @@ CASES = [
     ("NORESP", "No answer came back"),  # the CLI queue artefact, never shown verbatim
     ("ERROR", "boom"),              # stub emits is_error with text "boom"
 ]
+
+
+async def _make_topic(client, title):
+    from telethon.tl import functions
+    peer = await client.get_input_entity(int(GROUP_ID))
+    res = await client(functions.messages.CreateForumTopicRequest(peer=peer, title=title))
+    tid = next((u.message.id for u in res.updates
+                if getattr(getattr(u, "message", None), "id", None) and getattr(u.message, "action", None)), None)
+    if tid:
+        note_topic(tid)
+    return tid
+
+
+async def feature_live_front_desk(client, bot):
+    """/live in a topic: the call's front desk (in the group's Live topic) hands work
+    to that topic, and the work's report must actually ARRIVE there, in real Telegram;
+    the call must hear it is done; and a summary of the call must land in Live.
+
+    A hand-off can go, by a name several topics share, to a deleted topic, where
+    every report is refused by Telegram while the call says "done". The in-process
+    tests fake Telegram, which accepts any thread, so
+    only this tier sees whether a report reaches anyone.
+    """
+    name = "live: the front desk's hand-off reports in its topic, the call hears it, Live gets a summary"
+    if not GROUP_ID:
+        return (name, False, "STAGING_GROUP_ID is not set, so the front desk was never exercised")
+    group = int(GROUP_ID)
+    tid = await _make_topic(client, "live check")
+    if not tid:
+        return (name, False, "could not create a topic to test in")
+    print(f"    topic: {tid}")
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    problems = []
+    try:
+        await client.send_message(group, "/live", reply_to=tid)
+        links_file = os.environ["LIVE_LINKS_FILE"]
+        def link():
+            try:
+                with open(links_file) as fh:
+                    for uuid, l in json.load(fh).items():
+                        if l.get("key") == f"{group}:{tid}" and l.get("desk"):
+                            return uuid, l
+            except (OSError, ValueError):
+                return None
+        # The first /live starts the live server and its tunnel: up to a couple of minutes.
+        got = await _until(link, 240)
+        if not got:
+            return (name, False, "/live made no front-desk link (no Live topic?)")
+        uuid, l = got
+        desk = int(l["desk"].split(":")[1])
+        print(f"    Live topic: {desk}")
+        with open(os.environ["LIVE_TUNNEL_STATE"]) as fh:
+            port = json.load(fh)["port"]
+
+        ask = ("Hand this to the topic this call came from, do not do it yourself: create a file named "
+               "live-probe.txt containing the word KIWI42, then reply with the file's contents.")
+        print("  → on the call: asking for work that belongs in the topic")
+        proc = await asyncio.create_subprocess_exec("bun", os.path.join(ROOT, "test", "staging", "live_call.ts"), str(port), uuid, "600", ask,
+                                                    stdout=asyncio.subprocess.PIPE)
+        msgs = []
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            try:
+                msgs.append(json.loads(line))
+            except ValueError:
+                pass
+        await proc.wait()
+        said = [m.get("text", "") for m in msgs if m.get("type") == "bot"]
+        print(f"    the call said: {said[:4]}")
+        notice = next((m for m in msgs if m.get("type") == "notice"), None)
+        if not notice:
+            problems.append("the call never heard that the handed-off work finished")
+        elif not notice.get("ok"):
+            problems.append(f"the call was told the work went wrong: {notice.get('line')}")
+
+        in_topic = [m for m in seen if _topic_of(m) == tid and not m.out]
+        header = next((m for m in in_topic if (reply_text(m) or "").startswith("⬅️ From")), None)
+        report = next((m for m in in_topic if "KIWI42" in (reply_text(m) or "") and m is not header), None)
+        if not header:
+            problems.append("the hand-off's header never reached the topic")
+        if not report:
+            problems.append("the hand-off's report (with KIWI42) never reached the topic")
+        else:
+            print(f"    report in the topic: {(reply_text(report) or '')[:80]!r}")
+        if any("could not be posted" in (reply_text(m) or "") for m in seen):
+            problems.append("a report was said to be undeliverable")
+
+        # The front desk's claude is kept for the call: the turn after the first (the
+        # notice) finds it running. Read from the call's trace.
+        calls_dir = os.environ.get("LIVE_CALLS_DIR", "")
+        traces = sorted((os.path.join(calls_dir, d, "trace.jsonl") for d in os.listdir(calls_dir)), key=os.path.getmtime) if os.path.isdir(calls_dir) else []
+        timings = []
+        if traces:
+            with open(traces[-1]) as fh:
+                timings = [json.loads(l)["msg"] for l in fh if '"stage":"timing"' in l.replace(" ", "")]
+        print(f"    timings: {timings}")
+        if not any("claude already running" in t for t in timings):
+            problems.append("no turn found the front desk's claude already running")
+
+        # Hung up: the summary goes to Live a few seconds later (LIVE_SUMMARY_AFTER_MS).
+        summary = await _until(lambda: next((m for m in seen if _topic_of(m) == desk and not m.out
+                                             and (reply_text(m) or "").startswith("🎙 Call")), None), 90)
+        if not summary:
+            problems.append("no summary of the call was posted in Live")
+        else:
+            print(f"    summary in Live: {(reply_text(summary) or '')[:100]!r}")
+    finally:
+        client.remove_event_handler(handler)
+    return (name, not problems, "; ".join(problems) or "report in the topic, notice on the call, summary in Live")
+
+
+async def feature_live_desk_peek(client, bot):
+    """By voice, about another topic: the front desk looks into it (topic_list,
+    topic_peek) and answers from what was said there, without handing work off and
+    without the person switching topics."""
+    name = "live: the front desk answers about another topic from its messages"
+    if not GROUP_ID:
+        return (name, False, "STAGING_GROUP_ID is not set")
+    group = int(GROUP_ID)
+    word = f"MANGO{os.urandom(2).hex().upper()}"
+    peek = await _make_topic(client, "peek check")
+    origin = await _make_topic(client, "peek origin")
+    if not peek or not origin:
+        return (name, False, "could not create the topics to test in")
+    print(f"    topics: peek {peek}, origin {origin}")
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    problems = []
+    try:
+        await client.send_message(group, f"Note for later, no need to do anything: the launch codename is {word}.", reply_to=peek)
+        # Its answer, so the topic holds people's words and the bot's.
+        await _until(lambda: next((m for m in seen if _topic_of(m) == peek and not m.out), None), 180)
+        await client.send_message(group, "/live", reply_to=origin)
+        links_file = os.environ["LIVE_LINKS_FILE"]
+        def link():
+            try:
+                with open(links_file) as fh:
+                    for uuid, l in json.load(fh).items():
+                        if l.get("key") == f"{group}:{origin}" and l.get("desk"):
+                            return uuid, l
+            except (OSError, ValueError):
+                return None
+        got = await _until(link, 240)
+        if not got:
+            return (name, False, "/live made no front-desk link")
+        uuid, _l = got
+        with open(os.environ["LIVE_TUNNEL_STATE"]) as fh:
+            port = json.load(fh)["port"]
+        ask = 'What is the launch codename someone mentioned in the topic called "peek check"? Just look, do not hand anything off.'
+        print("  → on the call: asking about another topic")
+        proc = await asyncio.create_subprocess_exec("bun", os.path.join(ROOT, "test", "staging", "live_call.ts"), str(port), uuid, "300", ask,
+                                                    stdout=asyncio.subprocess.PIPE, env={**os.environ, "LIVE_CALL_UNTIL": "answered"})
+        msgs = []
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            try:
+                msgs.append(json.loads(line))
+            except ValueError:
+                pass
+        await proc.wait()
+        said = " ".join(m.get("text", "") for m in msgs if m.get("type") == "bot")
+        tools = [m.get("label", "") for m in msgs if m.get("type") == "tool"]
+        print(f"    the call said: {said[:200]!r}")
+        print(f"    tools: {tools}")
+        if word not in said.replace(" ", "").upper():
+            problems.append(f"the answer did not give the codename {word}")
+        if any((reply_text(m) or "").startswith("⬅️ From") for m in seen if _topic_of(m) == peek):
+            problems.append("the desk handed work to the topic instead of looking")
+    finally:
+        client.remove_event_handler(handler)
+    return (name, not problems, "; ".join(problems) or f"answered {word} from the other topic")
+
+
+async def feature_live_page_topics(client, bot):
+    """The live page lists the group's topics, and the topic open on it is where
+    "here" points: asked "what was mentioned here?" with a topic open, the front desk
+    answers from that topic, not the one /live came from."""
+    name = "live: the page lists the topics, and \"here\" is the one open"
+    if not GROUP_ID:
+        return (name, False, "STAGING_GROUP_ID is not set")
+    group = int(GROUP_ID)
+    word = f"PAPAYA{os.urandom(2).hex().upper()}"
+    viewed = await _make_topic(client, "view check")
+    origin = await _make_topic(client, "view origin")
+    gone = await _make_topic(client, "gone from list")
+    if not viewed or not origin or not gone:
+        return (name, False, "could not create the topics to test in")
+    from telethon.tl import functions
+    try:
+        await client(functions.messages.DeleteTopicHistoryRequest(peer=await client.get_input_entity(group), top_msg_id=gone))
+    except Exception as e:  # noqa: BLE001
+        return (name, False, f"the test account could not delete a topic ({e})")
+    print(f"    topics: viewed {viewed}, origin {origin}")
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    problems = []
+    try:
+        await client.send_message(group, f"Note for later, no need to do anything: the codename is {word}.", reply_to=viewed)
+        await _until(lambda: next((m for m in seen if _topic_of(m) == viewed and not m.out), None), 180)
+        await client.send_message(group, "/live", reply_to=origin)
+        links_file = os.environ["LIVE_LINKS_FILE"]
+        def link():
+            try:
+                with open(links_file) as fh:
+                    for uuid, l in json.load(fh).items():
+                        if l.get("key") == f"{group}:{origin}" and l.get("desk"):
+                            return uuid, l
+            except (OSError, ValueError):
+                return None
+        got = await _until(link, 240)
+        if not got:
+            return (name, False, "/live made no front-desk link")
+        uuid, _l = got
+        with open(os.environ["LIVE_TUNNEL_STATE"]) as fh:
+            port = json.load(fh)["port"]
+        ask = "What codename was mentioned here? Just look, do not hand anything off."
+        show = 'Show me the topic called "view origin" on my screen.'
+        print("  → on the call, with the other topic open: asking about \"here\", then to be shown another")
+        proc = await asyncio.create_subprocess_exec("bun", os.path.join(ROOT, "test", "staging", "live_call.ts"), str(port), uuid, "300", ask, show,
+                                                    stdout=asyncio.subprocess.PIPE, env={**os.environ, "LIVE_CALL_UNTIL": "answered", "LIVE_CALL_VIEW": str(viewed)})
+        msgs = []
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            try:
+                msgs.append(json.loads(line))
+            except ValueError:
+                pass
+        await proc.wait()
+        listed = next((m for m in msgs if m.get("type") == "topics"), None)
+        if not listed:
+            problems.append("the page got no list of topics")
+        else:
+            names = [t.get("name") for t in listed.get("topics", [])]
+            print(f"    listed {len(names)} topics, Live {listed.get('live')}, origin {listed.get('origin')}")
+            if "view check" not in names or listed.get("origin") != origin:
+                problems.append(f"the list lacks the topic or the origin: {names[:10]}")
+            if "gone from list" in names:
+                problems.append("a topic deleted in Telegram is still listed")
+            if not any(t.get("color") for t in listed.get("topics", [])):
+                problems.append("no topic in the list carries its icon colour")
+        shown = next((m for m in msgs if m.get("type") == "show"), None)
+        if not shown or shown.get("topic") != origin:
+            problems.append(f"asked to be shown \"view origin\", the page was not told to open it: {shown}")
+        said = " ".join(m.get("text", "") for m in msgs if m.get("type") == "bot")
+        print(f"    the call said: {said[:200]!r}")
+        if word not in said.replace(" ", "").replace("-", "").upper():
+            problems.append(f"the answer did not give {word} from the open topic")
+        if not os.path.exists(links_file) or not json.load(open(links_file)).get(uuid, {}).get("used"):
+            problems.append("the link was not stamped as used")
+    finally:
+        client.remove_event_handler(handler)
+    return (name, not problems, "; ".join(problems) or f"listed the topics; answered {word} from the open topic")
+
+
+async def feature_live_type_into_topic(client, bot):
+    """Typed into a topic on the live page: it shows in that topic in Telegram as the
+    person's ("✍️ name, from Live"), runs there, the answer is posted under it, and the
+    page sees the answer in the topic's messages."""
+    name = "live: typing into a topic on the page reaches the topic, and its answer the page"
+    if not GROUP_ID:
+        return (name, False, "STAGING_GROUP_ID is not set")
+    group = int(GROUP_ID)
+    word = f"KIWI{os.urandom(2).hex().upper()}"
+    target = await _make_topic(client, "type check")
+    origin = await _make_topic(client, "type origin")
+    if not target or not origin:
+        return (name, False, "could not create the topics to test in")
+    print(f"    topics: target {target}, origin {origin}")
+    seen = []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    problems = []
+    try:
+        await client.send_message(group, "/live", reply_to=origin)
+        links_file = os.environ["LIVE_LINKS_FILE"]
+        def link():
+            try:
+                with open(links_file) as fh:
+                    for uuid, l in json.load(fh).items():
+                        if l.get("key") == f"{group}:{origin}" and l.get("desk"):
+                            return uuid, l
+            except (OSError, ValueError):
+                return None
+        got = await _until(link, 240)
+        if not got:
+            return (name, False, "/live made no front-desk link")
+        uuid, _l = got
+        with open(os.environ["LIVE_TUNNEL_STATE"]) as fh:
+            port = json.load(fh)["port"]
+        text = f"Reply with just the word {word} and nothing else."
+        print("  → typing into the topic on the page")
+        proc = await asyncio.create_subprocess_exec("bun", os.path.join(ROOT, "test", "staging", "live_call.ts"), str(port), uuid, "300",
+                                                    stdout=asyncio.subprocess.PIPE, env={**os.environ, "LIVE_CALL_VIEW": str(target), "LIVE_CALL_TYPE": text})
+        msgs = []
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            try:
+                msgs.append(json.loads(line))
+            except ValueError:
+                pass
+        await proc.wait()
+        typed = next((m for m in msgs if m.get("type") == "typed"), None)
+        if not typed or not typed.get("ok"):
+            problems.append(f"the page was not told it was sent: {typed}")
+        in_topic = [m for m in seen if _topic_of(m) == target and not m.out]
+        quote = next((m for m in in_topic if (reply_text(m) or "").startswith("✍️") and "from Live" in (reply_text(m) or "")), None)
+        answer = next((m for m in in_topic if word in (reply_text(m) or "") and m is not quote), None)
+        if not quote:
+            problems.append("the typed message never showed in the topic")
+        else:
+            print(f"    in the topic: {(reply_text(quote) or '')[:90]!r}")
+        if not answer:
+            problems.append(f"no answer with {word} in the topic")
+        page = [m for m in msgs if m.get("type") == "messages"]
+        if not any(any(x.get("bot") and word in x.get("text", "") for x in m.get("messages", [])) for m in page):
+            problems.append("the page never got the answer in the topic's messages")
+        if page and not any(any(x.get("text") == text and not x.get("bot") for x in m.get("messages", [])) for m in page):
+            problems.append("the page's messages lack the typed one as the person's")
+    finally:
+        client.remove_event_handler(handler)
+    return (name, not problems, "; ".join(problems) or f"quoted in the topic, answered {word}, the page saw it")
+
+
+async def feature_live_allow_from_page(client, bot):
+    """Claude asks a question in a topic (AskUserQuestion, which always comes to the
+    person through the bot): the live page, open on that topic, shows it and answers
+    it; the run goes on with the answer, its reply is posted in the topic and reaches
+    the page, and the question in Telegram shows the answer. (A shell
+    command would not do: Bash is in the bot's allowed tools by default.)"""
+    name = "live: Claude's question in a topic is answered from the page"
+    if not GROUP_ID:
+        return (name, False, "STAGING_GROUP_ID is not set")
+    group = int(GROUP_ID)
+    word = f"PERM{os.urandom(2).hex().upper()}"
+    target = await _make_topic(client, "allow check")
+    origin = await _make_topic(client, "allow origin")
+    if not target or not origin:
+        return (name, False, "could not create the topics to test in")
+    print(f"    topics: target {target}, origin {origin}")
+    seen, edits = [], []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    @client.on(events.MessageEdited(chats=group))
+    async def edited(ev):
+        edits.append(ev.message)
+
+    problems = []
+    try:
+        await client.send_message(group, "/live", reply_to=origin)
+        links_file = os.environ["LIVE_LINKS_FILE"]
+        def link():
+            try:
+                with open(links_file) as fh:
+                    for uuid, l in json.load(fh).items():
+                        if l.get("key") == f"{group}:{origin}" and l.get("desk"):
+                            return uuid, l
+            except (OSError, ValueError):
+                return None
+        got = await _until(link, 240)
+        if not got:
+            return (name, False, "/live made no front-desk link")
+        uuid, _l = got
+        with open(os.environ["LIVE_TUNNEL_STATE"]) as fh:
+            port = json.load(fh)["port"]
+        await client.send_message(group, f"Use the AskUserQuestion tool to ask me one question: which colour, with exactly two options, Red and Blue. Then reply with just {word}- followed by the colour I picked.", reply_to=target)
+        asked = await _until(lambda: next((m for m in seen if _topic_of(m) == target and (reply_text(m) or "").startswith("❓")), None), 240)
+        if not asked:
+            return (name, False, "Claude never asked its question in the topic")
+        print(f"    asked in Telegram: {(reply_text(asked) or '')[:80]!r}")
+        print("  → the page, open on that topic, answers it (the second option)")
+        proc = await asyncio.create_subprocess_exec("bun", os.path.join(ROOT, "test", "staging", "live_call.ts"), str(port), uuid, "300",
+                                                    stdout=asyncio.subprocess.PIPE, env={**os.environ, "LIVE_CALL_VIEW": str(target), "LIVE_CALL_ALLOW": "1", "LIVE_CALL_EXPECT": word})
+        msgs = []
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            try:
+                msgs.append(json.loads(line))
+            except ValueError:
+                pass
+        await proc.wait()
+        answered = next((m for m in msgs if m.get("type") == "answered"), None)
+        if not answered or not answered.get("ok"):
+            problems.append(f"the page's answer did not go through: {answered}")
+        if not any(any(x.get("bot") and word in x.get("text", "") for x in m.get("messages", [])) for m in msgs if m.get("type") == "messages"):
+            problems.append("the page never got the answer after allowing")
+        answer = await _until(lambda: next((m for m in seen if _topic_of(m) == target and f"{word}-" in (reply_text(m) or "") and not (reply_text(m) or "").startswith("Use the")), None), 120)
+        if not answer:
+            problems.append(f"no answer with {word} in the topic")
+        elif "blue" not in (reply_text(answer) or "").lower():
+            problems.append(f"the answer did not follow the page's pick (Blue): {(reply_text(answer) or '')[:80]!r}")
+        if not any("✅ Blue" in (reply_text(m) or "") for m in edits):
+            problems.append("the question in Telegram never showed the answer")
+    finally:
+        client.remove_event_handler(handler)
+        client.remove_event_handler(edited)
+    return (name, not problems, "; ".join(problems) or f"answered Blue from the page; the run replied {word}-Blue; Telegram shows the answer")
+
+
+async def feature_live_answer_by_voice(client, bot):
+    """Claude asks a question in a topic, and the person answers it on the call, in
+    words: the front desk answers it for them (answer_wait), and the run goes on with
+    that answer."""
+    name = "live: Claude's question in a topic is answered by voice, through the front desk"
+    if not GROUP_ID:
+        return (name, False, "STAGING_GROUP_ID is not set")
+    group = int(GROUP_ID)
+    word = f"VOICE{os.urandom(2).hex().upper()}"
+    target = await _make_topic(client, "voice answer check")
+    origin = await _make_topic(client, "voice answer origin")
+    if not target or not origin:
+        return (name, False, "could not create the topics to test in")
+    print(f"    topics: target {target}, origin {origin}")
+    seen, edits = [], []
+
+    @client.on(events.NewMessage(chats=group))
+    async def handler(ev):
+        seen.append(ev.message)
+
+    @client.on(events.MessageEdited(chats=group))
+    async def edited(ev):
+        edits.append(ev.message)
+
+    problems = []
+    try:
+        await client.send_message(group, "/live", reply_to=origin)
+        links_file = os.environ["LIVE_LINKS_FILE"]
+        def link():
+            try:
+                with open(links_file) as fh:
+                    for uuid, l in json.load(fh).items():
+                        if l.get("key") == f"{group}:{origin}" and l.get("desk"):
+                            return uuid, l
+            except (OSError, ValueError):
+                return None
+        got = await _until(link, 240)
+        if not got:
+            return (name, False, "/live made no front-desk link")
+        uuid, _l = got
+        with open(os.environ["LIVE_TUNNEL_STATE"]) as fh:
+            port = json.load(fh)["port"]
+        await client.send_message(group, f"Use the AskUserQuestion tool to ask me one question: which colour, with exactly two options, Red and Blue. Then reply with just {word}- followed by the colour I picked.", reply_to=target)
+        asked = await _until(lambda: next((m for m in seen if _topic_of(m) == target and (reply_text(m) or "").startswith("❓")), None), 240)
+        if not asked:
+            return (name, False, "Claude never asked its question in the topic")
+        say = 'The "voice answer check" topic is asking which colour. Answer it for me: Blue.'
+        print("  → on the call: answering it in words")
+        proc = await asyncio.create_subprocess_exec("bun", os.path.join(ROOT, "test", "staging", "live_call.ts"), str(port), uuid, "300", say,
+                                                    stdout=asyncio.subprocess.PIPE, env={**os.environ, "LIVE_CALL_VIEW": str(target), "LIVE_CALL_EXPECT": word})
+        msgs = []
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            try:
+                msgs.append(json.loads(line))
+            except ValueError:
+                pass
+        await proc.wait()
+        tools = [m.get("label", "") for m in msgs if m.get("type") == "tool"]
+        print(f"    tools: {tools}")
+        print(f"    the call said: {' '.join(m.get('text', '') for m in msgs if m.get('type') == 'bot')[:200]!r}")
+        if not any("answer_wait" in t for t in tools):
+            problems.append("the front desk never used answer_wait")
+        answer = await _until(lambda: next((m for m in seen if _topic_of(m) == target and f"{word}-" in (reply_text(m) or "") and not (reply_text(m) or "").startswith("Use the")), None), 120)
+        if not answer:
+            problems.append(f"no answer with {word} in the topic")
+        elif "blue" not in (reply_text(answer) or "").lower():
+            problems.append(f"the answer did not follow what was said (Blue): {(reply_text(answer) or '')[:80]!r}")
+    finally:
+        client.remove_event_handler(handler)
+        client.remove_event_handler(edited)
+    return (name, not problems, "; ".join(problems) or f"the desk answered Blue; the run replied {word}-Blue")
+
+
+async def feature_handoff_to_deleted_topic(client, bot):
+    """Work handed to a topic deleted in Telegram must fail at once and say so, not run
+    with nowhere to post and be reported done."""
+    name = "a hand-off to a deleted topic fails loudly"
+    if not GROUP_ID:
+        return (name, False, "STAGING_GROUP_ID is not set")
+    from telethon.tl import functions
+    group = int(GROUP_ID)
+    tid = await _make_topic(client, "gone check")
+    if not tid:
+        return (name, False, "could not create a topic to test in")
+    try:
+        await client(functions.messages.DeleteTopicHistoryRequest(peer=await client.get_input_entity(group), top_msg_id=tid))
+    except Exception as e:  # noqa: BLE001
+        return (name, False, f"the test account could not delete the topic ({e})")
+    state = os.path.dirname(os.environ["TG_STATE_FILE"])
+    with open(os.path.join(state, "xesious.token")) as fh:
+        token = fh.read().strip()
+    env = {**os.environ, "XESIOUS_API_SOCK": os.path.join(state, "xesious.sock"), "XESIOUS_API_TOKEN": token}
+    proc = await asyncio.create_subprocess_exec("bun", os.path.join(ROOT, "tasks", "cli.ts"), "run", "--chat", str(group), "--topic", str(tid),
+                                                "Say hello", env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, err = await asyncio.wait_for(proc.communicate(), 120)
+    text = (out + err).decode(errors="replace")
+    print(f"    xesious run: exit {proc.returncode}: {text.strip()[:160]!r}")
+    ok = proc.returncode != 0 and "no longer exists" in text
+    return (name, ok, "refused: the topic no longer exists" if ok else f"expected a refusal, got exit {proc.returncode}: {text.strip()[:200]}")
 
 
 # Real-claude features are exercised by the async functions in FEATURE_TESTS (defined
@@ -3691,6 +4223,7 @@ FEATURE_TESTS = [feature_mode_enforcement, feature_rich_table, feature_tilde_pro
                  feature_config_topic_instructions,
                  feature_conversation_mode,
                  feature_auto_mode,
+                 feature_live_front_desk, feature_live_desk_peek, feature_live_page_topics, feature_live_type_into_topic, feature_live_allow_from_page, feature_live_answer_by_voice, feature_handoff_to_deleted_topic,
                  # Last, and in this order: they drive a group, spawn several sessions and
                  # keep talking for a while after they return. Ahead of the DM cases they
                  # simply make more noise for those to trip over.

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# One-time setup for turn-based voice: STT (faster-whisper) + TTS (Kokoro).
+# One-time setup for turn-based voice: STT (faster-whisper) + TTS (Paradee and Kokoro).
 # Idempotent, no API keys — everything runs locally on this box.
 #
-#   voice/setup.sh              # STT + Kokoro (the good voice). No root needed.
+#   voice/setup.sh              # STT + Paradee (the default voice) + Kokoro. No root needed.
 #   voice/setup.sh --espeak     # also install the robotic espeak-ng fallback (needs apt)
 #   voice/setup.sh --piper      # also install Piper + a neural voice
 #   voice/setup.sh --check      # report what is installed and change nothing
@@ -128,6 +128,8 @@ if [ "$CHECK" = 1 ]; then
   echo "kokoro-onnx    (TTS): $("$PY_BIN" -c 'import kokoro_onnx;print("present")' 2>/dev/null || echo MISSING)"
   echo "kokoro model        : $([ -f voice/kokoro/kokoro-v1.0.onnx ] && echo present || echo MISSING)"
   echo "kokoro voices       : $([ -f voice/kokoro/voices-v1.0.bin ] && echo present || echo MISSING)"
+  echo "paradee        (TTS): $(voice/paradee/.venv/bin/python3 -c 'import paradee;print("present")' 2>/dev/null || echo MISSING)"
+  echo "paradee model       : $([ -f voice/paradee/paradee_int8.onnx ] && [ -f voice/paradee/config.json ] && echo present || echo MISSING)"
   echo "espeak-ng  (fallback): $(command -v espeak-ng >/dev/null 2>&1 && echo present || echo MISSING)"
   exit 0
 fi
@@ -190,6 +192,46 @@ fetch "$KBASE/kokoro-v1.0.onnx" voice/kokoro/kokoro-v1.0.onnx "Kokoro model (~31
 fetch "$KBASE/voices-v1.0.bin" voice/kokoro/voices-v1.0.bin "Kokoro voices" \
   || { FAILED+=("kokoro voices"); NOTES+=("the Kokoro voices file did not download — re-run to retry."); }
 
+# 3b. Paradee — the DEFAULT voice. An 8.5 MB model distilled from Kokoro that speaks
+#     four of its voices (af_heart, am_puck, bf_isabella, bm_fable) and, measured on
+#     this class of box 2026-11-08, makes speech ~20x faster than it plays where
+#     Kokoro manages under 2x. Kokoro above stays: it has the other 24 English voices
+#     and the non-English ones, and a topic can switch to it with /voice engine.
+#
+#     A venv of its own, voice/paradee/.venv, and not the interpreter Kokoro uses.
+#     Its phonemiser (misaki) pulls in phonemizer-fork, which installs over the
+#     `phonemizer` package kokoro-onnx imports — one site-packages would trade one
+#     engine for the other. uv when it exists (it brings its own pip); otherwise the
+#     stdlib venv, which needs ensurepip.
+PARADEE_DIR=voice/paradee
+PARADEE_PY="$ROOT/$PARADEE_DIR/.venv/bin/python3"
+PARADEE_PKG="paradee @ git+https://github.com/sahilmahendrakar/paradee@c2789ef9abf54a9384eef89cc7de3f1afe5ad01d"
+# misaki loads this spaCy model on first use and, when it is missing, pip-installs it
+# from inside the synthesiser — which fails under PEP 668 and stalls the first answer.
+SPACY_SM="en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+PBASE="${TG_PARADEE_URL:-https://huggingface.co/sahilmahendrakar/Paradee-8M-v1.2/resolve/v1.2}"
+mkdir -p "$PARADEE_DIR"
+UV="$(command -v uv 2>/dev/null || true)"
+[ -z "$UV" ] && [ -x "$HOME/.local/bin/uv" ] && UV="$HOME/.local/bin/uv"
+if [ -x "$PARADEE_PY" ] && "$PARADEE_PY" -c 'import paradee, soundfile, en_core_web_sm' 2>/dev/null; then
+  say "paradee: already installed"
+else
+  say "installing Paradee into $PARADEE_DIR/.venv…"
+  ok=0
+  if [ -n "$UV" ]; then
+    "$UV" venv --quiet --allow-existing --python "$(command -v python3)" "$PARADEE_DIR/.venv" \
+      && VIRTUAL_ENV="$ROOT/$PARADEE_DIR/.venv" "$UV" pip install --quiet --python "$PARADEE_PY" "$PARADEE_PKG" soundfile "$SPACY_SM" \
+      && ok=1
+  elif python3 -m venv "$PARADEE_DIR/.venv" >/dev/null 2>&1 && "$PARADEE_PY" -m pip --version >/dev/null 2>&1; then
+    "$PARADEE_PY" -m pip install --quiet "$PARADEE_PKG" soundfile "$SPACY_SM" && ok=1
+  fi
+  [ $ok = 1 ] || { FAILED+=("paradee"); NOTES+=("Paradee did not install — needs uv, or python3-venv with pip. Kokoro still speaks."); }
+fi
+fetch "$PBASE/onnx/paradee_int8.onnx" "$PARADEE_DIR/paradee_int8.onnx" "Paradee model (~9MB)" \
+  || { FAILED+=("paradee model"); NOTES+=("the Paradee model did not download — re-run to retry."); }
+fetch "$PBASE/config.json" "$PARADEE_DIR/config.json" "Paradee config" \
+  || { FAILED+=("paradee config"); NOTES+=("the Paradee config did not download — re-run to retry."); }
+
 # 4. Optional extras. Neither is on the good path, and neither may abort the run —
 #    failing to install a FALLBACK is not a reason to fail the install.
 if [ "$WANT_ESPEAK" = 1 ] && ! command -v espeak-ng >/dev/null 2>&1; then
@@ -214,19 +256,21 @@ fi
 #    installed half of what was asked for is how you end up debugging silence.
 # ---------------------------------------------------------------------------
 echo
-STT_OK=0; TTS_OK=0
+STT_OK=0; TTS_OK=0; ENGINES=()
 "$PY_BIN" -c 'import faster_whisper' 2>/dev/null && STT_OK=1
-"$PY_BIN" -c 'import kokoro_onnx' 2>/dev/null && [ -f voice/kokoro/kokoro-v1.0.onnx ] && [ -f voice/kokoro/voices-v1.0.bin ] && have_ffmpeg && TTS_OK=1
+[ -x "$PARADEE_PY" ] && "$PARADEE_PY" -c 'import paradee' 2>/dev/null && [ -f "$PARADEE_DIR/paradee_int8.onnx" ] && [ -f "$PARADEE_DIR/config.json" ] && ENGINES+=(paradee)
+"$PY_BIN" -c 'import kokoro_onnx' 2>/dev/null && [ -f voice/kokoro/kokoro-v1.0.onnx ] && [ -f voice/kokoro/voices-v1.0.bin ] && ENGINES+=(kokoro)
+have_ffmpeg && [ ${#ENGINES[@]} -gt 0 ] && TTS_OK=1
 say "listening (speech → text): $([ $STT_OK = 1 ] && echo 'ready' || echo 'NOT WORKING')"
-say "speaking  (text → speech): $([ $TTS_OK = 1 ] && echo 'ready (kokoro)' || echo 'NOT WORKING')"
+say "speaking  (text → speech): $([ $TTS_OK = 1 ] && echo "ready (${ENGINES[*]})" || echo 'NOT WORKING')"
 for n in "${NOTES[@]:-}"; do [ -n "$n" ] && echo "    - $n"; done
 echo
 if [ $STT_OK = 1 ] || [ $TTS_OK = 1 ]; then
-  # NOT "now set TG_TTS_ENGINE": tts.sh already picks kokoro whenever the model file
-  # is on disk, so telling the user to edit .env implies voice is still broken when
-  # it is not. The variables are overrides, and are described as such.
-  [ $TTS_OK = 1 ] && say "no configuration needed — tts.sh selects kokoro because the model is present."
-  [ $TTS_OK = 1 ] && say "optional overrides:  TG_KOKORO_VOICE=af_heart  TG_TTS_ENGINE=kokoro|piper|espeak"
+  # NOT "now set TG_TTS_ENGINE": tts.sh already picks paradee, then kokoro, whichever
+  # is on disk first, so telling the user to edit .env implies voice is still broken
+  # when it is not. The variables are overrides, and are described as such.
+  [ $TTS_OK = 1 ] && say "no configuration needed — tts.sh selects ${ENGINES[0]} because it is installed."
+  [ $TTS_OK = 1 ] && say "optional overrides:  TG_KOKORO_VOICE=af_heart  TG_TTS_ENGINE=paradee|kokoro|piper|espeak"
   say "turn it on: send /voice on in a topic, or set TG_VOICE=1 in .env for every topic."
 fi
 [ $STT_OK = 1 ] && [ $TTS_OK = 1 ] && { say "done."; exit 0; }

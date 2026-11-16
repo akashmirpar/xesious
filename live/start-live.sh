@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run the live voice server in tmux so it survives SSH disconnect, respawning on
-# crash. Reads LIVE_* and TG_KOKORO_* from .env.
+# crash. Reads LIVE_* and TG_KOKORO_* from .env. Only for serving it behind your own
+# domain (LIVE_URL); with no LIVE_URL, /live starts the server itself.
 #
 #   live/start-live.sh                 # start (or report already running)
 #   tmux attach -t live-voice          # watch logs
@@ -16,7 +17,6 @@ if ! command -v bun >/dev/null 2>&1; then
 fi
 command -v bun >/dev/null 2>&1 || { echo "ERROR: bun not on PATH" >&2; exit 1; }
 [ -f "$DIR/.env" ] || { echo "ERROR: $DIR/.env missing" >&2; exit 1; }
-grep -qE '^LIVE_PASSCODE=.+' "$DIR/.env" || { echo "ERROR: set LIVE_PASSCODE in .env" >&2; exit 1; }
 
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "Already running in tmux '$SESSION'.  Attach: tmux attach -t $SESSION"

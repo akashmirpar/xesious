@@ -89,7 +89,7 @@ In a group, the commands that only inform the person asking — `/status`, `/job
 | `/resume [id]` | Restore the previous session (undo `/new`), or bind this topic to a specific past session — the 8-character prefix `/sessions` prints is enough, and an ambiguous one is refused rather than guessed |
 | `/compact [focus]` | Summarize this topic's session history to free up context (memory kept) |
 | `/stop` | Cancel the turn currently running in this topic. A `/bg` run or a task's run there goes on: those stop from `/jobs` (or a task's card), and `/stop` says they are still running |
-| `/voice [on\|off\|parts on\|off]` | Voice mode: transcribe voice notes and speak answers back (eyes-free). Default from `TG_VOICE`. `parts` decides whether the progressive notes are sent or only the full file. |
+| `/voice [on\|off\|transcribe on\|off\|answers full\|summary\|off\|parts on\|off\|engine paradee\|kokoro]` | Voice: two switches, set on the keyboard or one at a time: **transcribe voice notes** (`transcribe`, speech to text) and **speak answers** (`answers`, text to speech); `on`/`off` sets both. Also in `/config`. Defaults: `TG_VOICE` speaks; voice notes are transcribed wherever `SONIOX_API_KEY` is set, else with `TG_VOICE` (`TG_VOICE_NOTES=on\|off` decides it outright). `parts` decides whether the progressive notes are sent or only the full file; `engine` which voice model speaks here. A bare `/voice` **in reply to any message** (the bot's, yours, anyone's) reads that message out, whatever the voice mode. |
 | `/interrupt [on\|off]` | Toggle interrupt mode: a new message cancels the running task and starts immediately (its reply comes as a new message) instead of queueing. Default from `TG_INTERRUPT`. |
 | `/mode [plan\|acceptEdits\|auto\|bypass]` | Show or set this topic's permission mode. No argument opens a tap-to-switch keyboard. Persists per topic; defaults to `TG_PERMISSION_MODE`. |
 | `/plan <task>` | One read-only turn: Claude researches and proposes without editing. Doesn't change the topic's mode, so "go ahead" carries the plan out; the plan comes with a ✅ Go ahead button that does just that. |
@@ -156,13 +156,25 @@ Send and receive files through the same topic.
 ## Voice (eyes-free, turn-based)
 
 Talk to a topic and hear the answer — no reading or typing. It runs **locally, no
-API key**: `faster-whisper` for speech→text, **Kokoro** for text→speech, and a fast
-model (Haiku) to summarize long answers into a few spoken sentences.
+API key**: `faster-whisper` for speech→text, **Paradee** (or Kokoro) for text→speech,
+and a fast model (Haiku) to summarize long answers into a few spoken sentences.
+
+Two voice engines, chosen per topic on the `/voice` keyboard or with `/voice engine`:
+
+| Engine | Voices | Speed on this class of VPS |
+|---|---|---|
+| **Paradee** (default) | 4: `af_heart`, `am_puck`, `bf_isabella`, `bm_fable` | ~20x faster than it plays |
+| Kokoro | 28 English, plus 7 other languages | under 2x |
+
+[Paradee](https://github.com/sahilmahendrakar/paradee) is an 8.5 MB model distilled
+from Kokoro, speaking four of its voices under the same names. A speaker chosen under
+Kokoro is spoken by the Paradee voice of the same accent and gender; naming a voice
+only Kokoro has (`/voice speaker bm_george`) moves the topic to Kokoro.
 
 Setup once — **no root required**:
 
 ```bash
-voice/setup.sh            # faster-whisper + Kokoro (the good voice). ~340 MB of models.
+voice/setup.sh            # faster-whisper + Paradee + Kokoro. ~500 MB to download.
 voice/setup.sh --check    # report what's installed, change nothing
 voice/setup.sh --espeak   # also the robotic espeak-ng fallback (this one needs apt)
 voice/setup.sh --piper    # also Piper + a neural voice
@@ -174,10 +186,13 @@ and never dropping `--user`), and the one native tool — `ffmpeg`, used solely 
 transcode the outgoing WAV to Opus — is taken from the system if present and
 otherwise installed privately into `voice/bin/` from pip. If a step fails the script
 **keeps going and tells you what works**: a missing `ffmpeg` costs you speaking, not
-listening, and neither costs you the install.
+listening, and neither costs you the install. Paradee is the exception to `--user`: it
+gets its own venv, `voice/paradee/.venv` (made with `uv` when present), because its
+phonemiser installs a `phonemizer` that replaces the one Kokoro imports.
 
-No configuration follows: `voice/tts.sh` selects Kokoro whenever its model is on
-disk. `TG_TTS_ENGINE` (`kokoro|piper|espeak`) and `TG_KOKORO_VOICE` are overrides.
+No configuration follows: the bridge and `voice/tts.sh` select Paradee, then Kokoro,
+whichever is on disk. `TG_TTS_ENGINE` (`paradee|kokoro|piper|espeak`) sets the server's
+default and `TG_KOKORO_VOICE` its speaker; a topic's own choice wins over both.
 
 A long answer is **spoken as it is made** rather than after it — but by default it is
 **sent quietly**: one status bubble while it speaks, then the finished audio.
@@ -208,13 +223,29 @@ A long answer is **spoken as it is made** rather than after it — but by defaul
 Synthesis runs off the topic's queue, so the next message you send is answered
 immediately.
 
-Then per topic send `/voice on` (or set `TG_VOICE=1` for all topics). With voice on:
+Then per topic send `/voice on` (or set `TG_VOICE=1` for all topics). Voice is two
+switches, apart on the `/voice` keyboard and in `/config`: **Transcribe voice notes**
+(`/voice transcribe on|off`) and **Speak answers** (`/voice answers full|summary|off`);
+`/voice on` and `/voice off` set both. With both on:
 
 - **Send a voice note** → it's transcribed and run as your message. The bridge first
   echoes `🎙 "<what it heard>"` so a mis-hear is visible, then answers.
 - **Every answer is also spoken back** as a voice message — short answers verbatim,
   long ones summarized to a couple of sentences so the note stays seconds, not minutes.
 - Works with everything else: `/stop`, `/interrupt`, `/mode`, `/model` still apply.
+
+**Hearing voice notes with Soniox.** With `SONIOX_API_KEY` set (the live page's key),
+voice notes and round videos are heard by Soniox's file API instead: Persian as well
+as English, 2–3 s whatever the length, and voice notes are transcribed **in every
+topic by default** (turn it off per topic with `/voice transcribe off`). The note is uploaded to
+Soniox and deleted there once heard; local whisper is the fallback when Soniox fails,
+and `TG_STT_ENGINE=local` keeps notes on this machine.
+
+A **forwarded** voice note is someone else's words: it is heard and shown
+(`🎙 Forwarded from Sam: "…"`), then handed to Claude the way a forwarded text is,
+as material to read and never as what you asked. Sent with a comment, it joins that
+comment's turn. What a note said is kept as its text in the topic's history, so later
+mentions and the live page read it.
 
 `/voice off` returns a topic to text-only. Knobs: `TG_STT_MODEL` (whisper size),
 `TG_STT_LANG` (force a language), `TG_PIPER_VOICE`, `TG_VOICE_SUMMARY_MODEL`,
@@ -360,7 +391,7 @@ Claude Code keeps its own memory per working directory, and every topic has its 
 Things the bot does on its own, later, again and again, or when something happens, reporting where they were set up. Ask for one in plain words, in a topic or a DM:
 
 - "remind me in two hours to take the pills" — a 🔔 **reminder**: the message at its time, naming whoever asked, with ✅ Done and ⏰ +15 min.
-- "every weekday at 9, summarize what changed in the repo" — a ⏰ **scheduled** Claude run: a fresh session each time (or one session it keeps, if asked), in the topic's folder with its model, effort and permission mode, acting for the person who set it up.
+- "every weekday at 9, summarize what changed in the repo" — a ⏰ **scheduled** Claude run: a fresh session each time (or one session it keeps, if asked), in the topic's folder with its model, effort and permission mode, acting for the person who set it up. A task keeps the folder its topic had when it was made, so a later `/cwd` in the topic doesn't move it (its card shows it for scripts, plans and watchers); ask the bot to give it another one (`folder`).
 - "every evening, check the news and only tell us if something big happened" — a run that speaks only when it found something. A task can post its progress as it goes, its result (the default), only what's worth telling, only problems, or nothing; its history keeps every run either way. It can post to your DM instead, stop after a number of runs or at a date.
 - "tell me when this product's price drops below 300", "when the share price moves more than 1% in 3 minutes, find out why", "keep the sync loop running" — a 👀 **watcher**: see [Watchers](#watchers).
 - "every night, back up the database; only tell me if it fails" — a **script**: a command, with no AI. Its status decides; what it prints is posted as the task says (its output; only when it printed something; only when it fails, every failure, loud).
@@ -385,7 +416,7 @@ The rules:
 - At most `TG_TASKS_MAX_CLAUDE` (2) scheduled Claude runs at once, 2 scripts at once, 20 tasks per topic, at most one run a minute. Each run's model, tokens, cost and time are kept in its history.
 - A task runs until it's paused, deleted or finished, or until an end it was given ("for the next two weeks"); when it reaches that end it says so in its topic, with ▶️ Keep it running.
 
-In a forum group Claude can also make a topic for a new piece of work (with its own folder, or one you name, and another topic's settings), rename a topic, or move one to another folder: `topic_create`, `topic_rename`, `topic_set_cwd`. Moving the topic you're talking in happens when the turn ends.
+In a forum group Claude can also make a topic for a new piece of work (with its own folder, or one you name, and another topic's settings), rename a topic, or move one to another folder: `topic_create`, `topic_rename`, `topic_set_cwd`. Moving the topic you're talking in happens when the turn ends. It can also see what every topic is doing (`topic_list`: working on what, queued turns, waiting for you, last active) and look into one (`topic_peek`: its latest messages, people's and the bot's, and its run in progress).
 
 Scripts on the server reach the bot through a Unix socket, `state/xesious.sock`, open only to the bot's user, with the operator token in `state/xesious.token`:
 
@@ -409,7 +440,7 @@ Each Claude run talks to it with a token of its own, scoped to its chat, topic a
 
 ### Hand-offs and plans
 
-- **Hand-offs.** Work can be handed to another topic of the same group, where it's done as a turn of its own, fresh, in that topic's folder with its instructions and skills, as the person who handed it off. Claude does it when you ask ("hand this to the Posting topic"), and a task can say so (`then`): when its run works, its result and the files it made go to that topic. The topic gets a "⬅️ From …" header with the whole brief (a longer one in a quote that opens with a tap, and past what a message holds, as `brief.md` too), the run's progress and its result; the topic it came from gets a "➡️ Handed to …" line that says ✅ Done or why not. Chains stop at 3 deep, at most 30 an hour per group. The brief is relayed material, never a message from a person. A run can also wait for the result, up to 10 minutes, to carry on with it ("ask the Research topic, then use what it finds"); past that it goes on there.
+- **Hand-offs.** Work can be handed to another topic of the same group, where it's done as a turn of its own, fresh, in that topic's folder with its instructions and skills, as the person who handed it off. Claude does it when you ask ("hand this to the Posting topic"), and a task can say so (`then`): when its run works, its result and the files it made go to that topic. The topic gets a "⬅️ From …" header with the whole brief (a longer one in a quote that opens with a tap, and past what a message holds, as `brief.md` too), the run's progress and its result; the topic it came from gets a "➡️ Handed to …" line that says ✅ Done or why not. Chains stop at 3 deep, at most 60 an hour per group, and 3 run at once (the rest wait their turn). The brief is relayed material, never a message from a person. A run can also wait for the result, up to 10 minutes, to carry on with it ("ask the Research topic, then use what it finds"); past that it goes on there.
 - **Flows** (🔀). What a run set going (its hand-offs and theirs, the tasks that ran after it, the tasks it made) is one flow, on the task's card ("🔀 Its last run → ➡️ Posting ✅ → ➡️ @statsbot in Stats ⏳") and under 🔀 Flows in `/tasks` and on the board, the last week's, each part a link to where it happened. In a topic, the flows that start or arrive there; in the 🗂 Tasks topic, the whole group's.
 - **To another xesious bot.** When a topic is another xesious bot's, the hand-off goes to that bot ("hand this to @PostingBot in Posting"): an ordinary message in that topic that names it and carries a `#handoff-…` tag. That bot does the work under its own rules and replies ✅ or ❌, and the "➡️ Handed to @PostingBot …" line here says which; no answer in 6 hours is a loud failure (a late one still counts). Files go through Telegram, as documents in that topic just before the message: up to 2 GB each with `TG_API_ID`/`TG_API_HASH` set on both bots ([Big files](#big-files)), else up to 20 MB, what a bot can fetch from Telegram, and a bigger one goes as a link this bot serves for a day, which needs `TG_TASKS_WEBHOOK_PORT` (and `TG_TASKS_PUBLIC_URL` when the bots are on different machines). A brief too long for one message goes whole as `brief.md`, the same way. Work another bot hands to this one runs as a turn of its own in the topic, under the topic's mode, with the bot's tools, as its first allowed user (`TG_ALLOWED_USERS`); it is kept in the topic's history and answered the same way. Once: put both bots in the group with Bot-to-Bot Communication Mode on in @BotFather and privacy mode off (or as admins), and list each in the other's `TG_PEER_BOTS`. A peer is trusted like that user: what it hands over can make and change tasks and hand work on, in their name. Loops can't start: only a peer's message that names this bot is work, a reply to this bot's own messages never is, a tag is taken once, at most 20 an hour from a peer, and chains stop at the same depth.
 - **To a bot of another kind**, best effort: one listed in `TG_OTHER_BOTS` gets the brief as a message, as its command when the brief starts with one ("/forecast Paris" goes as `/forecast@WeatherBot Paris`, which a bot in privacy mode still gets) and as a mention otherwise; no files. Its reply to that message is the answer: the "➡️ Asked @WeatherBot …" line shows it, and it is kept in the topic's history, where the next turn there sees it. No reply in 30 minutes marks it failed, without an alarm. That bot needs Bot-to-Bot Communication Mode on too, which only its owner can switch on.
@@ -525,23 +556,131 @@ and people you fully trust.
 ## Live voice call (web, real-time)
 
 `live/` is a real-time voice page — open it on your phone, talk, and Claude talks
-back, with barge-in (talk over it to interrupt). It reuses whisper + Kokoro + the
-`claude` CLI (no API key). Turn-based Telegram voice is for messaging; this is for
-holding a conversation.
+back, with barge-in (talk over it to interrupt). It hears with Soniox and speaks
+with Paradee (English) and Soniox's streamed voice (Farsi); each request is a turn in
+its Telegram topic, run inside the bot. Turn-based Telegram voice is for messaging;
+this is for holding a conversation.
 
-- **Server:** `live/server.ts` (Bun) serves the page and a WebSocket. A persistent
-  `live/worker.py` keeps whisper + Kokoro loaded so each turn is ~a few seconds,
-  not ~15s. `live/start-live.sh` runs it in tmux.
-- **Page:** `live/index.html` — mic capture, client-side VAD (hands-free) or
-  push-to-talk, sentence-by-sentence playback, barge-in.
-- **Behind nginx** on its own subdomain (see `live/nginx-app.besporesh.ir.conf`):
-  proxy `/` to `127.0.0.1:3060` with WebSocket upgrade + a long read timeout.
-- **Per session, no password.** In a Telegram topic, `/live` mints a `LIVE_URL/<uuid>`
+- **Server:** `live/server.ts` (Bun) serves the page and a WebSocket, on 127.0.0.1
+  only. `live/paradee_worker.py` keeps Paradee loaded, so an English sentence is
+  spoken in a fraction of a second.
+- **Page:** `live/index.html` — hands-free or hold-to-talk, sentence-by-sentence
+  playback, barge-in. Every line heard shows who said it; tap one for **This is me**
+  (that voice is you from now on) or **Send this to Claude**.
+  The button left of the mic picks how answers arrive: 🔊 spoken, 🔔 a short sound
+  when one is ready, or 🔕 silent (no sound at all, notices included). The text is
+  on the page in every mode, and without speech no voice is made. The choice is
+  kept per link on the device.
+- **Hearing:** with `SONIOX_API_KEY` set, the page streams the mic (16 kHz, with the
+  browser's echo cancellation) to the server, which streams it on to Soniox:
+  Farsi and English, people told apart (`live/soniox.ts`). The first voice heard
+  is you, and only your words go to Claude; others are shown, and what they said
+  in the last few minutes goes along as background. Holding the talk button makes
+  anything said yours. "Stop" / "بس" / "وایسا" stops the answer, and so does talking
+  over it; the answer's own voice through the speaker is recognised and dropped
+  (`live/call.ts`). Hands-free streams the
+  whole time the page is open, which Soniox bills. Without the key, the browser's
+  own recognition is used (English only).
+- **Two modes, picked with the start buttons** (the last one used is marked) and
+  switched any time with the chip in the header:
+  - **🎙 Interactive:** it answers everything you say; other voices are shown and go
+    along as background, never acted on.
+  - **🧑‍💼 Assistant:** you are talking with people. It acts only when **you** call it
+    by name at the start of a sentence (*"Lucy, check the build"*, *"so Lucy, …"*; a name
+    in passing, *"I told Lucy"*, doesn't count), or by the name alone and then the
+    request (it shows it is listening: a short tone, the mic turns green, *"👂 Listening"*,
+    for 8 s, longer while you talk), or while you hold the mic; everything said before goes along as background.
+    The name is yours to set on the page (several spellings, e.g. `Lucy, لوسی`), kept
+    for all your calls in `state/live-prefs.json`; the default is `LIVE_WAKE_WORDS`.
+    Each piece of speech gets its reason in the call's trace (*"not called, kept as
+    background"*). An icon next to the mode chip (red while on) lets **others on the call** call it by
+    name too (off by default, kept with your wake words); their requests reach Claude
+    marked as someone else's, since it acts with your rights.
+  - **By voice:** *"switch to assistant"*, *"just listen"*, *"back to me"* (any
+    language): the desk switches the mode (`call_mode`) and the page follows.
+- **Listen to an answer:** a topic's answers that have a voice note show ▶️ Listen on
+  the page (Telegram's Opus, or MP3 where the browser can't play it). On a call, *"play
+  Research's last answer"* plays it there (`play_answer`). Its words are sent first, so
+  the mic hearing it isn't taken for a request; Stop stops it.
+- **Every call is recorded** under `state/live-calls/<time>-<link>/`: `mic.wav` (what
+  the page sent), `trace.jsonl` (every step with its time: audio, Soniox, whose
+  voice, Claude, voice, playback) and `answers/`. It holds anyone near the phone and
+  is deleted after 7 days (`LIVE_KEEP_DAYS`). To see whether a problem is the speech
+  recognition, feed the audio to Soniox again with other settings:
+  `bun live/replay.ts state/live-calls/<call> --languages en,fa --endpoint 2000`.
+- **Audio that isn't arriving is said, not silent.** The server tells the page how
+  much audio it has received; when the page is 4 s ahead of that (an upload stalled
+  on a slow link), it says *"Your audio isn't reaching the server"*, and at 12 s it
+  reconnects. A page that has sent nothing (not even its 20 s ping) for a minute has
+  its call closed (`LIVE_STALE_MS`), and a stopped server records each call's end.
+- **No domain needed.** The first `/live` starts the server and a
+  [Cloudflare quick tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/)
+  in front of it (`live/tunnel.ts`): an `https://<random>.trycloudflare.com` address,
+  no Cloudflare account, and no port opened on the host — `cloudflared` connects
+  out. If it is not installed, it is downloaded once into `~/.local/bin`. Both keep
+  running across bridge restarts and are reused; whatever has died is started again.
+  The address changes when the tunnel restarts, and `/live` always gives the
+  current one. Before sending a link, `/live` checks the page answers through it.
+- **Your own domain instead:** set `LIVE_URL`, run `live/start-live.sh` (tmux), and
+  proxy the subdomain to the server with WebSocket upgrade and a long read timeout
+  (see `live/nginx-example.conf`). No tunnel is started then.
+- **Per session, no password.** In a Telegram topic, `/live` mints a `<address>/<uuid>`
   link bound to *that* topic's Claude session (shared via `state/live-links.json`).
-  The uuid is the only secret. Speech-to-text happens in the browser (Web Speech
-  API) — only text is sent, so it's fast; the page shows your words live plus
-  Claude's thinking, tool use, and answer. Default permission mode `plan` (read-only).
+  The uuid is the key, and the first device that opens it keeps it: another device
+  with the same link is refused, and a new `/live` starts over. A link stops working an
+  hour (`LIVE_LINK_TTL_MIN`) after a page was last open on it (or after `/live`, if
+  never opened); an open call keeps it alive. The page shows
+  Claude's thinking, tool use and answer as they come.
+- **A front desk, in a forum group.** The first `/live` there makes the group a
+  **Live** topic (🎙 icon), and the call talks to the front desk working in it. It
+  answers quick things itself and hands longer work to the topic it belongs to (by
+  default the one `/live` was sent from), with the bot's usual hand-off: it runs and
+  posts there as usual, and the call hears when it is done: a chime and a line on the
+  page at once, and a sentence spoken at the next pause (`LIVE_NOTICE_WAIT_MS`).
+  By voice you can ask about any topic ("how is Research doing?") and the desk looks
+  with `topic_list` and `topic_peek`; "this" or a request naming no topic goes to the
+  topic you have open, and the desk says where it sent each piece of work.
+  The page lists the group's topics (beside the call; behind ☰ on a phone): Live
+  pinned, then what waits for you, what is working (its step) or queued, what just
+  finished, and a dot for new messages since the page opened. Tapping one makes it
+  the open topic (at first, the one `/live` came from) and shows its latest messages
+  and its run in place of the call (whose latest line stays above the mic; tap it to
+  go back). The text box types into the open topic: it shows there as *"✍️ you, from
+  Live: …"* and runs as your message in that topic's conversation, answered there as
+  usual; with Live open it goes to the front desk. A topic's row lights up when work
+  starts in it, and "show me Research" on the call opens it (`show_topic`). Topics
+  deleted in Telegram are left out, and each has its Telegram icon: with MTProto set
+  up (`TG_API_ID`), the bot reads each topic's "topic created" message, which is gone
+  for a deleted topic and carries its colour and custom emoji (bots can't list a
+  group's topics). The bot's answers are shown as rendered Markdown (tables
+  included) and photos inline. The page loads its fonts (Inter, Vazirmatn) from
+  Google Fonts; its Markdown renderer (marked, DOMPurify) is kept in `live/vendor`.
+- **Answering and stopping from the call.** What waits on you in a topic — Claude
+  asking permission, Claude's questions, a plan's Go ahead — shows on the page as a
+  card under the topic's messages (Allow/Deny, the options, your own words, Go ahead)
+  and as ❗ in the list; the call says it at the next pause, and you can answer by
+  voice ("yes, allow it", "the second one"; the desk's `answer_wait`). The Telegram
+  buttons still work: whichever answer comes first wins, and the message there says
+  who answered. A topic's run has a Stop on the page (tap twice), and "stop the
+  Research topic" works on the call (`stop_topic`); either is said in the topic.
+- **Locked down** (audited 2026-11-14): the page carries a Content Security Policy
+  (scripts only its own, by nonce; it talks only to its server; no outside images, so
+  an answer's Markdown can't send anything out; not framed), and calls are refused
+  from another site's page (`Origin`). A link is only a file's own entry, once per
+  connection; a photo needs the open page's own key, not just the link; a call ends
+  when its link is revoked or expires, or its owner may no longer use the bot. The
+  links file is written atomically, private to the bot's user. A few minutes after the
+  call ends (`LIVE_SUMMARY_AFTER_MS`, 3 min, so a phone that locks can reconnect), a
+  summary of it is posted in Live. Elsewhere (a DM, a group without topics) the call
+  talks to the topic itself.
+- **Each request is a turn inside the bot**, as the person who asked for the link: the
+  front desk's (or the topic's) session, queue, permission mode, instructions, group
+  memory and the bot's tools (history search, tasks, hand-offs). Nothing but the
+  call's summary is posted in the chat. The model is the topic's `/model` if one is set, otherwise `LIVE_MODEL`
+  (`sonnet`). Claude's permission prompts and questions come as buttons in
+  the Telegram topic for now. The live server reaches the bot through its local API
+  (`POST /v1/live/turn`); with tasks off (`TG_TASKS=0`) there is none, and the server
+  runs `claude` itself on the topic's session, without the bot's tools.
 
-Setup: `voice/setup.sh`, set `LIVE_PASSCODE` in `.env`, `live/start-live.sh`,
-point the subdomain at `:3060`. Latency floor is Kokoro (~1x realtime on CPU); a GPU
-or a lighter voice makes it snappier.
+Setup: `voice/setup.sh` (Paradee) for English answers, `SONIOX_API_KEY` in `.env`
+for hearing and the Farsi voice; then `/live`.
