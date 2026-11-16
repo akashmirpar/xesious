@@ -43,6 +43,8 @@ import { SonioxStream, TokenTracker, type Turn } from './soniox'
 import { ARMED_MS, CallState, CALL_MODES, requestText, sendDecision, type CallMode, type Line } from './call'
 import { CallRecorder, pruneCalls, pcmToWav } from './recorder'
 import { Vad } from './vad'
+import { usageOf } from '../lib'
+import { UsageLedger } from '../usage'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PORT = Number(process.env.LIVE_PORT || 3060)
@@ -114,6 +116,11 @@ const FARSI_VOICE = process.env.LIVE_FARSI_VOICE || 'Layla'   // Soniox has no P
 // name of a Soniox voice (e.g. Grace: streamed, first audio ~0.4 s).
 const ENGLISH_VOICE = process.env.LIVE_ENGLISH_VOICE || 'paradee'
 const PARADEE_PY = process.env.LIVE_PARADEE_PYTHON || join(HERE, '..', 'voice', 'paradee', '.venv', 'bin', 'python')
+// The bridge's usage ledger (usage.ts), shared on disk like the links: a call's turns
+// count toward the same instance total. Off with TG_USAGE=0; never fatal.
+let ledger: UsageLedger | undefined
+try { if (!/^(0|false|no|off)$/i.test(process.env.TG_USAGE || '1')) ledger = new UsageLedger(process.env.TG_USAGE_DB || join(HERE, '..', 'state', 'usage.db')) }
+catch (e) { console.error(`[live] usage ledger: ${e}`) }
 const PROFILE = process.env.LIVE_PROFILE ||
   'You are on a live VOICE call. Answer in one or two short spoken sentences — plain words, no markdown, no code, no lists, no URLs read aloud. ' +
   'Be direct and conversational. Answer in the language of their message; they may mix languages. ' +
@@ -647,6 +654,10 @@ function viaBot(ws: WS, req: Req, model: string, got: RunEvents): () => void {
 function viaCli(ws: WS, req: Req, model: string, perm: string[], got: RunEvents): () => void {
   const args = ['-p', req.text, '--output-format', 'stream-json', '--verbose', '--model', model, ...perm, '--append-system-prompt', PROFILE]
   if (ws.data.sessionId) args.push('--resume', ws.data.sessionId)
+  // For the usage ledger, as the bridge records it: whether this run started its
+  // session, and the model it resolved to (usage.ts, costOf).
+  const resumed = !!ws.data.sessionId
+  let runModel: string | undefined, recorded = false
   const child = spawn(CLAUDE_BIN, args, { cwd: ws.data.cwd, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
   let jsonBuf = '', errBuf = ''
   child.stderr!.on('data', d => { errBuf = (errBuf + d).slice(-2000) })
@@ -662,9 +673,20 @@ function viaCli(ws: WS, req: Req, model: string, perm: string[], got: RunEvents)
           else if (c.type === 'tool_use') got.tool(`🔧 ${c.name}`)
           else if (c.type === 'text' && c.text) got.text(c.text)
         }
+      } else if (ev.type === 'system' && ev.subtype === 'init') {
+        if (ev.model) runModel = String(ev.model)
       } else if (ev.type === 'result') {
         if (ev.session_id) { ws.data.sessionId = ev.session_id; if (ws.data.uuid) syncSession(ws.data.uuid, ev.session_id) }
         if (ev.is_error) ws.data.rec?.trace('claude', 'ended with an error', { result: String(ev.result ?? '').slice(0, 500) })
+        const u = usageOf(ev)
+        if (u) {
+          // The link's key is the topic's, chat:thread — so a call counts toward its topic.
+          const lk = ws.data.uuid ? ownLink(loadLinks(), ws.data.uuid)?.key : undefined
+          const [chat, thread] = typeof lk === 'string' ? lk.split(':') : []
+          ledger?.record({ ...u, model: runModel ?? u.model, kind: 'live', chat, thread: Number(thread) || undefined,
+            ok: !ev.is_error, session: ev.session_id, fresh: !resumed && !recorded })
+          recorded = true
+        }
       }
     }
   })

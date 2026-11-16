@@ -18,6 +18,9 @@ import { join, relative, dirname } from 'node:path'
 // --- Env must be set BEFORE bridge.ts is imported (it reads config at module load).
 const TMP = mkdtempSync(join(tmpdir(), 'xesious-e2e-'))
 const STATE_FILE = join(TMP, 'state.json')
+// Never the deployment's own .env: run from the live folder, its TG_PERMISSION_MODE,
+// TG_GROUP_MEMORY and friends silently replaced the defaults these tests assert on.
+process.env.TG_ENV_FILE = '/dev/null'
 process.env.TELEGRAM_BOT_TOKEN = '123:test-token'
 // 1 is the admin in every test group; 3 is an allowed member who is not an admin,
 // for the /config permission cases.
@@ -3449,7 +3452,7 @@ describe('/config — group settings from Telegram', () => {
     await bridge._ensureCommands()
     const set = calls.slice(before).find(c => c.method === 'setMyCommands')!
     const eph = set.payload.commands.filter((c: any) => c.is_ephemeral).map((c: any) => c.command)
-    expect(eph).toEqual(['config', 'private', 'recall', 'status', 'jobs', 'usage', 'live', 'whoami', 'help'])
+    expect(eph).toEqual(['config', 'private', 'recall', 'status', 'jobs', 'usage', 'stats', 'live', 'whoami', 'help'])
     expect(set.payload.commands.map((c: any) => c.command)).not.toContain('config_advanced')
     expect(set.payload.commands.map((c: any) => c.command)).toContain('help')
   })
@@ -6182,6 +6185,16 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     expect(deskLink()![1].sessionId).toBeUndefined()
   }, 30000)
 
+  test("a front-desk turn counts in the usage ledger as a live call, toward the Live topic", async () => {
+    const { Database } = await import('bun:sqlite')
+    const [uuid, link] = deskLink()!
+    const desk = Number(link.desk.split(':')[1])
+    const count = () => { const db = new Database(join(TMP, 'usage.db'), { readonly: true }); try { return (db.query("SELECT COUNT(*) AS n FROM usage WHERE kind = 'live' AND chat = ? AND thread = ?").get(String(C), desk) as any).n as number } finally { db.close() } }
+    const before = count()
+    expect((await liveTurn({ link: uuid, text: 'how much does this cost' })).events.at(-1)).toMatchObject({ type: 'done', isError: false })
+    expect(count()).toBe(before + 1)
+  }, 30000)
+
   test('the front desk is told how the call listens now, and that only call_mode changes it', async () => {
     const [uuid] = deskLink()!
     await liveTurn({ link: uuid, text: 'switch to interactive', callMode: 'assistant' })
@@ -7111,4 +7124,49 @@ describe('tasks: watchers (phase 2)', () => {
     expect(T().store.getTask(t.id).until).toBeUndefined()
     await waitFor(() => T().watchers.list().includes(t.id))
   }, 20000)
+})
+
+describe('the usage ledger', () => {
+  test('every turn lands in state/usage.db, and /stats sums the whole instance across topics', async () => {
+    const { UsageLedger } = await import('../usage')
+    // The bridge opens the same file next to its state file; two handles on one WAL
+    // database is how the live voice server shares it too.
+    const l = new UsageLedger(join(TMP, 'usage.db'))
+    const before = l.totals()
+    await incoming(1961, 'count me')
+    await incoming(1962, 'and me')
+    const after = l.totals()
+    expect(after.runs).toBeGreaterThanOrEqual(before.runs + 2)
+    // The stub's result carries 1200 in + 80 out + 300 cache read + 20 cache written.
+    expect(after.input - before.input).toBeGreaterThanOrEqual(2400)
+    expect(after.costUsd - before.costUsd).toBeGreaterThan(0.02)
+    expect(l.byKind().some(k => k.kind === 'turn')).toBe(true)
+    const r = finalReply(await incoming(1963, '/stats')) || ''
+    expect(r).toContain('Claude usage across all topics')
+    expect(r).toMatch(/all time\s+\d+ runs/)
+    expect(r).toContain('not a bill')
+    l.close()
+  })
+
+  test('/stats is for the bot\'s own users only', async () => {
+    const r = finalReply(await incoming(1964, '/stats', 3)) || ''
+    // fromId 3 is allowed (TG_ALLOWED_USERS=1,3), so it is served; the guard is on
+    // the id, which is what the trust-chat-members path would fail.
+    expect(r).toContain('Claude usage')
+  })
+})
+
+describe('the usage ledger prices runs, not sessions', () => {
+  test('a turn carries the model its run resolved to, and a run that started its session owns its total', async () => {
+    const { Database } = await import('bun:sqlite')
+    await incoming(1965, 'which model?')
+    const db = new Database(join(TMP, 'usage.db'), { readonly: true })
+    const row = db.query("SELECT model, cost FROM usage WHERE chat = '1965' ORDER BY id DESC LIMIT 1").get() as any
+    db.close()
+    expect(row).toBeTruthy()
+    expect(row.model).toBeTruthy()
+    // 'claude-stub' is the result's modelUsage key — the session's history, not this run.
+    expect(row.model).not.toBe('claude-stub')
+    expect(row.cost).toBeCloseTo(0.0123, 6)
+  })
 })
