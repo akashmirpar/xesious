@@ -2995,7 +2995,11 @@ async def feature_voice_keyboard_and_speaker(client, bot):
 
     # --- tapping a speaker changes it, per topic, without a restart ---------------
     before = speaker()
-    target = next((b for b in spk if not btn_data(b).decode().endswith(before or "af_heart")), None)
+    # A voice Paradee has: a Kokoro-only one moves the topic to Kokoro, and every voice
+    # case after this would then speak with it, which holds the CPU for minutes.
+    # (That move is covered by the in-process tests.)
+    others = [b for b in spk if not btn_data(b).decode().endswith(before or "af_heart")]
+    target = next((b for b in others if btn_data(b).decode().split(":")[-1] in PARADEE_SPEAKERS), others[0] if others else None)
     if not target:
         problems.append("no speaker to switch TO")
     else:
@@ -3013,21 +3017,28 @@ async def feature_voice_keyboard_and_speaker(client, bot):
             problems.append("the keyboard message did not re-render with the new speaker")
 
     # --- and the typed escape hatch reaches the other 46 -------------------------
-    print("  → /voice speaker bm_george")
-    replies = await send_and_wait(client, bot, "/voice speaker bm_george")
+    print("  → /voice speaker bm_fable")
+    replies = await send_and_wait(client, bot, "/voice speaker bm_fable")
     print(f"    ← {[r[:70] for r in replies]}")
-    if speaker() != "bm_george":
+    if speaker() != "bm_fable":
         problems.append("/voice speaker <id> did not take effect")
     # A speaker id is user text; it must be constrained, not trusted.
     bad = await send_and_wait(client, bot, "/voice speaker ../../etc/passwd")
     if not any("Not a Kokoro voice id" in r for r in bad):
         problems.append(f"a bogus speaker id was not refused: {bad}")
 
+    # Back to the default voice on Paradee, whatever happened above.
+    await send_and_wait(client, bot, "/voice speaker af_heart")
+    await send_and_wait(client, bot, "/voice engine paradee")
     await send_and_wait(client, bot, "/voice off")
     return ("/voice is a keyboard and the speaker is per topic", not problems,
             "; ".join(problems) if problems else
             f"{len(spk)} named speaker buttons with a pager to the rest, the tap stored it "
             "per topic without a restart, and /voice speaker reached one off the page")
+
+
+# The voices Paradee has (lib.ts PARADEE_SPEAKERS).
+PARADEE_SPEAKERS = ("af_heart", "am_puck", "bf_isabella", "bm_fable")
 
 
 def is_full_file(msg):
