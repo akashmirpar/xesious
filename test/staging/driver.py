@@ -181,7 +181,7 @@ async def feature_live_front_desk(client, bot):
 
         # Hung up: the summary goes to Live a few seconds later (LIVE_SUMMARY_AFTER_MS).
         summary = await _until(lambda: next((m for m in seen if _topic_of(m) == desk and not m.out
-                                             and (reply_text(m) or "").startswith("🎙 Call")), None), 90)
+                                             and (reply_text(m) or "").startswith("🎙 Live session")), None), 90)
         if not summary:
             problems.append("no summary of the call was posted in Live")
         else:
