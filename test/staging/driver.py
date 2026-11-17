@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 try:
     from telethon import TelegramClient, events
@@ -1521,8 +1522,11 @@ async def feature_big_upload_over_mtproto(client, bot):
     client.add_event_handler(handler, events.NewMessage(chats=bot))
     client.add_event_handler(handler, events.MessageEdited(chats=bot))
     print("  → /get big-slow.bin (200 MB)")
+    t0 = time.monotonic()
     await client.send_message(bot, "/get big-slow.bin")
     slow = await _until(lambda: next((m for m in seen if m.file and m.file.name == "big-slow.bin"), None), 400)
+    took = time.monotonic() - t0
+    print(f"    200 MB came back in {took:.0f} s")
     await asyncio.sleep(1)
     client.remove_event_handler(handler)
     if not slow:
@@ -1530,10 +1534,17 @@ async def feature_big_upload_over_mtproto(client, bot):
     elif slow.file.size != 200 * 1024 * 1024:
         problems.append(f"big-slow.bin came back as {slow.file.size} bytes")
     else:
-        problems += await _progress_problems(client, bot, seen, "⬆️ Uploading big-slow.bin")
+        # The bar is for a transfer that looks like taking over 20 s. mtcute sends
+        # several parts at once, and on a fast link 200 MB can take less than that, so
+        # a bar is required only when it was slow, and must be gone either way.
+        bar = any((reply_text(m) or "").startswith("⬆️ Uploading big-slow.bin") for m in seen)
+        if bar or took > 30:
+            problems += await _progress_problems(client, bot, seen, "⬆️ Uploading big-slow.bin")
+        else:
+            print(f"    no bar, and none needed: done in {took:.0f} s")
     os.remove(os.path.join(cwd, "big-slow.bin"))
     return (name, not problems, "; ".join(problems) if problems else
-            "60 MB came back whole with no bar; 200 MB came back with a bar that was then removed")
+            f"60 MB came back whole with no bar; 200 MB came back in {took:.0f} s" + (" with a bar that was then removed" if took > 30 else ""))
 
 
 async def feature_files_in_and_out(client, bot):
@@ -2988,7 +2999,10 @@ async def feature_voice_keyboard_and_speaker(client, bot):
     # All 28 English voices must be reachable by tapping, not only by typing.
     pager = [b for row in menu.reply_markup.rows for b in row.buttons
              if btn_data(b).startswith(b"vspg:")]
-    if not pager:
+    # Only Kokoro's list is long enough to page: on Paradee the keyboard lists just
+    # its own few voices, all on one page.
+    kokoro_on = any(b.text.startswith("● Kokoro") for row in menu.reply_markup.rows for b in row.buttons)
+    if kokoro_on and not pager:
         problems.append("no pager — the voices past the first page are unreachable by tap")
     if not any(l.startswith("● ") for l in labels):
         problems.append("nothing marks the current selection")
@@ -4265,7 +4279,13 @@ async def main():
         try:
             for t in selected:
                 total += 1
-                name, ok, detail = await t(client, bot)
+                # A case that raises is that case failing, not the end of the run: one
+                # button the bot answered late (BotResponseTimeoutError) used to stop
+                # the driver, and every case after it went unrun.
+                try:
+                    name, ok, detail = await t(client, bot)
+                except Exception as e:
+                    name, ok, detail = t.__name__, False, f"raised {type(e).__name__}: {e}"
                 print(f"[{'PASS' if ok else 'FAIL'}] {name}")
                 print(f"    {detail}")
                 if not ok:

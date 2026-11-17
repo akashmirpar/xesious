@@ -2552,10 +2552,13 @@ function noteGroupChange(m: ConfigMenu, id: string): void {
 
 // Apply one change. scope: g = the group's own value (topics with their own keep
 // it), e = the group's value AND every topic override cleared, t = this topic only.
-async function applySetting(m: ConfigMenu, i: number, ci: string, scope: 'g' | 'e' | 't'): Promise<string> {
+// `ack` answers the tap. It goes before the announcement: Telegram gives a bot a few
+// seconds to answer a button, and a slow post in the group used to outlast them, the
+// button spinning while the setting had in fact been saved.
+async function applySetting(m: ConfigMenu, i: number, ci: string, scope: 'g' | 'e' | 't', ack: (text: string) => Promise<unknown>): Promise<void> {
   const d = SETTINGS[i]
   const value = ci === 'r' ? undefined : d.choices![Number(ci)]?.value
-  if (ci !== 'r' && value === undefined) return 'That choice no longer exists.'
+  if (ci !== 'r' && value === undefined) { await ack('That choice no longer exists.'); return }
   const key = keyFor(m.chatId, m.threadId)
   const label = value === undefined ? `the server default (${choiceLabel(d, serverDefault(d.id))})` : choiceLabel(d, value)
   const note = d.id === 'topicMode' ? topicModeNote(value === undefined ? serverDefault('topicMode') : value) : undefined
@@ -2568,10 +2571,11 @@ async function applySetting(m: ConfigMenu, i: number, ci: string, scope: 'g' | '
       if (value === undefined) delete topicStore(id)[key]; else topicStore(id)[key] = 'mode'
     }
     saveState()
+    await ack('Saved for this topic')
     await announceConfig(m, value === undefined
       ? `${m.userName} set ${d.label} in ${topicTitle(key)} to follow the group.`
       : `${m.userName} set ${d.label} → ${label} for ${topicTitle(key)} only.`, note)
-    return 'Saved for this topic'
+    return
   }
   const g = (groupSettings[String(m.chatId)] ??= {})
   if (value === undefined) delete g[d.id]; else g[d.id] = value
@@ -2592,6 +2596,7 @@ async function applySetting(m: ConfigMenu, i: number, ci: string, scope: 'g' | '
   }
   saveState()
   if (d.id === 'retention') pruneConversations()
+  await ack('Saved')
   if (scope === 'e') {
     await announceConfig(m, `${m.userName} set ${d.label} → ${label} everywhere in this group` +
       (cleared ? ` (reset ${plural(cleared, 'topic')}).` : '.'), note)
@@ -2599,7 +2604,6 @@ async function applySetting(m: ConfigMenu, i: number, ci: string, scope: 'g' | '
     await announceConfig(m, `${m.userName} set ${d.label} → ${label} for this group.` +
       (kept ? ` ${plural(kept, 'topic')} keep their own setting.` : ''), note)
   }
-  return 'Saved'
 }
 
 // A reply the bridge asked for with a force-reply prompt. Handled before anything
@@ -2738,9 +2742,9 @@ async function handleConfigCallback(ctx: Context, data: string): Promise<void> {
     const i = Number(r[1])
     // A DM has one conversation and no topics to tell apart: apply it everywhere,
     // so an old per-chat override from /model or /voice cannot shadow the change.
-    if (m.isPrivate) { await toast(await applySetting(m, i, r[2], 'e')); await showMenu(m, settingScreen(tok, m, access, i)); return }
+    if (m.isPrivate) { await applySetting(m, i, r[2], 'e', t => toast(t)); await showMenu(m, settingScreen(tok, m, access, i)); return }
     // A setting only the whole group can have (retention) has nowhere else to land.
-    if (!SETTINGS[i].topic) { await toast(await applySetting(m, i, r[2], 'g')); await showMenu(m, settingScreen(tok, m, access, i)); return }
+    if (!SETTINGS[i].topic) { await applySetting(m, i, r[2], 'g', t => toast(t)); await showMenu(m, settingScreen(tok, m, access, i)); return }
     await toast('')
     await showMenu(m, scopeScreen(tok, m, i, r[2]))
     return
@@ -2748,7 +2752,7 @@ async function handleConfigCallback(ctx: Context, data: string): Promise<void> {
   if ((r = act.match(/^a(\d+)\.(\d+|r)\.([get])$/)) && SETTINGS[Number(r[1])]?.kind === 'choice') {
     if (!await needEdit()) return
     const i = Number(r[1])
-    await toast(await applySetting(m, i, r[2], r[3] as 'g' | 'e' | 't'))
+    await applySetting(m, i, r[2], r[3] as 'g' | 'e' | 't', t => toast(t))
     await showMenu(m, settingScreen(tok, m, access, i))
     return
   }
@@ -2758,8 +2762,8 @@ async function handleConfigCallback(ctx: Context, data: string): Promise<void> {
     if (!k) { await toast('That list is out of date. Open it again.', true); return }
     for (const d of overridesOf(k)) delete topicStore(d.id)[k]
     saveState()
-    await announceConfig(m, `${m.userName} reset ${topicTitle(k)} to follow the group's settings.`)
     await toast('Reset')
+    await announceConfig(m, `${m.userName} reset ${topicTitle(k)} to follow the group's settings.`)
     await showMenu(m, diffScreen(tok, m, access))
     return
   }
@@ -2781,8 +2785,8 @@ async function handleConfigCallback(ctx: Context, data: string): Promise<void> {
     const tkey = keyFor(m.chatId, m.threadId)
     delete topicStore('instructions')[tkey]
     saveState()
-    await announceConfig(m, `${m.userName} removed the instructions for ${topicTitle(tkey)}; it follows the group's again.`, INSTRUCTIONS_NOTE)
     await toast('Removed')
+    await announceConfig(m, `${m.userName} removed the instructions for ${topicTitle(tkey)}; it follows the group's again.`, INSTRUCTIONS_NOTE)
     await showMenu(m, settingScreen(tok, m, access, SETTINGS.findIndex(d => d.id === 'instructions')))
     return
   }
@@ -2791,8 +2795,8 @@ async function handleConfigCallback(ctx: Context, data: string): Promise<void> {
     delete groupSettings[String(m.chatId)]?.instructions
     noteGroupChange(m, 'instructions')
     saveState()
-    await announceConfig(m, `${m.userName} removed this group's instructions for Claude.`, INSTRUCTIONS_NOTE)
     await toast('Removed')
+    await announceConfig(m, `${m.userName} removed this group's instructions for Claude.`, INSTRUCTIONS_NOTE)
     await showMenu(m, settingScreen(tok, m, access, SETTINGS.findIndex(d => d.id === 'instructions')))
     return
   }
