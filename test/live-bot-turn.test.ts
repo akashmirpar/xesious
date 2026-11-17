@@ -180,6 +180,35 @@ test('a notice from the bot is shown, then asked of the front desk on its own, a
   expect(asked[n].body.text).toBeUndefined()
 })
 
+test('a notice waits while the page still plays the answer before it, instead of cutting it off', async () => {
+  A.ws.send(JSON.stringify({ type: 'playing', on: true }))
+  await Bun.sleep(100)
+  A.got.length = 0
+  const n = asked.length
+  push({ kind: 'notice', chat: '-100777', handoff: 'h-43', topic: 'Backend', ok: true, line: 'Fixed the login page' })
+  await A.wait(m => m.type === 'notice')   // shown (and chimed) at once
+  await Bun.sleep(600)
+  expect(A.got.some(m => m.type === 'working')).toBe(false)
+  expect(asked.length).toBe(n)
+  A.ws.send(JSON.stringify({ type: 'playing', on: false }))
+  const working = await A.wait(m => m.type === 'working')
+  expect(working.said).toBe('🔔 Backend: done')
+  await A.wait(m => m.type === 'turn_end' && m.req === working.req)
+  expect(asked[n].body).toMatchObject({ notice: 'h-43' })
+})
+
+test('the desk turning the mic off reaches the page, never for more than 3 minutes', async () => {
+  A.got.length = 0
+  push({ kind: 'mic', chat: '-100777', ms: 60_000 })
+  expect(await A.wait(m => m.type === 'mic')).toEqual({ type: 'mic', on: false, ms: 60_000 })
+  A.got.length = 0
+  push({ kind: 'mic', chat: '-100777', ms: 3_600_000 })
+  expect(await A.wait(m => m.type === 'mic')).toEqual({ type: 'mic', on: false, ms: 180_000 })
+  A.got.length = 0
+  push({ kind: 'mic', chat: '-100777' })
+  expect(await A.wait(m => m.type === 'mic')).toEqual({ type: 'mic', on: false, ms: 0 })
+})
+
 test("a call with a front desk gets the group's topics, again soon after a run starts or ends", async () => {
   const first = A.all.find(m => m.type === 'topics')
   expect(first).toMatchObject({ live: 99, origin: 12 })

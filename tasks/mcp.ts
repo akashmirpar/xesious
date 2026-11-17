@@ -226,6 +226,11 @@ const INTERACTIVE_TOOLS = [
     inputSchema: { type: 'object', properties: { mode: { type: 'string', enum: ['interactive', 'assistant'] } }, required: ['mode'] },
   },
   {
+    name: 'mic_off',
+    description: 'On a live call (/live): turn the mic off on the person\'s page, when they ask by voice ("mute the mic", "turn the microphone off for a minute"). With minutes (at most 3) it comes back on by itself after that, with a sound; without, it stays off until they turn it on with the mic button. You cannot hear them while it is off, so it cannot be turned back on by voice. Say in a few words what you did.',
+    inputSchema: { type: 'object', properties: { minutes: { type: 'number', description: 'Optional: how long, in minutes (0.5 for 30 seconds); at most 3. Leave out when they give no time.' } } },
+  },
+  {
     name: 'topic_create',
     description: "Create a forum topic in this chat for a new piece of work, so the person doesn't have to make it by hand. Optional cwd: an absolute path to an existing folder it works in (default: a new folder of its own). Optional like: a topic (id or name) whose settings to copy.",
     inputSchema: { type: 'object', properties: { name: { type: 'string' }, cwd: { type: 'string' }, like: { type: 'string' } }, required: ['name'] },
@@ -349,6 +354,7 @@ export function routeOf(name: string, a: any, kind: 'interactive' | 'scheduled')
     case 'topic_list': return { method: 'GET', path: '/v1/topics' }
     case 'show_topic': return { method: 'POST', path: '/v1/live/show', body: { topic: a?.topic } }
     case 'call_mode': return { method: 'POST', path: '/v1/live/mode', body: { mode: a?.mode } }
+    case 'mic_off': return { method: 'POST', path: '/v1/live/mic', body: { minutes: a?.minutes } }
     case 'play_answer': return { method: 'POST', path: '/v1/live/play', body: { topic: a?.topic, id: a?.id } }
     case 'answer_wait': return { method: 'POST', path: `/v1/waits/${enc(String(a?.id ?? ''))}/answer`, body: { allow: a?.allow, go: a?.go, answers: a?.answers } }
     case 'stop_topic': return { method: 'POST', path: `/v1/topics/${enc(String(a?.topic ?? ''))}/stop`, body: {} }

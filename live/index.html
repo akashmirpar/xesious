@@ -399,6 +399,7 @@ function connect(){
       case 'main': mainSpeaker=m.speaker; chip('#me', mainSpeaker==null?'':'you = speaker '+mainSpeaker); restyle(); break
       case 'waiting': for(const id of m.ids) lineState(id,'…'); break
       case 'heard': heardS=m.s; break
+      case 'mic': if(m.on===false) micOffByVoice(Number(m.ms)||0); break
       case 'call_mode': if(m.byVoice && MODES[m.mode] && m.mode!==callMode){ callMode=m.mode; try{ localStorage.setItem(modeKey, m.mode) }catch{}; paintMode(); sys(MODES[m.mode].label+' mode, switched by voice') } break
       case 'others': othersOn=!!m.on; paintMode(); if(tipFor===$('#othersBtn')) showTip(tipFor); break
       case 'called': listening(m.ms||8000); break
@@ -610,7 +611,19 @@ function paint(){ mic.classList.toggle('on', micOn && !talking); mic.classList.t
 
 // One button, like a video call: tap = mic on/off; hold = talking (what you say is
 // yours, pauses don't cut it, letting go sends it). Space does the same as holding.
-function setMic(on){ if(micOn===on) return; micOn=on; paint(); trace(on?'mic on':'mic off'); if(stt==='browser'){ on?startRec():stopRec() } }
+function setMic(on){ if(on) clearTimeout(micBack); if(micOn===on) return; micOn=on; paint(); trace(on?'mic on':'mic off'); if(stt==='browser'){ on?startRec():stopRec() } }
+// The mic turned off by voice (the front desk's mic_off): with ms, back on by itself
+// then, with a sound so the caller knows it is listening again; the server allows at
+// most 3 minutes. Turning it on by hand first cancels that.
+let micBack=null
+function micOffByVoice(ms){
+  if(!started) return
+  setMic(false); vibrate(20)
+  if(!(ms>0)){ sys('🔇 Mic off, asked by voice — tap it to turn it back on'); return }
+  const s=Math.round(ms/1000), span=s>=60 ? (s%60 ? (s/60).toFixed(1) : s/60)+' min' : s+' s'
+  sys('🔇 Mic off for '+span+', asked by voice — it comes back on by itself')
+  micBack=setTimeout(()=>{ micBack=null; if(micOn) return; setMic(true); micBackTone(); vibrate([20,50,20]); sys('🎙 The mic is back on') }, ms)
+}
 function talk(on){
   if(talking===on) return; talking=on; paint(); vibrate(on?12:6)
   if(stt==='soniox') ws?.send(JSON.stringify({type:'hold', on}))
@@ -717,6 +730,19 @@ function listenTone(){
       const o=actx.createOscillator(), g=actx.createGain(); o.frequency.value=f; o.type='sine'
       g.gain.setValueAtTime(0,t+i*.09); g.gain.linearRampToValueAtTime(.14,t+i*.09+.015); g.gain.exponentialRampToValueAtTime(.001,t+i*.09+.18)
       o.connect(g); g.connect(actx.destination); o.start(t+i*.09); o.stop(t+i*.09+.2)
+    }
+  }catch{}
+}
+// Three rising notes: the mic is listening again. Played whatever the answers button
+// says, since a mic coming back on by itself must never go unnoticed.
+function micBackTone(){
+  try{
+    actx = actx || new (window.AudioContext||window.webkitAudioContext)()
+    const t=actx.currentTime
+    for(const [i,f] of [[0,523],[1,659],[2,784]]){
+      const o=actx.createOscillator(), g=actx.createGain(); o.frequency.value=f; o.type='triangle'
+      g.gain.setValueAtTime(0,t+i*.12); g.gain.linearRampToValueAtTime(.2,t+i*.12+.015); g.gain.exponentialRampToValueAtTime(.001,t+i*.12+.25)
+      o.connect(g); g.connect(actx.destination); o.start(t+i*.12); o.stop(t+i*.12+.3)
     }
   }catch{}
 }

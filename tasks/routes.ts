@@ -27,6 +27,7 @@ export interface BridgeHandlers {
   liveVoice(scope: Scope, query: URLSearchParams): Promise<ApiReply> | ApiReply
   playAnswer(scope: Scope, body: any): Promise<ApiReply> | ApiReply
   callMode(scope: Scope, body: any): Promise<ApiReply> | ApiReply
+  micOff(scope: Scope, body: any): Promise<ApiReply> | ApiReply
   liveAnswer(scope: Scope, body: any): Promise<ApiReply> | ApiReply
   liveStop(scope: Scope, body: any): Promise<ApiReply> | ApiReply
   answerWaitTool(scope: Scope, id: string, body: any): Promise<ApiReply> | ApiReply
@@ -77,6 +78,7 @@ export function taskRoutes(svc: TaskService, bridge: BridgeHandlers): Route[] {
     { method: 'GET', path: '/v1/live/voice', operatorOnly: true, handler: (s, q) => bridge.liveVoice(s, q.query) },
     { method: 'POST', path: '/v1/live/play', handler: (s, q) => bridge.playAnswer(s, q.body) },
     { method: 'POST', path: '/v1/live/mode', handler: (s, q) => bridge.callMode(s, q.body) },
+    { method: 'POST', path: '/v1/live/mic', handler: (s, q) => bridge.micOff(s, q.body) },
     // Answering what waits on the person, and stopping a run: from the page, and by the
     // front desk on the call.
     { method: 'POST', path: '/v1/live/answer', operatorOnly: true, handler: (s, q) => bridge.liveAnswer(s, q.body) },

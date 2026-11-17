@@ -110,6 +110,11 @@ const QUIET_MS = Number(process.env.LIVE_QUIET_MS ?? 1000)
 const MERGE_MS = Number(process.env.LIVE_MERGE_MS ?? 10_000)
 const MAX_WAIT_MS = Number(process.env.LIVE_MAX_WAIT_MS ?? 6000)
 const NOTICE_WAIT_MS = Number(process.env.LIVE_NOTICE_WAIT_MS ?? 30_000)
+// How long a notice waits at most for an answer still playing on the page.
+const PLAYING_WAIT_MS = 120_000
+// The longest the desk may turn the mic off for, to come back on by itself: longer, and
+// it may come on when the caller has forgotten it was off (the bot checks this too).
+const MIC_OFF_MAX_MS = 3 * 60_000
 const SONIOX_TTS_URL = process.env.LIVE_SONIOX_TTS_URL || 'https://tts-rt.soniox.com/tts'
 const FARSI_VOICE = process.env.LIVE_FARSI_VOICE || 'Layla'   // Soniox has no Persian voice; this Arabic one reads Farsi
 // English: Paradee, kept loaded on this machine (~0.1–0.4 s a sentence). Or kokoro (~6.5 s a sentence on this CPU), or the
@@ -308,6 +313,9 @@ type Conn = {
   // How answers arrive, picked on the page: spoken, a sound when one is ready, or
   // nothing (the text is on the page either way). Without speech none is made.
   answers: Answers
+  // A notice waiting for the page to finish playing an answer: the fallback, should the
+  // page never say it has.
+  queuedFor?: ReturnType<typeof setTimeout>
 }
 type Answers = 'voice' | 'sound' | 'silent'
 const ANSWERS: Answers[] = ['voice', 'sound', 'silent']
@@ -359,10 +367,35 @@ function stopAll(ws: WS, why: string) {
   for (const q of ws.data.queue) out(ws, { type: 'dropped', req: q.id, ids: q.ids })
   ws.data.current = undefined
   ws.data.queue = []
+  clearTimeout(ws.data.queuedFor); ws.data.queuedFor = undefined
   clearHeld(ws)
   ws.data.speakStop?.()
   out(ws, { type: 'hush' })
   ws.data.rec?.trace('stop', why)
+}
+
+// What was asked while a turn ran goes next, as one request; a notice goes on its own.
+// A notice also waits for the answer before it to finish playing on the page: started
+// at once, it took the call from that answer and cut it off mid-sentence.
+function runQueued(ws: WS, force = false) {
+  clearTimeout(ws.data.queuedFor); ws.data.queuedFor = undefined
+  if (!ws.data.queue.length || ws.data.run || ws.data.current) return
+  if (ws.data.queue[0].notice && ws.data.call?.playing && !force) {
+    // Played to its end, the page says so (and runQueued runs again); this is in case it never does.
+    ws.data.queuedFor = setTimeout(() => runQueued(ws, true), PLAYING_WAIT_MS)
+    return
+  }
+  const firstNotice = ws.data.queue.findIndex(r => r.notice)
+  const n = firstNotice === 0 ? 1 : firstNotice < 0 ? ws.data.queue.length : firstNotice
+  const q = ws.data.queue.splice(0, n)
+  const next: Req = q.length === 1 ? q[0] : { id: q[q.length - 1].id, said: q.map(r => r.said).join('\n'), ids: q.flatMap(r => r.ids), text: q.map(r => r.text).join('\n\n'), background: q.map(r => r.background).filter(Boolean).join('\n') }
+  if (linkHolds(ws)) runTurn(ws, next)
+}
+// A notice for the call: now, or after what the call is doing (an answer running, being
+// spoken, or still playing on the page).
+function noticeTurn(ws: WS, req: Req) {
+  ws.data.queue.push(req)
+  runQueued(ws)
 }
 
 // Run one request through claude, streaming events + spoken audio to the client.
@@ -451,15 +484,7 @@ function runTurn(ws: WS, req: Req) {
         if (!alive()) return      // stopped, or cancelled to be asked again whole
         if (ws.data.current?.req === req) ws.data.current = undefined
         out(ws, { type: 'turn_end', req: req.id })
-        // What was asked while this turn ran goes next, as one request.
-        if (ws.data.queue.length && !ws.data.run) {
-          // A notice goes on its own; what the caller said meanwhile goes as one request.
-          const firstNotice = ws.data.queue.findIndex(r => r.notice)
-          const n = firstNotice === 0 ? 1 : firstNotice < 0 ? ws.data.queue.length : firstNotice
-          const q = ws.data.queue.splice(0, n)
-          const next: Req = q.length === 1 ? q[0] : { id: q[q.length - 1].id, said: q.map(r => r.said).join('\n'), ids: q.flatMap(r => r.ids), text: q.map(r => r.text).join('\n\n'), background: q.map(r => r.background).filter(Boolean).join('\n') }
-          if (linkHolds(ws)) runTurn(ws, next)
-        }
+        runQueued(ws)
       }, 150)
     },
   }
@@ -571,13 +596,19 @@ function onBotEvent(ws: WS, ev: any) {
     ws.data.rec?.trace('notice', `${ev.topic}: waits on you (${ev.what})`)
     out(ws, { type: 'ask', topic: ev.topic, thread: ev.thread ?? 'General', id: ev.id, what: ev.what })
     const req: Req = { id: ++ws.data.reqs, said: `❗ ${ev.topic}: ${ev.what === 'permission' ? 'asks for permission' : ev.what === 'plan' ? 'a plan is ready' : 'asks you'}`, ids: [], text: '', background: '', notice: `ask:${ev.id}` }
-    if (ws.data.run) ws.data.queue.push(req)
-    else if (linkHolds(ws)) runTurn(ws, req)
+    noticeTurn(ws, req)
   }
   // Answered (anywhere) before the call got to it: it isn't said.
   if (ev.kind === 'wait_end' && typeof ev.id === 'string') ws.data.queue = ws.data.queue.filter(r => r.notice !== `ask:${ev.id}`)
   if (ev.kind === 'runs') out(ws, { type: 'work', runs: ev.runs })
   else if (ev.kind === 'show') { if (ws.data.desk) out(ws, { type: 'show', topic: ev.topic }) }
+  // The desk turned the mic off, asked by voice ("mute the mic for a minute"): the
+  // page does it, and turns it back on after ms (0: only the caller turns it on).
+  else if (ev.kind === 'mic') {
+    const ms = Number.isFinite(ev.ms) && ev.ms > 0 ? Math.min(ev.ms, MIC_OFF_MAX_MS) : 0
+    ws.data.rec?.trace('page', ms ? `mic off by voice for ${Math.round(ms / 1000)} s` : 'mic off by voice')
+    out(ws, { type: 'mic', on: false, ms })
+  }
   // The desk switched the call's mode, asked by voice ("switch to assistant", "back to me").
   else if (ev.kind === 'call_mode') {
     const m = modeFrom(ev.mode)
@@ -592,8 +623,7 @@ function onBotEvent(ws: WS, ev: any) {
     ws.data.rec?.trace('notice', `${ev.topic}: ${ev.ok ? 'done' : 'failed'}`, { line: ev.line })
     out(ws, { type: 'notice', topic: ev.topic, ok: ev.ok, line: ev.line })
     const req: Req = { id: ++ws.data.reqs, said: `🔔 ${ev.topic}: ${ev.ok ? 'done' : 'did not finish'}`, ids: [], text: '', background: '', notice: ev.handoff }
-    if (ws.data.run) ws.data.queue.push(req)
-    else if (linkHolds(ws)) runTurn(ws, req)
+    noticeTurn(ws, req)
   }
 }
 
@@ -891,7 +921,7 @@ const server = Bun.serve<Conn>({
       open.delete(ws)
       ws.data.run?.stop()
       ws.data.events?.abort()
-      clearInterval(ws.data.topicsTimer); clearTimeout(ws.data.topicsSoon)
+      clearInterval(ws.data.topicsTimer); clearTimeout(ws.data.topicsSoon); clearTimeout(ws.data.queuedFor)
       if (ws.data.photoKey) photoKeys.delete(ws.data.photoKey)
       clearHeld(ws)
       ws.data.stt?.close()
@@ -1116,7 +1146,7 @@ function onMessage(ws: WS, raw: string | Buffer) {
         }
         // The words of an answer the page is about to play (its voice note): what the mic will hear back.
         case 'echo': call.speaking(String(msg.text ?? '').slice(0, 8000)); return
-        case 'playing': call.setPlaying(!!msg.on); rec.trace('page', msg.on ? 'playing the answer' : 'answer playback ended'); return
+        case 'playing': call.setPlaying(!!msg.on); rec.trace('page', msg.on ? 'playing the answer' : 'answer playback ended'); if (!msg.on) runQueued(ws); return
         // What the page saw: mic on/off, permission refused, playback trouble…
         case 'trace': {
           const extra = msg.extra && typeof msg.extra === 'object' && JSON.stringify(msg.extra).length <= 2000 ? { extra: msg.extra } : {}
