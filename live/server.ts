@@ -40,13 +40,27 @@ import type { ServerWebSocket } from 'bun'
 import { linkExpired, claimDevice, ownLink } from './access'
 import { drainSentences } from './sentences'
 import { SonioxStream, TokenTracker, type Turn } from './soniox'
-import { ARMED_MS, CallState, CALL_MODES, requestText, sendDecision, type CallMode, type Line } from './call'
+import { ARMED_MS, CallState, CALL_MODES, callWord, requestText, sendDecision, type CallMode, type Line } from './call'
+import { kwsKeywords, type Vocab } from './kws-tokens'
+import KWS_VOCAB from './kws-vocab.json'
 import { CallRecorder, pruneCalls, pcmToWav } from './recorder'
 import { Vad } from './vad'
 import { usageOf } from '../lib'
 import { UsageLedger } from '../usage'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
+// The phone's wake-word spotter (sherpa-onnx KWS built for the browser, see
+// live/kws-build.sh): its files, served at /kws/. Without them the page has no wake
+// word while the mic is off, and everything else works as before.
+const KWS_DIR = process.env.LIVE_KWS_DIR || join(HERE, '..', 'state', 'kws')
+const KWS_FILES: Record<string, string> = { 'sherpa-onnx-wasm-kws-main.js': 'text/javascript; charset=utf-8', 'sherpa-onnx-kws.js': 'text/javascript; charset=utf-8',
+  'sherpa-onnx-wasm-kws-main.wasm': 'application/wasm', 'sherpa-onnx-wasm-kws-main.data': 'application/octet-stream' }
+const kwsReady = () => Object.keys(KWS_FILES).every(f => existsSync(join(KWS_DIR, f)))
+// What the page's spotter listens for, from the call's wake words ("HEY LUCY").
+const kwsFor = (wake: string[]) => { if (!kwsReady()) return undefined; const k = kwsKeywords(wake, KWS_VOCAB as Vocab); return k.keywords ? k : undefined }
+// A wake heard on the phone must be the wake phrase in what Soniox hears within this
+// long; if not, the mic goes off again by itself (a false wake costs only these seconds).
+const WOKE_CONFIRM_MS = Number(process.env.LIVE_WOKE_CONFIRM_MS ?? 8000)
 const PORT = Number(process.env.LIVE_PORT || 3060)
 const DEFAULT_MODEL = process.env.LIVE_MODEL || 'sonnet'
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude'
@@ -316,6 +330,8 @@ type Conn = {
   // A notice waiting for the page to finish playing an answer: the fallback, should the
   // page never say it has.
   queuedFor?: ReturnType<typeof setTimeout>
+  // A wake heard on the phone, not yet confirmed by what Soniox heard.
+  woke?: ReturnType<typeof setTimeout>
 }
 type Answers = 'voice' | 'sound' | 'silent'
 const ANSWERS: Answers[] = ['voice', 'sound', 'silent']
@@ -835,6 +851,8 @@ function heard(ws: WS, turns: Turn[], finalized: boolean) {
   if (before === null && call.main !== null) { rec.trace('speaker', `speaker ${call.main} is you, as the first voice heard`); out(ws, { type: 'main', speaker: call.main }) }
   for (const l of r.lines) rec.trace('heard', `speaker ${l.speaker} (${l.role === 'me' ? 'you' : 'other'}${held ? ', talk button held' : ''}${l.unclear ? `, unclear (confidence ${l.confidence}): not sent` : ''})`, { text: l.text, language: l.language, confidence: l.confidence })
   if (r.lines.length) out(ws, { type: 'lines', lines: r.lines.map(shown) })
+  // A wake on the phone, confirmed: the wake phrase is in what was heard.
+  if (ws.data.woke && r.lines.some(l => callWord(l.text, call.wake))) { clearTimeout(ws.data.woke); ws.data.woke = undefined; rec.trace('voice', 'wake confirmed: the mic stays on') }
   if (r.stop) { stopAll(ws, `you said "${r.lines.filter(l => l.role === 'me').map(l => l.text).join(' ')}"`); return }
   if (r.send) {
     // The caller's words after the caller's request, before its answer: one request, asked again. Not
@@ -896,6 +914,10 @@ const server = Bun.serve<Conn>({
     }
     // The page's Markdown renderer and its sanitiser, served from here (live/vendor),
     // not a CDN: a compromised CDN would otherwise run inside the call.
+    // The wake-word spotter: its worker (from here) and the built files (KWS_DIR).
+    const kwsFile = url.pathname.match(/^\/kws\/([\w.-]+)$/)?.[1]
+    if (kwsFile === 'kws-worker.js') return new Response(Bun.file(join(HERE, 'kws-worker.js')), { headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-cache' } })
+    if (kwsFile && KWS_FILES[kwsFile] && existsSync(join(KWS_DIR, kwsFile))) return new Response(Bun.file(join(KWS_DIR, kwsFile)), { headers: { 'content-type': KWS_FILES[kwsFile], 'cache-control': 'public, max-age=604800' } })
     const vendor = url.pathname.match(/^\/vendor\/(marked\.min\.js|purify\.min\.js)$/)
     if (vendor) return new Response(Bun.file(join(HERE, 'vendor', vendor[1])), { headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'public, max-age=86400' } })
     // Any other path serves the page (the uuid lives in the path, read client-side),
@@ -908,7 +930,7 @@ const server = Bun.serve<Conn>({
       'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff',
       'content-security-policy': [
         `default-src 'none'`, `script-src 'self' 'nonce-${nonce}' blob:`, `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com`,
-        `font-src https://fonts.gstatic.com`, `img-src 'self' data: blob:`, `connect-src 'self'`, `media-src 'self' blob:`,
+        `font-src https://fonts.gstatic.com`, `img-src 'self' data: blob:`, `connect-src 'self'`, `media-src 'self' blob:`, `worker-src 'self'`,
         `frame-ancestors 'none'`, `base-uri 'none'`, `form-action 'none'`,
       ].join('; '),
     } })
@@ -921,7 +943,7 @@ const server = Bun.serve<Conn>({
       open.delete(ws)
       ws.data.run?.stop()
       ws.data.events?.abort()
-      clearInterval(ws.data.topicsTimer); clearTimeout(ws.data.topicsSoon); clearTimeout(ws.data.queuedFor)
+      clearInterval(ws.data.topicsTimer); clearTimeout(ws.data.topicsSoon); clearTimeout(ws.data.queuedFor); clearTimeout(ws.data.woke)
       if (ws.data.photoKey) photoKeys.delete(ws.data.photoKey)
       clearHeld(ws)
       ws.data.stt?.close()
@@ -1008,7 +1030,7 @@ function onMessage(ws: WS, raw: string | Buffer) {
           ws.data.topicsTimer = setInterval(() => { if (!linkHolds(ws)) return; stampUsed(ws.data.uuid); void sendTopics(ws) }, TOPICS_EVERY_MS)
         } else ws.data.topicsTimer = setInterval(() => { if (linkHolds(ws)) stampUsed(ws.data.uuid) }, 60_000)
         const mode = ws.data.permission!.includes('--dangerously-skip-permissions') ? 'bypass' : ws.data.permission![ws.data.permission!.indexOf('--permission-mode') + 1]
-        out(ws, { type: 'ready', where: link.cwd, model: link.model || DEFAULT_MODEL, mode, callMode: ws.data.call.mode, wake: ws.data.call.wake, others: ws.data.call.othersMayCall, stt: SONIOX_KEY ? 'soniox' : 'browser', desk: !!link.desk, pk: ws.data.photoKey, ...(link.user ? { me: link.user.id } : {}) })
+        out(ws, { type: 'ready', where: link.cwd, model: link.model || DEFAULT_MODEL, mode, callMode: ws.data.call.mode, wake: ws.data.call.wake, others: ws.data.call.othersMayCall, stt: SONIOX_KEY ? 'soniox' : 'browser', desk: !!link.desk, pk: ws.data.photoKey, ...(link.user ? { me: link.user.id } : {}), ...(SONIOX_KEY && kwsFor(ws.data.call.wake) ? { kws: kwsFor(ws.data.call.wake) } : {}) })
         return
       }
       if (!ws.data.authed) return
@@ -1069,7 +1091,7 @@ function onMessage(ws: WS, raw: string | Buffer) {
           call.wake = w
           savePref(prefsKey(ws), { wake: w })
           rec.trace('page', 'wake words changed', { wake: w })
-          out(ws, { type: 'wake', words: w })
+          out(ws, { type: 'wake', words: w, ...(SONIOX_KEY ? { kws: kwsFor(w) ?? null } : {}) })
           return
         }
         // Whether others on the call may call it by name (Assistant mode): this person's, kept.
@@ -1146,6 +1168,20 @@ function onMessage(ws: WS, raw: string | Buffer) {
         }
         // The words of an answer the page is about to play (its voice note): what the mic will hear back.
         case 'echo': call.speaking(String(msg.text ?? '').slice(0, 8000)); return
+        // The phone heard the wake phrase while the mic was off and turned the mic on,
+        // sending the seconds before it first. Soniox must hear the wake phrase in them,
+        // or the mic goes off again (heard() confirms it).
+        case 'woke': {
+          clearTimeout(ws.data.woke)
+          const said = String(msg.keyword ?? '').slice(0, 80)
+          rec.trace('voice', `wake phrase heard on the phone (${said}): mic on`)
+          ws.data.woke = setTimeout(() => {
+            ws.data.woke = undefined
+            rec.trace('voice', `false wake: no wake word heard within ${WOKE_CONFIRM_MS / 1000} s, mic off again`)
+            out(ws, { type: 'mic', on: false, ms: 0, why: 'false_wake' })
+          }, WOKE_CONFIRM_MS)
+          return
+        }
         case 'playing': call.setPlaying(!!msg.on); rec.trace('page', msg.on ? 'playing the answer' : 'answer playback ended'); if (!msg.on) runQueued(ws); return
         // What the page saw: mic on/off, permission refused, playback trouble…
         case 'trace': {

@@ -203,6 +203,10 @@
   #listen .field input{font:15px/1.3 inherit;font-family:inherit;color:var(--text);background:rgba(0,0,0,.2);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:9px 11px;outline:none;unicode-bidi:plaintext}
   #listen .field input:focus{border-color:var(--accent)}
   #listen .field small{font-size:12px}
+  #listen .check{display:none;gap:10px;align-items:flex-start;font-size:14px;color:var(--text);cursor:pointer}
+  #listen .check.show{display:flex}
+  #listen .check input{margin-top:3px;accent-color:var(--accent)}
+  #listen .check small{display:block;font-size:12px;color:var(--hint);margin-top:2px}
   #hint.tap{cursor:pointer}
   /* Others on the call may call it (Assistant mode): its own icon in the header, red
      while on, since then anyone in the room can ask it things with your rights. */
@@ -272,6 +276,7 @@
   <div class="as" id="asOnly">
     <label class="field">Wake word<input id="wakeIn" dir="auto" autocomplete="off" spellcheck="false" enterkeyhint="done"><small>Said at the start of a sentence. Several spellings, separated by commas.</small></label>
   </div>
+  <label class="check" id="wakeMicRow"><input type="checkbox" id="wakeMic"><span><span id="wakeMicLabel">Mic on by voice</span><small>While the mic is off, this phone listens for it by itself. Nothing is sent until it hears it.</small></span></label>
 </div>
 <div id="sheet"><div class="q" id="quote"></div><button class="primary" id="isme">This is me</button><button id="sendit">Send this to Claude</button><button id="cancel">Cancel</button></div>
 <script>
@@ -370,7 +375,7 @@ function connect(){
     if(typeof ev.data!=='string') return playChunk(ev.data)
     const m=JSON.parse(ev.data)
     switch(m.type){
-      case 'ready': if(Array.isArray(m.wake)) wake=m.wake; othersOn=!!m.others; paintMode(); clearPending(); callReady=true; sentBytes=0; heardS=0; stt=m.stt; document.body.classList.toggle('desk', !!m.desk); me=m.me??null; photoKey=m.pk||''
+      case 'ready': kwsCfg=m.kws||null; if(Array.isArray(m.wake)) wake=m.wake; othersOn=!!m.others; paintMode(); clearPending(); callReady=true; sentBytes=0; heardS=0; stt=m.stt; paintWakeMic(); if(!micOn) startSpotting(); document.body.classList.toggle('desk', !!m.desk); me=m.me??null; photoKey=m.pk||''
         if(m.desk && viewing!==null) ws.send(JSON.stringify({type:'view', topic:viewing}))
         $('#sub').textContent=(m.model||'')+(m.where && !m.desk?'  ·  '+m.where:''); chip('#mode', m.mode); setDot('on')
         if(retry){
@@ -399,11 +404,11 @@ function connect(){
       case 'main': mainSpeaker=m.speaker; chip('#me', mainSpeaker==null?'':'you = speaker '+mainSpeaker); restyle(); break
       case 'waiting': for(const id of m.ids) lineState(id,'…'); break
       case 'heard': heardS=m.s; break
-      case 'mic': if(m.on===false) micOffByVoice(Number(m.ms)||0); break
+      case 'mic': if(m.on===false) micOffByVoice(Number(m.ms)||0, m.why); break
       case 'call_mode': if(m.byVoice && MODES[m.mode] && m.mode!==callMode){ callMode=m.mode; try{ localStorage.setItem(modeKey, m.mode) }catch{}; paintMode(); sys(MODES[m.mode].label+' mode, switched by voice') } break
       case 'others': othersOn=!!m.on; paintMode(); if(tipFor===$('#othersBtn')) showTip(tipFor); break
       case 'called': listening(m.ms||8000); break
-      case 'wake': if(Array.isArray(m.words)) wake=m.words; paintMode(); if(m.error) sys('wake word not changed: '+m.error); break
+      case 'wake': if('kws' in m){ kwsCfg=m.kws||null; paintWakeMic(); kwsWorker?.postMessage({type:'keywords', keywords:kwsCfg?.keywords||''}) } if(Array.isArray(m.words)) wake=m.words; paintMode(); if(m.error) sys('wake word not changed: '+m.error); break
       case 'sent': endListening(); for(const id of m.ids) lineState(id, m.queued?'⏳ queued':'✓'); break
       case 'working':
         // only one request runs at a time: anything still showing as running has ended
@@ -485,6 +490,7 @@ async function openMic(){
     mutedTalk(!live && level>0.35)
     health.made++
     if(live && ws?.readyState===1){ ws.send(e.data.pcm); health.sent++; if(callReady) sentBytes+=e.data.pcm.byteLength }
+    if(!live) spot(e.data.pcm); else wakeRing.length=0
   }
   const st=micStream.getAudioTracks()[0]?.getSettings?.()||{}
   const caps=micStream.getAudioTracks()[0]?.getCapabilities?.()||{}
@@ -605,21 +611,27 @@ function mutedTalk(loud){
   const on = !!loudSince && now-loudSince>400
   if(on===mutedOn) return; mutedOn=on
   mic.classList.toggle('muted-talk', on)
-  const h=$('#hint'); h.textContent = on ? 'You are talking with the mic off — tap it to turn it on' : hintNow(); h.classList.toggle('warn', on)
+  const h=$('#hint'); h.textContent = on ? 'You are talking with the mic off — tap it'+(spotOn()?' or say “'+wakeSays()+'”':'')+' to turn it on' : hintNow(); h.classList.toggle('warn', on)
 }
 function paint(){ mic.classList.toggle('on', micOn && !talking); mic.classList.toggle('talking', talking); mic.classList.toggle('speaking', botSpeaking && !talking && micOn) }
 
 // One button, like a video call: tap = mic on/off; hold = talking (what you say is
 // yours, pauses don't cut it, letting go sends it). Space does the same as holding.
-function setMic(on){ if(on) clearTimeout(micBack); if(micOn===on) return; micOn=on; paint(); trace(on?'mic on':'mic off'); if(stt==='browser'){ on?startRec():stopRec() } }
+function setMic(on){ if(on) clearTimeout(micBack); if(micOn===on) return; micOn=on; paint(); trace(on?'mic on':'mic off'); if(stt==='browser'){ on?startRec():stopRec() }
+  if(!on) startSpotting() }
 // The mic turned off by voice (the front desk's mic_off): with ms, back on by itself
 // then, with a sound so the caller knows it is listening again; the server allows at
 // most 3 minutes. Turning it on by hand first cancels that.
 let micBack=null
-function micOffByVoice(ms){
+function micOffByVoice(ms, why){
   if(!started) return
-  setMic(false); vibrate(20)
-  if(!(ms>0)){ sys('🔇 Mic off, asked by voice — tap it to turn it back on'); return }
+  if(why==='false_wake'){
+    // The phone thought it heard the wake phrase, but it wasn't in what was said.
+    if(!wokeAt) return
+    wokeAt=0; setMic(false); sys('🔇 That wasn’t “'+wakeSays()+'” — the mic is off again'); return
+  }
+  wokeAt=0; setMic(false); vibrate(20)
+  if(!(ms>0)){ sys('🔇 Mic off, asked by voice — '+(spotOn()?'say “'+wakeSays()+'” or tap it':'tap it')+' to turn it back on'); return }
   const s=Math.round(ms/1000), span=s>=60 ? (s%60 ? (s/60).toFixed(1) : s/60)+' min' : s+' s'
   sys('🔇 Mic off for '+span+', asked by voice — it comes back on by itself')
   micBack=setTimeout(()=>{ micBack=null; if(micOn) return; setMic(true); micBackTone(); vibrate([20,50,20]); sys('🎙 The mic is back on') }, ms)
@@ -633,7 +645,7 @@ let pressTimer=null, pressHeld=false
 mic.addEventListener('pointerdown', e=>{ e.preventDefault(); if(!actx) return; if(actx.state==='suspended') actx.resume()
   pressHeld=false; mic.setPointerCapture?.(e.pointerId); pressTimer=setTimeout(()=>{ pressHeld=true; talk(true) }, 280) })
 const up=e=>{ e.preventDefault(); if(pressTimer===null) return; clearTimeout(pressTimer); pressTimer=null
-  if(pressHeld) talk(false); else setMic(!micOn) }
+  if(pressHeld) talk(false); else { wokeAt=0; setMic(!micOn) } }
 mic.addEventListener('pointerup', up); mic.addEventListener('pointercancel', up)
 mic.addEventListener('contextmenu', e=>e.preventDefault())
 const typing=t=>t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))
@@ -745,6 +757,50 @@ function micBackTone(){
       o.connect(g); g.connect(actx.destination); o.start(t+i*.12); o.stop(t+i*.12+.3)
     }
   }catch{}
+}
+// ---- the wake phrase while the mic is off ("Hey Lucy"), heard on this phone ----
+// sherpa-onnx's keyword spotter in a worker (/kws/), fed the audio the page captures
+// anyway while the mic is off; nothing of it is sent until the phrase is heard. Then
+// the last 2 s go first (so "Hey Lucy, what time is it" arrives whole) and the mic is
+// on. The server checks that Soniox heard the wake phrase in them; if not, it turns
+// the mic off again (micOffByVoice 'false_wake'). Off with the switch in "How the call
+// listens"; it loads the first time the mic goes off.
+let kwsCfg=null, kwsWorker=null, kwsReady=false, kwsFailed=false, wokeAt=0
+const wakeRing=[], WAKE_RING=20   // 100 ms pieces: 2 s
+const wakeMicKey='xesious-live-wake-mic'
+let wakeMicOn=true
+try{ wakeMicOn=localStorage.getItem(wakeMicKey)!=='off' }catch{}
+const wakeSays=()=>{ const t=(kwsCfg?.text||'').split(',')[0].trim().toLowerCase(); return t ? t.replace(/\b\w/g,c=>c.toUpperCase()) : 'Hey Lucy' }
+const spotOn=()=>!!kwsCfg && wakeMicOn && !kwsFailed && stt==='soniox'
+function paintWakeMic(){
+  $('#wakeMicRow').classList.toggle('show', !!kwsCfg && stt==='soniox')
+  $('#wakeMic').checked=wakeMicOn; $('#wakeMicLabel').textContent='Mic on by voice: “'+wakeSays()+'”'
+}
+$('#wakeMic').addEventListener('change', e=>{ wakeMicOn=e.target.checked; try{ localStorage.setItem(wakeMicKey, wakeMicOn?'on':'off') }catch{}; trace('wake by voice '+(wakeMicOn?'on':'off')); if(wakeMicOn && !micOn) startSpotting() })
+function startSpotting(){
+  if(!started || !spotOn()) return
+  if(kwsWorker){ if(kwsReady) kwsWorker.postMessage({type:'reset'}); return }
+  try{ kwsWorker=new Worker('/kws/kws-worker.js') }catch(err){ kwsFailed=true; trace('wake spotter could not start', {error:String(err)}); return }
+  const t0=Date.now()
+  kwsWorker.onmessage=e=>{ const m=e.data||{}
+    if(m.type==='ready'){ kwsReady=true; trace('wake spotter ready', {ms:Date.now()-t0}) }
+    else if(m.type==='error'){ kwsFailed=true; trace('wake spotter failed', {error:String(m.error).slice(0,300)}); kwsWorker.terminate(); kwsWorker=null }
+    else if(m.type==='hit') woke(m.keyword)
+  }
+  kwsWorker.onerror=e=>{ kwsFailed=true; trace('wake spotter failed', {error:String(e.message||e)}); try{ kwsWorker.terminate() }catch{}; kwsWorker=null }
+  kwsWorker.postMessage({type:'init', keywords:kwsCfg.keywords, threshold:0.25})
+}
+function spot(pcm){
+  if(!started) return
+  wakeRing.push(pcm); if(wakeRing.length>WAKE_RING) wakeRing.shift()
+  if(kwsReady && spotOn() && !talking) kwsWorker.postMessage({type:'audio', pcm:pcm.slice(0)})
+}
+function woke(keyword){
+  if(micOn || talking || !spotOn() || ws?.readyState!==1) return
+  wokeAt=Date.now()
+  ws.send(JSON.stringify({type:'woke', keyword:String(keyword||'')}))
+  for(const p of wakeRing.splice(0)) ws.send(p)
+  setMic(true); micBackTone(); vibrate([20,50,20]); sys('🎙 Heard “'+wakeSays()+'” — the mic is on')
 }
 function ding(){
   try{

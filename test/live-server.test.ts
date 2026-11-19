@@ -1,7 +1,7 @@
 // live/server.ts end to end: the real server, a fake Soniox (a local WebSocket the
 // test drives), a stand-in claude, and a test client in the page's place.
 import { test, expect, beforeAll, afterAll } from 'bun:test'
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, chmodSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync, existsSync } from 'node:fs'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -13,6 +13,10 @@ const CALLS = join(TMP, 'calls')
 const PROMPTS = join(TMP, 'prompts.jsonl')
 const UUID = '7f1c2a9e-0000-4000-8000-000000000001'
 const D1 = 'device-one-aaaaaaaaaaaaaaaa', D2 = 'device-two-bbbbbbbbbbbbbbbb'
+// The phone's wake-word spotter's built files: stand-ins, served as they are.
+const KWS = join(TMP, 'kws')
+mkdirSync(KWS)
+for (const f of ['sherpa-onnx-wasm-kws-main.js', 'sherpa-onnx-kws.js', 'sherpa-onnx-wasm-kws-main.wasm', 'sherpa-onnx-wasm-kws-main.data']) writeFileSync(join(KWS, f), `stand-in ${f}`)
 
 // claude: records its prompt; SLOW… never answers (until killed), anything else
 // answers one sentence.
@@ -91,7 +95,8 @@ beforeAll(async () => {
   writeFileSync(LINKS, JSON.stringify({ [UUID]: { key: 'chat:topic', cwd: TMP, created: new Date().toISOString(), permission: ['--permission-mode', 'auto'] } }))
   server = spawn(process.execPath, ['run', join(import.meta.dir, '..', 'live', 'server.ts')], {
     env: { ...process.env, LIVE_PORT: '0', LIVE_TTS: 'off', LIVE_LINKS_FILE: LINKS, LIVE_CALLS_DIR: CALLS, CLAUDE_BIN: STUB,
-      SONIOX_API_KEY: 'test-key', LIVE_SONIOX_URL: `ws://127.0.0.1:${soniox.port}`, LIVE_QUIET_MS: '150', LIVE_MAX_WAIT_MS: '1500', LIVE_END_SILENCE_MS: '1300' },
+      SONIOX_API_KEY: 'test-key', LIVE_SONIOX_URL: `ws://127.0.0.1:${soniox.port}`, LIVE_QUIET_MS: '150', LIVE_MAX_WAIT_MS: '1500', LIVE_END_SILENCE_MS: '1300',
+      LIVE_KWS_DIR: KWS, LIVE_WOKE_CONFIRM_MS: '1200' },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   port = await new Promise<number>((res, rej) => {
@@ -111,6 +116,21 @@ test('the first device takes the link; a second device is refused', async () => 
   await B.wait(m => m.type === 'other_device')
 })
 
+test('the page is told what its wake spotter listens for ("hey" before each wake word it can spell), and gets its files', async () => {
+  const ready = A.got.find(m => m.type === 'ready')
+  expect(ready.kws.keywords).toContain('▁HE Y ▁ LU C Y @HEY_LUCY')
+  expect(ready.kws.text).toContain('HEY LUCY')
+  const wasm = await fetch(`http://127.0.0.1:${port}/kws/sherpa-onnx-wasm-kws-main.wasm`)
+  expect(wasm.headers.get('content-type')).toBe('application/wasm')
+  expect(await wasm.text()).toBe('stand-in sherpa-onnx-wasm-kws-main.wasm')
+  expect((await fetch(`http://127.0.0.1:${port}/kws/kws-worker.js`)).headers.get('content-type')).toContain('javascript')
+  // nothing else from that folder, and nothing outside it
+  expect((await fetch(`http://127.0.0.1:${port}/kws/..%2Flive-links.json`)).headers.get('content-type')).toContain('text/html')
+  expect((await fetch(`http://127.0.0.1:${port}/kws/secret.txt`)).headers.get('content-type')).toContain('text/html')
+  const page = await fetch(`http://127.0.0.1:${port}/${UUID}`)
+  expect(page.headers.get('content-security-policy')).toContain(`worker-src 'self'`)
+})
+
 test('mic audio reaches Soniox with the key, both languages and speakers on', async () => {
   A.ws.send(new Uint8Array(3200))
   for (let i = 0; i < 40 && sonioxBytes < 3200; i++) await Bun.sleep(50)
@@ -118,6 +138,16 @@ test('mic audio reaches Soniox with the key, both languages and speakers on', as
   expect(sonioxConfig).toMatchObject({ api_key: 'test-key', model: 'stt-rt-v6', language_hints: ['en', 'fa'], enable_speaker_diarization: true, sample_rate: 16000,
     enable_endpoint_detection: false })
   expect(sonioxConfig.context).toBeUndefined()   // no "expected words" unless LIVE_TERMS is set
+})
+
+
+test('a wake heard on the phone that Soniox did not hear is a false wake: the mic goes off again', async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  A.got.length = 0
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'HEY_LUCY' }))
+  expect(await A.wait(m => m.type === 'mic', 4000)).toEqual({ type: 'mic', on: false, ms: 0, why: 'false_wake' })
+  expect(traceNow()).toContain('wake phrase heard on the phone (HEY_LUCY)')
+  expect(traceNow()).toContain('false wake')
 })
 
 test('the first voice is "you" and runs a turn in the topic\'s mode; the answer says what it answers', async () => {
@@ -315,6 +345,19 @@ test('Assistant mode, others allowed: another voice calling it by name is a requ
   A.ws.send(JSON.stringify({ type: 'mode', mode: 'interactive' }))
   await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
 })
+
+test('a wake heard on the phone that Soniox hears too ("Hey Hanna, …") is confirmed: the mic stays on', async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  A.got.length = 0
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'HEY_LUCY' }))
+  // By now the caller is speaker 2 and the wake word is Hanna (the tests above).
+  say('2', 'Hey Hanna, what day is it?')
+  const sent = await A.wait(m => m.type === 'sent')
+  await A.wait(m => m.type === 'turn_end' && m.req === sent.req)
+  await Bun.sleep(1500)   // past the confirmation window
+  expect(A.got.some(m => m.type === 'mic')).toBe(false)
+  expect(traceNow()).toContain('wake confirmed')
+}, 20000)
 
 test('the call is recorded: mic audio, and a trace of every step', async () => {
   A.ws.close()
