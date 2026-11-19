@@ -41,23 +41,29 @@ import { linkExpired, claimDevice, ownLink } from './access'
 import { drainSentences } from './sentences'
 import { SonioxStream, TokenTracker, type Turn } from './soniox'
 import { ARMED_MS, CallState, CALL_MODES, callWord, requestText, sendDecision, type CallMode, type Line } from './call'
-import { kwsKeywords, type Vocab } from './kws-tokens'
-import KWS_VOCAB from './kws-vocab.json'
+import { kwsPhrases } from './kws'
 import { CallRecorder, pruneCalls, pcmToWav } from './recorder'
 import { Vad } from './vad'
 import { usageOf } from '../lib'
 import { UsageLedger } from '../usage'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-// The phone's wake-word spotter (sherpa-onnx KWS built for the browser, see
-// live/kws-build.sh): its files, served at /kws/. Without them the page has no wake
-// word while the mic is off, and everything else works as before.
+// The phone's wake-word spotter: Vosk in the browser (vosk-browser) with its small
+// English model, set up once with live/kws-setup.sh, served at /kws/. Without them the
+// page has no wake word while the mic is off, and everything else works as before.
 const KWS_DIR = process.env.LIVE_KWS_DIR || join(HERE, '..', 'state', 'kws')
-const KWS_FILES: Record<string, string> = { 'sherpa-onnx-wasm-kws-main.js': 'text/javascript; charset=utf-8', 'sherpa-onnx-kws.js': 'text/javascript; charset=utf-8',
-  'sherpa-onnx-wasm-kws-main.wasm': 'application/wasm', 'sherpa-onnx-wasm-kws-main.data': 'application/octet-stream' }
+const KWS_MODEL = 'vosk-model-small-en-us-0.15.tar.gz'
+const KWS_FILES: Record<string, string> = { 'vosk.js': 'text/javascript; charset=utf-8', 'vosk-worker.js': 'text/javascript; charset=utf-8', [KWS_MODEL]: 'application/gzip' }
 const kwsReady = () => Object.keys(KWS_FILES).every(f => existsSync(join(KWS_DIR, f)))
-// What the page's spotter listens for, from the call's wake words ("HEY LUCY").
-const kwsFor = (wake: string[]) => { if (!kwsReady()) return undefined; const k = kwsKeywords(wake, KWS_VOCAB as Vocab); return k.keywords ? k : undefined }
+const kwsFor = (wake: string[]) => {
+  if (!kwsReady()) return undefined
+  const phrases = kwsPhrases(wake)
+  return phrases.length ? { model: `/kws/${KWS_MODEL}`, phrases, conf: KWS_CONF } : undefined
+}
+// A hit counts only when Vosk is this sure of "hey" (the phrase's first word; the
+// browser build scores the last word at ~0.5 regardless). Tested 2026-11-19 in the
+// browser on ~50 fast "Hey Lucy": 44/50 at 0.9, 47/50 with no cutoff.
+const KWS_CONF = Number(process.env.LIVE_KWS_CONF ?? 0.9)
 // A wake heard on the phone must be the wake phrase in what Soniox hears within this
 // long; if not, the mic goes off again by itself (a false wake costs only these seconds).
 const WOKE_CONFIRM_MS = Number(process.env.LIVE_WOKE_CONFIRM_MS ?? 8000)
@@ -914,9 +920,8 @@ const server = Bun.serve<Conn>({
     }
     // The page's Markdown renderer and its sanitiser, served from here (live/vendor),
     // not a CDN: a compromised CDN would otherwise run inside the call.
-    // The wake-word spotter: its worker (from here) and the built files (KWS_DIR).
+    // The wake-word spotter's files (KWS_DIR).
     const kwsFile = url.pathname.match(/^\/kws\/([\w.-]+)$/)?.[1]
-    if (kwsFile === 'kws-worker.js') return new Response(Bun.file(join(HERE, 'kws-worker.js')), { headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-cache' } })
     if (kwsFile && KWS_FILES[kwsFile] && existsSync(join(KWS_DIR, kwsFile))) return new Response(Bun.file(join(KWS_DIR, kwsFile)), { headers: { 'content-type': KWS_FILES[kwsFile], 'cache-control': 'public, max-age=604800' } })
     const vendor = url.pathname.match(/^\/vendor\/(marked\.min\.js|purify\.min\.js)$/)
     if (vendor) return new Response(Bun.file(join(HERE, 'vendor', vendor[1])), { headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'public, max-age=86400' } })

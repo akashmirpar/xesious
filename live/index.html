@@ -408,7 +408,7 @@ function connect(){
       case 'call_mode': if(m.byVoice && MODES[m.mode] && m.mode!==callMode){ callMode=m.mode; try{ localStorage.setItem(modeKey, m.mode) }catch{}; paintMode(); sys(MODES[m.mode].label+' mode, switched by voice') } break
       case 'others': othersOn=!!m.on; paintMode(); if(tipFor===$('#othersBtn')) showTip(tipFor); break
       case 'called': listening(m.ms||8000); break
-      case 'wake': if('kws' in m){ kwsCfg=m.kws||null; paintWakeMic(); kwsWorker?.postMessage({type:'keywords', keywords:kwsCfg?.keywords||''}) } if(Array.isArray(m.words)) wake=m.words; paintMode(); if(m.error) sys('wake word not changed: '+m.error); break
+      case 'wake': if('kws' in m){ kwsCfg=m.kws||null; paintWakeMic(); if(kwsModel) kwsRecognizer() } if(Array.isArray(m.words)) wake=m.words; paintMode(); if(m.error) sys('wake word not changed: '+m.error); break
       case 'sent': endListening(); for(const id of m.ids) lineState(id, m.queued?'⏳ queued':'✓'); break
       case 'working':
         // only one request runs at a time: anything still showing as running has ended
@@ -759,46 +759,81 @@ function micBackTone(){
   }catch{}
 }
 // ---- the wake phrase while the mic is off ("Hey Lucy"), heard on this phone ----
-// sherpa-onnx's keyword spotter in a worker (/kws/), fed the audio the page captures
-// anyway while the mic is off; nothing of it is sent until the phrase is heard. Then
-// the last 2 s go first (so "Hey Lucy, what time is it" arrives whole) and the mic is
-// on. The server checks that Soniox heard the wake phrase in them; if not, it turns
-// the mic off again (micOffByVoice 'false_wake'). Off with the switch in "How the call
-// listens"; it loads the first time the mic goes off.
-let kwsCfg=null, kwsWorker=null, kwsReady=false, kwsFailed=false, wokeAt=0
+// Vosk in the browser (/kws/vosk.js, its own worker), told to listen only for the wake
+// phrases (a grammar), fed the audio the page captures anyway while the mic is off;
+// nothing of it is sent until the phrase is heard. A partial result with the phrase
+// asks for the final one at once, which says how sure Vosk is of each word; with "hey"
+// under the cutoff it isn't a wake. Audio goes in as -1..1 floats, as vosk-browser expects. Then the last 2 s go first (so "Hey Lucy, what time is it"
+// arrives whole) and the mic is on. The server checks that Soniox heard the wake phrase
+// in them; if not, it turns the mic off again (micOffByVoice 'false_wake'). Off with the
+// switch in "How the call listens"; it loads the first time the mic goes off.
+let kwsCfg=null, kwsModel=null, kwsRec=null, kwsLoading=false, kwsFailed=false, kwsAsked=false, wokeAt=0
 const wakeRing=[], WAKE_RING=20   // 100 ms pieces: 2 s
 const wakeMicKey='xesious-live-wake-mic'
 let wakeMicOn=true
 try{ wakeMicOn=localStorage.getItem(wakeMicKey)!=='off' }catch{}
-const wakeSays=()=>{ const t=(kwsCfg?.text||'').split(',')[0].trim().toLowerCase(); return t ? t.replace(/\b\w/g,c=>c.toUpperCase()) : 'Hey Lucy' }
+const wakeSays=()=>{ const t=(kwsCfg?.phrases||[])[0]; return t ? t.replace(/\b\w/g,c=>c.toUpperCase()) : 'Hey Lucy' }
 const spotOn=()=>!!kwsCfg && wakeMicOn && !kwsFailed && stt==='soniox'
 function paintWakeMic(){
   $('#wakeMicRow').classList.toggle('show', !!kwsCfg && stt==='soniox')
   $('#wakeMic').checked=wakeMicOn; $('#wakeMicLabel').textContent='Mic on by voice: “'+wakeSays()+'”'
 }
 $('#wakeMic').addEventListener('change', e=>{ wakeMicOn=e.target.checked; try{ localStorage.setItem(wakeMicKey, wakeMicOn?'on':'off') }catch{}; trace('wake by voice '+(wakeMicOn?'on':'off')); if(wakeMicOn && !micOn) startSpotting() })
+function kwsFail(what, err){ kwsFailed=true; kwsLoading=false; trace('wake spotter failed', {what, error:String(err?.message||err).slice(0,300)}); paintWakeMic() }
+function kwsRecognizer(){
+  try{ kwsRec?.remove() }catch{}
+  kwsRec=null; kwsAsked=false
+  if(!kwsModel || !kwsCfg?.phrases?.length) return
+  const r=new kwsModel.KaldiRecognizer(16000, JSON.stringify([...kwsCfg.phrases, '[unk]']))
+  r.setWords(true)
+  // The phrase in a partial result: ask for the final one, which has the confidences.
+  r.on('partialresult', m=>{ const p=m.result?.partial||''; if(!kwsAsked && kwsCfg.phrases.some(x=>p.includes(x))){ kwsAsked=true; r.retrieveFinalResult() } })
+  r.on('result', m=>{
+    kwsAsked=false
+    const ws=m.result?.result||[], need=kwsCfg.conf||0.9
+    for(const p of kwsCfg.phrases){
+      const pw=p.split(' ')
+      for(let i=0;i+pw.length<=ws.length;i++){
+        const run=ws.slice(i,i+pw.length)
+        // How sure Vosk is of "hey": vosk-browser's forced final result scores the word
+        // just heard ("lucy") at about 0.5 every time, so only the first word is judged.
+        if(run.every((w,j)=>w.word===pw[j]) && run[0].conf>=need){ woke(p, run[0].conf); return }
+      }
+    }
+  })
+  kwsRec=r
+}
 function startSpotting(){
   if(!started || !spotOn()) return
-  if(kwsWorker){ if(kwsReady) kwsWorker.postMessage({type:'reset'}); return }
-  try{ kwsWorker=new Worker('/kws/kws-worker.js') }catch(err){ kwsFailed=true; trace('wake spotter could not start', {error:String(err)}); return }
-  const t0=Date.now()
-  kwsWorker.onmessage=e=>{ const m=e.data||{}
-    if(m.type==='ready'){ kwsReady=true; trace('wake spotter ready', {ms:Date.now()-t0}) }
-    else if(m.type==='error'){ kwsFailed=true; trace('wake spotter failed', {error:String(m.error).slice(0,300)}); kwsWorker.terminate(); kwsWorker=null }
-    else if(m.type==='hit') woke(m.keyword)
+  if(kwsModel){ kwsRecognizer(); return }   // a fresh start: nothing heard before counts
+  if(kwsLoading) return
+  kwsLoading=true
+  const t0=Date.now(), s=document.createElement('script')
+  // Vosk's worker from its own file, not a blob (see live/kws-setup.sh).
+  window.VOSK_WORKER_URL=location.origin+'/kws/vosk-worker.js'
+  s.src='/kws/vosk.js'
+  s.onerror=()=>kwsFail('vosk.js', 'could not load')
+  s.onload=async()=>{
+    try{
+      // An absolute URL: the model is fetched inside Vosk's own worker.
+      kwsModel=await window.Vosk.createModel(location.origin+kwsCfg.model, -1)
+      kwsLoading=false; kwsRecognizer(); trace('wake spotter ready', {ms:Date.now()-t0})
+    }catch(err){ kwsFail('model', err) }
   }
-  kwsWorker.onerror=e=>{ kwsFailed=true; trace('wake spotter failed', {error:String(e.message||e)}); try{ kwsWorker.terminate() }catch{}; kwsWorker=null }
-  kwsWorker.postMessage({type:'init', keywords:kwsCfg.keywords, threshold:0.25})
+  document.head.appendChild(s)
 }
 function spot(pcm){
   if(!started) return
   wakeRing.push(pcm); if(wakeRing.length>WAKE_RING) wakeRing.shift()
-  if(kwsReady && spotOn() && !talking) kwsWorker.postMessage({type:'audio', pcm:pcm.slice(0)})
+  if(!kwsRec || !spotOn() || talking) return
+  const i16=new Int16Array(pcm), f=new Float32Array(i16.length)
+  for(let i=0;i<i16.length;i++) f[i]=i16[i]/32768
+  try{ kwsRec.acceptWaveformFloat(f, 16000) }catch(err){ kwsFail('audio', err) }
 }
-function woke(keyword){
+function woke(phrase, conf){
   if(micOn || talking || !spotOn() || ws?.readyState!==1) return
   wokeAt=Date.now()
-  ws.send(JSON.stringify({type:'woke', keyword:String(keyword||'')}))
+  ws.send(JSON.stringify({type:'woke', keyword:String(phrase||''), conf}))
   for(const p of wakeRing.splice(0)) ws.send(p)
   setMic(true); micBackTone(); vibrate([20,50,20]); sys('🎙 Heard “'+wakeSays()+'” — the mic is on')
 }

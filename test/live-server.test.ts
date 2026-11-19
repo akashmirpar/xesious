@@ -16,7 +16,7 @@ const D1 = 'device-one-aaaaaaaaaaaaaaaa', D2 = 'device-two-bbbbbbbbbbbbbbbb'
 // The phone's wake-word spotter's built files: stand-ins, served as they are.
 const KWS = join(TMP, 'kws')
 mkdirSync(KWS)
-for (const f of ['sherpa-onnx-wasm-kws-main.js', 'sherpa-onnx-kws.js', 'sherpa-onnx-wasm-kws-main.wasm', 'sherpa-onnx-wasm-kws-main.data']) writeFileSync(join(KWS, f), `stand-in ${f}`)
+for (const f of ['vosk.js', 'vosk-worker.js', 'vosk-model-small-en-us-0.15.tar.gz']) writeFileSync(join(KWS, f), `stand-in ${f}`)
 
 // claude: records its prompt; SLOW… never answers (until killed), anything else
 // answers one sentence.
@@ -118,12 +118,11 @@ test('the first device takes the link; a second device is refused', async () => 
 
 test('the page is told what its wake spotter listens for ("hey" before each wake word it can spell), and gets its files', async () => {
   const ready = A.got.find(m => m.type === 'ready')
-  expect(ready.kws.keywords).toContain('▁HE Y ▁ LU C Y @HEY_LUCY')
-  expect(ready.kws.text).toContain('HEY LUCY')
-  const wasm = await fetch(`http://127.0.0.1:${port}/kws/sherpa-onnx-wasm-kws-main.wasm`)
-  expect(wasm.headers.get('content-type')).toBe('application/wasm')
-  expect(await wasm.text()).toBe('stand-in sherpa-onnx-wasm-kws-main.wasm')
-  expect((await fetch(`http://127.0.0.1:${port}/kws/kws-worker.js`)).headers.get('content-type')).toContain('javascript')
+  expect(ready.kws).toEqual({ model: '/kws/vosk-model-small-en-us-0.15.tar.gz', phrases: ['hey lucy', 'hey lucie'], conf: 0.9 })
+  const model = await fetch(`http://127.0.0.1:${port}/kws/vosk-model-small-en-us-0.15.tar.gz`)
+  expect(model.headers.get('content-type')).toBe('application/gzip')
+  expect(await model.text()).toBe('stand-in vosk-model-small-en-us-0.15.tar.gz')
+  expect((await fetch(`http://127.0.0.1:${port}/kws/vosk-worker.js`)).headers.get('content-type')).toContain('javascript')
   // nothing else from that folder, and nothing outside it
   expect((await fetch(`http://127.0.0.1:${port}/kws/..%2Flive-links.json`)).headers.get('content-type')).toContain('text/html')
   expect((await fetch(`http://127.0.0.1:${port}/kws/secret.txt`)).headers.get('content-type')).toContain('text/html')
