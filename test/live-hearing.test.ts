@@ -297,9 +297,20 @@ describe('Assistant mode: only what is addressed to it by name goes', () => {
     expect(c.heard([T('1', 'Lucy, check the build.')]).send).toBe('check the build.')
     expect(c.heard([T('1', 'Hey Lucy what time is it?')]).send).toBe('what time is it?')
     expect(c.heard([T('1', 'So, Lucy, what do you think?')]).send).toBe('what do you think?')
-    // Only at the start: said in passing, or at the end, it isn't a call.
-    expect(c.heard([T('1', 'what do you think about that, Lucy?')]).send).toBeNull()
+    // Said in passing, it isn't a call.
     expect(c.heard([T('1', 'I told Lucy about it yesterday.')]).send).toBeNull()
+    // At the end of a sentence, after a comma, it is (G, 2026-11-20): the request is the rest.
+    const e = c.heard([T('1', 'what do you think about that, Lucy?')])
+    expect(e.send).toBe('what do you think about that?')
+    expect(e.why).toBe('assistant: called by name ("Lucy")')
+    expect(c.heard([T('1', 'Microphone off, Lucy.')]).send).toBe('Microphone off.')
+    expect(c.heard([T('1', 'We land at nine. Check the weather there, hey Lucy!')]).send).toBe('We land at nine. Check the weather there!')
+    expect(c.heard([T('1', 'Turn the mic off, Lucy')]).send).toBe('Turn the mic off')
+    expect(c.heard([T('1', 'دوباره بخون، لوسی')]).send).toBe('دوباره بخون')
+    expect(c.heard([T('1', 'Stop, Lucy.')]).stop).toBe(true)
+    // Without the comma, or with more after the name in its sentence, it's a mention.
+    expect(c.heard([T('1', 'I already told Lucy.')]).send).toBeNull()
+    expect(c.heard([T('1', 'Tell it to me, Lucy and Sam.')]).send).toBeNull()
     expect(c.heard([T('1', 'Okay so Lucy, read it again.')]).send).toBe('read it again.')
     // At the start of a later sentence in the same piece.
     expect(c.heard([T('1', 'I agree with you. Lucy, check the build.')]).send).toBe('check the build.')

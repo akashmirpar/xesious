@@ -24,9 +24,11 @@ export const CALL_MODES: CallMode[] = ['interactive', 'assistant']
 export const ARMED_MS = 8000
 
 // Where a wake word is in the text: what comes after it, or null when it isn't there.
-// Only at the start: nothing before it but a filler or two ("so", "okay", «خب»…), so a
-// name said in passing ("I told Lucy yesterday") is not a call. Whole words, any case;
-// Arabic and Persian letter forms alike (ي/ی, ك/ک).
+// At the start: nothing before it but a filler or two ("so", "okay", «خب»…), so a
+// name said in passing ("I told Lucy yesterday") is not a call. Or at the end of a
+// sentence, set off by a comma ("Turn the mic off, Lucy."): then the request is the
+// rest of the text, without the name; with no comma ("I told Lucy.") it is a mention.
+// Whole words, any case; Arabic and Persian letter forms alike (ي/ی, ك/ک).
 const FILLERS = new Set(['so', 'ok', 'okay', 'hey', 'hi', 'um', 'uh', 'erm', 'well', 'and', 'oh', 'right', 'yeah', 'خب', 'خوب', 'هی', 'ببین', 'آهان', 'اوکی', 'باشه', 'ام'])
 const fold = (s: string) => s.toLowerCase().replace(/ي/g, 'ی').replace(/ك/g, 'ک')
 export function callWord(text: string, wake: string[]): { rest: string; word: string } | null {
@@ -45,6 +47,18 @@ export function callWord(text: string, wake: string[]): { rest: string; word: st
     if (before.length > 2 || before.some(w => !FILLERS.has(w))) continue
     const rest = text.slice(end).replace(/\s+/g, ' ').replace(/[\s,،]+([.!?؟])/g, '$1').replace(/^[\s,،.!?؟:;-]+|[\s,،:;-]+$/g, '').trim()
     return { rest: /[\p{L}\p{N}]/u.test(rest) ? rest : '', word: w.trim() }
+  }
+  for (const w of wake) {
+    const ww = fold(w.trim())
+    if (!ww) continue
+    const esc = ww.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')
+    const re = new RegExp(`[,،]\\s*(?:(?:hey|hi|ok|okay|هی)\\s+)?${esc}(?=\\s*(?:[.!?؟]|$))`, 'iu')
+    const m = re.exec(t)
+    if (!m) continue
+    const before = text.slice(0, m.index).trim(), after = text.slice(m.index + m[0].length)
+    if (!/[\p{L}\p{N}]/u.test(before)) continue   // ", Lucy." alone: the start rule's case
+    const rest = (before + after).replace(/\s+/g, ' ').replace(/^[\s,،.!?؟:;-]+|[\s,،:;-]+$/g, '').trim()
+    return { rest, word: w.trim() }
   }
   return null
 }
