@@ -368,7 +368,7 @@ function connect(){
   clearTimeout(retryTimer)
   ws = new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws`); ws.binaryType='arraybuffer'
   setDot('busy'); if(!everReady) pendingSys('connecting…')
-  ws.onopen = ()=> ws.send(JSON.stringify({type:'auth', uuid, device:deviceToken(), agent:navigator.userAgent, answers:answersMode, mode:callMode}))
+  ws.onopen = ()=> ws.send(JSON.stringify({type:'auth', uuid, device:deviceToken(), agent:navigator.userAgent, answers:answersMode, mode:callMode, net:netInfo()}))
   ws.onclose= ()=>{
     callReady=false; lagShow(0)
     setDot('err'); running.clear(); showStop(); hush()
@@ -382,7 +382,7 @@ function connect(){
     if(typeof ev.data!=='string') return playChunk(ev.data)
     const m=JSON.parse(ev.data)
     switch(m.type){
-      case 'ready': kwsCfg=m.kws||null; if(Array.isArray(m.wake)) wake=m.wake; othersOn=!!m.others; paintMode(); clearPending(); callReady=true; sentBytes=0; heardS=0; stt=m.stt; paintWakeMic(); if(!micOn) startSpotting(); document.body.classList.toggle('desk', !!m.desk); me=m.me??null; photoKey=m.pk||''
+      case 'ready': useOpus=!!opusCfg && Array.isArray(m.audio) && m.audio.includes('opus'); encReset(); kwsCfg=m.kws||null; if(Array.isArray(m.wake)) wake=m.wake; othersOn=!!m.others; paintMode(); clearPending(); callReady=true; sentBytes=0; heardS=0; stt=m.stt; paintWakeMic(); if(!micOn) startSpotting(); document.body.classList.toggle('desk', !!m.desk); me=m.me??null; photoKey=m.pk||''
         if(m.desk && viewing!==null) ws.send(JSON.stringify({type:'view', topic:viewing}))
         $('#sub').textContent=(m.model||'')+(m.where && !m.desk?'  ·  '+m.where:''); chip('#mode', m.mode); setDot('on')
         if(retry){
@@ -411,6 +411,7 @@ function connect(){
       case 'main': mainSpeaker=m.speaker; chip('#me', mainSpeaker==null?'':'you = speaker '+mainSpeaker); restyle(); break
       case 'waiting': for(const id of m.ids) lineState(id,'…'); break
       case 'heard': heardS=m.s; break
+      case 'rtt': if(m.t) rtts.push(performance.now()-m.t); break
       case 'mic': if(m.on===false) micOffByVoice(Number(m.ms)||0, m.why); break
       case 'answers': if(m.byVoice && ANSWERS[m.mode] && m.mode!==answersMode){ answersMode=m.mode; try{ localStorage.setItem(answersKey, m.mode) }catch{}; paintAnswers(); if(answersMode!=='voice') hush(); sys(ANSWERS[m.mode]+', switched by voice') } break
       case 'call_mode': if(m.byVoice && MODES[m.mode] && m.mode!==callMode){ callMode=m.mode; try{ localStorage.setItem(modeKey, m.mode) }catch{}; paintMode(); sys(MODES[m.mode].label+' mode, switched by voice') } break
@@ -497,7 +498,9 @@ async function openMic(){
     mic.style.setProperty('--lvl', level.toFixed(3))
     mutedTalk(!live && level>0.35)
     health.made++
-    if(live && ws?.readyState===1){ ws.send(e.data.pcm); health.sent++; if(callReady) sentBytes+=e.data.pcm.byteLength }
+    if(live && ws?.readyState===1){ sendAudio(e.data.pcm); health.sent++ }
+    else if(wasLive) encFlush()
+    wasLive=live
     if(!live) spot(e.data.pcm); else wakeRing.length=0
   }
   const st=micStream.getAudioTracks()[0]?.getSettings?.()||{}
@@ -512,12 +515,57 @@ function stopMic(){
 // How the audio is getting out, every 10 s into the call's trace: pieces the mic made
 // (100 ms each), pieces sent, what waits in the socket, the tab and the audio clock.
 const health={made:0, sent:0, at:performance.now(), clock:0}
+// The connection, in the same line every 10 s: round trips (a ping every 2 s, answered at
+// once by the server), pings with no answer yet, what was uploaded, and in which format.
+let rtts=[], pingsOut=0, upBytes=0
+setInterval(()=>{ if(ws?.readyState===1){ try{ ws.send(JSON.stringify({type:'rtt', t:performance.now()})); pingsOut++ }catch{} } }, 2000)
+function rttSummary(){
+  const r=rtts.splice(0).sort((a,b)=>a-b), lost=Math.max(0, pingsOut-r.length); pingsOut=0
+  return r.length ? {n:r.length, min:Math.round(r[0]), med:Math.round(r[r.length>>1]), max:Math.round(r[r.length-1]), unanswered:lost} : {n:0, unanswered:lost}
+}
+function netInfo(){ const c=navigator.connection; return c ? {type:c.type, effective:c.effectiveType, rtt:c.rtt, downlink:c.downlink, saveData:c.saveData} : undefined }
 setInterval(()=>{
   if(!micStream || ws?.readyState!==1) return
   const now=performance.now(), wall=(now-health.at)/1000, clock=actx?(actx.currentTime-health.clock):0
-  trace('audio health', {made:health.made, sent:health.sent, wall_s:+wall.toFixed(1), audio_clock_s:+clock.toFixed(1), buffered_kb:Math.round(ws.bufferedAmount/1024), hidden:document.hidden, ctx:actx?.state, mic:micOn, talking})
+  trace('audio health', {made:health.made, sent:health.sent, wall_s:+wall.toFixed(1), audio_clock_s:+clock.toFixed(1), buffered_kb:Math.round(ws.bufferedAmount/1024), hidden:document.hidden, ctx:actx?.state, mic:micOn, talking,
+    audio:useOpus?'opus':'pcm', up_kbit_s:+(upBytes*8/1000/Math.max(wall,0.1)).toFixed(1), rtt_ms:rttSummary(), net:netInfo()})
+  upBytes=0
   health.made=0; health.sent=0; health.at=now; health.clock=actx?actx.currentTime:0
 }, 10000)
+// The mic as Opus (~24 kbit/s instead of 256 of raw PCM), so a weak upload keeps up: the
+// browser's own encoder (WebCodecs), 20 ms frames sent every 100 ms as "OPS1" then
+// [2-byte length][frame]…, decoded by the server (live/opus.ts). Used when this browser
+// can and the server says it takes it; otherwise, or if the encoder fails, raw PCM.
+const OPUS_CFGS=[{codec:'opus', sampleRate:16000, numberOfChannels:1, bitrate:24000, opus:{frameDuration:20000, complexity:5}},
+  {codec:'opus', sampleRate:16000, numberOfChannels:1, bitrate:24000}]
+let opusCfg=null, useOpus=false, enc=null, encTs=0, encOut=[], encTimer=0, wasLive=false
+;(async()=>{ if(!('AudioEncoder' in window)) return
+  for(const c of OPUS_CFGS){ try{ const r=await AudioEncoder.isConfigSupported(c); if(r.supported){ opusCfg=c; return } }catch{} } })()
+function sendAudio(pcm){
+  if(ws?.readyState!==1) return
+  if(callReady) sentBytes+=pcm.byteLength
+  if(useOpus && encode(pcm)) return
+  ws.send(pcm); upBytes+=pcm.byteLength
+}
+function encode(pcm){
+  try{
+    if(!enc){ enc=new AudioEncoder({output:c=>{ const b=new Uint8Array(c.byteLength); c.copyTo(b); encOut.push(b); if(!encTimer) encTimer=setTimeout(encSend, 100) }, error:opusFail}); enc.configure(opusCfg) }
+    const n=pcm.byteLength/2, ad=new AudioData({format:'s16', sampleRate:16000, numberOfFrames:n, numberOfChannels:1, timestamp:encTs, data:pcm})
+    encTs+=Math.round(n*1e6/16000); enc.encode(ad); ad.close(); return true
+  }catch(e){ opusFail(e); return false }
+}
+function encSend(){
+  clearTimeout(encTimer); encTimer=0
+  const fr=encOut.splice(0); if(!fr.length || ws?.readyState!==1) return
+  let n=4; for(const f of fr) n+=2+f.byteLength
+  const m=new Uint8Array(n); m.set([0x4f,0x50,0x53,0x31]); let i=4
+  for(const f of fr){ m[i]=f.byteLength>>8; m[i+1]=f.byteLength&255; m.set(f,i+2); i+=2+f.byteLength }
+  ws.send(m); upBytes+=n
+}
+// The mic stopped sending: what the encoder still holds goes now.
+function encFlush(){ if(enc && useOpus) enc.flush().then(encSend, ()=>{}) }
+function encReset(){ try{ enc?.close() }catch{}; enc=null; encTs=0; encOut=[]; clearTimeout(encTimer); encTimer=0 }
+function opusFail(e){ if(!useOpus) return; trace('opus encoder failed: raw audio from now', {error:String(e?.message||e).slice(0,200)}); useOpus=false; opusCfg=null; encReset() }
 // Audio that isn't arriving. The server says how much it has got (heard, each second
 // of it); far less than was sent means the upload has stalled somewhere on the way, and
 // the call would just go quiet. Said at once, and past LAG_RECONNECT_S the connection
@@ -866,7 +914,7 @@ function woke(phrase, conf){
   if(micOn || talking || !spotOn() || ws?.readyState!==1) return
   wokeAt=Date.now()
   ws.send(JSON.stringify({type:'woke', keyword:String(phrase||''), conf}))
-  for(const p of wakeRing.splice(0)) ws.send(p)
+  for(const p of wakeRing.splice(0)) sendAudio(p)
   setMic(true); micBackTone(); vibrate([20,50,20]); sys('🎙 Heard “'+wakeSays()+'” — the mic is on')
 }
 function ding(){

@@ -577,7 +577,8 @@ this is for holding a conversation.
   page in ~0.3 s, without a Claude turn; anything else, or anything it isn't sure of,
   goes to Claude. Without the key (or with `LIVE_FAST=0`) Claude does these too.
 - **Hearing:** with `SONIOX_API_KEY` set, the page streams the mic (16 kHz, with the
-  browser's echo cancellation) to the server, which streams it on to Soniox:
+  browser's echo cancellation; as Opus at ~24 kbit/s where the browser can encode it,
+  WebCodecs, else raw at 256 kbit/s; `live/opus.ts` decodes it) to the server, which streams it on to Soniox:
   Farsi and English, people told apart (`live/soniox.ts`). The first voice heard
   is you, and only your words go to Claude; others are shown, and what they said
   in the last few minutes goes along as background. Holding the talk button makes

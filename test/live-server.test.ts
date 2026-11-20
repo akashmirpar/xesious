@@ -1,6 +1,7 @@
 // live/server.ts end to end: the real server, a fake Soniox (a local WebSocket the
 // test drives), a stand-in claude, and a test client in the page's place.
 import { test, expect, beforeAll, afterAll } from 'bun:test'
+import { packOpus } from '../live/opus'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync, existsSync } from 'node:fs'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
@@ -154,6 +155,22 @@ test('mic audio reaches Soniox with the key, both languages and speakers on', as
   expect(sonioxConfig.context).toEqual({ terms: ['Lucy', 'Hey Lucy', 'Lucie', 'Hey Lucie', 'لوسی'] })
 })
 
+
+test('the mic as Opus is decoded to PCM for Soniox and counted as heard; the server says it takes it; pings come back', async () => {
+  expect(A.got.find(m => m.type === 'ready').audio).toEqual(['pcm', 'opus'])
+  const tone: Uint8Array[] = JSON.parse(readFileSync(join(import.meta.dir, 'fixtures-opus-tone.json'), 'utf8')).frames.map((b: string) => new Uint8Array(Buffer.from(b, 'base64')))
+  const before = sonioxBytes
+  for (let i = 0; i < tone.length; i += 5) A.ws.send(packOpus(tone.slice(i, i + 5)))
+  for (let i = 0; i < 60 && sonioxBytes < before + tone.length * 640; i++) await Bun.sleep(50)
+  expect(sonioxBytes - before).toBe(tone.length * 640)   // 20 ms of 16 kHz 16-bit PCM per frame
+  const trace = readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  expect(trace).toContain('the mic comes as Opus')
+  // A real mic goes on after the tone: quiet, so the voice detector doesn't hold the next tests' requests.
+  A.ws.send(new Uint8Array(32000 * 1.6))
+  await Bun.sleep(300)
+  A.ws.send(JSON.stringify({ type: 'rtt', t: 12345.5 }))
+  expect(await A.wait(m => m.type === 'rtt')).toEqual({ type: 'rtt', t: 12345.5 })
+})
 
 test('a wake heard on the phone that Soniox did not hear is a false wake: the mic goes off again', async () => {
   const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
@@ -438,7 +455,7 @@ test('the call is recorded: mic audio, and a trace of every step', async () => {
   await Bun.sleep(300)
   const [dir] = readdirSync(CALLS)
   const wav = readFileSync(join(CALLS, dir, 'mic.wav'))
-  expect(wav.readUInt32LE(40)).toBe(3200 * 22)   // every chunk the page sent
+  expect(wav.readUInt32LE(40)).toBe(3200 * 22 + 26 * 640 + 32000 * 1.6)   // every PCM chunk the page sent, the Opus tone decoded (26 frames of 20 ms), and the quiet after it
   const trace = readFileSync(join(CALLS, dir, 'trace.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
   const stages = new Set(trace.map(t => t.stage))
   for (const s of ['auth', 'audio', 'soniox', 'speaker', 'heard', 'decide', 'turn', 'claude', 'stop', 'call']) expect(stages).toContain(s)

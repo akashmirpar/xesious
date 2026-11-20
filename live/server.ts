@@ -42,6 +42,7 @@ import { drainSentences } from './sentences'
 import { SonioxStream, TokenTracker, type Turn } from './soniox'
 import { requestTimings, summarize, latencyLine, readTrace } from './latency'
 import { decideFast, fastAction, fastWorthAsking, type FastResult } from './fast'
+import { OpusIn, isOpus } from './opus'
 import { ARMED_MS, CallState, CALL_MODES, callWord, requestText, sendDecision, type CallMode, type Line } from './call'
 import { kwsPhrases } from './kws'
 import { CallRecorder, pruneCalls, pcmToWav } from './recorder'
@@ -337,7 +338,11 @@ type Conn = {
   // This page's key to the group's photos (in their URLs), and its message budget.
   photoKey?: string; budget?: { n: number; since: number }
   me?: number   // the link's owner: what waits on them is told to the call
-  got?: { bytes: number; since: number }
+  got?: { bytes: number; wire: number; since: number }
+  // the mic as Opus (live/opus.ts), made on its first Opus message
+  opus?: OpusIn
+  // the Cloudflare site the page's connection came in through (cf-ray), e.g. FRA
+  edge?: string
   // All the audio received on this call, and how much of it the page has been told
   // of (heard_s): the page compares it with what it sent, and says so when its audio
   // is not getting here, instead of the call just going quiet.
@@ -962,7 +967,9 @@ const server = Bun.serve<Conn>({
       // Only the page itself may open a call from a browser: another site's page could
       // otherwise talk to this server from its visitor's browser.
       if (!sameOrigin(req)) return new Response('forbidden', { status: 403 })
-      if (srv.upgrade(req, { data: { authed: false, cwd: join(HERE, '..'), gen: 0, queue: [], reqs: 0, held: false, heldUntilFinal: false, hold: { texts: [], ids: [], since: 0 }, answers: 'voice' } })) return
+      // cf-ray ends in the Cloudflare site the page came in through (e.g. "…-FRA"): where its audio enters.
+      const edge = (req.headers.get('cf-ray') ?? '').split('-')[1]?.slice(0, 8) || undefined
+      if (srv.upgrade(req, { data: { authed: false, cwd: join(HERE, '..'), gen: 0, queue: [], reqs: 0, held: false, heldUntilFinal: false, hold: { texts: [], ids: [], since: 0 }, answers: 'voice', edge } })) return
       return new Response('upgrade failed', { status: 400 })
     }
     // A topic's custom emoji icon, as the bot saved it (public Telegram emoji).
@@ -1026,6 +1033,7 @@ const server = Bun.serve<Conn>({
       if (ws.data.photoKey) photoKeys.delete(ws.data.photoKey)
       clearHeld(ws)
       ws.data.stt?.close()
+      ws.data.opus?.free()
       const rec = ws.data.rec
       if (rec) {
         const s = summarize(requestTimings(readTrace(rec.dir)))
@@ -1043,37 +1051,49 @@ const server = Bun.serve<Conn>({
     },
   },
 })
+// Mic audio (16 kHz mono 16-bit PCM) in: the recording, the page's count, Soniox, the quiet.
+function audioIn(ws: WS, pcm: Uint8Array) {
+  ws.data.rec?.audio(pcm)
+  ws.data.audioIn = (ws.data.audioIn ?? 0) + pcm.byteLength
+  if (ws.data.audioIn - (ws.data.acked ?? 0) >= ACK_BYTES) { ws.data.acked = ws.data.audioIn; out(ws, { type: 'heard', s: +(ws.data.audioIn / 32000).toFixed(1) }) }
+  // How much audio arrives, every 10 s (beside the page's own count of what it sent).
+  const h = ws.data.got ??= { bytes: 0, wire: 0, since: Date.now() }
+  h.bytes += pcm.byteLength
+  if (Date.now() - h.since >= 10_000) { ws.data.rec?.trace('audio', `received ${(h.bytes / 32000).toFixed(1)} s of audio in ${((Date.now() - h.since) / 1000).toFixed(1)} s`, { kbit_s: Math.round(h.wire * 8 / (Date.now() - h.since)) }); ws.data.got = { bytes: 0, wire: 0, since: Date.now() } }
+  if (!ws.data.stt) return
+  ws.data.stt.send(pcm)
+  // End the piece of speech after END_SILENCE_MS of quiet in the audio — once
+  // per quiet stretch, and not while the button is held.
+  const vad = ws.data.vad!
+  const wasSpeaking = vad.speaking()
+  vad.push(pcm)
+  if (!wasSpeaking && vad.speaking() && ws.data.hold.texts.length) scheduleFlush(ws)   // the caller started again
+  const quiet = vad.quietMs()
+  if (!ws.data.held && Number.isFinite(quiet) && quiet >= END_SILENCE_MS) {
+    const voiceAt = vad.position - quiet
+    if (voiceAt !== ws.data.endedForVoice) {
+      ws.data.endedForVoice = voiceAt
+      ws.data.rec?.trace('soniox', `${Math.round(quiet)} ms of quiet in the audio: ending the piece`, { noise_floor: Math.round(vad.noiseFloor) })
+      ws.data.stt.finalize()
+    }
+  }
+}
+
 function onMessage(ws: WS, raw: string | Buffer) {
   {
     {
-      // Mic audio: 16 kHz mono 16-bit PCM.
+      // Mic audio: 16 kHz mono 16-bit PCM, or Opus (live/opus.ts) decoded to it.
       if (typeof raw !== 'string') {
         if (!ws.data.authed) return
-        const pcm = raw instanceof Uint8Array ? raw : new Uint8Array(raw as ArrayBuffer)
-        ws.data.rec?.audio(pcm)
-        ws.data.audioIn = (ws.data.audioIn ?? 0) + pcm.byteLength
-        if (ws.data.audioIn - (ws.data.acked ?? 0) >= ACK_BYTES) { ws.data.acked = ws.data.audioIn; out(ws, { type: 'heard', s: +(ws.data.audioIn / 32000).toFixed(1) }) }
-        // How much audio arrives, every 10 s (beside the page's own count of what it sent).
-        const h = ws.data.got ??= { bytes: 0, since: Date.now() }
-        h.bytes += pcm.byteLength
-        if (Date.now() - h.since >= 10_000) { ws.data.rec?.trace('audio', `received ${(h.bytes / 32000).toFixed(1)} s of audio in ${((Date.now() - h.since) / 1000).toFixed(1)} s`); ws.data.got = { bytes: 0, since: Date.now() } }
-        if (!ws.data.stt) return
-        ws.data.stt.send(pcm)
-        // End the piece of speech after END_SILENCE_MS of quiet in the audio — once
-        // per quiet stretch, and not while the button is held.
-        const vad = ws.data.vad!
-        const wasSpeaking = vad.speaking()
-        vad.push(pcm)
-        if (!wasSpeaking && vad.speaking() && ws.data.hold.texts.length) scheduleFlush(ws)   // the caller started again
-        const quiet = vad.quietMs()
-        if (!ws.data.held && Number.isFinite(quiet) && quiet >= END_SILENCE_MS) {
-          const voiceAt = vad.position - quiet
-          if (voiceAt !== ws.data.endedForVoice) {
-            ws.data.endedForVoice = voiceAt
-            ws.data.rec?.trace('soniox', `${Math.round(quiet)} ms of quiet in the audio: ending the piece`, { noise_floor: Math.round(vad.noiseFloor) })
-            ws.data.stt.finalize()
-          }
+        const msg = raw instanceof Uint8Array ? raw : new Uint8Array(raw as ArrayBuffer)
+        const g = ws.data.got ??= { bytes: 0, wire: 0, since: Date.now() }
+        g.wire += msg.byteLength
+        if (isOpus(msg)) {
+          if (!ws.data.opus) { ws.data.opus = new OpusIn(pcm => { try { audioIn(ws, pcm) } catch (e) { ws.data.rec?.trace('error', `audio: ${e instanceof Error ? e.message : e}`) } }); ws.data.rec?.trace('audio', 'the mic comes as Opus') }
+          if (!ws.data.opus.push(msg) && ws.data.opus.errors === 1) ws.data.rec?.trace('error', 'a piece of Opus audio was malformed: dropped')
+          return
         }
+        audioIn(ws, msg)
         return
       }
       let msg: any; try { msg = JSON.parse(raw) } catch { return }
@@ -1096,7 +1116,7 @@ function onMessage(ws: WS, raw: string | Buffer) {
           soniox: SONIOX_KEY ? { model: SONIOX.model, languages: SONIOX.languages, endpoint_ms: SONIOX.endpointMs, end_silence_ms: END_SILENCE_MS, quiet_ms: QUIET_MS, max_wait_ms: MAX_WAIT_MS } : undefined,
           agent: String(msg.agent || '').slice(0, 300),
         })
-        ws.data.rec.trace('auth', device === 'bound' ? 'link opened; this device now holds it' : 'link opened by its device', { answers: ws.data.answers })
+        ws.data.rec.trace('auth', device === 'bound' ? 'link opened; this device now holds it' : 'link opened by its device', { answers: ws.data.answers, edge: ws.data.edge ?? 'direct', ...(msg.net && typeof msg.net === 'object' ? { net: msg.net } : {}) })
         startEvents(ws)
         stampUsed(msg.uuid)
         ws.data.photoKey = randomUUID(); photoKeys.set(ws.data.photoKey, msg.uuid)
@@ -1114,7 +1134,7 @@ function onMessage(ws: WS, raw: string | Buffer) {
           ws.data.topicsTimer = setInterval(() => { if (!linkHolds(ws)) return; stampUsed(ws.data.uuid); void sendTopics(ws) }, TOPICS_EVERY_MS)
         } else ws.data.topicsTimer = setInterval(() => { if (linkHolds(ws)) stampUsed(ws.data.uuid) }, 60_000)
         const mode = ws.data.permission!.includes('--dangerously-skip-permissions') ? 'bypass' : ws.data.permission![ws.data.permission!.indexOf('--permission-mode') + 1]
-        out(ws, { type: 'ready', where: link.cwd, model: link.model || DEFAULT_MODEL, mode, callMode: ws.data.call.mode, wake: ws.data.call.wake, others: ws.data.call.othersMayCall, stt: SONIOX_KEY ? 'soniox' : 'browser', desk: !!link.desk, pk: ws.data.photoKey, ...(link.user ? { me: link.user.id } : {}), ...(SONIOX_KEY && kwsFor(ws.data.call.wake) ? { kws: kwsFor(ws.data.call.wake) } : {}) })
+        out(ws, { type: 'ready', where: link.cwd, model: link.model || DEFAULT_MODEL, mode, callMode: ws.data.call.mode, wake: ws.data.call.wake, others: ws.data.call.othersMayCall, stt: SONIOX_KEY ? 'soniox' : 'browser', audio: ['pcm', 'opus'], desk: !!link.desk, pk: ws.data.photoKey, ...(link.user ? { me: link.user.id } : {}), ...(SONIOX_KEY && kwsFor(ws.data.call.wake) ? { kws: kwsFor(ws.data.call.wake) } : {}) })
         return
       }
       if (!ws.data.authed) return
@@ -1277,6 +1297,8 @@ function onMessage(ws: WS, raw: string | Buffer) {
           rec.trace('page', String(msg.msg || '').slice(0, 500), extra); return
         }
         case 'ping': return   // keeps the connection busy, so nothing on the way closes it as idle
+        // The page's round-trip check (every 2 s), answered at once: its time comes back as sent.
+        case 'rtt': out(ws, { type: 'rtt', t: Number(msg.t) || 0 }); return
       }
     }
   }
