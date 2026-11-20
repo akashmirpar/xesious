@@ -118,7 +118,7 @@ test('the first device takes the link; a second device is refused', async () => 
 
 test('the page is told what its wake spotter listens for ("hey" before each wake word it can spell), and gets its files', async () => {
   const ready = A.got.find(m => m.type === 'ready')
-  expect(ready.kws).toEqual({ model: '/kws/vosk-model-small-en-us-0.15.tar.gz', phrases: ['hey lucy', 'hey lucie'], conf: 0.9 })
+  expect(ready.kws).toEqual({ model: '/kws/vosk-model-small-en-us-0.15.tar.gz', bytes: 'stand-in vosk-model-small-en-us-0.15.tar.gz'.length, phrases: ['hey lucy', 'hey lucie'], conf: 0.9 })
   const model = await fetch(`http://127.0.0.1:${port}/kws/vosk-model-small-en-us-0.15.tar.gz`)
   expect(model.headers.get('content-type')).toBe('application/gzip')
   expect(await model.text()).toBe('stand-in vosk-model-small-en-us-0.15.tar.gz')

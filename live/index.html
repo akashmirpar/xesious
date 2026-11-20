@@ -541,7 +541,10 @@ const MODES={interactive:{label:'🎙 Interactive'}, assistant:{label:'🧑‍�
 const modeKey='xesious-live-mode'
 let callMode='interactive', wake=['Lucy'], othersOn=false
 try{ const v=localStorage.getItem(modeKey); if(MODES[v]) callMode=v }catch{}
-const hintNow=()=> callMode==='assistant' ? `Assistant: say “${wake[0]||'its name'} …” or hold the mic to ask` : HINT
+// While the wake-word model loads (its first download takes up to half a minute), the
+// hint says so with the mic off, so a "Hey Lucy" that can't be heard yet isn't a mystery.
+let kwsLoadMsg=''
+const hintNow=()=> kwsLoadMsg && kwsLoadShown() ? kwsLoadMsg+' — or tap the mic' : callMode==='assistant' ? `Assistant: say “${wake[0]||'its name'} …” or hold the mic to ask` : HINT
 function paintMode(){
   const b=$('#callmode'); b.textContent=MODES[callMode].label+' ▾'; b.style.display=started?'inline':'none'
   for(const g of document.querySelectorAll('#listen .seg button')) g.classList.toggle('on', g.dataset.mode===callMode)
@@ -611,14 +614,16 @@ function mutedTalk(loud){
   const on = !!loudSince && now-loudSince>400
   if(on===mutedOn) return; mutedOn=on
   mic.classList.toggle('muted-talk', on)
-  const h=$('#hint'); h.textContent = on ? 'You are talking with the mic off — tap it'+(spotOn()?' or say “'+wakeSays()+'”':'')+' to turn it on' : hintNow(); h.classList.toggle('warn', on)
+  const h=$('#hint'); h.textContent = on ? mutedText() : hintNow(); h.classList.toggle('warn', on)
 }
+const mutedText=()=>'You are talking with the mic off — tap it'+(spotOn() && kwsModel ? ' or say “'+wakeSays()+'”' : '')+' to turn it on'+(kwsLoadMsg && kwsLoadShown() ? ' ('+kwsLoadMsg+')' : '')
 function paint(){ mic.classList.toggle('on', micOn && !talking); mic.classList.toggle('talking', talking); mic.classList.toggle('speaking', botSpeaking && !talking && micOn) }
 
 // One button, like a video call: tap = mic on/off; hold = talking (what you say is
 // yours, pauses don't cut it, letting go sends it). Space does the same as holding.
 function setMic(on){ if(on) clearTimeout(micBack); if(micOn===on) return; micOn=on; paint(); trace(on?'mic on':'mic off'); if(stt==='browser'){ on?startRec():stopRec() }
-  if(!on) startSpotting() }
+  if(!on) startSpotting(); if(kwsLoadMsg) hintRefresh() }
+function hintRefresh(){ $('#hint').textContent = mutedOn && !micOn ? mutedText() : hintNow() }
 // The mic turned off by voice (the front desk's mic_off): with ms, back on by itself
 // then, with a sound so the caller knows it is listening again; the server allows at
 // most 3 minutes. Turning it on by hand first cancels that.
@@ -778,8 +783,13 @@ function paintWakeMic(){
   $('#wakeMicRow').classList.toggle('show', !!kwsCfg && stt==='soniox')
   $('#wakeMic').checked=wakeMicOn; $('#wakeMicLabel').textContent='Mic on by voice: “'+wakeSays()+'”'
 }
-$('#wakeMic').addEventListener('change', e=>{ wakeMicOn=e.target.checked; try{ localStorage.setItem(wakeMicKey, wakeMicOn?'on':'off') }catch{}; trace('wake by voice '+(wakeMicOn?'on':'off')); if(wakeMicOn && !micOn) startSpotting() })
-function kwsFail(what, err){ kwsFailed=true; kwsLoading=false; trace('wake spotter failed', {what, error:String(err?.message||err).slice(0,300)}); paintWakeMic() }
+$('#wakeMic').addEventListener('change', e=>{ wakeMicOn=e.target.checked; try{ localStorage.setItem(wakeMicKey, wakeMicOn?'on':'off') }catch{}; trace('wake by voice '+(wakeMicOn?'on':'off')); if(wakeMicOn && !micOn) startSpotting(); hintRefresh() })
+function kwsLoadShown(){ return started && !micOn && spotOn() }
+function kwsLoadSay(msg){ kwsLoadMsg=msg; hintRefresh() }
+function kwsFail(what, err){
+  kwsFailed=true; kwsLoading=false; trace('wake spotter failed', {what, error:String(err?.message||err).slice(0,300)}); paintWakeMic()
+  if(kwsLoadMsg){ kwsLoadSay(''); sys('“'+wakeSays()+'” couldn’t load on this phone — tap the mic to turn it on') }
+}
 function kwsRecognizer(){
   try{ kwsRec?.remove() }catch{}
   kwsRec=null; kwsAsked=false
@@ -810,15 +820,23 @@ function startSpotting(){
   kwsLoading=true
   const t0=Date.now(), s=document.createElement('script')
   // Vosk's worker from its own file, not a blob (see live/kws-setup.sh).
-  window.VOSK_WORKER_URL=location.origin+'/kws/vosk-worker.js'
+  window.VOSK_WORKER_URL=location.origin+'/kws/vosk-worker.js?v=3'   // ?v: a new build past the week-long cache
   s.src='/kws/vosk.js'
   s.onerror=()=>kwsFail('vosk.js', 'could not load')
+  // Said only after 1 s: kept from an earlier call, it is ready in well under that.
+  const getting=()=>'Getting “'+wakeSays()+'” ready…'
+  const slow=setTimeout(()=>{ if(kwsLoading && !kwsLoadMsg) kwsLoadSay(getting()) }, 1000)
   s.onload=async()=>{
     try{
-      // An absolute URL: the model is fetched inside Vosk's own worker.
-      kwsModel=await window.Vosk.createModel(location.origin+kwsCfg.model, -1)
-      kwsLoading=false; kwsRecognizer(); trace('wake spotter ready', {ms:Date.now()-t0})
-    }catch(err){ kwsFail('model', err) }
+      // An absolute URL: the model is fetched inside Vosk's own worker, which reports the
+      // download (a percent at a time; after 100% it unpacks it).
+      const m=new window.Vosk.Model(location.origin+kwsCfg.model, -1)
+      m.on('progress', d=>{ const total=d.total||kwsCfg?.bytes; if(!(total>0)) return; const pct=Math.min(100, Math.floor(100*d.loaded/total))
+        kwsLoadSay(pct<100 ? 'Downloading “'+wakeSays()+'”: '+pct+'%' : getting()) })
+      kwsModel=await new Promise((ok, no)=>{ m.on('load', d=>d.result ? ok(m) : no(new Error(d.error||'the model did not load'))); m.on('error', d=>no(new Error(d.error||'the model failed'))) })
+      clearTimeout(slow); kwsLoading=false; kwsRecognizer(); trace('wake spotter ready', {ms:Date.now()-t0})
+      if(kwsLoadMsg){ const shown=kwsLoadShown(); kwsLoadSay(''); if(shown) sys('👂 Ready: say “'+wakeSays()+'” to turn the mic on') }
+    }catch(err){ clearTimeout(slow); kwsFail('model', err) }
   }
   document.head.appendChild(s)
 }

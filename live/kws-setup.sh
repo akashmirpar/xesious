@@ -42,6 +42,12 @@ body = code[code.index('\n', 10) + 1:]
 keep = 'return this.Vosk.syncFilesystem(false);'
 assert body.count(keep) == 1, 'vosk worker: the cache step changed'
 body = body.replace(keep, 'return this.Vosk.syncFilesystem(false).catch(e => this.logger.warn(`model not kept in the browser: ${e}`));')
+# The first download is ~40 MB (half a minute on a slow line): the worker already counts
+# the bytes, so it also tells the page (model.on('progress')), once per whole percent.
+count = 'if(length){log(`${Math.round(100*bytesWritten/length)}%'
+assert body.count(count) == 1, 'vosk worker: the download counter changed'
+# Without a size (a proxy may drop it) it reports every 0.5 MB; the page knows the size.
+body = body.replace(count, 'const step=length?Math.floor(100*bytesWritten/length):Math.floor(bytesWritten/524288);if(step!==self.kwsStep){self.kwsStep=step;self.postMessage({event:"progress",loaded:bytesWritten,total:length||0})}' + count)
 open(os.path.join(out, 'vosk-worker.js'), 'w', encoding='utf-8').write(body)
 old = 'url = url || createURL(base64, sourcemapArg, enableUnicodeArg);'
 assert s.count(old) == 1, 'vosk.js: the worker factory changed'

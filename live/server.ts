@@ -31,7 +31,7 @@
 // topic's Claude session (state/live-links.json, shared on disk). It expires (an
 // hour) and belongs to the first device that opens it (live/access.ts).
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, renameSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, renameSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -58,7 +58,8 @@ const kwsReady = () => Object.keys(KWS_FILES).every(f => existsSync(join(KWS_DIR
 const kwsFor = (wake: string[]) => {
   if (!kwsReady()) return undefined
   const phrases = kwsPhrases(wake)
-  return phrases.length ? { model: `/kws/${KWS_MODEL}`, phrases, conf: KWS_CONF } : undefined
+  // bytes: so the page can show the first download as a percent even if the size header is lost on the way
+  return phrases.length ? { model: `/kws/${KWS_MODEL}`, bytes: statSync(join(KWS_DIR, KWS_MODEL)).size, phrases, conf: KWS_CONF } : undefined
 }
 // A hit counts only when Vosk is this sure of "hey" (the phrase's first word; the
 // browser build scores the last word at ~0.5 regardless). Tested 2026-11-19 in the
