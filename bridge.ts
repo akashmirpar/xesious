@@ -70,6 +70,7 @@ import { runCommand, runScript, type ScriptOutcome } from './tasks/scripts'
 import { bigFiles, MTPROTO_MAX, type TopicStart } from './mtproto'
 import { ensureLive, pageAnswers, serverDown } from './live/tunnel'
 import { LINK_TTL_MIN, linkExpired } from './live/access'
+import { callLatency } from './live/latency'
 import { Watchers } from './tasks/watchers'
 import { TaskService, type Action as TaskAction } from './tasks/service'
 import { taskRoutes, type BridgeHandlers } from './tasks/routes'
@@ -9410,9 +9411,9 @@ async function runDeskTurn(ctx: Context, key: string, thread: number | undefined
 // connected for LIVE_SUMMARY_AFTER_MS (a phone that locks reconnects within that).
 const LIVE_SUMMARY_AFTER_MS = Number(process.env.LIVE_SUMMARY_AFTER_MS ?? 180_000)
 const LIVE_SUMMARY_MODEL = process.env.LIVE_SUMMARY_MODEL || 'haiku'
-type LiveCall = { exchanges: { at: number; said: string; answer: string; notice?: boolean }[]; pages: number; timer?: ReturnType<typeof setTimeout> }
+type LiveCall = { exchanges: { at: number; said: string; answer: string; notice?: boolean }[]; pages: number; timer?: ReturnType<typeof setTimeout>; since: number }
 const liveCalls = new Map<string, LiveCall>()
-const liveCall = (uuid: string): LiveCall => { let c = liveCalls.get(uuid); if (!c) liveCalls.set(uuid, c = { exchanges: [], pages: 0 }); return c }
+const liveCall = (uuid: string): LiveCall => { let c = liveCalls.get(uuid); if (!c) liveCalls.set(uuid, c = { exchanges: [], pages: 0, since: Date.now() }); return c }
 function livePageCame(uuid: string): void { const c = liveCall(uuid); c.pages++; if (c.timer) { clearTimeout(c.timer); c.timer = undefined } }
 function livePageWent(uuid: string): void {
   const c = liveCall(uuid)
@@ -9430,7 +9431,7 @@ const clock = (t: number) => new Date(t).toISOString().slice(11, 16)
 async function summarizeCall(uuid: string): Promise<void> {
   const c = liveCalls.get(uuid)
   if (!c?.exchanges.length) { liveCalls.delete(uuid); return }
-  const ex = c.exchanges.splice(0)
+  const ex = c.exchanges.splice(0), since = c.since
   liveCalls.delete(uuid)
   const link = loadLinks()[uuid]
   const where = link?.desk ?? link?.key
@@ -9446,7 +9447,10 @@ async function summarizeCall(uuid: string): Promise<void> {
   const body = summary || ex.filter(e => !e.notice).map(e => `• ${oneLine(e.said, 100)}`).slice(0, 12).join('\n')
   const asked = ex.filter(e => !e.notice).length
   const head = `🎙 Live session${link?.user ? ` with ${link.user.name}` : ''}, ${clock(ex[0].at)}–${clock(ex[ex.length - 1].at)} UTC, ${asked} request${asked === 1 ? '' : 's'}:`
-  const post = (th: number | undefined) => bot.api.sendMessage(chat, clipTo(`${head}\n${body}`, 4000), { ...destOpts({ threadId: th }), disable_notification: true })
+  // How long it took, from the call's traces (the speed work's measure).
+  let speed = ''
+  try { speed = callLatency(process.env.LIVE_CALLS_DIR || join(dirname(LINKS_FILE), 'live-calls'), uuid, since - 60_000) } catch {}
+  const post = (th: number | undefined) => bot.api.sendMessage(chat, clipTo(`${head}\n${body}${speed ? `\n\n${speed}` : ''}`, 4000), { ...destOpts({ threadId: th }), disable_notification: true })
     .then(() => { noteBotMessage(keyFor(chat, th)); return true })
   try { await post(thread) } catch (e) {
     console.error(`[live] summary: ${e}`)

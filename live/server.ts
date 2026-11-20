@@ -40,6 +40,7 @@ import type { ServerWebSocket } from 'bun'
 import { linkExpired, claimDevice, ownLink } from './access'
 import { drainSentences } from './sentences'
 import { SonioxStream, TokenTracker, type Turn } from './soniox'
+import { requestTimings, summarize, latencyLine, readTrace } from './latency'
 import { ARMED_MS, CallState, CALL_MODES, callWord, requestText, sendDecision, type CallMode, type Line } from './call'
 import { kwsPhrases } from './kws'
 import { CallRecorder, pruneCalls, pcmToWav } from './recorder'
@@ -969,7 +970,12 @@ const server = Bun.serve<Conn>({
       if (ws.data.photoKey) photoKeys.delete(ws.data.photoKey)
       clearHeld(ws)
       ws.data.stt?.close()
-      ws.data.rec?.close()
+      const rec = ws.data.rec
+      if (rec) {
+        const s = summarize(requestTimings(readTrace(rec.dir)))
+        if (s.requests) rec.trace('latency', latencyLine(s), s)
+        rec.close()
+      }
     },
     message(ws, raw) {
       // One bad message must not take the server — and every call on it — down.
