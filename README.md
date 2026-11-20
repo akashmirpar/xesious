@@ -571,6 +571,11 @@ this is for holding a conversation.
   when one is ready, or 🔕 silent (no sound at all, notices included). The text is
   on the page in every mode, and without speech no voice is made. The choice is
   kept per link on the device.
+- **Fast page actions (optional):** with `OPENROUTER_API_KEY` set, a short request of
+  yours ("turn off the mic", "switch to assistant", "just a sound", "stay silent") is
+  decided by a fast decision model (Jev on OpenRouter, `live/fast.ts`) and done on the
+  page in ~0.3 s, without a Claude turn; anything else, or anything it isn't sure of,
+  goes to Claude. Without the key (or with `LIVE_FAST=0`) Claude does these too.
 - **Hearing:** with `SONIOX_API_KEY` set, the page streams the mic (16 kHz, with the
   browser's echo cancellation) to the server, which streams it on to Soniox:
   Farsi and English, people told apart (`live/soniox.ts`). The first voice heard
