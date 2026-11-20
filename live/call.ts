@@ -96,11 +96,14 @@ export function isStopPhrase(text: string): boolean {
   return STOP_PHRASES.has(ws.join(' '))
 }
 
-// Words a finished sentence doesn't end on.
-const DANGLING = new Set(['and', 'or', 'but', 'so', 'the', 'a', 'an', 'to', 'of', 'for', 'with', 'in', 'on', 'at', 'from', 'my', 'your',
-  'our', 'their', 'his', 'her', 'its', 'that', 'this', 'because', 'if', 'then', 'also', 'uh', 'um', 'like', 'is', 'are', 'was', 'were',
-  'and', 'when', 'which', 'who', 'about', 'than', 'as', 'by', 'into', 'i', "i'm", 'we', 'you', 'it', 'let', "let's", 'me',
-  'و', 'که', 'یا', 'با', 'به', 'از', 'در', 'برای', 'اما', 'ولی', 'بعد', 'هم', 'این', 'اون', 'آن', 'رو', 'را', 'تا', 'اگه', 'اگر', 'یه', 'یک', 'من', 'تو', 'اِم', 'ام'])
+// Words a finished sentence can't end on, even when Soniox gave it a full stop: what
+// they lead into is still to come. Not pronouns or words English leaves at the end ("Can
+// you check this?", "Turn it on.", "What are you looking at?"): in the recorded calls every
+// wait on those (it, this, that, me, at, are) waited the full 6 s for nothing. Farsi
+// object marker رو/را stays: its verb comes after it.
+const DANGLING = new Set(['and', 'or', 'but', 'the', 'a', 'an', 'of', 'my', 'your', 'our', 'their', 'its', 'because', 'if', 'than',
+  'uh', 'um', 'i', "i'm", "let's", 'into',
+  'و', 'که', 'یا', 'با', 'به', 'از', 'در', 'برای', 'اما', 'ولی', 'اگه', 'اگر', 'یه', 'یک', 'رو', 'را', 'تا', 'اِم', 'ام'])
 // Does this sound cut off? Soniox punctuates finished sentences, so no final
 // punctuation, a trailing dash or comma, or a dangling last word means more is
 // probably coming. A stand-in for a classifier that would judge it.

@@ -190,6 +190,14 @@ describe('whose words count', () => {
       expect(looksUnfinished(s)).toBe(true)
     for (const s of ['Is the train on time today?', 'Stop.', 'Thanks!', 'فردا هوا بارونیه؟', 'He said "hi."'])
       expect(looksUnfinished(s)).toBe(false)
+    // Even with a full stop, a word that leads into more is still cut off.
+    for (const s of ['Send the summary and.', 'Put it in the.', 'Check the price because.', 'این فایل رو.', 'برو به.'])
+      expect(looksUnfinished(s)).toBe(true)
+    // Pronouns and words English leaves at the end finish a sentence: each of these
+    // endings waited 6 s for nothing on real calls.
+    for (const s of ['Can you check this?', 'Read it to me.', 'Open it.', 'What do you think of it?', 'Is that so?', 'Do that.',
+      'What are you looking at?', 'Where are you?', 'Thank you.', 'Turn it on.', "I'd love to.", 'I think so.', 'چی هست این؟'])
+      expect(looksUnfinished(s)).toBe(false)
   })
   test('send now, or wait: the button, talking again, unfinished, and the limit', () => {
     const base = { text: 'Give me a—', waitedMs: 1000, stillTalking: false, force: false, maxWaitMs: 6000 }
