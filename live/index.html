@@ -170,6 +170,12 @@
   #answers .i{display:none} #answers[data-mode=voice] .voice, #answers[data-mode=sound] .sound, #answers[data-mode=silent] .silent{display:block}
   #stop svg{width:16px;height:16px}
   #hint{color:var(--hint);font-size:12px;text-align:center}
+  /* The wake word's first download (see kwsLoadSay): fills with it, then slides while it unpacks */
+  #kwsBar{display:none;width:180px;max-width:60%;height:4px;margin:5px auto 0;border-radius:2px;background:var(--bg2);overflow:hidden}
+  #kwsBar.show{display:block} #kwsBar i{display:block;height:100%;width:0;border-radius:2px;background:var(--accent);transition:width .3s}
+  #kwsBar.busy i{width:35%;animation:kwsSlide 1.1s ease-in-out infinite alternate}
+  @keyframes kwsSlide{from{transform:translateX(-10%)}to{transform:translateX(195%)}}
+  @media (prefers-reduced-motion:reduce){#kwsBar.busy i{animation:none;width:100%;opacity:.5}}
   #lag{color:#e0645a;font-size:12px;text-align:center;font-weight:600}
   /* What is running in the group's topics, from the bot: one line each, done ones fade. */
   #work{display:none;flex-direction:column;gap:3px;padding:6px 16px;border-top:1px solid rgba(128,128,128,.14);font-size:12.5px;color:var(--hint);max-height:30vh;overflow-y:auto}
@@ -258,6 +264,7 @@
     <button id="stop" class="side" aria-label="stop the answer" title="Stop the answer"><svg viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2.5" fill="currentColor"/></svg></button>
   </div>
   <div id="hint">Tap to turn the mic on or off · hold (or hold Space) to talk</div>
+  <div id="kwsBar" role="progressbar" aria-label="Wake word loading" aria-valuemin="0" aria-valuemax="100"><i></i></div>
   <div id="lag" role="status" hidden></div>
 </footer>
 </div>
@@ -543,7 +550,7 @@ let callMode='interactive', wake=['Lucy'], othersOn=false
 try{ const v=localStorage.getItem(modeKey); if(MODES[v]) callMode=v }catch{}
 // While the wake-word model loads (its first download takes up to half a minute), the
 // hint says so with the mic off, so a "Hey Lucy" that can't be heard yet isn't a mystery.
-let kwsLoadMsg=''
+let kwsLoadMsg='', kwsLoadPct=null
 const hintNow=()=> kwsLoadMsg && kwsLoadShown() ? kwsLoadMsg+' — or tap the mic' : callMode==='assistant' ? `Assistant: say “${wake[0]||'its name'} …” or hold the mic to ask` : HINT
 function paintMode(){
   const b=$('#callmode'); b.textContent=MODES[callMode].label+' ▾'; b.style.display=started?'inline':'none'
@@ -623,7 +630,13 @@ function paint(){ mic.classList.toggle('on', micOn && !talking); mic.classList.t
 // yours, pauses don't cut it, letting go sends it). Space does the same as holding.
 function setMic(on){ if(on) clearTimeout(micBack); if(micOn===on) return; micOn=on; paint(); trace(on?'mic on':'mic off'); if(stt==='browser'){ on?startRec():stopRec() }
   if(!on) startSpotting(); if(kwsLoadMsg) hintRefresh() }
-function hintRefresh(){ $('#hint').textContent = mutedOn && !micOn ? mutedText() : hintNow() }
+function hintRefresh(){ $('#hint').textContent = mutedOn && !micOn ? mutedText() : hintNow(); paintKwsBar() }
+function paintKwsBar(){
+  const b=$('#kwsBar'), on=!!kwsLoadMsg && kwsLoadShown(), known=kwsLoadPct!=null
+  b.classList.toggle('show', on); b.classList.toggle('busy', on && !known)
+  b.firstChild.style.width = known ? kwsLoadPct+'%' : ''
+  if(known) b.setAttribute('aria-valuenow', String(kwsLoadPct)); else b.removeAttribute('aria-valuenow')
+}
 // The mic turned off by voice (the front desk's mic_off): with ms, back on by itself
 // then, with a sound so the caller knows it is listening again; the server allows at
 // most 3 minutes. Turning it on by hand first cancels that.
@@ -785,7 +798,7 @@ function paintWakeMic(){
 }
 $('#wakeMic').addEventListener('change', e=>{ wakeMicOn=e.target.checked; try{ localStorage.setItem(wakeMicKey, wakeMicOn?'on':'off') }catch{}; trace('wake by voice '+(wakeMicOn?'on':'off')); if(wakeMicOn && !micOn) startSpotting(); hintRefresh() })
 function kwsLoadShown(){ return started && !micOn && spotOn() }
-function kwsLoadSay(msg){ kwsLoadMsg=msg; hintRefresh() }
+function kwsLoadSay(msg, pct=null){ kwsLoadMsg=msg; kwsLoadPct=pct; hintRefresh() }
 function kwsFail(what, err){
   kwsFailed=true; kwsLoading=false; trace('wake spotter failed', {what, error:String(err?.message||err).slice(0,300)}); paintWakeMic()
   if(kwsLoadMsg){ kwsLoadSay(''); sys('“'+wakeSays()+'” couldn’t load on this phone — tap the mic to turn it on') }
@@ -832,7 +845,7 @@ function startSpotting(){
       // download (a percent at a time; after 100% it unpacks it).
       const m=new window.Vosk.Model(location.origin+kwsCfg.model, -1)
       m.on('progress', d=>{ const total=d.total||kwsCfg?.bytes; if(!(total>0)) return; const pct=Math.min(100, Math.floor(100*d.loaded/total))
-        kwsLoadSay(pct<100 ? 'Downloading “'+wakeSays()+'”: '+pct+'%' : getting()) })
+        pct<100 ? kwsLoadSay('Downloading “'+wakeSays()+'”: '+pct+'%', pct) : kwsLoadSay(getting()) })
       kwsModel=await new Promise((ok, no)=>{ m.on('load', d=>d.result ? ok(m) : no(new Error(d.error||'the model did not load'))); m.on('error', d=>no(new Error(d.error||'the model failed'))) })
       clearTimeout(slow); kwsLoading=false; kwsRecognizer(); trace('wake spotter ready', {ms:Date.now()-t0})
       if(kwsLoadMsg){ const shown=kwsLoadShown(); kwsLoadSay(''); if(shown) sys('👂 Ready: say “'+wakeSays()+'” to turn the mic on') }
