@@ -53,7 +53,9 @@ const soniox = Bun.serve({
     },
   },
 })
-let ms = 0
+// Word times (audio ms): real Soniox's never run ahead of the audio sent, and a false wake
+// drops words before that point, so these start past all the audio the tests send.
+let ms = 600_000
 let pendingTokens: any[] = []
 function partial(speaker: string, text: string) {
   pendingTokens = text.split(/(?= )/).map(w => ({ text: w, speaker, is_final: false, language: 'en', start_ms: (ms += 200) - 150, end_ms: ms }))
@@ -356,6 +358,35 @@ test('a wake heard on the phone that Soniox hears too ("Hey Hanna, …") is conf
   await Bun.sleep(1500)   // past the confirmation window
   expect(A.got.some(m => m.type === 'mic')).toBe(false)
   expect(traceNow()).toContain('wake confirmed')
+}, 20000)
+
+test('a wake is confirmed from the words still coming: a long sentence with no pause keeps the mic on', async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  A.got.length = 0
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'HEY_LUCY' }))
+  partial('2', 'Hey Hanna, what is up, and I have got a question about the gold price')
+  await Bun.sleep(1800)   // past the confirmation window, the sentence still open
+  expect(A.got.some(m => m.type === 'mic')).toBe(false)
+  expect(traceNow()).toContain('wake confirmed in the words still coming')
+  say('2', ' today?')
+  const sent = await A.wait(m => m.type === 'sent')
+  await A.wait(m => m.type === 'turn_end' && m.req === sent.req)
+}, 20000)
+
+test("a false wake's words don't wait in the open piece to join the next request", async () => {
+  A.got.length = 0
+  const before = finalizes
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'HEY_LUCY' }))
+  partial('2', 'some talk on the radio')
+  expect(await A.wait(m => m.type === 'mic', 4000)).toEqual({ type: 'mic', on: false, ms: 0, why: 'false_wake' })
+  for (let i = 0; i < 40 && finalizes === before; i++) await Bun.sleep(50)
+  expect(finalizes).toBe(before + 1)   // the piece is ended, without its words
+  say('2', 'Hey Hanna, what day is it?')
+  const sent = await A.wait(m => m.type === 'sent')
+  expect(sent.said ?? prompts().at(-1)?.prompt ?? '').not.toContain('radio')
+  await A.wait(m => m.type === 'turn_end' && m.req === sent.req)
+  expect(prompts().at(-1).prompt).not.toContain('radio')
+  expect(A.got.filter(m => m.type === 'lines').flatMap(m => m.lines.map((l: any) => l.text)).join(' ')).not.toContain('radio')
 }, 20000)
 
 test('the call is recorded: mic audio, and a trace of every step', async () => {

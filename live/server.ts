@@ -828,6 +828,8 @@ function startHearing(ws: WS) {
         ws.data.speakStop?.(); out(ws, { type: 'hush' })
         rec.trace('speaker', `speaker ${call.main} (you) talked over the answer, so the reading stops`, { text: r.live.map(t => t.text).join(' ') })
       }
+      // A wake on the phone, confirmed as the words come (a long sentence may not end in time).
+      if (ws.data.woke && r.live.some(t => callWord(t.text, call.wake))) wakeConfirmed(ws, 'in the words still coming')
       if (r.done) { heard(ws, r.done, r.finalized); return }
       // In a busy room the audio is never quiet: end the piece when the caller has been quiet
       // END_SILENCE_MS while someone else keeps talking (their later words prove the
@@ -845,6 +847,11 @@ function startHearing(ws: WS) {
   })
 }
 
+function wakeConfirmed(ws: WS, where: string) {
+  clearTimeout(ws.data.woke); ws.data.woke = undefined
+  ws.data.rec!.trace('voice', `wake confirmed ${where}: the mic stays on`)
+}
+
 function heard(ws: WS, turns: Turn[], finalized: boolean) {
   const call = ws.data.call!, rec = ws.data.rec!
   const held = ws.data.held || ws.data.heldUntilFinal
@@ -859,7 +866,7 @@ function heard(ws: WS, turns: Turn[], finalized: boolean) {
   for (const l of r.lines) rec.trace('heard', `speaker ${l.speaker} (${l.role === 'me' ? 'you' : 'other'}${held ? ', talk button held' : ''}${l.unclear ? `, unclear (confidence ${l.confidence}): not sent` : ''})`, { text: l.text, language: l.language, confidence: l.confidence })
   if (r.lines.length) out(ws, { type: 'lines', lines: r.lines.map(shown) })
   // A wake on the phone, confirmed: the wake phrase is in what was heard.
-  if (ws.data.woke && r.lines.some(l => callWord(l.text, call.wake))) { clearTimeout(ws.data.woke); ws.data.woke = undefined; rec.trace('voice', 'wake confirmed: the mic stays on') }
+  if (ws.data.woke && r.lines.some(l => callWord(l.text, call.wake))) wakeConfirmed(ws, 'in what was said')
   if (r.stop) { stopAll(ws, `you said "${r.lines.filter(l => l.role === 'me').map(l => l.text).join(' ')}"`); return }
   if (r.send) {
     // The caller's words after the caller's request, before its answer: one request, asked again. Not
@@ -1183,8 +1190,11 @@ function onMessage(ws: WS, raw: string | Buffer) {
           rec.trace('voice', `wake phrase heard on the phone (${said}): mic on`)
           ws.data.woke = setTimeout(() => {
             ws.data.woke = undefined
-            rec.trace('voice', `false wake: no wake word heard within ${WOKE_CONFIRM_MS / 1000} s, mic off again`)
+            rec.trace('voice', `false wake: no wake word heard within ${WOKE_CONFIRM_MS / 1000} s, mic off again; what was heard since is dropped`)
             out(ws, { type: 'mic', on: false, ms: 0, why: 'false_wake' })
+            // Its words would otherwise wait in the open piece and join the next request.
+            const t = ws.data.tracker, stt = ws.data.stt
+            if (t && stt) { t.dropBefore(Math.max(stt.sentMs, t.openWordEnd() ?? 0)); stt.finalize() }
           }, WOKE_CONFIRM_MS)
           return
         }

@@ -58,6 +58,19 @@ describe('Soniox tokens', () => {
     t.push({ tokens: [tok('Hello', '1', 900, false)], total_audio_proc_ms: 2400 })
     expect(t.silenceMs()).toBe(1500)
   })
+  test("a false wake's words are dropped: those held, and those Soniox sends later", () => {
+    const t = new TokenTracker()
+    t.push({ tokens: [tok('Some', '1', 300), tok(' TV', '1', 600, false)], total_audio_proc_ms: 700 })
+    t.dropBefore(1000)
+    expect(t.push({ tokens: [tok(' talk', '1', 900, false)] }).live).toEqual([])
+    // finalized later, and the next wake's words after it
+    let r = t.push({ tokens: [tok(' TV', '1', 600), tok(' talk', '1', 900), { text: '<fin>', is_final: true }] })
+    expect(r.done).toEqual([])
+    r = t.push({ tokens: [tok('Hey', '1', 1300), tok(' Lucy', '1', 1600), { text: '<end>', is_final: true }] })
+    expect(r.done).toEqual([{ speaker: '1', text: 'Hey Lucy', language: 'en' }])
+    t.reset()   // a new connection: word times start over
+    expect(t.push({ tokens: [tok('Hi', '1', 200, false)] }).live[0].text).toBe('Hi')
+  })
   test('the config asks for both languages, speakers, and the key', () => {
     const c = configMessage({ key: 'k', model: 'stt-rt-v6', languages: ['en', 'fa'], endpointMs: 100 })
     expect(c).toMatchObject({ api_key: 'k', model: 'stt-rt-v6', audio_format: 'pcm_s16le', sample_rate: 16000, language_hints: ['en', 'fa'],
