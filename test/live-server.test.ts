@@ -365,7 +365,7 @@ test('a wake is confirmed from the words still coming: a long sentence with no p
   const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
   A.got.length = 0
   A.ws.send(JSON.stringify({ type: 'woke', keyword: 'HEY_LUCY' }))
-  partial('2', 'Hey Hanna, what is up, and I have got a question about the gold price')
+  partial('2', 'Hey Hanna, so I was wondering, before we leave, whether the museum opens late on Fridays')
   await Bun.sleep(1800)   // past the confirmation window, the sentence still open
   expect(A.got.some(m => m.type === 'mic')).toBe(false)
   expect(traceNow()).toContain('wake confirmed in the words still coming')
