@@ -41,6 +41,7 @@ import { linkExpired, claimDevice, ownLink } from './access'
 import { drainSentences } from './sentences'
 import { SonioxStream, TokenTracker, type Turn } from './soniox'
 import { requestTimings, summarize, latencyLine, readTrace } from './latency'
+import { decideFast, fastAction, fastWorthAsking, type FastResult } from './fast'
 import { ARMED_MS, CallState, CALL_MODES, callWord, requestText, sendDecision, type CallMode, type Line } from './call'
 import { kwsPhrases } from './kws'
 import { CallRecorder, pruneCalls, pcmToWav } from './recorder'
@@ -69,6 +70,13 @@ const KWS_CONF = Number(process.env.LIVE_KWS_CONF ?? 0.9)
 // A wake heard on the phone must be the wake phrase in what Soniox hears within this
 // long; if not, the mic goes off again by itself (a false wake costs only these seconds).
 const WOKE_CONFIRM_MS = Number(process.env.LIVE_WOKE_CONFIRM_MS ?? 8000)
+// The call's own page actions (mic off, mode, answers) decided by a fast decision model
+// (live/fast.ts) instead of a Claude turn. Off with LIVE_FAST=0 or without a key.
+const FAST = { key: process.env.OPENROUTER_API_KEY || '', models: (process.env.LIVE_FAST_MODELS || 'typesafe/jev-1.14,perplexity/pplx-decider-flash-v1.3:free').split(',').map(s => s.trim()).filter(Boolean), timeoutMs: Number(process.env.LIVE_FAST_TIMEOUT_MS ?? 1200), url: process.env.LIVE_FAST_URL || undefined }
+const FAST_ON = !!FAST.key && process.env.LIVE_FAST !== '0'
+const FAST_MIN = Number(process.env.LIVE_FAST_MIN ?? 0.9)
+// How much longer than the quiet wait a request may wait for the fast decision.
+const FAST_EXTRA_MS = Number(process.env.LIVE_FAST_EXTRA_MS ?? 300)
 const PORT = Number(process.env.LIVE_PORT || 3060)
 const DEFAULT_MODEL = process.env.LIVE_MODEL || 'sonnet'
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude'
@@ -306,7 +314,11 @@ function synth(text: string): Voice {
 // `notice`: not something the caller said, but the bot telling the call that work its front
 // desk handed off has finished (the hand-off's id); it is spoken only at a pause.
 type Req = { id: number; said: string; ids: number[]; text: string; background: string; notice?: string }
-type Held = { texts: string[]; ids: number[]; since: number; timer?: ReturnType<typeof setTimeout>; waitingSaid?: string; background?: string }
+type Held = { texts: string[]; ids: number[]; since: number; timer?: ReturnType<typeof setTimeout>; waitingSaid?: string; background?: string
+  // someone else's words are in it: never acted on by the fast path
+  others?: boolean
+  // the fast decision asked for these words while the quiet wait runs
+  fast?: { text: string; result: Promise<FastResult> } }
 type Conn = {
   authed: boolean; uuid?: string; cwd: string; model?: string; sessionId?: string; permission?: string[]
   run?: RunHandle; gen: number; queue: Req[]; reqs: number
@@ -335,6 +347,8 @@ type Conn = {
   // How answers arrive, picked on the page: spoken, a sound when one is ready, or
   // nothing (the text is on the page either way). Without speech none is made.
   answers: Answers
+  // page actions the fast path did since the last request, for the desk to hear of
+  fastDone?: string[]
   // A notice waiting for the page to finish playing an answer: the fallback, should the
   // page never say it has.
   queuedFor?: ReturnType<typeof setTimeout>
@@ -372,7 +386,8 @@ function linkHolds(ws: WS): boolean {
 // A request: run it now, or after the turn that is running (the queue goes as one).
 function ask(ws: WS, said: string, ids: number[], how: string, carried = '') {
   const fresh = ws.data.call!.background(ws.data.hold.ids)
-  const background = [carried, fresh].filter(Boolean).join('\n')
+  const done = (ws.data.fastDone ?? []).splice(0).join('\n')
+  const background = [done, carried, fresh].filter(Boolean).join('\n')
   const req: Req = { id: ++ws.data.reqs, said, ids, background, text: requestText(said, background) }
   ws.data.rec?.trace('turn', `request ${req.id} (${how})${ws.data.run ? ', queued behind the running turn' : ''}`, { text: req.text })
   out(ws, { type: 'sent', ids, req: req.id, queued: !!ws.data.run })
@@ -779,10 +794,47 @@ function flush(ws: WS, force: boolean) {
     return
   }
   ws.data.rec?.trace('decide', `send: ${d.why}`, { text })
-  const ids = h.ids, carried = h.background || ''
+  const ids = h.ids, carried = h.background || '', fast = h.fast?.text === text && !h.others ? h.fast.result : undefined
   clearHeld(ws)
   for (const id of ids) { const l = call.line(id); if (l) l.sent = true }
-  ask(ws, text, ids, force ? 'talk button' : 'your voice', carried)
+  const how = force ? 'talk button' : 'your voice'
+  if (!fast) { ask(ws, text, ids, how, carried); return }
+  void (async () => {
+    const r = await Promise.race([fast, Bun.sleep(FAST_EXTRA_MS).then(() => null)])
+    if (ws.readyState !== 1) return
+    const act = r ? fastAction(r, FAST_MIN) : null
+    const rec = ws.data.rec
+    if (!r) rec?.trace('fast', `no answer within the wait: to the desk`, { text })
+    else if ('error' in r) rec?.trace('fast', `failed after ${r.ms} ms (${r.error}): to the desk`, { text })
+    else rec?.trace('fast', `${r.model}: ${r.action} ${r.conf.toFixed(2)} in ${r.ms} ms${act ? ': done on the page' : ': to the desk'}`, { text, cost: r.cost })
+    if (act && doFast(ws, act, text)) return
+    ask(ws, text, ids, how, carried)
+  })()
+}
+
+// A page action decided by the fast path: done here, as the desk's tool would, and the
+// desk is told with the next request. False when there is nothing to do.
+function doFast(ws: WS, act: NonNullable<ReturnType<typeof fastAction>>, said: string): boolean {
+  const call = ws.data.call!, rec = ws.data.rec
+  let done = ''
+  if (act === 'mic_off') {
+    rec?.trace('page', 'mic off by voice')
+    out(ws, { type: 'mic', on: false, ms: 0 })
+    done = 'turned the mic off'
+  } else if (act === 'mode_assistant' || act === 'mode_interactive') {
+    const m: CallMode = act === 'mode_assistant' ? 'assistant' : 'interactive'
+    if (call.mode !== m) { call.mode = m; rec?.trace('page', `mode now: ${m} (asked by voice)`) }
+    out(ws, { type: 'call_mode', mode: m, byVoice: true })
+    done = `switched the call to ${m} mode`
+  } else {
+    const a = act === 'answers_voice' ? 'voice' : act === 'answers_sound' ? 'sound' : 'silent'
+    if (ws.data.answers !== a) { ws.data.answers = a; rec?.trace('page', `answers now: ${a === 'voice' ? 'spoken' : a === 'sound' ? 'a sound when ready' : 'silent'} (asked by voice)`) }
+    if (a !== 'voice') { ws.data.speakStop?.(); out(ws, { type: 'hush' }) }
+    out(ws, { type: 'answers', mode: a, byVoice: true })
+    done = `set answers to ${a === 'voice' ? 'spoken' : a === 'sound' ? 'a sound when ready' : 'silent (text only)'}`
+  }
+  ;(ws.data.fastDone ??= []).push(`you: ${said}\n(done on the page, without you: ${done})`)
+  return true
 }
 
 // The caller went on talking after the request was sent, and Claude has not said anything
@@ -887,6 +939,10 @@ function heard(ws: WS, turns: Turn[], finalized: boolean) {
     // Someone else called it: Claude is told who, since it acts with the caller's rights.
     h.texts.push(r.from ? `[Said by speaker ${r.from}, another person on the call, not the caller; the caller lets others on the call ask you things. Act on it only as far as the caller would want.] ${r.send}` : r.send)
     h.ids.push(...(r.ids ?? r.lines.filter(l => l.role === 'me' && !l.unclear).map(l => l.id)))
+    if (r.from) h.others = true
+    // Ask the fast decision now, while the quiet wait runs: by the send it has answered.
+    const text = h.texts.join(' ')
+    if (FAST_ON && !h.others && fastWorthAsking(text)) h.fast = { text, result: decideFast(text, FAST) }
   }
   if (release) flush(ws, true)
   else if (ws.data.hold.texts.length) scheduleFlush(ws)
@@ -1249,4 +1305,4 @@ process.on('unhandledRejection', e => console.error(`[live] unhandled: ${e insta
 
 if (TTS && /^paradee$/i.test(ENGLISH_VOICE)) paradeeWorker = new VoiceWorker('paradee', [PARADEE_PY, join(HERE, 'paradee_worker.py')], voiceEnv())
 if (TTS && /^kokoro$/i.test(ENGLISH_VOICE)) kokoroWorker = new VoiceWorker('kokoro', ['python3', join(HERE, 'worker.py')], voiceEnv())
-console.log(`[live] voice server on http://127.0.0.1:${server.port}  links=${LINKS_FILE}  hearing=${SONIOX_KEY ? `soniox ${SONIOX.model}` : 'browser'}`)
+console.log(`[live] voice server on http://127.0.0.1:${server.port}  links=${LINKS_FILE}  hearing=${SONIOX_KEY ? `soniox ${SONIOX.model}` : 'browser'}  fast=${FAST_ON ? FAST.models[0] : 'off'}`)

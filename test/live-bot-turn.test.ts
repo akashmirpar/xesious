@@ -112,7 +112,7 @@ let server: ChildProcess
 let A: Client
 beforeAll(async () => {
   writeFileSync(LINKS, JSON.stringify({ [UUID]: { key: '-100777:12', desk: '-100777:99', cwd: TMP, created: new Date().toISOString(), user: { id: 1, name: 'Tester' } } }))
-  const env: NodeJS.ProcessEnv = { ...process.env, LIVE_TOPICS_EVERY_MS: '60000', LIVE_PORT: '0', LIVE_TTS: 'off', LIVE_LINKS_FILE: LINKS, LIVE_CALLS_DIR: join(TMP, 'calls'), CLAUDE_BIN: '/nonexistent/claude' }
+  const env: NodeJS.ProcessEnv = { ...process.env, LIVE_TOPICS_EVERY_MS: '60000', LIVE_PORT: '0', LIVE_TTS: 'off', LIVE_LINKS_FILE: LINKS, LIVE_CALLS_DIR: join(TMP, 'calls'), CLAUDE_BIN: '/nonexistent/claude', LIVE_FAST: '0' }
   delete env.SONIOX_API_KEY; delete env.LIVE_API_SOCK; delete env.LIVE_API_TOKEN_FILE
   server = spawn(process.execPath, ['run', join(import.meta.dir, '..', 'live', 'server.ts')], { env, stdio: ['ignore', 'pipe', 'pipe'] })
   port = await new Promise<number>((res, rej) => {

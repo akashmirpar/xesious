@@ -55,6 +55,18 @@ const soniox = Bun.serve({
 })
 // Word times (audio ms): real Soniox's never run ahead of the audio sent, and a false wake
 // drops words before that point, so these start past all the audio the tests send.
+// --- fake decisions model (the fast path, live/fast.ts) ---
+const decisions: string[] = []
+const decider = Bun.serve({
+  port: 0, hostname: '127.0.0.1',
+  async fetch(req) {
+    const b: any = await req.json()
+    const said = String(b.state).split('Said: ')[1] ?? ''
+    decisions.push(said)
+    const pick = /turn off the mic/i.test(said) ? ['mic_off', 0.99] : /only a sound/i.test(said) ? ['answers_sound', 0.98] : /switch to assistant/i.test(said) ? ['mode_assistant', 0.6] : ['none', 0.97]
+    return Response.json({ model: b.model, answers: { action: { type: 'choice', choice: pick[0], confidence: pick[1] } }, usage: { cost: 0.00002 } })
+  },
+})
 let ms = 600_000
 let pendingTokens: any[] = []
 function partial(speaker: string, text: string) {
@@ -98,7 +110,7 @@ beforeAll(async () => {
   server = spawn(process.execPath, ['run', join(import.meta.dir, '..', 'live', 'server.ts')], {
     env: { ...process.env, LIVE_PORT: '0', LIVE_TTS: 'off', LIVE_LINKS_FILE: LINKS, LIVE_CALLS_DIR: CALLS, CLAUDE_BIN: STUB,
       SONIOX_API_KEY: 'test-key', LIVE_SONIOX_URL: `ws://127.0.0.1:${soniox.port}`, LIVE_QUIET_MS: '150', LIVE_MAX_WAIT_MS: '1500', LIVE_END_SILENCE_MS: '1300',
-      LIVE_KWS_DIR: KWS, LIVE_WOKE_CONFIRM_MS: '1200' },
+      LIVE_KWS_DIR: KWS, LIVE_WOKE_CONFIRM_MS: '1200', OPENROUTER_API_KEY: 'test-or', LIVE_FAST_URL: `http://127.0.0.1:${decider.port}` },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   port = await new Promise<number>((res, rej) => {
@@ -107,7 +119,7 @@ beforeAll(async () => {
     setTimeout(() => rej(new Error(`server did not start: ${buf}`)), 10000)
   })
 })
-afterAll(() => { server?.kill('SIGKILL'); soniox.stop(true) })
+afterAll(() => { server?.kill('SIGKILL'); soniox.stop(true); decider.stop(true) })
 
 let A: Client
 test('the first device takes the link; a second device is refused', async () => {
@@ -388,6 +400,37 @@ test("a false wake's words don't wait in the open piece to join the next request
   await A.wait(m => m.type === 'turn_end' && m.req === sent.req)
   expect(prompts().at(-1).prompt).not.toContain('radio')
   expect(A.got.filter(m => m.type === 'lines').flatMap(m => m.lines.map((l: any) => l.text)).join(' ')).not.toContain('radio')
+}, 20000)
+
+test('a short page action is done on the page by the fast path, with no Claude turn; the desk hears of it next time', async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  await Bun.sleep(1500)   // past the earlier tests' answers
+  A.got.length = 0
+  const n = prompts().length
+  say('2', 'Turn off the mic.')
+  expect(await A.wait(m => m.type === 'mic', 4000)).toEqual({ type: 'mic', on: false, ms: 0 })
+  await Bun.sleep(400)
+  expect(prompts()).toHaveLength(n)                  // no turn
+  expect(A.got.some(m => m.type === 'sent')).toBe(false)
+  expect(traceNow()).toMatch(/fast.*mic_off 0\.99 in \d+ ms: done on the page/)
+  // the answers switch too
+  say('2', 'Only a sound please.')
+  expect(await A.wait(m => m.type === 'answers', 4000)).toEqual({ type: 'answers', mode: 'sound', byVoice: true })
+  expect(prompts()).toHaveLength(n)
+  // unsure (0.6): the desk decides, and is told what the page did before
+  say('2', 'Switch to assistant mode.')
+  const sent = await A.wait(m => m.type === 'sent')
+  await A.wait(m => m.type === 'turn_end' && m.req === sent.req)
+  const p = prompts().at(-1).prompt
+  expect(p).toStartWith('Switch to assistant mode.')
+  expect(p).toContain('(done on the page, without you: turned the mic off)')
+  expect(p).toContain('(done on the page, without you: set answers to a sound when ready)')
+  // a long request, or one with a number, is never asked about
+  const asked = decisions.length
+  say('2', 'Turn off the mic for 2 minutes.')
+  await A.wait(m => m.type === 'sent' && m.req !== sent.req)
+  expect(decisions.length).toBe(asked)
+  A.ws.send(JSON.stringify({ type: 'answers', mode: 'voice' }))
 }, 20000)
 
 test('the call is recorded: mic audio, and a trace of every step', async () => {

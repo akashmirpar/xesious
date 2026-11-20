@@ -412,6 +412,7 @@ function connect(){
       case 'waiting': for(const id of m.ids) lineState(id,'…'); break
       case 'heard': heardS=m.s; break
       case 'mic': if(m.on===false) micOffByVoice(Number(m.ms)||0, m.why); break
+      case 'answers': if(m.byVoice && ANSWERS[m.mode] && m.mode!==answersMode){ answersMode=m.mode; try{ localStorage.setItem(answersKey, m.mode) }catch{}; paintAnswers(); if(answersMode!=='voice') hush(); sys(ANSWERS[m.mode]+', switched by voice') } break
       case 'call_mode': if(m.byVoice && MODES[m.mode] && m.mode!==callMode){ callMode=m.mode; try{ localStorage.setItem(modeKey, m.mode) }catch{}; paintMode(); sys(MODES[m.mode].label+' mode, switched by voice') } break
       case 'others': othersOn=!!m.on; paintMode(); if(tipFor===$('#othersBtn')) showTip(tipFor); break
       case 'called': listening(m.ms||8000); break
