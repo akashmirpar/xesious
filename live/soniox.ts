@@ -134,6 +134,8 @@ export class SonioxStream {
   get sentMs(): number { return Math.round(this.sentBytes / 32) }
 
   constructor(private c: SonioxConfig, private h: Handlers) {}
+  // Words to expect, sent when it next connects.
+  setTerms(terms: string[]): void { this.c = { ...this.c, terms } }
 
   send(pcm: Uint8Array): void {
     if (this.closed) return

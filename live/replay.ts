@@ -3,7 +3,7 @@
 // settings — the way to tell a speech-recognition problem from everything after it.
 //
 //   bun live/replay.ts state/live-calls/<call> [--model stt-rt-v6] [--languages en,fa]
-//                      [--endpoint 1500] [--speed 1] [--from 0] [--to 0]
+//                      [--endpoint 1500] [--speed 1] [--from 0] [--to 0] [--terms 'Hey Lucy,Lucy']
 //
 // Prints each finished piece with who said it and where it is in the audio. Uses
 // SONIOX_API_KEY (from .env) and paid Soniox time, like a call does.
@@ -26,7 +26,7 @@ const from = Math.floor(Number(opt('from', '0')) * BPS / 2) * 2
 const toS = Number(opt('to', '0'))
 const pcm = wav.subarray(44 + from, toS > 0 ? 44 + Math.floor(toS * BPS / 2) * 2 : wav.length)
 const speed = Math.max(0.25, Number(opt('speed', '1')))
-const cfg = { key, model: opt('model', 'stt-rt-v6'), languages: opt('languages', 'en,fa').split(','), endpointMs: Number(opt('endpoint', '1500')) }
+const cfg = { key, model: opt('model', 'stt-rt-v6'), languages: opt('languages', 'en,fa').split(','), endpointMs: Number(opt('endpoint', '1500')), terms: opt('terms', '').split(',').map(s => s.trim()).filter(Boolean) }
 console.log(`replaying ${(pcm.length / BPS).toFixed(1)} s of ${wavPath} — ${cfg.model}, ${cfg.languages.join('+')}, endpoint ${cfg.endpointMs} ms, ${speed}x`)
 
 const tracker = new TokenTracker()

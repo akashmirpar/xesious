@@ -138,7 +138,8 @@ test('mic audio reaches Soniox with the key, both languages and speakers on', as
   expect(sonioxBytes).toBe(3200)
   expect(sonioxConfig).toMatchObject({ api_key: 'test-key', model: 'stt-rt-v6', language_hints: ['en', 'fa'], enable_speaker_diarization: true, sample_rate: 16000,
     enable_endpoint_detection: false })
-  expect(sonioxConfig.context).toBeUndefined()   // no "expected words" unless LIVE_TERMS is set
+  // Soniox expects the wake words (and "Hey …" for Latin ones), so a noisy "Hey Lucy" isn't heard as something else.
+  expect(sonioxConfig.context).toEqual({ terms: ['Lucy', 'Hey Lucy', 'Lucie', 'Hey Lucie', 'لوسی'] })
 })
 
 

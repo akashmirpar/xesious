@@ -804,11 +804,20 @@ function redoIfCut(ws: WS): boolean {
 }
 
 // --- hearing (Soniox) ---------------------------------------------------------
+// Soniox is told to expect the wake words. Without it, in a noisy place "Hey Lucy" came
+// out as Farsi «خیلی چیز» every time (2026-11-20), so the phone's wake looked false and
+// the request uncalled; with it, all were "Hey Lucy", and no "Lucy" appeared in calls
+// without one.
+function sonioxTerms(wake: string[]): string[] {
+  const t = [...SONIOX.terms]
+  for (const w of wake.map(x => x.trim()).filter(Boolean)) t.push(w, ...(/^[\p{Script=Latin}\s'-]+$/u.test(w) ? [`Hey ${w}`] : []))
+  return [...new Set(t)].slice(0, 50)
+}
 function startHearing(ws: WS) {
   const rec = ws.data.rec!, call = ws.data.call!
   const tracker = ws.data.tracker = new TokenTracker()
   let firstWords = true
-  ws.data.stt = new SonioxStream({ ...SONIOX, key: SONIOX_KEY }, {
+  ws.data.stt = new SonioxStream({ ...SONIOX, key: SONIOX_KEY, terms: sonioxTerms(call.wake) }, {
     connected: n => {
       tracker.reset(); ws.data.endedFor = undefined
       if (n > 1 && call.main !== null) { call.reset(); out(ws, { type: 'main', speaker: null }); out(ws, { type: 'status', text: 'reconnected to speech recognition — the first voice now is "you" again (tap a line to change)' }) }
@@ -1026,7 +1035,6 @@ function onMessage(ws: WS, raw: string | Buffer) {
           agent: String(msg.agent || '').slice(0, 300),
         })
         ws.data.rec.trace('auth', device === 'bound' ? 'link opened; this device now holds it' : 'link opened by its device', { answers: ws.data.answers })
-        if (SONIOX_KEY) startHearing(ws)
         startEvents(ws)
         stampUsed(msg.uuid)
         ws.data.photoKey = randomUUID(); photoKeys.set(ws.data.photoKey, msg.uuid)
@@ -1034,6 +1042,7 @@ function onMessage(ws: WS, raw: string | Buffer) {
         ws.data.call.mode = modeFrom(msg.mode) ?? 'interactive'
         ws.data.call.wake = wakeFor(prefsKey(ws))
         ws.data.call.othersMayCall = othersFor(prefsKey(ws))
+        if (SONIOX_KEY) startHearing(ws)   // after the wake words: Soniox is told to expect them
         ws.data.rec.trace('page', `mode: ${ws.data.call.mode}`, { wake: ws.data.call.wake, others_may_call: ws.data.call.othersMayCall })
         // While open: the link is in use; and a link revoked (a new /live) or expired
         // closes the page, not just its next turn.
@@ -1103,7 +1112,8 @@ function onMessage(ws: WS, raw: string | Buffer) {
           if (!w.length) { out(ws, { type: 'wake', words: call.wake, error: 'needs at least one word' }); return }
           call.wake = w
           savePref(prefsKey(ws), { wake: w })
-          rec.trace('page', 'wake words changed', { wake: w })
+          rec.trace('page', 'wake words changed (Soniox expects them from its next connection)', { wake: w })
+          ws.data.stt?.setTerms(sonioxTerms(w))
           out(ws, { type: 'wake', words: w, ...(SONIOX_KEY ? { kws: kwsFor(w) ?? null } : {}) })
           return
         }
