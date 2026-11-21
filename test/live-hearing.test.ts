@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, readdirSync, existsSync, utimesSync, mkdirSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TokenTracker, splitTurns, configMessage, type Token } from '../live/soniox'
-import { CallState, isStopPhrase, words, requestText, looksUnfinished, sendDecision, unclear } from '../live/call'
+import { CallState, isStopPhrase, words, requestText, looksUnfinished, sendDecision, unclear, quietAfter } from '../live/call'
 import { CallRecorder, pruneCalls } from '../live/recorder'
 import { Vad, rms } from '../live/vad'
 
@@ -198,6 +198,14 @@ describe('whose words count', () => {
     for (const s of ['Can you check this?', 'Read it to me.', 'Open it.', 'What do you think of it?', 'Is that so?', 'Do that.',
       'What are you looking at?', 'Where are you?', 'Thank you.', 'Turn it on.', "I'd love to.", 'I think so.', 'چی هست این؟'])
       expect(looksUnfinished(s)).toBe(false)
+  })
+  test('after a piece ends: a short wait when it sounds finished, the full one when cut off', () => {
+    expect(quietAfter('What time is it in Tokyo?', 1000, 300)).toBe(300)
+    expect(quietAfter('Read it to me.', 1000, 300)).toBe(300)
+    expect(quietAfter('Book a table for', 1000, 300)).toBe(1000)
+    expect(quietAfter('Send the summary and.', 1000, 300)).toBe(1000)
+    expect(quietAfter('I want the button,', 1000, 300)).toBe(1000)
+    expect(quietAfter('Done.', 150, 300)).toBe(150)   // never longer than the full wait
   })
   test('send now, or wait: the button, talking again, unfinished, and the limit', () => {
     const base = { text: 'Give me a—', waitedMs: 1000, stillTalking: false, force: false, maxWaitMs: 6000 }

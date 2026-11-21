@@ -116,6 +116,12 @@ export function looksUnfinished(text: string): boolean {
   return !!last && DANGLING.has(last)
 }
 
+// How long to wait after a piece of speech ends before sending, in case they go on: the
+// full wait when it sounds cut off, a short one when it already sounds finished.
+export function quietAfter(text: string, fullMs: number, doneMs: number): number {
+  return looksUnfinished(text) ? fullMs : Math.min(doneMs, fullMs)
+}
+
 // After a piece of the caller's speech ends: send what the caller said, or wait for more.
 // - force: the talk button was let go — send now.
 // - stillTalking: the caller has started again — wait.

@@ -43,7 +43,7 @@ import { SonioxStream, TokenTracker, type Turn } from './soniox'
 import { requestTimings, summarize, latencyLine, readTrace } from './latency'
 import { decideFast, fastAction, fastWorthAsking, type FastResult } from './fast'
 import { OpusIn, isOpus } from './opus'
-import { ARMED_MS, CallState, CALL_MODES, callWord, requestText, sendDecision, type CallMode, type Line } from './call'
+import { ARMED_MS, CallState, CALL_MODES, callWord, quietAfter, requestText, sendDecision, type CallMode, type Line } from './call'
 import { kwsPhrases } from './kws'
 import { CallRecorder, pruneCalls, pcmToWav } from './recorder'
 import { Vad } from './vad'
@@ -134,6 +134,12 @@ const STALE_MS = Number(process.env.LIVE_STALE_MS ?? 60_000)
 // The page is told how much audio has arrived after each this much of it.
 const ACK_BYTES = 32_000
 const QUIET_MS = Number(process.env.LIVE_QUIET_MS ?? 1000)
+// …or only this much when what was said already sounds finished (final punctuation, no
+// word left hanging). On the recorded calls (2026-11-21), of 109 such pieces that went out
+// as requests, 104 waited the full second for nothing; 2 went on 0.7–0.8 s later (sent
+// early, then redone with the rest, as redoIfCut does), the rest sooner or caught by
+// "still talking". Saves ~0.7 s on most requests.
+const QUIET_DONE_MS = Math.min(Number(process.env.LIVE_QUIET_DONE_MS ?? 300), QUIET_MS)
 // Sent too soon: if they go on within this long and Claude has not said anything yet,
 // the run is cancelled and the whole thing is asked again as one request. People
 // pause 3–5 s mid-sentence to think; waiting that long every time would
@@ -879,7 +885,7 @@ function startHearing(ws: WS) {
     connected: n => {
       tracker.reset(); ws.data.endedFor = undefined
       if (n > 1 && call.main !== null) { call.reset(); out(ws, { type: 'main', speaker: null }); out(ws, { type: 'status', text: 'reconnected to speech recognition — the first voice now is "you" again (tap a line to change)' }) }
-      rec.trace('soniox', n > 1 ? 'reconnected; speaker numbers start over' : 'connected', { model: SONIOX.model, languages: SONIOX.languages, endpoint_ms: SONIOX.endpointMs, end_silence_ms: END_SILENCE_MS, quiet_ms: QUIET_MS, max_wait_ms: MAX_WAIT_MS })
+      rec.trace('soniox', n > 1 ? 'reconnected; speaker numbers start over' : 'connected', { model: SONIOX.model, languages: SONIOX.languages, endpoint_ms: SONIOX.endpointMs, end_silence_ms: END_SILENCE_MS, quiet_ms: QUIET_MS, quiet_done_ms: QUIET_DONE_MS, max_wait_ms: MAX_WAIT_MS })
     },
     status: s => { rec.trace('soniox', s); out(ws, { type: 'status', text: s }) },
     fatal: s => { rec.trace('soniox', `stopped: ${s}`); out(ws, { type: 'status', text: `speech recognition stopped: ${s}` }) },
@@ -950,7 +956,7 @@ function heard(ws: WS, turns: Turn[], finalized: boolean) {
     if (FAST_ON && !h.others && fastWorthAsking(text)) h.fast = { text, result: decideFast(text, FAST) }
   }
   if (release) flush(ws, true)
-  else if (ws.data.hold.texts.length) scheduleFlush(ws)
+  else if (ws.data.hold.texts.length) scheduleFlush(ws, quietAfter(ws.data.hold.texts.join(' '), QUIET_MS, QUIET_DONE_MS))
 }
 
 pruneCalls(CALLS_DIR, KEEP_DAYS)
@@ -1113,7 +1119,7 @@ function onMessage(ws: WS, raw: string | Buffer) {
         ws.data.vad = new Vad()
         ws.data.rec = new CallRecorder(CALLS_DIR, msg.uuid, {
           topic: link.key, cwd: link.cwd, model: link.model || DEFAULT_MODEL, permission: ws.data.permission, stt: SONIOX_KEY ? 'soniox' : 'browser',
-          soniox: SONIOX_KEY ? { model: SONIOX.model, languages: SONIOX.languages, endpoint_ms: SONIOX.endpointMs, end_silence_ms: END_SILENCE_MS, quiet_ms: QUIET_MS, max_wait_ms: MAX_WAIT_MS } : undefined,
+          soniox: SONIOX_KEY ? { model: SONIOX.model, languages: SONIOX.languages, endpoint_ms: SONIOX.endpointMs, end_silence_ms: END_SILENCE_MS, quiet_ms: QUIET_MS, quiet_done_ms: QUIET_DONE_MS, max_wait_ms: MAX_WAIT_MS } : undefined,
           agent: String(msg.agent || '').slice(0, 300),
         })
         ws.data.rec.trace('auth', device === 'bound' ? 'link opened; this device now holds it' : 'link opened by its device', { answers: ws.data.answers, edge: ws.data.edge ?? 'direct', ...(msg.net && typeof msg.net === 'object' ? { net: msg.net } : {}) })
