@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, readdirSync, existsSync, utimesSync, mkdirSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TokenTracker, splitTurns, configMessage, type Token } from '../live/soniox'
-import { CallState, isStopPhrase, words, requestText, looksUnfinished, sendDecision, unclear, quietAfter } from '../live/call'
+import { CallState, isStopPhrase, words, requestText, looksUnfinished, sendDecision, unclear, quietAfter, isCorrection, FOLLOW_MS } from '../live/call'
 import { CallRecorder, pruneCalls } from '../live/recorder'
 import { Vad, rms } from '../live/vad'
 
@@ -196,8 +196,12 @@ describe('whose words count', () => {
     // Pronouns and words English leaves at the end finish a sentence: each of these
     // endings waited 6 s for nothing on real calls.
     for (const s of ['Can you check this?', 'Read it to me.', 'Open it.', 'What do you think of it?', 'Is that so?', 'Do that.',
-      'What are you looking at?', 'Where are you?', 'Thank you.', 'Turn it on.', "I'd love to.", 'I think so.', 'چی هست این؟'])
+      'What are you looking at?', 'Where are you?', 'Thank you.', 'Turn it on.', 'I think so.', 'چی هست این؟', 'Who is it for?', 'Which one are you talking about!'])
       expect(looksUnfinished(s)).toBe(false)
+    // A preposition last, with a full stop: Soniox heard no question, it stopped at a pause
+    // (2026-11-22: "what time is it in." went early). A rare "I'd love to." waits too.
+    for (const s of ['Hey Lucy, what time is it in.', 'Send the report to.', 'Book a table for.', "What's the weather like in", "I'd love to."])
+      expect(looksUnfinished(s)).toBe(true)
   })
   test('after a piece ends: a short wait when it sounds finished, the full one when cut off', () => {
     expect(quietAfter('What time is it in Tokyo?', 1000, 300)).toBe(300)
@@ -334,6 +338,22 @@ describe('Assistant mode: only what is addressed to it by name goes', () => {
     expect(c.heard([T('1', 'لوسی، ساعت چنده؟')]).send).toBe('ساعت چنده؟')
     // A word that only contains it is not it.
     expect(c.heard([T('1', 'I was lucky today')]).send).toBeNull()
+  })
+  test("a correction right after its request is for it too, without the name; other talk isn't", () => {
+    let t = 0
+    const c = assistant(() => t)
+    expect(c.heard([T('1', 'Lucy, book a flight to Istanbul for 2 people.')]).send).toBe('book a flight to Istanbul for 2 people.')
+    t = 3000
+    const r = c.heard([T('1', 'Wait, I mean 3 people.')])
+    expect(r.send).toBe('Wait, I mean 3 people.')
+    expect(r.why).toBe(`assistant: a correction within ${FOLLOW_MS / 1000} s of its request`)
+    t = 4000
+    expect(c.heard([T('1', 'Anyway, how was your weekend?')]).send).toBeNull()   // talking to someone: background
+    expect(c.heard([T('1', 'نه، سه نفر.')]).send).toBe('نه، سه نفر.')              // a correction again, 1 s after the last
+    t = 4000 + FOLLOW_MS + 1
+    expect(c.heard([T('1', 'Sorry, I mean four.')]).send).toBeNull()             // too late: background
+    expect(['wait, make it five', 'No, the other one.', 'Actually, cancel that.', 'یعنی فردا', 'Um, sorry, not that'].every(isCorrection)).toBe(true)
+    expect(['Nowhere near.', 'Waiter, please.', 'Book it.', 'Noted.'].some(isCorrection)).toBe(false)
   })
   test("the unsent talk goes with the next request, the caller's and others'", () => {
     const c = assistant()
