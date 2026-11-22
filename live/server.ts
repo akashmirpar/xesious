@@ -43,7 +43,7 @@ import { SonioxStream, TokenTracker, type Turn } from './soniox'
 import { requestTimings, summarize, latencyLine, readTrace } from './latency'
 import { decideFast, fastAction, fastWorthAsking, type FastResult } from './fast'
 import { OpusIn, isOpus } from './opus'
-import { ARMED_MS, CallState, CALL_MODES, callWord, quietAfter, requestText, sendDecision, type CallMode, type Line } from './call'
+import { ARMED_MS, CallState, CALL_MODES, callWord, quietAfter, requestText, sendDecision, unclear, type CallMode, type Line } from './call'
 import { kwsPhrases } from './kws'
 import { CallRecorder, pruneCalls, pcmToWav } from './recorder'
 import { Vad } from './vad'
@@ -71,6 +71,9 @@ const KWS_CONF = Number(process.env.LIVE_KWS_CONF ?? 0.9)
 // A wake heard on the phone must be the wake phrase in what Soniox hears within this
 // long; if not, the mic goes off again by itself (a false wake costs only these seconds).
 const WOKE_CONFIRM_MS = Number(process.env.LIVE_WOKE_CONFIRM_MS ?? 8000)
+// …and if nothing is asked this long after a wake, the mic goes off again (a wake from
+// someone nearby kept it on 27 s, 2026-11-22). Longer while the caller is still talking.
+const WOKE_IDLE_MS = Number(process.env.LIVE_WOKE_IDLE_MS ?? 10_000)
 // The call's own page actions (mic off, mode, answers) decided by a fast decision model
 // (live/fast.ts) instead of a Claude turn. Off with LIVE_FAST=0 or without a key.
 const FAST = { key: process.env.OPENROUTER_API_KEY || '', models: (process.env.LIVE_FAST_MODELS || 'typesafe/jev-1.14,perplexity/pplx-decider-flash-v1.3:free').split(',').map(s => s.trim()).filter(Boolean), timeoutMs: Number(process.env.LIVE_FAST_TIMEOUT_MS ?? 1200), url: process.env.LIVE_FAST_URL || undefined }
@@ -365,6 +368,10 @@ type Conn = {
   queuedFor?: ReturnType<typeof setTimeout>
   // A wake heard on the phone, not yet confirmed by what Soniox heard.
   woke?: ReturnType<typeof setTimeout>
+  // After a wake: the mic goes off again if nothing is asked (wokeIdle), counted from wokeAt.
+  wokeIdle?: ReturnType<typeof setTimeout>; wokeAt?: number
+  // when the caller last asked something (a request, or a page action done by the fast path)
+  askedAt?: number
 }
 type Answers = 'voice' | 'sound' | 'silent'
 const ANSWERS: Answers[] = ['voice', 'sound', 'silent']
@@ -400,6 +407,7 @@ function ask(ws: WS, said: string, ids: number[], how: string, carried = '') {
   const done = (ws.data.fastDone ?? []).splice(0).join('\n')
   const background = [done, carried, fresh].filter(Boolean).join('\n')
   const req: Req = { id: ++ws.data.reqs, said, ids, background, text: requestText(said, background) }
+  ws.data.askedAt = Date.now()
   ws.data.rec?.trace('turn', `request ${req.id} (${how})${ws.data.run ? ', queued behind the running turn' : ''}`, { text: req.text })
   out(ws, { type: 'sent', ids, req: req.id, queued: !!ws.data.run })
   if (ws.data.run) { ws.data.queue.push(req); return }
@@ -844,6 +852,7 @@ function doFast(ws: WS, act: NonNullable<ReturnType<typeof fastAction>>, said: s
     out(ws, { type: 'answers', mode: a, byVoice: true })
     done = `set answers to ${a === 'voice' ? 'spoken' : a === 'sound' ? 'a sound when ready' : 'silent (text only)'}`
   }
+  ws.data.askedAt = Date.now()
   ;(ws.data.fastDone ??= []).push(`you: ${said}\n(done on the page, without you: ${done})`)
   return true
 }
@@ -902,7 +911,7 @@ function startHearing(ws: WS) {
         rec.trace('speaker', `speaker ${call.main} (you) talked over the answer, so the reading stops`, { text: r.live.map(t => t.text).join(' ') })
       }
       // A wake on the phone, confirmed as the words come (a long sentence may not end in time).
-      if (ws.data.woke && r.live.some(t => callWord(t.text, call.wake))) wakeConfirmed(ws, 'in the words still coming')
+      if (ws.data.woke && r.live.some(t => wakeIn(call, t.text, t.confidence))) wakeConfirmed(ws, 'in the words still coming')
       if (r.done) { heard(ws, r.done, r.finalized); return }
       // In a busy room the audio is never quiet: end the piece when the caller has been quiet
       // END_SILENCE_MS while someone else keeps talking (their later words prove the
@@ -920,6 +929,28 @@ function startHearing(ws: WS) {
   })
 }
 
+// The wake phrase, said clearly: an unclear "Hi, Lucy." (0.66) from someone nearby
+// confirmed a wake (2026-11-22). Whoever said it: at the start of a call Soniox's
+// speaker numbers are shaky, and a caller's own clear "Hey Lucy." came as speaker 2. A
+// clear one from someone else is caught by the mic going off when nothing is asked.
+function wakeIn(call: CallState, text: string, confidence?: number): boolean {
+  return !!callWord(text, call.wake) && !unclear(text, confidence)
+}
+// After a wake: nothing asked within WOKE_IDLE_MS (and not still talking), the mic goes
+// off again. The page does so only while the mic is on because of the wake.
+function wokeIdle(ws: WS, at: number, ms = WOKE_IDLE_MS, more = 5) {
+  clearTimeout(ws.data.wokeIdle)
+  ws.data.wokeAt = at
+  ws.data.wokeIdle = setTimeout(() => {
+    ws.data.wokeIdle = undefined
+    if ((ws.data.askedAt ?? 0) >= at || ws.readyState !== 1) return
+    const call = ws.data.call, t = ws.data.tracker
+    const talking = ws.data.hold.texts.length > 0 || (!!t && !!call && call.main !== null && t.openWordEnd(call.main) !== null) || !!ws.data.vad?.speaking()
+    if (talking && more > 0) return wokeIdle(ws, at, 3000, more - 1)
+    ws.data.rec?.trace('voice', `nothing asked after the wake: mic off again`)
+    out(ws, { type: 'mic', on: false, ms: 0, why: 'nothing_asked' })
+  }, ms)
+}
 function wakeConfirmed(ws: WS, where: string) {
   clearTimeout(ws.data.woke); ws.data.woke = undefined
   ws.data.rec!.trace('voice', `wake confirmed ${where}: the mic stays on`)
@@ -939,7 +970,7 @@ function heard(ws: WS, turns: Turn[], finalized: boolean) {
   for (const l of r.lines) rec.trace('heard', `speaker ${l.speaker} (${l.role === 'me' ? 'you' : 'other'}${held ? ', talk button held' : ''}${l.unclear ? `, unclear (confidence ${l.confidence}): not sent` : ''})`, { text: l.text, language: l.language, confidence: l.confidence })
   if (r.lines.length) out(ws, { type: 'lines', lines: r.lines.map(shown) })
   // A wake on the phone, confirmed: the wake phrase is in what was heard.
-  if (ws.data.woke && r.lines.some(l => callWord(l.text, call.wake))) wakeConfirmed(ws, 'in what was said')
+  if (ws.data.woke && r.lines.some(l => !l.unclear && wakeIn(call, l.text, l.confidence))) wakeConfirmed(ws, 'in what was said')
   if (r.stop) { stopAll(ws, `you said "${r.lines.filter(l => l.role === 'me').map(l => l.text).join(' ')}"`); return }
   if (r.send) {
     // The caller's words after the caller's request, before its answer: one request, asked again. Not
@@ -1035,7 +1066,7 @@ const server = Bun.serve<Conn>({
       open.delete(ws)
       ws.data.run?.stop()
       ws.data.events?.abort()
-      clearInterval(ws.data.topicsTimer); clearTimeout(ws.data.topicsSoon); clearTimeout(ws.data.queuedFor); clearTimeout(ws.data.woke)
+      clearInterval(ws.data.topicsTimer); clearTimeout(ws.data.topicsSoon); clearTimeout(ws.data.queuedFor); clearTimeout(ws.data.woke); clearTimeout(ws.data.wokeIdle)
       if (ws.data.photoKey) photoKeys.delete(ws.data.photoKey)
       clearHeld(ws)
       ws.data.stt?.close()
@@ -1286,8 +1317,10 @@ function onMessage(ws: WS, raw: string | Buffer) {
           clearTimeout(ws.data.woke)
           const said = String(msg.keyword ?? '').slice(0, 80)
           rec.trace('voice', `wake phrase heard on the phone (${said}): mic on`)
+          wokeIdle(ws, Date.now())
           ws.data.woke = setTimeout(() => {
             ws.data.woke = undefined
+            clearTimeout(ws.data.wokeIdle); ws.data.wokeIdle = undefined
             rec.trace('voice', `false wake: no wake word heard within ${WOKE_CONFIRM_MS / 1000} s, mic off again; what was heard since is dropped`)
             out(ws, { type: 'mic', on: false, ms: 0, why: 'false_wake' })
             // Its words would otherwise wait in the open piece and join the next request.

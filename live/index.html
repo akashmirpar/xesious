@@ -697,6 +697,11 @@ function micOffByVoice(ms, why){
     if(!wokeAt) return
     wokeAt=0; setMic(false); sys('🔇 That wasn’t “'+wakeSays()+'” — the mic is off again'); return
   }
+  if(why==='nothing_asked'){
+    // On by the wake word, and nothing was asked: off again (not if tapped on since).
+    if(!wokeAt) return
+    wokeAt=0; setMic(false); sys('🔇 Nothing asked after “'+wakeSays()+'” — the mic is off again'); return
+  }
   wokeAt=0; setMic(false); vibrate(20)
   if(!(ms>0)){ sys('🔇 Mic off, asked by voice — '+(spotOn()?'say “'+wakeSays()+'” or tap it':'tap it')+' to turn it back on'); return }
   const s=Math.round(ms/1000), span=s>=60 ? (s%60 ? (s/60).toFixed(1) : s/60)+' min' : s+' s'
