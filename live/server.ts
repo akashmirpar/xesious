@@ -937,8 +937,9 @@ function wakeIn(call: CallState, text: string, confidence?: number): boolean {
   return !!callWord(text, call.wake) && !unclear(text, confidence)
 }
 // After a wake: nothing asked within WOKE_IDLE_MS (and not still talking), the mic goes
-// off again. The page does so only while the mic is on because of the wake.
-function wokeIdle(ws: WS, at: number, ms = WOKE_IDLE_MS, more = 5) {
+// off again. The page does so only while the mic is on because of the wake. While someone
+// is still talking it keeps waiting, with no limit: a long request is never cut off.
+function wokeIdle(ws: WS, at: number, ms = WOKE_IDLE_MS) {
   clearTimeout(ws.data.wokeIdle)
   ws.data.wokeAt = at
   ws.data.wokeIdle = setTimeout(() => {
@@ -946,7 +947,7 @@ function wokeIdle(ws: WS, at: number, ms = WOKE_IDLE_MS, more = 5) {
     if ((ws.data.askedAt ?? 0) >= at || ws.readyState !== 1) return
     const call = ws.data.call, t = ws.data.tracker
     const talking = ws.data.hold.texts.length > 0 || (!!t && !!call && call.main !== null && t.openWordEnd(call.main) !== null) || !!ws.data.vad?.speaking()
-    if (talking && more > 0) return wokeIdle(ws, at, 3000, more - 1)
+    if (talking) return wokeIdle(ws, at, Math.min(3000, WOKE_IDLE_MS))
     ws.data.rec?.trace('voice', `nothing asked after the wake: mic off again`)
     out(ws, { type: 'mic', on: false, ms: 0, why: 'nothing_asked' })
   }, ms)

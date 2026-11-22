@@ -414,6 +414,26 @@ test('a wake with nothing asked after it turns the mic off again', async () => {
   await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
 }, 20000)
 
+test('a long request after a wake is never cut off: the mic stays on while still talking', async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'assistant' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'assistant')
+  A.got.length = 0
+  const before = traceNow().split('nothing asked after the wake').length
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'hey lucy' }))
+  const start = 'Hey Hanna, in the garden topic, add a note that the roses need water, and also that'
+  partial('2', start)
+  // past the old limit (idle time plus five rechecks: 9 s here, 25 s in a real call)
+  await Bun.sleep(10_000)
+  expect(A.got.some(m => m.type === 'mic')).toBe(false)
+  expect(traceNow().split('nothing asked after the wake').length).toBe(before)
+  say('2', start + ' the tulips can wait.')   // Soniox makes the whole piece final at the end
+  const sent = await A.wait(m => m.type === 'sent')
+  await A.wait(m => m.type === 'turn_end' && m.req === sent.req)
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'interactive' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
+}, 30000)
+
 test('a wake is confirmed from the words still coming: a long sentence with no pause keeps the mic on', async () => {
   const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
   A.got.length = 0
