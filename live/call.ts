@@ -38,7 +38,8 @@ export function isCorrection(text: string): boolean { return CORRECTION.test(tex
 // Whole words, any case; Arabic and Persian letter forms alike (ي/ی, ك/ک).
 const FILLERS = new Set(['so', 'ok', 'okay', 'hey', 'hi', 'um', 'uh', 'erm', 'well', 'and', 'oh', 'right', 'yeah', 'خب', 'خوب', 'هی', 'ببین', 'آهان', 'اوکی', 'باشه', 'ام'])
 const fold = (s: string) => s.toLowerCase().replace(/ي/g, 'ی').replace(/ك/g, 'ک')
-export function callWord(text: string, wake: string[]): { rest: string; word: string } | null {
+// `at`: where the name was, at its sentence's start or at its end.
+export function callWord(text: string, wake: string[]): { rest: string; word: string; at: 'start' | 'end' } | null {
   const t = fold(text)
   for (const w of wake) {
     const ww = fold(w.trim())
@@ -53,7 +54,7 @@ export function callWord(text: string, wake: string[]): { rest: string; word: st
     const before = fold(lead.slice(cut + 1)).match(/[\p{L}\p{N}]+/gu) ?? []
     if (before.length > 2 || before.some(w => !FILLERS.has(w))) continue
     const rest = text.slice(end).replace(/\s+/g, ' ').replace(/[\s,،]+([.!?؟])/g, '$1').replace(/^[\s,،.!?؟:;-]+|[\s,،:;-]+$/g, '').trim()
-    return { rest: /[\p{L}\p{N}]/u.test(rest) ? rest : '', word: w.trim() }
+    return { rest: /[\p{L}\p{N}]/u.test(rest) ? rest : '', word: w.trim(), at: 'start' }
   }
   for (const w of wake) {
     const ww = fold(w.trim())
@@ -65,7 +66,7 @@ export function callWord(text: string, wake: string[]): { rest: string; word: st
     const before = text.slice(0, m.index).trim(), after = text.slice(m.index + m[0].length)
     if (!/[\p{L}\p{N}]/u.test(before)) continue   // ", Lucy." alone: the start rule's case
     const rest = (before + after).replace(/\s+/g, ' ').replace(/^[\s,،.!?؟:;-]+|[\s,،:;-]+$/g, '').trim()
-    return { rest, word: w.trim() }
+    return { rest, word: w.trim(), at: 'end' }
   }
   return null
 }
@@ -160,6 +161,8 @@ export class CallState {
   othersMayCall = false
   // Waiting for the request after its name, and the caller is talking: the wait lasts until they
   // stop (a request begun at 6 s used to be dropped when it ended past 8 s).
+  // A false wake: nothing it heard may call it, nor wait on a request after its name.
+  disarm(): void { this.armedUntil = 0; this.askedAt = -Infinity }
   keepArmed(): boolean {
     if (this.armedBy !== null || this.now() >= this.armedUntil) return false
     this.armedUntil = this.now() + ARMED_MS

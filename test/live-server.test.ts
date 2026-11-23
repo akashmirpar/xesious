@@ -151,8 +151,9 @@ test('mic audio reaches Soniox with the key, both languages and speakers on', as
   expect(sonioxBytes).toBe(3200)
   expect(sonioxConfig).toMatchObject({ api_key: 'test-key', model: 'stt-rt-v6', language_hints: ['en', 'fa'], enable_speaker_diarization: true, sample_rate: 16000,
     enable_endpoint_detection: false })
-  // Soniox expects the wake words (and "Hey …" for Latin ones), so a noisy "Hey Lucy" isn't heard as something else.
-  expect(sonioxConfig.context).toEqual({ terms: ['Lucy', 'Hey Lucy', 'Lucie', 'Hey Lucie', 'لوسی'] })
+  // Soniox expects the Latin wake words and "Hey …", so a noisy "Hey Lucy" isn't heard as something else;
+  // not the Farsi «لوسی», which it wrote into Farsi talk where nobody said it.
+  expect(sonioxConfig.context).toEqual({ terms: ['Lucy', 'Hey Lucy', 'Lucie', 'Hey Lucie'] })
 })
 
 
@@ -395,6 +396,27 @@ test("an unclear wake phrase doesn't confirm a wake: the mic goes off again", as
   A.ws.send(JSON.stringify({ type: 'woke', keyword: 'hey lucy' }))
   say('3', 'Hi, Hanna.', 0.6)            // unclear: 2 words under 0.75 (someone nearby, 2026-11-22)
   expect(await A.wait(m => m.type === 'mic', 4000)).toEqual({ type: 'mic', on: false, ms: 0, why: 'false_wake' })
+}, 20000)
+
+test("a wake from the phone isn't confirmed by the name at a sentence's end, and what was heard asks nothing", async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  await Bun.sleep(300)
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'assistant' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'assistant')
+  A.got.length = 0
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'hey lucy' }))
+  // the phone took a word for the wake phrase, and Soniox wrote the name at the end (2026-11-23)
+  say('2', "It isn't much, Hanna. Just hide those two files.")
+  expect(await A.wait(m => m.type === 'mic', 4000)).toEqual({ type: 'mic', on: false, ms: 0, why: 'false_wake' })
+  expect(A.got.some(m => m.type === 'sent' || m.type === 'called')).toBe(false)
+  expect(traceNow()).toContain('not sent: the wake heard on the phone is not confirmed')
+  // with the mic on, the name at the end still calls it
+  A.got.length = 0
+  say('2', 'Turn the answers to silent, Hanna.')
+  const sent = await A.wait(m => m.type === 'sent')
+  await A.wait(m => m.type === 'turn_end' && m.req === sent.req)
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'interactive' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
 }, 20000)
 
 test('a wake with nothing asked after it turns the mic off again', async () => {

@@ -881,9 +881,12 @@ function redoIfCut(ws: WS): boolean {
 // out as Farsi «خیلی چیز» every time (2026-11-20), so the phone's wake looked false and
 // the request uncalled; with it, all were "Hey Lucy", and no "Lucy" appeared in calls
 // without one.
+// Only the wake words in Latin letters: given «لوسی», Soniox wrote it into Farsi talk
+// where nobody said it (2026-11-23); without it, the replays kept every real "Hey Lucy".
+// A Farsi wake word still calls it when Soniox hears it.
 function sonioxTerms(wake: string[]): string[] {
   const t = [...SONIOX.terms]
-  for (const w of wake.map(x => x.trim()).filter(Boolean)) t.push(w, ...(/^[\p{Script=Latin}\s'-]+$/u.test(w) ? [`Hey ${w}`] : []))
+  for (const w of wake.map(x => x.trim()).filter(Boolean)) if (/^[\p{Script=Latin}\s'-]+$/u.test(w)) t.push(w, `Hey ${w}`)
   return [...new Set(t)].slice(0, 50)
 }
 function startHearing(ws: WS) {
@@ -933,8 +936,11 @@ function startHearing(ws: WS) {
 // confirmed a wake (2026-11-22). Whoever said it: at the start of a call Soniox's
 // speaker numbers are shaky, and a caller's own clear "Hey Lucy." came as speaker 2. A
 // clear one from someone else is caught by the mic going off when nothing is asked.
+// The phone hears "Hey Lucy" at the start of what is said, so only the name at a
+// sentence's start confirms it: a name at the end ("…, Lucy") was, on 2026-11-23,
+// a word Soniox wrote that nobody said, after the phone took Farsi «خیلی» for "hey lucy".
 function wakeIn(call: CallState, text: string, confidence?: number): boolean {
-  return !!callWord(text, call.wake) && !unclear(text, confidence)
+  return callWord(text, call.wake)?.at === 'start' && !unclear(text, confidence)
 }
 // After a wake: nothing asked within WOKE_IDLE_MS (and not still talking), the mic goes
 // off again. The page does so only while the mic is on because of the wake. While someone
@@ -965,13 +971,19 @@ function heard(ws: WS, turns: Turn[], finalized: boolean) {
   const before = call.main
   const r = call.heard(turns, { held, busy: !!ws.data.run, assembling: ws.data.hold.texts.length > 0 })
   if (r.why) rec.trace('decide', r.why, { text: r.lines.filter(l => l.role === 'me').map(l => l.text).join(' ') })
+  // A wake on the phone, confirmed: the wake phrase is in what was heard. Until it is,
+  // what is heard asks nothing: a false wake's words were sent as a request before its
+  // 8 s were up (2026-11-23). The talk button held is asking.
+  if (ws.data.woke && r.lines.some(l => !l.unclear && wakeIn(call, l.text, l.confidence))) wakeConfirmed(ws, 'in what was said')
+  else if (ws.data.woke && !held && (r.send || r.armed)) {
+    rec.trace('decide', 'not sent: the wake heard on the phone is not confirmed (no wake word at the start of what was said)', { text: r.send ?? r.lines.map(l => l.text).join(' ') })
+    call.disarm(); r.send = null; r.armed = false; r.from = undefined
+  }
   if (r.armed) out(ws, { type: 'called', ms: ARMED_MS })
   for (const t of r.echo) rec.trace('speaker', `dropped: the answer's own voice heard through the speaker (speaker ${t.speaker})`, { text: t.text })
   if (before === null && call.main !== null) { rec.trace('speaker', `speaker ${call.main} is you, as the first voice heard`); out(ws, { type: 'main', speaker: call.main }) }
   for (const l of r.lines) rec.trace('heard', `speaker ${l.speaker} (${l.role === 'me' ? 'you' : 'other'}${held ? ', talk button held' : ''}${l.unclear ? `, unclear (confidence ${l.confidence}): not sent` : ''})`, { text: l.text, language: l.language, confidence: l.confidence })
   if (r.lines.length) out(ws, { type: 'lines', lines: r.lines.map(shown) })
-  // A wake on the phone, confirmed: the wake phrase is in what was heard.
-  if (ws.data.woke && r.lines.some(l => !l.unclear && wakeIn(call, l.text, l.confidence))) wakeConfirmed(ws, 'in what was said')
   if (r.stop) { stopAll(ws, `you said "${r.lines.filter(l => l.role === 'me').map(l => l.text).join(' ')}"`); return }
   if (r.send) {
     // The caller's words after the caller's request, before its answer: one request, asked again. Not
