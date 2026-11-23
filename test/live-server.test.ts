@@ -151,8 +151,9 @@ test('mic audio reaches Soniox with the key, both languages and speakers on', as
   expect(sonioxBytes).toBe(3200)
   expect(sonioxConfig).toMatchObject({ api_key: 'test-key', model: 'stt-rt-v6', language_hints: ['en', 'fa'], enable_speaker_diarization: true, sample_rate: 16000,
     enable_endpoint_detection: false })
-  // Soniox expects the wake words (and "Hey …" for Latin ones), so a noisy "Hey Lucy" isn't heard as something else.
-  expect(sonioxConfig.context).toEqual({ terms: ['Lucy', 'Hey Lucy', 'Lucie', 'Hey Lucie', 'لوسی'] })
+  // Soniox expects the Latin wake words and "Hey …", so a noisy "Hey Lucy" isn't heard as something else;
+  // not the Farsi «لوسی», which it wrote into Farsi talk where nobody said it.
+  expect(sonioxConfig.context).toEqual({ terms: ['Lucy', 'Hey Lucy', 'Lucie', 'Hey Lucie'] })
 })
 
 
@@ -397,6 +398,27 @@ test("an unclear wake phrase doesn't confirm a wake: the mic goes off again", as
   expect(await A.wait(m => m.type === 'mic', 4000)).toEqual({ type: 'mic', on: false, ms: 0, why: 'false_wake' })
 }, 20000)
 
+test("a wake from the phone isn't confirmed by the name at a sentence's end, and what was heard asks nothing", async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  await Bun.sleep(300)
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'assistant' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'assistant')
+  A.got.length = 0
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'hey lucy' }))
+  // the phone took a word for the wake phrase, and Soniox wrote the name at the end (2026-11-23)
+  say('2', "Not today, Hanna. Water the plants first.")
+  expect(await A.wait(m => m.type === 'mic', 4000)).toEqual({ type: 'mic', on: false, ms: 0, why: 'false_wake' })
+  expect(A.got.some(m => m.type === 'sent' || m.type === 'called')).toBe(false)
+  expect(traceNow()).toContain('not sent: the wake heard on the phone is not confirmed')
+  // with the mic on, the name at the end still calls it
+  A.got.length = 0
+  say('2', 'Turn the answers to silent, Hanna.')
+  const sent = await A.wait(m => m.type === 'sent')
+  await A.wait(m => m.type === 'turn_end' && m.req === sent.req)
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'interactive' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
+}, 20000)
+
 test('a wake with nothing asked after it turns the mic off again', async () => {
   const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
   await Bun.sleep(300)
@@ -433,6 +455,43 @@ test('a long request after a wake is never cut off: the mic stays on while still
   A.ws.send(JSON.stringify({ type: 'mode', mode: 'interactive' }))
   await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
 }, 30000)
+
+test("after a wake, words not yet known as the caller's keep the mic on too", async () => {
+  // At a call's start whose voice is the caller's is known only from the first finished piece:
+  // a caller's long request was cut off 10 s in (2026-11-23). Here the open words are speaker 3's.
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'assistant' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'assistant')
+  A.got.length = 0
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'hey lucy' }))
+  const start = 'Hey Hanna, could you look up when the library closes on Saturday, and whether'
+  partial('3', start)
+  await Bun.sleep(5000)   // past the idle time and a recheck (1.5 s each here)
+  expect(A.got.some(m => m.type === 'mic')).toBe(false)
+  say('3', start + ' it opens on Sunday?')
+  // someone else's request is not sent (others may not call it), so the mic goes off after all
+  expect(await A.wait(m => m.type === 'mic', 8000)).toMatchObject({ on: false, why: 'nothing_asked' })
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'interactive' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
+}, 30000)
+
+test("called by name right after a request, it's a request of its own: done at once, the first one not cancelled", async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'assistant' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'assistant')
+  A.got.length = 0
+  const cancels = () => traceNow().split('before any answer: it is cancelled').length
+  const before = cancels()
+  say('2', 'Hanna, SLOW send the recipe to the cooking topic.')   // sent; Claude is slow to answer
+  const first = await A.wait(m => m.type === 'sent')
+  A.got.length = 0
+  say('2', 'Hanna, turn off the microphone.')                       // 2 s later in the real call
+  expect(await A.wait(m => m.type === 'mic', 5000)).toMatchObject({ on: false })
+  expect(A.got.some(m => m.type === 'retract' && m.req === first.req)).toBe(false)
+  expect(cancels()).toBe(before)
+  A.ws.send(JSON.stringify({ type: 'interrupt' }))
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'interactive' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
+}, 20000)
 
 test('a wake is confirmed from the words still coming: a long sentence with no pause keeps the mic on', async () => {
   const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
