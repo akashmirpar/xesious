@@ -2,7 +2,7 @@
 import { test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { OpusIn, isOpus, opusFrames, packOpus, OPUS_MAGIC } from '../live/opus'
+import { OpusIn, isOpus, opusFrames, opusPacketMs, packOpus, OPUS_MAGIC, OPUS_MAX_MESSAGE_MS } from '../live/opus'
 
 const tone: Uint8Array[] = JSON.parse(readFileSync(join(import.meta.dir, 'fixtures-opus-tone.json'), 'utf8')).frames.map((b: string) => new Uint8Array(Buffer.from(b, 'base64')))
 
@@ -30,4 +30,43 @@ test('decoded to 16 kHz 16-bit PCM: as long as it was, and not silent', async ()
   expect(o.push(new Uint8Array([...OPUS_MAGIC, 0, 9, 1]))).toBe(false)
   expect(o.errors).toBe(1)
   o.free()
+})
+
+test('how long a packet plays is read from its first bytes', () => {
+  expect(opusPacketMs(tone[0])).toBe(20)                        // what the page sends
+  expect(opusPacketMs(new Uint8Array([0x18]))).toBe(60)         // one byte: 60 ms
+  expect(opusPacketMs(new Uint8Array([0x1b, 0x02]))).toBe(120)  // two bytes: two 60 ms frames
+  expect(opusPacketMs(new Uint8Array([0xf8]))).toBe(20)
+  expect(opusPacketMs(new Uint8Array([0x1b, 0x03]))).toBe(0)    // three would be 180 ms: no packet is that long
+  expect(opusPacketMs(new Uint8Array([0x1b]))).toBe(0)          // a frame count that isn't there
+  expect(opusPacketMs(new Uint8Array(0))).toBe(0)
+})
+
+test('a message holding more audio than a page ever sends is refused before any of it is decoded', async () => {
+  // 64 kB of one-byte packets: 22 minutes of "audio", 42 MB of PCM, from one message.
+  const flood = packOpus(Array.from({ length: 21_844 }, () => new Uint8Array([0x18])))
+  expect(flood.byteLength).toBeLessThanOrEqual(64 * 1024)
+  expect(opusFrames(flood)).toBeNull()
+  // up to the limit it is taken: 30 s of the page's own 20 ms frames, and not one more
+  const most = OPUS_MAX_MESSAGE_MS / 20
+  expect(opusFrames(packOpus(Array.from({ length: most }, () => tone[0])))!.length).toBe(most)
+  expect(opusFrames(packOpus(Array.from({ length: most + 1 }, () => tone[0])))).toBeNull()
+  let pcm = 0
+  const o = new OpusIn(p => { pcm += p.byteLength })
+  expect(o.push(flood)).toBe(false)
+  await Bun.sleep(100)
+  expect(pcm).toBe(0)
+  expect(o.errors).toBe(1)
+  o.free()
+})
+
+test('nothing is decoded once the call is over', async () => {
+  let pcm = 0
+  const o = new OpusIn(p => { pcm += p.byteLength })
+  expect(o.push(packOpus(tone.slice(0, 5)))).toBe(true)   // may still be waiting for the decoder to load
+  o.free()
+  expect(o.push(packOpus(tone.slice(5, 10)))).toBe(false)
+  const then = pcm
+  await Bun.sleep(150)
+  expect(pcm).toBe(then)                                  // what waited is not decoded into a closed recording
 })

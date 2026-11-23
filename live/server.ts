@@ -81,6 +81,13 @@ const FAST_ON = !!FAST.key && process.env.LIVE_FAST !== '0'
 const FAST_MIN = Number(process.env.LIVE_FAST_MIN ?? 0.9)
 // How much longer than the quiet wait a request may wait for the fast decision.
 const FAST_EXTRA_MS = Number(process.env.LIVE_FAST_EXTRA_MS ?? 300)
+// Whether the mic may come as Opus: only when the decoder starts here. Under Bun before
+// 1.3.13 it throws while unpacking its own code; a page told to send Opus would then be
+// sending what this server can only drop, and the call would hear nothing.
+const OPUS_OK = (() => {
+  try { new OpusIn(() => {}).free(); return true }
+  catch (e) { console.error(`[live] the Opus decoder does not start here (Bun ${Bun.version}; it needs 1.3.13 or later): the mic comes as raw audio. ${e instanceof Error ? e.message.trim().split('\n').pop() : e}`); return false }
+})()
 const PORT = Number(process.env.LIVE_PORT || 3060)
 const DEFAULT_MODEL = process.env.LIVE_MODEL || 'sonnet'
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude'
@@ -1127,6 +1134,7 @@ function onMessage(ws: WS, raw: string | Buffer) {
         const g = ws.data.got ??= { bytes: 0, wire: 0, since: Date.now() }
         g.wire += msg.byteLength
         if (isOpus(msg)) {
+          if (!OPUS_OK) return   // not offered (see OPUS_OK): nothing here can decode it
           if (!ws.data.opus) { ws.data.opus = new OpusIn(pcm => { try { audioIn(ws, pcm) } catch (e) { ws.data.rec?.trace('error', `audio: ${e instanceof Error ? e.message : e}`) } }); ws.data.rec?.trace('audio', 'the mic comes as Opus') }
           if (!ws.data.opus.push(msg) && ws.data.opus.errors === 1) ws.data.rec?.trace('error', 'a piece of Opus audio was malformed: dropped')
           return
@@ -1172,7 +1180,7 @@ function onMessage(ws: WS, raw: string | Buffer) {
           ws.data.topicsTimer = setInterval(() => { if (!linkHolds(ws)) return; stampUsed(ws.data.uuid); void sendTopics(ws) }, TOPICS_EVERY_MS)
         } else ws.data.topicsTimer = setInterval(() => { if (linkHolds(ws)) stampUsed(ws.data.uuid) }, 60_000)
         const mode = ws.data.permission!.includes('--dangerously-skip-permissions') ? 'bypass' : ws.data.permission![ws.data.permission!.indexOf('--permission-mode') + 1]
-        out(ws, { type: 'ready', where: link.cwd, model: link.model || DEFAULT_MODEL, mode, callMode: ws.data.call.mode, wake: ws.data.call.wake, others: ws.data.call.othersMayCall, stt: SONIOX_KEY ? 'soniox' : 'browser', audio: ['pcm', 'opus'], desk: !!link.desk, pk: ws.data.photoKey, ...(link.user ? { me: link.user.id } : {}), ...(SONIOX_KEY && kwsFor(ws.data.call.wake) ? { kws: kwsFor(ws.data.call.wake) } : {}) })
+        out(ws, { type: 'ready', where: link.cwd, model: link.model || DEFAULT_MODEL, mode, callMode: ws.data.call.mode, wake: ws.data.call.wake, others: ws.data.call.othersMayCall, stt: SONIOX_KEY ? 'soniox' : 'browser', audio: OPUS_OK ? ['pcm', 'opus'] : ['pcm'], desk: !!link.desk, pk: ws.data.photoKey, ...(link.user ? { me: link.user.id } : {}), ...(SONIOX_KEY && kwsFor(ws.data.call.wake) ? { kws: kwsFor(ws.data.call.wake) } : {}) })
         return
       }
       if (!ws.data.authed) return
