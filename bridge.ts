@@ -9391,6 +9391,9 @@ class DeskSession {
   }
 }
 const LIVE_DESK_IDLE_MS = Number(process.env.LIVE_DESK_IDLE_MS ?? 10 * 60_000)
+// The longest the front desk may turn a call's mic off for, to come back on by itself
+// (mic_off): longer, and it may come on when the caller has forgotten it was off.
+const MIC_OFF_MAX_MIN = 3
 const deskSessions = new Map<string, DeskSession>()
 // One front-desk turn, in its kept process (started if there is none, or if the
 // Live topic's settings changed since).
@@ -10722,6 +10725,25 @@ const taskBridge: BridgeHandlers = {
       ? 'The call is in Assistant mode now: you act only when they call you by name, or hold the mic.'
       : 'The call is in Interactive mode now: you answer everything they say.' })
   },
+  // The front desk turning the mic off on the person's page, asked by voice ("mute the
+  // mic", "mic off for a minute"). With minutes it comes back on by itself, with a
+  // sound; at most 3, so it never comes on when they have forgotten it was off.
+  micOff(s, body) {
+    if (!s.chat) return fail(403, 'no chat')
+    const raw = body?.minutes
+    const asked = raw === undefined || raw === null || raw === '' ? 0 : Number(raw)
+    if (!Number.isFinite(asked) || asked < 0) return fail(400, 'minutes is a number of minutes (at most 3), or left out for off until they turn it on')
+    const open = [...liveCalls.entries()].some(([uuid, c]) => c.pages > 0 && loadLinks()[uuid]?.desk?.startsWith(`${s.chat}:`))
+    if (!open) return fail(409, 'no live call is open in this group')
+    const minutes = Math.min(asked, MIC_OFF_MAX_MIN)
+    const ms = Math.round(minutes * 60_000)
+    liveBus.emit('event', { kind: 'mic', chat: s.chat, ms })
+    const span = (m: number) => m >= 1 ? `${+m.toFixed(1)} minute${m === 1 ? '' : 's'}` : `${Math.round(m * 60)} seconds`
+    return reply(200, { message: !ms
+      ? 'The mic is off on their page until they turn it back on with the mic button. You cannot hear them until then, so it cannot be turned back on by voice: tell them so in a few words.'
+      : `The mic is off on their page for ${span(minutes)}; it comes back on by itself then, with a sound, or sooner with the mic button.` +
+        (asked > MIC_OFF_MAX_MIN ? ` They asked for ${span(asked)}, but ${MIC_OFF_MAX_MIN} minutes is the most, so it doesn't come back on when they have forgotten it was off: tell them so.` : ' Say so in a few words.') })
+  },
   // The live page answering what waits on the person: a permission, Claude's
   // questions, a plan's Go ahead. As the link's owner.
   liveAnswer(_s, body) {
@@ -10871,7 +10893,8 @@ const taskBridge: BridgeHandlers = {
         `Anything that takes longer than about a minute (changing code or files, research, long reading, running jobs) you hand off with the handoff tool to the topic it belongs to, giving the topic by its id, ` +
         `with a brief that stands on its own, and without waiting for it (leave out wait_minutes). When you send work somewhere, say where in a few words ("Sent to Research"), so they can correct you. You are told when it finishes. ` +
         `When they ask to see a topic ("show me Research"), open it on their page with show_topic; to hear a topic's answer ("play Research's last answer"), play it there with play_answer. ` +
-        `When they ask to change how the call listens, switch it with call_mode: assistant ("just listen", "I'm talking with someone", "switch to assistant") or interactive ("back to me", "switch to interactive").` + modeNote
+        `When they ask to change how the call listens, switch it with call_mode: assistant ("just listen", "I'm talking with someone", "switch to assistant") or interactive ("back to me", "switch to interactive"). ` +
+        `When they ask to turn the mic off ("mute the mic", "mic off for a minute"), do it with mic_off, with the minutes if they give a time.` + modeNote
       : ''
     const askLine = (v: WaitView) => v.kind === 'permission' ? `${v.text} (allow or not)`
       : v.kind === 'plan' ? `${v.text} (go ahead or not)`

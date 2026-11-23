@@ -22,11 +22,20 @@ export type CallMode = 'interactive' | 'assistant'
 export const CALL_MODES: CallMode[] = ['interactive', 'assistant']
 // After its name alone ("Lucy?"), this long for the request.
 export const ARMED_MS = 8000
+// After a request of the caller's in Assistant mode, a correction this soon is for it too
+// even without its name ("Wait, I mean 3 people." 3 s after "Lucy, book a flight… for 2
+// people.", 2026-11-22): it goes as the caller's, and joins the request if no answer
+// has come yet.
+export const FOLLOW_MS = 8000
+const CORRECTION = /^(?:(?:uh|um|oh|so|ok|okay|sorry)[\s,]+)*(?:wait|no|nope|sorry|actually|i mean|i meant|not that|make it|change (?:it|that)|scratch that|correction|نه|یعنی|ببخشید|صبر کن|منظورم|اشتباه)(?=$|[^\p{L}\p{N}])/iu
+export function isCorrection(text: string): boolean { return CORRECTION.test(text.trim().toLowerCase()) }
 
 // Where a wake word is in the text: what comes after it, or null when it isn't there.
-// Only at the start: nothing before it but a filler or two ("so", "okay", «خب»…), so a
-// name said in passing ("I told Lucy yesterday") is not a call. Whole words, any case;
-// Arabic and Persian letter forms alike (ي/ی, ك/ک).
+// At the start: nothing before it but a filler or two ("so", "okay", «خب»…), so a
+// name said in passing ("I told Lucy yesterday") is not a call. Or at the end of a
+// sentence, set off by a comma ("Turn the mic off, Lucy."): then the request is the
+// rest of the text, without the name; with no comma ("I told Lucy.") it is a mention.
+// Whole words, any case; Arabic and Persian letter forms alike (ي/ی, ك/ک).
 const FILLERS = new Set(['so', 'ok', 'okay', 'hey', 'hi', 'um', 'uh', 'erm', 'well', 'and', 'oh', 'right', 'yeah', 'خب', 'خوب', 'هی', 'ببین', 'آهان', 'اوکی', 'باشه', 'ام'])
 const fold = (s: string) => s.toLowerCase().replace(/ي/g, 'ی').replace(/ك/g, 'ک')
 export function callWord(text: string, wake: string[]): { rest: string; word: string } | null {
@@ -45,6 +54,18 @@ export function callWord(text: string, wake: string[]): { rest: string; word: st
     if (before.length > 2 || before.some(w => !FILLERS.has(w))) continue
     const rest = text.slice(end).replace(/\s+/g, ' ').replace(/[\s,،]+([.!?؟])/g, '$1').replace(/^[\s,،.!?؟:;-]+|[\s,،:;-]+$/g, '').trim()
     return { rest: /[\p{L}\p{N}]/u.test(rest) ? rest : '', word: w.trim() }
+  }
+  for (const w of wake) {
+    const ww = fold(w.trim())
+    if (!ww) continue
+    const esc = ww.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')
+    const re = new RegExp(`[,،]\\s*(?:(?:hey|hi|ok|okay|هی)\\s+)?${esc}(?=\\s*(?:[.!?؟]|$))`, 'iu')
+    const m = re.exec(t)
+    if (!m) continue
+    const before = text.slice(0, m.index).trim(), after = text.slice(m.index + m[0].length)
+    if (!/[\p{L}\p{N}]/u.test(before)) continue   // ", Lucy." alone: the start rule's case
+    const rest = (before + after).replace(/\s+/g, ' ').replace(/^[\s,،.!?؟:;-]+|[\s,،:;-]+$/g, '').trim()
+    return { rest, word: w.trim() }
   }
   return null
 }
@@ -82,11 +103,19 @@ export function isStopPhrase(text: string): boolean {
   return STOP_PHRASES.has(ws.join(' '))
 }
 
-// Words a finished sentence doesn't end on.
-const DANGLING = new Set(['and', 'or', 'but', 'so', 'the', 'a', 'an', 'to', 'of', 'for', 'with', 'in', 'on', 'at', 'from', 'my', 'your',
-  'our', 'their', 'his', 'her', 'its', 'that', 'this', 'because', 'if', 'then', 'also', 'uh', 'um', 'like', 'is', 'are', 'was', 'were',
-  'and', 'when', 'which', 'who', 'about', 'than', 'as', 'by', 'into', 'i', "i'm", 'we', 'you', 'it', 'let', "let's", 'me',
-  'و', 'که', 'یا', 'با', 'به', 'از', 'در', 'برای', 'اما', 'ولی', 'بعد', 'هم', 'این', 'اون', 'آن', 'رو', 'را', 'تا', 'اگه', 'اگر', 'یه', 'یک', 'من', 'تو', 'اِم', 'ام'])
+// Words a finished sentence can't end on, even when Soniox gave it a full stop: what
+// they lead into is still to come. Not pronouns or words English leaves at the end ("Can
+// you check this?", "Turn it on.", "What are you looking at?"): in the recorded calls every
+// wait on those (it, this, that, me, at, are) waited the full 6 s for nothing. Farsi
+// object marker رو/را stays: its verb comes after it.
+const DANGLING = new Set(['and', 'or', 'but', 'the', 'a', 'an', 'of', 'my', 'your', 'our', 'their', 'its', 'because', 'if', 'than',
+  'uh', 'um', 'i', "i'm", "let's", 'into',
+  'و', 'که', 'یا', 'با', 'به', 'از', 'در', 'برای', 'اما', 'ولی', 'اگه', 'اگر', 'یه', 'یک', 'رو', 'را', 'تا', 'اِم', 'ام'])
+// Words a sentence may end on when it is a question ("What are you looking at?"), but
+// that leave it cut off when Soniox heard no question in the voice and wrote a full
+// stop at the pause: "Hey Lucy, what time is it in." (2026-11-22). Not "on"/"off"
+// ("Turn it on.").
+const LEADS_ON = new Set(['to', 'for', 'with', 'from', 'in', 'at', 'about', 'by'])
 // Does this sound cut off? Soniox punctuates finished sentences, so no final
 // punctuation, a trailing dash or comma, or a dangling last word means more is
 // probably coming. A stand-in for a classifier that would judge it.
@@ -96,7 +125,14 @@ export function looksUnfinished(text: string): boolean {
   if (/[—–\-,،:;]$/.test(t)) return true
   if (!/[.!?؟…]["'»)\]]*$/.test(t)) return true
   const last = words(t).at(-1)
-  return !!last && DANGLING.has(last)
+  if (!last) return false
+  return DANGLING.has(last) || (LEADS_ON.has(last) && !/[?!؟]["'»)\]]*$/.test(t))
+}
+
+// How long to wait after a piece of speech ends before sending, in case they go on: the
+// full wait when it sounds cut off, a short one when it already sounds finished.
+export function quietAfter(text: string, fullMs: number, doneMs: number): number {
+  return looksUnfinished(text) ? fullMs : Math.min(doneMs, fullMs)
 }
 
 // After a piece of the caller's speech ends: send what the caller said, or wait for more.
@@ -119,6 +155,7 @@ export class CallState {
   wake: string[] = ['Lucy']
   private armedUntil = 0
   private armedBy: string | null = null   // whose name-alone it waits on: null is the caller
+  private askedAt = -Infinity             // when the caller's last request in Assistant mode went
   // Assistant mode: others in the room may call it by its name too (a setting).
   othersMayCall = false
   // Waiting for the request after its name, and the caller is talking: the wait lasts until they
@@ -221,13 +258,15 @@ export class CallState {
     if (this.mode === 'interactive') return { lines, send: text, stop: false, echo }
     // Assistant: only what is addressed to it. Not addressed, the caller's words stay with the
     // others' as background for the next request.
-    if (o.held) return { lines, send: text, stop: false, echo, why: 'assistant: said with the talk button held' }
+    const asked = <T>(r: T): T => { this.askedAt = this.now(); return r }
+    if (o.held) return asked({ lines, send: text, stop: false, echo, why: 'assistant: said with the talk button held' })
     const called = callWord(text, this.wake)
     if (called?.rest && isStopPhrase(called.rest)) { this.armedUntil = 0; return { lines, send: null, stop: true, echo, why: `assistant: told to stop by name ("${called.word}")` } }
-    if (called?.rest) { this.armedUntil = 0; return { lines, send: called.rest, stop: false, echo, why: `assistant: called by name ("${called.word}")` } }
+    if (called?.rest) { this.armedUntil = 0; return asked({ lines, send: called.rest, stop: false, echo, why: `assistant: called by name ("${called.word}")` }) }
     if (called) { this.armedBy = null; this.armedUntil = this.now() + ARMED_MS; return { lines, send: null, stop: false, echo, armed: true, why: `assistant: called by name ("${called.word}"), waiting ${ARMED_MS / 1000} s for the request` } }
-    if (this.armedBy === null && this.now() < this.armedUntil) { this.armedUntil = 0; return { lines, send: text, stop: false, echo, why: 'assistant: the request after its name' } }
-    if (o.assembling) return { lines, send: text, stop: false, echo, why: 'assistant: the rest of the request' }
+    if (this.armedBy === null && this.now() < this.armedUntil) { this.armedUntil = 0; return asked({ lines, send: text, stop: false, echo, why: 'assistant: the request after its name' }) }
+    if (o.assembling) return asked({ lines, send: text, stop: false, echo, why: 'assistant: the rest of the request' })
+    if (this.now() - this.askedAt < FOLLOW_MS && isCorrection(text)) return asked({ lines, send: text, stop: false, echo, why: `assistant: a correction within ${FOLLOW_MS / 1000} s of its request` })
     return fromOthers() ?? { lines, send: null, stop: false, echo, why: 'assistant: not called, kept as background' }
   }
 

@@ -31,7 +31,7 @@
 // topic's Claude session (state/live-links.json, shared on disk). It expires (an
 // hour) and belongs to the first device that opens it (live/access.ts).
 import { spawn, type ChildProcess } from 'node:child_process'
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, renameSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, renameSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
@@ -40,13 +40,47 @@ import type { ServerWebSocket } from 'bun'
 import { linkExpired, claimDevice, ownLink } from './access'
 import { drainSentences } from './sentences'
 import { SonioxStream, TokenTracker, type Turn } from './soniox'
-import { ARMED_MS, CallState, CALL_MODES, requestText, sendDecision, type CallMode, type Line } from './call'
+import { requestTimings, summarize, latencyLine, readTrace } from './latency'
+import { decideFast, fastAction, fastWorthAsking, type FastResult } from './fast'
+import { OpusIn, isOpus } from './opus'
+import { ARMED_MS, CallState, CALL_MODES, callWord, quietAfter, requestText, sendDecision, unclear, type CallMode, type Line } from './call'
+import { kwsPhrases } from './kws'
 import { CallRecorder, pruneCalls, pcmToWav } from './recorder'
 import { Vad } from './vad'
 import { usageOf } from '../lib'
 import { UsageLedger } from '../usage'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
+// The phone's wake-word spotter: Vosk in the browser (vosk-browser) with its small
+// English model, set up once with live/kws-setup.sh, served at /kws/. Without them the
+// page has no wake word while the mic is off, and everything else works as before.
+const KWS_DIR = process.env.LIVE_KWS_DIR || join(HERE, '..', 'state', 'kws')
+const KWS_MODEL = 'vosk-model-small-en-us-0.15.tar.gz'
+const KWS_FILES: Record<string, string> = { 'vosk.js': 'text/javascript; charset=utf-8', 'vosk-worker.js': 'text/javascript; charset=utf-8', [KWS_MODEL]: 'application/gzip' }
+const kwsReady = () => Object.keys(KWS_FILES).every(f => existsSync(join(KWS_DIR, f)))
+const kwsFor = (wake: string[]) => {
+  if (!kwsReady()) return undefined
+  const phrases = kwsPhrases(wake)
+  // bytes: so the page can show the first download as a percent even if the size header is lost on the way
+  return phrases.length ? { model: `/kws/${KWS_MODEL}`, bytes: statSync(join(KWS_DIR, KWS_MODEL)).size, phrases, conf: KWS_CONF } : undefined
+}
+// A hit counts only when Vosk is this sure of "hey" (the phrase's first word; the
+// browser build scores the last word at ~0.5 regardless). Tested 2026-11-19 in the
+// browser on ~50 fast "Hey Lucy": 44/50 at 0.9, 47/50 with no cutoff.
+const KWS_CONF = Number(process.env.LIVE_KWS_CONF ?? 0.9)
+// A wake heard on the phone must be the wake phrase in what Soniox hears within this
+// long; if not, the mic goes off again by itself (a false wake costs only these seconds).
+const WOKE_CONFIRM_MS = Number(process.env.LIVE_WOKE_CONFIRM_MS ?? 8000)
+// …and if nothing is asked this long after a wake, the mic goes off again (a wake from
+// someone nearby kept it on 27 s, 2026-11-22). Longer while the caller is still talking.
+const WOKE_IDLE_MS = Number(process.env.LIVE_WOKE_IDLE_MS ?? 10_000)
+// The call's own page actions (mic off, mode, answers) decided by a fast decision model
+// (live/fast.ts) instead of a Claude turn. Off with LIVE_FAST=0 or without a key.
+const FAST = { key: process.env.OPENROUTER_API_KEY || '', models: (process.env.LIVE_FAST_MODELS || 'typesafe/jev-1.14,perplexity/pplx-decider-flash-v1.3:free').split(',').map(s => s.trim()).filter(Boolean), timeoutMs: Number(process.env.LIVE_FAST_TIMEOUT_MS ?? 1200), url: process.env.LIVE_FAST_URL || undefined }
+const FAST_ON = !!FAST.key && process.env.LIVE_FAST !== '0'
+const FAST_MIN = Number(process.env.LIVE_FAST_MIN ?? 0.9)
+// How much longer than the quiet wait a request may wait for the fast decision.
+const FAST_EXTRA_MS = Number(process.env.LIVE_FAST_EXTRA_MS ?? 300)
 const PORT = Number(process.env.LIVE_PORT || 3060)
 const DEFAULT_MODEL = process.env.LIVE_MODEL || 'sonnet'
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude'
@@ -103,6 +137,12 @@ const STALE_MS = Number(process.env.LIVE_STALE_MS ?? 60_000)
 // The page is told how much audio has arrived after each this much of it.
 const ACK_BYTES = 32_000
 const QUIET_MS = Number(process.env.LIVE_QUIET_MS ?? 1000)
+// …or only this much when what was said already sounds finished (final punctuation, no
+// word left hanging). On the recorded calls (2026-11-21), of 109 such pieces that went out
+// as requests, 104 waited the full second for nothing; 2 went on 0.7–0.8 s later (sent
+// early, then redone with the rest, as redoIfCut does), the rest sooner or caught by
+// "still talking". Saves ~0.7 s on most requests.
+const QUIET_DONE_MS = Math.min(Number(process.env.LIVE_QUIET_DONE_MS ?? 300), QUIET_MS)
 // Sent too soon: if they go on within this long and Claude has not said anything yet,
 // the run is cancelled and the whole thing is asked again as one request. People
 // pause 3–5 s mid-sentence to think; waiting that long every time would
@@ -110,6 +150,11 @@ const QUIET_MS = Number(process.env.LIVE_QUIET_MS ?? 1000)
 const MERGE_MS = Number(process.env.LIVE_MERGE_MS ?? 10_000)
 const MAX_WAIT_MS = Number(process.env.LIVE_MAX_WAIT_MS ?? 6000)
 const NOTICE_WAIT_MS = Number(process.env.LIVE_NOTICE_WAIT_MS ?? 30_000)
+// How long a notice waits at most for an answer still playing on the page.
+const PLAYING_WAIT_MS = 120_000
+// The longest the desk may turn the mic off for, to come back on by itself: longer, and
+// it may come on when the caller has forgotten it was off (the bot checks this too).
+const MIC_OFF_MAX_MS = 3 * 60_000
 const SONIOX_TTS_URL = process.env.LIVE_SONIOX_TTS_URL || 'https://tts-rt.soniox.com/tts'
 const FARSI_VOICE = process.env.LIVE_FARSI_VOICE || 'Layla'   // Soniox has no Persian voice; this Arabic one reads Farsi
 // English: Paradee, kept loaded on this machine (~0.1–0.4 s a sentence). Or kokoro (~6.5 s a sentence on this CPU), or the
@@ -279,7 +324,11 @@ function synth(text: string): Voice {
 // `notice`: not something the caller said, but the bot telling the call that work its front
 // desk handed off has finished (the hand-off's id); it is spoken only at a pause.
 type Req = { id: number; said: string; ids: number[]; text: string; background: string; notice?: string }
-type Held = { texts: string[]; ids: number[]; since: number; timer?: ReturnType<typeof setTimeout>; waitingSaid?: string; background?: string }
+type Held = { texts: string[]; ids: number[]; since: number; timer?: ReturnType<typeof setTimeout>; waitingSaid?: string; background?: string
+  // someone else's words are in it: never acted on by the fast path
+  others?: boolean
+  // the fast decision asked for these words while the quiet wait runs
+  fast?: { text: string; result: Promise<FastResult> } }
 type Conn = {
   authed: boolean; uuid?: string; cwd: string; model?: string; sessionId?: string; permission?: string[]
   run?: RunHandle; gen: number; queue: Req[]; reqs: number
@@ -298,7 +347,11 @@ type Conn = {
   // This page's key to the group's photos (in their URLs), and its message budget.
   photoKey?: string; budget?: { n: number; since: number }
   me?: number   // the link's owner: what waits on them is told to the call
-  got?: { bytes: number; since: number }
+  got?: { bytes: number; wire: number; since: number }
+  // the mic as Opus (live/opus.ts), made on its first Opus message
+  opus?: OpusIn
+  // the Cloudflare site the page's connection came in through (cf-ray), e.g. FRA
+  edge?: string
   // All the audio received on this call, and how much of it the page has been told
   // of (heard_s): the page compares it with what it sent, and says so when its audio
   // is not getting here, instead of the call just going quiet.
@@ -308,6 +361,17 @@ type Conn = {
   // How answers arrive, picked on the page: spoken, a sound when one is ready, or
   // nothing (the text is on the page either way). Without speech none is made.
   answers: Answers
+  // page actions the fast path did since the last request, for the desk to hear of
+  fastDone?: string[]
+  // A notice waiting for the page to finish playing an answer: the fallback, should the
+  // page never say it has.
+  queuedFor?: ReturnType<typeof setTimeout>
+  // A wake heard on the phone, not yet confirmed by what Soniox heard.
+  woke?: ReturnType<typeof setTimeout>
+  // After a wake: the mic goes off again if nothing is asked (wokeIdle), counted from wokeAt.
+  wokeIdle?: ReturnType<typeof setTimeout>; wokeAt?: number
+  // when the caller last asked something (a request, or a page action done by the fast path)
+  askedAt?: number
 }
 type Answers = 'voice' | 'sound' | 'silent'
 const ANSWERS: Answers[] = ['voice', 'sound', 'silent']
@@ -340,8 +404,10 @@ function linkHolds(ws: WS): boolean {
 // A request: run it now, or after the turn that is running (the queue goes as one).
 function ask(ws: WS, said: string, ids: number[], how: string, carried = '') {
   const fresh = ws.data.call!.background(ws.data.hold.ids)
-  const background = [carried, fresh].filter(Boolean).join('\n')
+  const done = (ws.data.fastDone ?? []).splice(0).join('\n')
+  const background = [done, carried, fresh].filter(Boolean).join('\n')
   const req: Req = { id: ++ws.data.reqs, said, ids, background, text: requestText(said, background) }
+  ws.data.askedAt = Date.now()
   ws.data.rec?.trace('turn', `request ${req.id} (${how})${ws.data.run ? ', queued behind the running turn' : ''}`, { text: req.text })
   out(ws, { type: 'sent', ids, req: req.id, queued: !!ws.data.run })
   if (ws.data.run) { ws.data.queue.push(req); return }
@@ -359,10 +425,35 @@ function stopAll(ws: WS, why: string) {
   for (const q of ws.data.queue) out(ws, { type: 'dropped', req: q.id, ids: q.ids })
   ws.data.current = undefined
   ws.data.queue = []
+  clearTimeout(ws.data.queuedFor); ws.data.queuedFor = undefined
   clearHeld(ws)
   ws.data.speakStop?.()
   out(ws, { type: 'hush' })
   ws.data.rec?.trace('stop', why)
+}
+
+// What was asked while a turn ran goes next, as one request; a notice goes on its own.
+// A notice also waits for the answer before it to finish playing on the page: started
+// at once, it took the call from that answer and cut it off mid-sentence.
+function runQueued(ws: WS, force = false) {
+  clearTimeout(ws.data.queuedFor); ws.data.queuedFor = undefined
+  if (!ws.data.queue.length || ws.data.run || ws.data.current) return
+  if (ws.data.queue[0].notice && ws.data.call?.playing && !force) {
+    // Played to its end, the page says so (and runQueued runs again); this is in case it never does.
+    ws.data.queuedFor = setTimeout(() => runQueued(ws, true), PLAYING_WAIT_MS)
+    return
+  }
+  const firstNotice = ws.data.queue.findIndex(r => r.notice)
+  const n = firstNotice === 0 ? 1 : firstNotice < 0 ? ws.data.queue.length : firstNotice
+  const q = ws.data.queue.splice(0, n)
+  const next: Req = q.length === 1 ? q[0] : { id: q[q.length - 1].id, said: q.map(r => r.said).join('\n'), ids: q.flatMap(r => r.ids), text: q.map(r => r.text).join('\n\n'), background: q.map(r => r.background).filter(Boolean).join('\n') }
+  if (linkHolds(ws)) runTurn(ws, next)
+}
+// A notice for the call: now, or after what the call is doing (an answer running, being
+// spoken, or still playing on the page).
+function noticeTurn(ws: WS, req: Req) {
+  ws.data.queue.push(req)
+  runQueued(ws)
 }
 
 // Run one request through claude, streaming events + spoken audio to the client.
@@ -451,15 +542,7 @@ function runTurn(ws: WS, req: Req) {
         if (!alive()) return      // stopped, or cancelled to be asked again whole
         if (ws.data.current?.req === req) ws.data.current = undefined
         out(ws, { type: 'turn_end', req: req.id })
-        // What was asked while this turn ran goes next, as one request.
-        if (ws.data.queue.length && !ws.data.run) {
-          // A notice goes on its own; what the caller said meanwhile goes as one request.
-          const firstNotice = ws.data.queue.findIndex(r => r.notice)
-          const n = firstNotice === 0 ? 1 : firstNotice < 0 ? ws.data.queue.length : firstNotice
-          const q = ws.data.queue.splice(0, n)
-          const next: Req = q.length === 1 ? q[0] : { id: q[q.length - 1].id, said: q.map(r => r.said).join('\n'), ids: q.flatMap(r => r.ids), text: q.map(r => r.text).join('\n\n'), background: q.map(r => r.background).filter(Boolean).join('\n') }
-          if (linkHolds(ws)) runTurn(ws, next)
-        }
+        runQueued(ws)
       }, 150)
     },
   }
@@ -571,13 +654,19 @@ function onBotEvent(ws: WS, ev: any) {
     ws.data.rec?.trace('notice', `${ev.topic}: waits on you (${ev.what})`)
     out(ws, { type: 'ask', topic: ev.topic, thread: ev.thread ?? 'General', id: ev.id, what: ev.what })
     const req: Req = { id: ++ws.data.reqs, said: `❗ ${ev.topic}: ${ev.what === 'permission' ? 'asks for permission' : ev.what === 'plan' ? 'a plan is ready' : 'asks you'}`, ids: [], text: '', background: '', notice: `ask:${ev.id}` }
-    if (ws.data.run) ws.data.queue.push(req)
-    else if (linkHolds(ws)) runTurn(ws, req)
+    noticeTurn(ws, req)
   }
   // Answered (anywhere) before the call got to it: it isn't said.
   if (ev.kind === 'wait_end' && typeof ev.id === 'string') ws.data.queue = ws.data.queue.filter(r => r.notice !== `ask:${ev.id}`)
   if (ev.kind === 'runs') out(ws, { type: 'work', runs: ev.runs })
   else if (ev.kind === 'show') { if (ws.data.desk) out(ws, { type: 'show', topic: ev.topic }) }
+  // The desk turned the mic off, asked by voice ("mute the mic for a minute"): the
+  // page does it, and turns it back on after ms (0: only the caller turns it on).
+  else if (ev.kind === 'mic') {
+    const ms = Number.isFinite(ev.ms) && ev.ms > 0 ? Math.min(ev.ms, MIC_OFF_MAX_MS) : 0
+    ws.data.rec?.trace('page', ms ? `mic off by voice for ${Math.round(ms / 1000)} s` : 'mic off by voice')
+    out(ws, { type: 'mic', on: false, ms })
+  }
   // The desk switched the call's mode, asked by voice ("switch to assistant", "back to me").
   else if (ev.kind === 'call_mode') {
     const m = modeFrom(ev.mode)
@@ -592,8 +681,7 @@ function onBotEvent(ws: WS, ev: any) {
     ws.data.rec?.trace('notice', `${ev.topic}: ${ev.ok ? 'done' : 'failed'}`, { line: ev.line })
     out(ws, { type: 'notice', topic: ev.topic, ok: ev.ok, line: ev.line })
     const req: Req = { id: ++ws.data.reqs, said: `🔔 ${ev.topic}: ${ev.ok ? 'done' : 'did not finish'}`, ids: [], text: '', background: '', notice: ev.handoff }
-    if (ws.data.run) ws.data.queue.push(req)
-    else if (linkHolds(ws)) runTurn(ws, req)
+    noticeTurn(ws, req)
   }
 }
 
@@ -725,10 +813,48 @@ function flush(ws: WS, force: boolean) {
     return
   }
   ws.data.rec?.trace('decide', `send: ${d.why}`, { text })
-  const ids = h.ids, carried = h.background || ''
+  const ids = h.ids, carried = h.background || '', fast = h.fast?.text === text && !h.others ? h.fast.result : undefined
   clearHeld(ws)
   for (const id of ids) { const l = call.line(id); if (l) l.sent = true }
-  ask(ws, text, ids, force ? 'talk button' : 'your voice', carried)
+  const how = force ? 'talk button' : 'your voice'
+  if (!fast) { ask(ws, text, ids, how, carried); return }
+  void (async () => {
+    const r = await Promise.race([fast, Bun.sleep(FAST_EXTRA_MS).then(() => null)])
+    if (ws.readyState !== 1) return
+    const act = r ? fastAction(r, FAST_MIN) : null
+    const rec = ws.data.rec
+    if (!r) rec?.trace('fast', `no answer within the wait: to the desk`, { text })
+    else if ('error' in r) rec?.trace('fast', `failed after ${r.ms} ms (${r.error}): to the desk`, { text })
+    else rec?.trace('fast', `${r.model}: ${r.action} ${r.conf.toFixed(2)} in ${r.ms} ms${act ? ': done on the page' : ': to the desk'}`, { text, cost: r.cost })
+    if (act && doFast(ws, act, text)) return
+    ask(ws, text, ids, how, carried)
+  })()
+}
+
+// A page action decided by the fast path: done here, as the desk's tool would, and the
+// desk is told with the next request. False when there is nothing to do.
+function doFast(ws: WS, act: NonNullable<ReturnType<typeof fastAction>>, said: string): boolean {
+  const call = ws.data.call!, rec = ws.data.rec
+  let done = ''
+  if (act === 'mic_off') {
+    rec?.trace('page', 'mic off by voice')
+    out(ws, { type: 'mic', on: false, ms: 0 })
+    done = 'turned the mic off'
+  } else if (act === 'mode_assistant' || act === 'mode_interactive') {
+    const m: CallMode = act === 'mode_assistant' ? 'assistant' : 'interactive'
+    if (call.mode !== m) { call.mode = m; rec?.trace('page', `mode now: ${m} (asked by voice)`) }
+    out(ws, { type: 'call_mode', mode: m, byVoice: true })
+    done = `switched the call to ${m} mode`
+  } else {
+    const a = act === 'answers_voice' ? 'voice' : act === 'answers_sound' ? 'sound' : 'silent'
+    if (ws.data.answers !== a) { ws.data.answers = a; rec?.trace('page', `answers now: ${a === 'voice' ? 'spoken' : a === 'sound' ? 'a sound when ready' : 'silent'} (asked by voice)`) }
+    if (a !== 'voice') { ws.data.speakStop?.(); out(ws, { type: 'hush' }) }
+    out(ws, { type: 'answers', mode: a, byVoice: true })
+    done = `set answers to ${a === 'voice' ? 'spoken' : a === 'sound' ? 'a sound when ready' : 'silent (text only)'}`
+  }
+  ws.data.askedAt = Date.now()
+  ;(ws.data.fastDone ??= []).push(`you: ${said}\n(done on the page, without you: ${done})`)
+  return true
 }
 
 // The caller went on talking after the request was sent, and Claude has not said anything
@@ -751,15 +877,24 @@ function redoIfCut(ws: WS): boolean {
 }
 
 // --- hearing (Soniox) ---------------------------------------------------------
+// Soniox is told to expect the wake words. Without it, in a noisy place "Hey Lucy" came
+// out as Farsi «خیلی چیز» every time (2026-11-20), so the phone's wake looked false and
+// the request uncalled; with it, all were "Hey Lucy", and no "Lucy" appeared in calls
+// without one.
+function sonioxTerms(wake: string[]): string[] {
+  const t = [...SONIOX.terms]
+  for (const w of wake.map(x => x.trim()).filter(Boolean)) t.push(w, ...(/^[\p{Script=Latin}\s'-]+$/u.test(w) ? [`Hey ${w}`] : []))
+  return [...new Set(t)].slice(0, 50)
+}
 function startHearing(ws: WS) {
   const rec = ws.data.rec!, call = ws.data.call!
   const tracker = ws.data.tracker = new TokenTracker()
   let firstWords = true
-  ws.data.stt = new SonioxStream({ ...SONIOX, key: SONIOX_KEY }, {
+  ws.data.stt = new SonioxStream({ ...SONIOX, key: SONIOX_KEY, terms: sonioxTerms(call.wake) }, {
     connected: n => {
       tracker.reset(); ws.data.endedFor = undefined
       if (n > 1 && call.main !== null) { call.reset(); out(ws, { type: 'main', speaker: null }); out(ws, { type: 'status', text: 'reconnected to speech recognition — the first voice now is "you" again (tap a line to change)' }) }
-      rec.trace('soniox', n > 1 ? 'reconnected; speaker numbers start over' : 'connected', { model: SONIOX.model, languages: SONIOX.languages, endpoint_ms: SONIOX.endpointMs, end_silence_ms: END_SILENCE_MS, quiet_ms: QUIET_MS, max_wait_ms: MAX_WAIT_MS })
+      rec.trace('soniox', n > 1 ? 'reconnected; speaker numbers start over' : 'connected', { model: SONIOX.model, languages: SONIOX.languages, endpoint_ms: SONIOX.endpointMs, end_silence_ms: END_SILENCE_MS, quiet_ms: QUIET_MS, quiet_done_ms: QUIET_DONE_MS, max_wait_ms: MAX_WAIT_MS })
     },
     status: s => { rec.trace('soniox', s); out(ws, { type: 'status', text: s }) },
     fatal: s => { rec.trace('soniox', `stopped: ${s}`); out(ws, { type: 'status', text: `speech recognition stopped: ${s}` }) },
@@ -775,6 +910,8 @@ function startHearing(ws: WS) {
         ws.data.speakStop?.(); out(ws, { type: 'hush' })
         rec.trace('speaker', `speaker ${call.main} (you) talked over the answer, so the reading stops`, { text: r.live.map(t => t.text).join(' ') })
       }
+      // A wake on the phone, confirmed as the words come (a long sentence may not end in time).
+      if (ws.data.woke && r.live.some(t => wakeIn(call, t.text, t.confidence))) wakeConfirmed(ws, 'in the words still coming')
       if (r.done) { heard(ws, r.done, r.finalized); return }
       // In a busy room the audio is never quiet: end the piece when the caller has been quiet
       // END_SILENCE_MS while someone else keeps talking (their later words prove the
@@ -792,6 +929,34 @@ function startHearing(ws: WS) {
   })
 }
 
+// The wake phrase, said clearly: an unclear "Hi, Lucy." (0.66) from someone nearby
+// confirmed a wake (2026-11-22). Whoever said it: at the start of a call Soniox's
+// speaker numbers are shaky, and a caller's own clear "Hey Lucy." came as speaker 2. A
+// clear one from someone else is caught by the mic going off when nothing is asked.
+function wakeIn(call: CallState, text: string, confidence?: number): boolean {
+  return !!callWord(text, call.wake) && !unclear(text, confidence)
+}
+// After a wake: nothing asked within WOKE_IDLE_MS (and not still talking), the mic goes
+// off again. The page does so only while the mic is on because of the wake. While someone
+// is still talking it keeps waiting, with no limit: a long request is never cut off.
+function wokeIdle(ws: WS, at: number, ms = WOKE_IDLE_MS) {
+  clearTimeout(ws.data.wokeIdle)
+  ws.data.wokeAt = at
+  ws.data.wokeIdle = setTimeout(() => {
+    ws.data.wokeIdle = undefined
+    if ((ws.data.askedAt ?? 0) >= at || ws.readyState !== 1) return
+    const call = ws.data.call, t = ws.data.tracker
+    const talking = ws.data.hold.texts.length > 0 || (!!t && !!call && call.main !== null && t.openWordEnd(call.main) !== null) || !!ws.data.vad?.speaking()
+    if (talking) return wokeIdle(ws, at, Math.min(3000, WOKE_IDLE_MS))
+    ws.data.rec?.trace('voice', `nothing asked after the wake: mic off again`)
+    out(ws, { type: 'mic', on: false, ms: 0, why: 'nothing_asked' })
+  }, ms)
+}
+function wakeConfirmed(ws: WS, where: string) {
+  clearTimeout(ws.data.woke); ws.data.woke = undefined
+  ws.data.rec!.trace('voice', `wake confirmed ${where}: the mic stays on`)
+}
+
 function heard(ws: WS, turns: Turn[], finalized: boolean) {
   const call = ws.data.call!, rec = ws.data.rec!
   const held = ws.data.held || ws.data.heldUntilFinal
@@ -805,6 +970,8 @@ function heard(ws: WS, turns: Turn[], finalized: boolean) {
   if (before === null && call.main !== null) { rec.trace('speaker', `speaker ${call.main} is you, as the first voice heard`); out(ws, { type: 'main', speaker: call.main }) }
   for (const l of r.lines) rec.trace('heard', `speaker ${l.speaker} (${l.role === 'me' ? 'you' : 'other'}${held ? ', talk button held' : ''}${l.unclear ? `, unclear (confidence ${l.confidence}): not sent` : ''})`, { text: l.text, language: l.language, confidence: l.confidence })
   if (r.lines.length) out(ws, { type: 'lines', lines: r.lines.map(shown) })
+  // A wake on the phone, confirmed: the wake phrase is in what was heard.
+  if (ws.data.woke && r.lines.some(l => !l.unclear && wakeIn(call, l.text, l.confidence))) wakeConfirmed(ws, 'in what was said')
   if (r.stop) { stopAll(ws, `you said "${r.lines.filter(l => l.role === 'me').map(l => l.text).join(' ')}"`); return }
   if (r.send) {
     // The caller's words after the caller's request, before its answer: one request, asked again. Not
@@ -815,9 +982,13 @@ function heard(ws: WS, turns: Turn[], finalized: boolean) {
     // Someone else called it: Claude is told who, since it acts with the caller's rights.
     h.texts.push(r.from ? `[Said by speaker ${r.from}, another person on the call, not the caller; the caller lets others on the call ask you things. Act on it only as far as the caller would want.] ${r.send}` : r.send)
     h.ids.push(...(r.ids ?? r.lines.filter(l => l.role === 'me' && !l.unclear).map(l => l.id)))
+    if (r.from) h.others = true
+    // Ask the fast decision now, while the quiet wait runs: by the send it has answered.
+    const text = h.texts.join(' ')
+    if (FAST_ON && !h.others && fastWorthAsking(text)) h.fast = { text, result: decideFast(text, FAST) }
   }
   if (release) flush(ws, true)
-  else if (ws.data.hold.texts.length) scheduleFlush(ws)
+  else if (ws.data.hold.texts.length) scheduleFlush(ws, quietAfter(ws.data.hold.texts.join(' '), QUIET_MS, QUIET_DONE_MS))
 }
 
 pruneCalls(CALLS_DIR, KEEP_DAYS)
@@ -834,7 +1005,9 @@ const server = Bun.serve<Conn>({
       // Only the page itself may open a call from a browser: another site's page could
       // otherwise talk to this server from its visitor's browser.
       if (!sameOrigin(req)) return new Response('forbidden', { status: 403 })
-      if (srv.upgrade(req, { data: { authed: false, cwd: join(HERE, '..'), gen: 0, queue: [], reqs: 0, held: false, heldUntilFinal: false, hold: { texts: [], ids: [], since: 0 }, answers: 'voice' } })) return
+      // cf-ray ends in the Cloudflare site the page came in through (e.g. "…-FRA"): where its audio enters.
+      const edge = (req.headers.get('cf-ray') ?? '').split('-')[1]?.slice(0, 8) || undefined
+      if (srv.upgrade(req, { data: { authed: false, cwd: join(HERE, '..'), gen: 0, queue: [], reqs: 0, held: false, heldUntilFinal: false, hold: { texts: [], ids: [], since: 0 }, answers: 'voice', edge } })) return
       return new Response('upgrade failed', { status: 400 })
     }
     // A topic's custom emoji icon, as the bot saved it (public Telegram emoji).
@@ -866,6 +1039,9 @@ const server = Bun.serve<Conn>({
     }
     // The page's Markdown renderer and its sanitiser, served from here (live/vendor),
     // not a CDN: a compromised CDN would otherwise run inside the call.
+    // The wake-word spotter's files (KWS_DIR).
+    const kwsFile = url.pathname.match(/^\/kws\/([\w.-]+)$/)?.[1]
+    if (kwsFile && KWS_FILES[kwsFile] && existsSync(join(KWS_DIR, kwsFile))) return new Response(Bun.file(join(KWS_DIR, kwsFile)), { headers: { 'content-type': KWS_FILES[kwsFile], 'cache-control': 'public, max-age=604800' } })
     const vendor = url.pathname.match(/^\/vendor\/(marked\.min\.js|purify\.min\.js)$/)
     if (vendor) return new Response(Bun.file(join(HERE, 'vendor', vendor[1])), { headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'public, max-age=86400' } })
     // Any other path serves the page (the uuid lives in the path, read client-side),
@@ -878,7 +1054,7 @@ const server = Bun.serve<Conn>({
       'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff',
       'content-security-policy': [
         `default-src 'none'`, `script-src 'self' 'nonce-${nonce}' blob:`, `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com`,
-        `font-src https://fonts.gstatic.com`, `img-src 'self' data: blob:`, `connect-src 'self'`, `media-src 'self' blob:`,
+        `font-src https://fonts.gstatic.com`, `img-src 'self' data: blob:`, `connect-src 'self'`, `media-src 'self' blob:`, `worker-src 'self'`,
         `frame-ancestors 'none'`, `base-uri 'none'`, `form-action 'none'`,
       ].join('; '),
     } })
@@ -891,11 +1067,17 @@ const server = Bun.serve<Conn>({
       open.delete(ws)
       ws.data.run?.stop()
       ws.data.events?.abort()
-      clearInterval(ws.data.topicsTimer); clearTimeout(ws.data.topicsSoon)
+      clearInterval(ws.data.topicsTimer); clearTimeout(ws.data.topicsSoon); clearTimeout(ws.data.queuedFor); clearTimeout(ws.data.woke); clearTimeout(ws.data.wokeIdle)
       if (ws.data.photoKey) photoKeys.delete(ws.data.photoKey)
       clearHeld(ws)
       ws.data.stt?.close()
-      ws.data.rec?.close()
+      ws.data.opus?.free()
+      const rec = ws.data.rec
+      if (rec) {
+        const s = summarize(requestTimings(readTrace(rec.dir)))
+        if (s.requests) rec.trace('latency', latencyLine(s), s)
+        rec.close()
+      }
     },
     message(ws, raw) {
       // One bad message must not take the server — and every call on it — down.
@@ -907,37 +1089,49 @@ const server = Bun.serve<Conn>({
     },
   },
 })
+// Mic audio (16 kHz mono 16-bit PCM) in: the recording, the page's count, Soniox, the quiet.
+function audioIn(ws: WS, pcm: Uint8Array) {
+  ws.data.rec?.audio(pcm)
+  ws.data.audioIn = (ws.data.audioIn ?? 0) + pcm.byteLength
+  if (ws.data.audioIn - (ws.data.acked ?? 0) >= ACK_BYTES) { ws.data.acked = ws.data.audioIn; out(ws, { type: 'heard', s: +(ws.data.audioIn / 32000).toFixed(1) }) }
+  // How much audio arrives, every 10 s (beside the page's own count of what it sent).
+  const h = ws.data.got ??= { bytes: 0, wire: 0, since: Date.now() }
+  h.bytes += pcm.byteLength
+  if (Date.now() - h.since >= 10_000) { ws.data.rec?.trace('audio', `received ${(h.bytes / 32000).toFixed(1)} s of audio in ${((Date.now() - h.since) / 1000).toFixed(1)} s`, { kbit_s: Math.round(h.wire * 8 / (Date.now() - h.since)) }); ws.data.got = { bytes: 0, wire: 0, since: Date.now() } }
+  if (!ws.data.stt) return
+  ws.data.stt.send(pcm)
+  // End the piece of speech after END_SILENCE_MS of quiet in the audio — once
+  // per quiet stretch, and not while the button is held.
+  const vad = ws.data.vad!
+  const wasSpeaking = vad.speaking()
+  vad.push(pcm)
+  if (!wasSpeaking && vad.speaking() && ws.data.hold.texts.length) scheduleFlush(ws)   // the caller started again
+  const quiet = vad.quietMs()
+  if (!ws.data.held && Number.isFinite(quiet) && quiet >= END_SILENCE_MS) {
+    const voiceAt = vad.position - quiet
+    if (voiceAt !== ws.data.endedForVoice) {
+      ws.data.endedForVoice = voiceAt
+      ws.data.rec?.trace('soniox', `${Math.round(quiet)} ms of quiet in the audio: ending the piece`, { noise_floor: Math.round(vad.noiseFloor) })
+      ws.data.stt.finalize()
+    }
+  }
+}
+
 function onMessage(ws: WS, raw: string | Buffer) {
   {
     {
-      // Mic audio: 16 kHz mono 16-bit PCM.
+      // Mic audio: 16 kHz mono 16-bit PCM, or Opus (live/opus.ts) decoded to it.
       if (typeof raw !== 'string') {
         if (!ws.data.authed) return
-        const pcm = raw instanceof Uint8Array ? raw : new Uint8Array(raw as ArrayBuffer)
-        ws.data.rec?.audio(pcm)
-        ws.data.audioIn = (ws.data.audioIn ?? 0) + pcm.byteLength
-        if (ws.data.audioIn - (ws.data.acked ?? 0) >= ACK_BYTES) { ws.data.acked = ws.data.audioIn; out(ws, { type: 'heard', s: +(ws.data.audioIn / 32000).toFixed(1) }) }
-        // How much audio arrives, every 10 s (beside the page's own count of what it sent).
-        const h = ws.data.got ??= { bytes: 0, since: Date.now() }
-        h.bytes += pcm.byteLength
-        if (Date.now() - h.since >= 10_000) { ws.data.rec?.trace('audio', `received ${(h.bytes / 32000).toFixed(1)} s of audio in ${((Date.now() - h.since) / 1000).toFixed(1)} s`); ws.data.got = { bytes: 0, since: Date.now() } }
-        if (!ws.data.stt) return
-        ws.data.stt.send(pcm)
-        // End the piece of speech after END_SILENCE_MS of quiet in the audio — once
-        // per quiet stretch, and not while the button is held.
-        const vad = ws.data.vad!
-        const wasSpeaking = vad.speaking()
-        vad.push(pcm)
-        if (!wasSpeaking && vad.speaking() && ws.data.hold.texts.length) scheduleFlush(ws)   // the caller started again
-        const quiet = vad.quietMs()
-        if (!ws.data.held && Number.isFinite(quiet) && quiet >= END_SILENCE_MS) {
-          const voiceAt = vad.position - quiet
-          if (voiceAt !== ws.data.endedForVoice) {
-            ws.data.endedForVoice = voiceAt
-            ws.data.rec?.trace('soniox', `${Math.round(quiet)} ms of quiet in the audio: ending the piece`, { noise_floor: Math.round(vad.noiseFloor) })
-            ws.data.stt.finalize()
-          }
+        const msg = raw instanceof Uint8Array ? raw : new Uint8Array(raw as ArrayBuffer)
+        const g = ws.data.got ??= { bytes: 0, wire: 0, since: Date.now() }
+        g.wire += msg.byteLength
+        if (isOpus(msg)) {
+          if (!ws.data.opus) { ws.data.opus = new OpusIn(pcm => { try { audioIn(ws, pcm) } catch (e) { ws.data.rec?.trace('error', `audio: ${e instanceof Error ? e.message : e}`) } }); ws.data.rec?.trace('audio', 'the mic comes as Opus') }
+          if (!ws.data.opus.push(msg) && ws.data.opus.errors === 1) ws.data.rec?.trace('error', 'a piece of Opus audio was malformed: dropped')
+          return
         }
+        audioIn(ws, msg)
         return
       }
       let msg: any; try { msg = JSON.parse(raw) } catch { return }
@@ -957,11 +1151,10 @@ function onMessage(ws: WS, raw: string | Buffer) {
         ws.data.vad = new Vad()
         ws.data.rec = new CallRecorder(CALLS_DIR, msg.uuid, {
           topic: link.key, cwd: link.cwd, model: link.model || DEFAULT_MODEL, permission: ws.data.permission, stt: SONIOX_KEY ? 'soniox' : 'browser',
-          soniox: SONIOX_KEY ? { model: SONIOX.model, languages: SONIOX.languages, endpoint_ms: SONIOX.endpointMs, end_silence_ms: END_SILENCE_MS, quiet_ms: QUIET_MS, max_wait_ms: MAX_WAIT_MS } : undefined,
+          soniox: SONIOX_KEY ? { model: SONIOX.model, languages: SONIOX.languages, endpoint_ms: SONIOX.endpointMs, end_silence_ms: END_SILENCE_MS, quiet_ms: QUIET_MS, quiet_done_ms: QUIET_DONE_MS, max_wait_ms: MAX_WAIT_MS } : undefined,
           agent: String(msg.agent || '').slice(0, 300),
         })
-        ws.data.rec.trace('auth', device === 'bound' ? 'link opened; this device now holds it' : 'link opened by its device', { answers: ws.data.answers })
-        if (SONIOX_KEY) startHearing(ws)
+        ws.data.rec.trace('auth', device === 'bound' ? 'link opened; this device now holds it' : 'link opened by its device', { answers: ws.data.answers, edge: ws.data.edge ?? 'direct', ...(msg.net && typeof msg.net === 'object' ? { net: msg.net } : {}) })
         startEvents(ws)
         stampUsed(msg.uuid)
         ws.data.photoKey = randomUUID(); photoKeys.set(ws.data.photoKey, msg.uuid)
@@ -969,6 +1162,7 @@ function onMessage(ws: WS, raw: string | Buffer) {
         ws.data.call.mode = modeFrom(msg.mode) ?? 'interactive'
         ws.data.call.wake = wakeFor(prefsKey(ws))
         ws.data.call.othersMayCall = othersFor(prefsKey(ws))
+        if (SONIOX_KEY) startHearing(ws)   // after the wake words: Soniox is told to expect them
         ws.data.rec.trace('page', `mode: ${ws.data.call.mode}`, { wake: ws.data.call.wake, others_may_call: ws.data.call.othersMayCall })
         // While open: the link is in use; and a link revoked (a new /live) or expired
         // closes the page, not just its next turn.
@@ -978,7 +1172,7 @@ function onMessage(ws: WS, raw: string | Buffer) {
           ws.data.topicsTimer = setInterval(() => { if (!linkHolds(ws)) return; stampUsed(ws.data.uuid); void sendTopics(ws) }, TOPICS_EVERY_MS)
         } else ws.data.topicsTimer = setInterval(() => { if (linkHolds(ws)) stampUsed(ws.data.uuid) }, 60_000)
         const mode = ws.data.permission!.includes('--dangerously-skip-permissions') ? 'bypass' : ws.data.permission![ws.data.permission!.indexOf('--permission-mode') + 1]
-        out(ws, { type: 'ready', where: link.cwd, model: link.model || DEFAULT_MODEL, mode, callMode: ws.data.call.mode, wake: ws.data.call.wake, others: ws.data.call.othersMayCall, stt: SONIOX_KEY ? 'soniox' : 'browser', desk: !!link.desk, pk: ws.data.photoKey, ...(link.user ? { me: link.user.id } : {}) })
+        out(ws, { type: 'ready', where: link.cwd, model: link.model || DEFAULT_MODEL, mode, callMode: ws.data.call.mode, wake: ws.data.call.wake, others: ws.data.call.othersMayCall, stt: SONIOX_KEY ? 'soniox' : 'browser', audio: ['pcm', 'opus'], desk: !!link.desk, pk: ws.data.photoKey, ...(link.user ? { me: link.user.id } : {}), ...(SONIOX_KEY && kwsFor(ws.data.call.wake) ? { kws: kwsFor(ws.data.call.wake) } : {}) })
         return
       }
       if (!ws.data.authed) return
@@ -1038,8 +1232,9 @@ function onMessage(ws: WS, raw: string | Buffer) {
           if (!w.length) { out(ws, { type: 'wake', words: call.wake, error: 'needs at least one word' }); return }
           call.wake = w
           savePref(prefsKey(ws), { wake: w })
-          rec.trace('page', 'wake words changed', { wake: w })
-          out(ws, { type: 'wake', words: w })
+          rec.trace('page', 'wake words changed (Soniox expects them from its next connection)', { wake: w })
+          ws.data.stt?.setTerms(sonioxTerms(w))
+          out(ws, { type: 'wake', words: w, ...(SONIOX_KEY ? { kws: kwsFor(w) ?? null } : {}) })
           return
         }
         // Whether others on the call may call it by name (Assistant mode): this person's, kept.
@@ -1116,13 +1311,34 @@ function onMessage(ws: WS, raw: string | Buffer) {
         }
         // The words of an answer the page is about to play (its voice note): what the mic will hear back.
         case 'echo': call.speaking(String(msg.text ?? '').slice(0, 8000)); return
-        case 'playing': call.setPlaying(!!msg.on); rec.trace('page', msg.on ? 'playing the answer' : 'answer playback ended'); return
+        // The phone heard the wake phrase while the mic was off and turned the mic on,
+        // sending the seconds before it first. Soniox must hear the wake phrase in them,
+        // or the mic goes off again (heard() confirms it).
+        case 'woke': {
+          clearTimeout(ws.data.woke)
+          const said = String(msg.keyword ?? '').slice(0, 80)
+          rec.trace('voice', `wake phrase heard on the phone (${said}): mic on`)
+          wokeIdle(ws, Date.now())
+          ws.data.woke = setTimeout(() => {
+            ws.data.woke = undefined
+            clearTimeout(ws.data.wokeIdle); ws.data.wokeIdle = undefined
+            rec.trace('voice', `false wake: no wake word heard within ${WOKE_CONFIRM_MS / 1000} s, mic off again; what was heard since is dropped`)
+            out(ws, { type: 'mic', on: false, ms: 0, why: 'false_wake' })
+            // Its words would otherwise wait in the open piece and join the next request.
+            const t = ws.data.tracker, stt = ws.data.stt
+            if (t && stt) { t.dropBefore(Math.max(stt.sentMs, t.openWordEnd() ?? 0)); stt.finalize() }
+          }, WOKE_CONFIRM_MS)
+          return
+        }
+        case 'playing': call.setPlaying(!!msg.on); rec.trace('page', msg.on ? 'playing the answer' : 'answer playback ended'); if (!msg.on) runQueued(ws); return
         // What the page saw: mic on/off, permission refused, playback trouble…
         case 'trace': {
           const extra = msg.extra && typeof msg.extra === 'object' && JSON.stringify(msg.extra).length <= 2000 ? { extra: msg.extra } : {}
           rec.trace('page', String(msg.msg || '').slice(0, 500), extra); return
         }
         case 'ping': return   // keeps the connection busy, so nothing on the way closes it as idle
+        // The page's round-trip check (every 2 s), answered at once: its time comes back as sent.
+        case 'rtt': out(ws, { type: 'rtt', t: Number(msg.t) || 0 }); return
       }
     }
   }
@@ -1151,4 +1367,4 @@ process.on('unhandledRejection', e => console.error(`[live] unhandled: ${e insta
 
 if (TTS && /^paradee$/i.test(ENGLISH_VOICE)) paradeeWorker = new VoiceWorker('paradee', [PARADEE_PY, join(HERE, 'paradee_worker.py')], voiceEnv())
 if (TTS && /^kokoro$/i.test(ENGLISH_VOICE)) kokoroWorker = new VoiceWorker('kokoro', ['python3', join(HERE, 'worker.py')], voiceEnv())
-console.log(`[live] voice server on http://127.0.0.1:${server.port}  links=${LINKS_FILE}  hearing=${SONIOX_KEY ? `soniox ${SONIOX.model}` : 'browser'}`)
+console.log(`[live] voice server on http://127.0.0.1:${server.port}  links=${LINKS_FILE}  hearing=${SONIOX_KEY ? `soniox ${SONIOX.model}` : 'browser'}  fast=${FAST_ON ? FAST.models[0] : 'off'}`)

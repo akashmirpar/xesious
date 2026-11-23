@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, readdirSync, existsSync, utimesSync, mkdirSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TokenTracker, splitTurns, configMessage, type Token } from '../live/soniox'
-import { CallState, isStopPhrase, words, requestText, looksUnfinished, sendDecision, unclear } from '../live/call'
+import { CallState, isStopPhrase, words, requestText, looksUnfinished, sendDecision, unclear, quietAfter, isCorrection, FOLLOW_MS } from '../live/call'
 import { CallRecorder, pruneCalls } from '../live/recorder'
 import { Vad, rms } from '../live/vad'
 
@@ -57,6 +57,19 @@ describe('Soniox tokens', () => {
     // Soniox keeps reporting during silence, with the audio position moving on
     t.push({ tokens: [tok('Hello', '1', 900, false)], total_audio_proc_ms: 2400 })
     expect(t.silenceMs()).toBe(1500)
+  })
+  test("a false wake's words are dropped: those held, and those Soniox sends later", () => {
+    const t = new TokenTracker()
+    t.push({ tokens: [tok('Some', '1', 300), tok(' TV', '1', 600, false)], total_audio_proc_ms: 700 })
+    t.dropBefore(1000)
+    expect(t.push({ tokens: [tok(' talk', '1', 900, false)] }).live).toEqual([])
+    // finalized later, and the next wake's words after it
+    let r = t.push({ tokens: [tok(' TV', '1', 600), tok(' talk', '1', 900), { text: '<fin>', is_final: true }] })
+    expect(r.done).toEqual([])
+    r = t.push({ tokens: [tok('Hey', '1', 1300), tok(' Lucy', '1', 1600), { text: '<end>', is_final: true }] })
+    expect(r.done).toEqual([{ speaker: '1', text: 'Hey Lucy', language: 'en' }])
+    t.reset()   // a new connection: word times start over
+    expect(t.push({ tokens: [tok('Hi', '1', 200, false)] }).live[0].text).toBe('Hi')
   })
   test('the config asks for both languages, speakers, and the key', () => {
     const c = configMessage({ key: 'k', model: 'stt-rt-v6', languages: ['en', 'fa'], endpointMs: 100 })
@@ -177,6 +190,26 @@ describe('whose words count', () => {
       expect(looksUnfinished(s)).toBe(true)
     for (const s of ['Is the train on time today?', 'Stop.', 'Thanks!', 'فردا هوا بارونیه؟', 'He said "hi."'])
       expect(looksUnfinished(s)).toBe(false)
+    // Even with a full stop, a word that leads into more is still cut off.
+    for (const s of ['Send the summary and.', 'Put it in the.', 'Check the price because.', 'این فایل رو.', 'برو به.'])
+      expect(looksUnfinished(s)).toBe(true)
+    // Pronouns and words English leaves at the end finish a sentence: each of these
+    // endings waited 6 s for nothing on real calls.
+    for (const s of ['Can you check this?', 'Read it to me.', 'Open it.', 'What do you think of it?', 'Is that so?', 'Do that.',
+      'What are you looking at?', 'Where are you?', 'Thank you.', 'Turn it on.', 'I think so.', 'چی هست این؟', 'Who is it for?', 'Which one are you talking about!'])
+      expect(looksUnfinished(s)).toBe(false)
+    // A preposition last, with a full stop: Soniox heard no question, it stopped at a pause
+    // (2026-11-22: "what time is it in." went early). A rare "I'd love to." waits too.
+    for (const s of ['Hey Lucy, what time is it in.', 'Send the report to.', 'Book a table for.', "What's the weather like in", "I'd love to."])
+      expect(looksUnfinished(s)).toBe(true)
+  })
+  test('after a piece ends: a short wait when it sounds finished, the full one when cut off', () => {
+    expect(quietAfter('What time is it in Tokyo?', 1000, 300)).toBe(300)
+    expect(quietAfter('Read it to me.', 1000, 300)).toBe(300)
+    expect(quietAfter('Book a table for', 1000, 300)).toBe(1000)
+    expect(quietAfter('Send the summary and.', 1000, 300)).toBe(1000)
+    expect(quietAfter('I want the button,', 1000, 300)).toBe(1000)
+    expect(quietAfter('Done.', 150, 300)).toBe(150)   // never longer than the full wait
   })
   test('send now, or wait: the button, talking again, unfinished, and the limit', () => {
     const base = { text: 'Give me a—', waitedMs: 1000, stillTalking: false, force: false, maxWaitMs: 6000 }
@@ -284,9 +317,20 @@ describe('Assistant mode: only what is addressed to it by name goes', () => {
     expect(c.heard([T('1', 'Lucy, check the build.')]).send).toBe('check the build.')
     expect(c.heard([T('1', 'Hey Lucy what time is it?')]).send).toBe('what time is it?')
     expect(c.heard([T('1', 'So, Lucy, what do you think?')]).send).toBe('what do you think?')
-    // Only at the start: said in passing, or at the end, it isn't a call.
-    expect(c.heard([T('1', 'what do you think about that, Lucy?')]).send).toBeNull()
+    // Said in passing, it isn't a call.
     expect(c.heard([T('1', 'I told Lucy about it yesterday.')]).send).toBeNull()
+    // At the end of a sentence, after a comma, it is (G, 2026-11-20): the request is the rest.
+    const e = c.heard([T('1', 'what do you think about that, Lucy?')])
+    expect(e.send).toBe('what do you think about that?')
+    expect(e.why).toBe('assistant: called by name ("Lucy")')
+    expect(c.heard([T('1', 'Microphone off, Lucy.')]).send).toBe('Microphone off.')
+    expect(c.heard([T('1', 'We land at nine. Check the weather there, hey Lucy!')]).send).toBe('We land at nine. Check the weather there!')
+    expect(c.heard([T('1', 'Turn the mic off, Lucy')]).send).toBe('Turn the mic off')
+    expect(c.heard([T('1', 'دوباره بخون، لوسی')]).send).toBe('دوباره بخون')
+    expect(c.heard([T('1', 'Stop, Lucy.')]).stop).toBe(true)
+    // Without the comma, or with more after the name in its sentence, it's a mention.
+    expect(c.heard([T('1', 'I already told Lucy.')]).send).toBeNull()
+    expect(c.heard([T('1', 'Tell it to me, Lucy and Sam.')]).send).toBeNull()
     expect(c.heard([T('1', 'Okay so Lucy, read it again.')]).send).toBe('read it again.')
     // At the start of a later sentence in the same piece.
     expect(c.heard([T('1', 'I agree with you. Lucy, check the build.')]).send).toBe('check the build.')
@@ -294,6 +338,22 @@ describe('Assistant mode: only what is addressed to it by name goes', () => {
     expect(c.heard([T('1', 'لوسی، ساعت چنده؟')]).send).toBe('ساعت چنده؟')
     // A word that only contains it is not it.
     expect(c.heard([T('1', 'I was lucky today')]).send).toBeNull()
+  })
+  test("a correction right after its request is for it too, without the name; other talk isn't", () => {
+    let t = 0
+    const c = assistant(() => t)
+    expect(c.heard([T('1', 'Lucy, book a flight to Istanbul for 2 people.')]).send).toBe('book a flight to Istanbul for 2 people.')
+    t = 3000
+    const r = c.heard([T('1', 'Wait, I mean 3 people.')])
+    expect(r.send).toBe('Wait, I mean 3 people.')
+    expect(r.why).toBe(`assistant: a correction within ${FOLLOW_MS / 1000} s of its request`)
+    t = 4000
+    expect(c.heard([T('1', 'Anyway, how was your weekend?')]).send).toBeNull()   // talking to someone: background
+    expect(c.heard([T('1', 'نه، سه نفر.')]).send).toBe('نه، سه نفر.')              // a correction again, 1 s after the last
+    t = 4000 + FOLLOW_MS + 1
+    expect(c.heard([T('1', 'Sorry, I mean four.')]).send).toBeNull()             // too late: background
+    expect(['wait, make it five', 'No, the other one.', 'Actually, cancel that.', 'یعنی فردا', 'Um, sorry, not that'].every(isCorrection)).toBe(true)
+    expect(['Nowhere near.', 'Waiter, please.', 'Book it.', 'Noted.'].some(isCorrection)).toBe(false)
   })
   test("the unsent talk goes with the next request, the caller's and others'", () => {
     const c = assistant()

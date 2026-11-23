@@ -112,7 +112,7 @@ let server: ChildProcess
 let A: Client
 beforeAll(async () => {
   writeFileSync(LINKS, JSON.stringify({ [UUID]: { key: '-100777:12', desk: '-100777:99', cwd: TMP, created: new Date().toISOString(), user: { id: 1, name: 'Tester' } } }))
-  const env: NodeJS.ProcessEnv = { ...process.env, LIVE_TOPICS_EVERY_MS: '60000', LIVE_PORT: '0', LIVE_TTS: 'off', LIVE_LINKS_FILE: LINKS, LIVE_CALLS_DIR: join(TMP, 'calls'), CLAUDE_BIN: '/nonexistent/claude' }
+  const env: NodeJS.ProcessEnv = { ...process.env, LIVE_TOPICS_EVERY_MS: '60000', LIVE_PORT: '0', LIVE_TTS: 'off', LIVE_LINKS_FILE: LINKS, LIVE_CALLS_DIR: join(TMP, 'calls'), CLAUDE_BIN: '/nonexistent/claude', LIVE_FAST: '0' }
   delete env.SONIOX_API_KEY; delete env.LIVE_API_SOCK; delete env.LIVE_API_TOKEN_FILE
   server = spawn(process.execPath, ['run', join(import.meta.dir, '..', 'live', 'server.ts')], { env, stdio: ['ignore', 'pipe', 'pipe'] })
   port = await new Promise<number>((res, rej) => {
@@ -178,6 +178,35 @@ test('a notice from the bot is shown, then asked of the front desk on its own, a
   await A.wait(m => m.type === 'turn_end' && m.req === working.req)
   expect(asked[n].body).toMatchObject({ link: UUID, notice: 'h-42' })
   expect(asked[n].body.text).toBeUndefined()
+})
+
+test('a notice waits while the page still plays the answer before it, instead of cutting it off', async () => {
+  A.ws.send(JSON.stringify({ type: 'playing', on: true }))
+  await Bun.sleep(100)
+  A.got.length = 0
+  const n = asked.length
+  push({ kind: 'notice', chat: '-100777', handoff: 'h-43', topic: 'Backend', ok: true, line: 'Fixed the login page' })
+  await A.wait(m => m.type === 'notice')   // shown (and chimed) at once
+  await Bun.sleep(600)
+  expect(A.got.some(m => m.type === 'working')).toBe(false)
+  expect(asked.length).toBe(n)
+  A.ws.send(JSON.stringify({ type: 'playing', on: false }))
+  const working = await A.wait(m => m.type === 'working')
+  expect(working.said).toBe('🔔 Backend: done')
+  await A.wait(m => m.type === 'turn_end' && m.req === working.req)
+  expect(asked[n].body).toMatchObject({ notice: 'h-43' })
+})
+
+test('the desk turning the mic off reaches the page, never for more than 3 minutes', async () => {
+  A.got.length = 0
+  push({ kind: 'mic', chat: '-100777', ms: 60_000 })
+  expect(await A.wait(m => m.type === 'mic')).toEqual({ type: 'mic', on: false, ms: 60_000 })
+  A.got.length = 0
+  push({ kind: 'mic', chat: '-100777', ms: 3_600_000 })
+  expect(await A.wait(m => m.type === 'mic')).toEqual({ type: 'mic', on: false, ms: 180_000 })
+  A.got.length = 0
+  push({ kind: 'mic', chat: '-100777' })
+  expect(await A.wait(m => m.type === 'mic')).toEqual({ type: 'mic', on: false, ms: 0 })
 })
 
 test("a call with a front desk gets the group's topics, again soon after a run starts or ends", async () => {

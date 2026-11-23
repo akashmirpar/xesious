@@ -42,6 +42,8 @@ export class TokenTracker {
   private final: Token[] = []
   private pending: Token[] = []
   processedMs = 0
+  // Words that start before this (audio ms) are dropped: what was said in a false wake.
+  private dropMs = 0
 
   push(m: SonioxMessage): { live: Turn[]; done: Turn[] | null; finalized: boolean } {
     this.processedMs = Math.max(this.processedMs, m.total_audio_proc_ms || 0)
@@ -49,6 +51,7 @@ export class TokenTracker {
     const pending: Token[] = []
     for (const t of m.tokens || []) {
       if (t.text === '<end>' || t.text === '<fin>') { finished = true; finalized ||= t.text === '<fin>' }
+      else if (this.dropped(t)) continue
       else if (t.is_final) this.final.push(t)
       else pending.push(t)
     }
@@ -81,7 +84,13 @@ export class TokenTracker {
     const end = this.openWordEnd(speaker)
     return end === null ? null : this.processedMs - end
   }
-  reset(): void { this.final = []; this.pending = []; this.processedMs = 0 }
+  // Forget the words said before audio ms `ms`, and any of them Soniox sends later.
+  dropBefore(ms: number): void {
+    this.dropMs = Math.max(this.dropMs, ms)
+    this.final = this.final.filter(t => !this.dropped(t)); this.pending = this.pending.filter(t => !this.dropped(t))
+  }
+  private dropped(t: Token): boolean { return (t.start_ms ?? t.end_ms ?? Infinity) < this.dropMs }
+  reset(): void { this.final = []; this.pending = []; this.processedMs = 0; this.dropMs = 0 }
 }
 
 export type SonioxConfig = { url?: string; key: string; model: string; languages: string[]; endpointMs?: number; terms?: string[] }
@@ -120,13 +129,18 @@ export class SonioxStream {
   private keepalive: ReturnType<typeof setInterval> | null = null
   private backoff = 1000
   private connections = 0
+  private sentBytes = 0
+  // How much audio this connection has been sent (ms): where Soniox's word times are now.
+  get sentMs(): number { return Math.round(this.sentBytes / 32) }
 
   constructor(private c: SonioxConfig, private h: Handlers) {}
+  // Words to expect, sent when it next connects.
+  setTerms(terms: string[]): void { this.c = { ...this.c, terms } }
 
   send(pcm: Uint8Array): void {
     if (this.closed) return
     if (!this.ws) this.connect()
-    if (this.open) { this.ws!.send(pcm as Uint8Array<ArrayBuffer>); this.lastSent = Date.now(); return }
+    if (this.open) { this.ws!.send(pcm as Uint8Array<ArrayBuffer>); this.sentBytes += pcm.byteLength; this.lastSent = Date.now(); return }
     this.queue.push(pcm); this.queued += pcm.byteLength
     while (this.queued > MAX_QUEUED_BYTES && this.queue.length) {
       const old = this.queue.shift()!
@@ -151,9 +165,9 @@ export class SonioxStream {
     this.ws = ws
     ws.onopen = () => {
       ws.send(JSON.stringify(configMessage(this.c)))
-      this.open = true; this.backoff = 1000; this.connections++
+      this.open = true; this.backoff = 1000; this.connections++; this.sentBytes = 0
       this.h.connected(this.connections)
-      for (const q of this.queue) ws.send(q as string | Uint8Array<ArrayBuffer>)
+      for (const q of this.queue) { ws.send(q as string | Uint8Array<ArrayBuffer>); if (typeof q !== 'string') this.sentBytes += q.byteLength }
       this.queue = []; this.queued = 0; this.lastSent = Date.now()
       if (!this.keepalive) this.keepalive = setInterval(() => {
         if (this.open && Date.now() - this.lastSent > KEEPALIVE_MS) { try { this.ws!.send(JSON.stringify({ type: 'keepalive' })); this.lastSent = Date.now() } catch {} }

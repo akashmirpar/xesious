@@ -1,7 +1,8 @@
 // live/server.ts end to end: the real server, a fake Soniox (a local WebSocket the
 // test drives), a stand-in claude, and a test client in the page's place.
 import { test, expect, beforeAll, afterAll } from 'bun:test'
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, chmodSync, existsSync } from 'node:fs'
+import { packOpus } from '../live/opus'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync, existsSync } from 'node:fs'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -13,6 +14,10 @@ const CALLS = join(TMP, 'calls')
 const PROMPTS = join(TMP, 'prompts.jsonl')
 const UUID = '7f1c2a9e-0000-4000-8000-000000000001'
 const D1 = 'device-one-aaaaaaaaaaaaaaaa', D2 = 'device-two-bbbbbbbbbbbbbbbb'
+// The phone's wake-word spotter's built files: stand-ins, served as they are.
+const KWS = join(TMP, 'kws')
+mkdirSync(KWS)
+for (const f of ['vosk.js', 'vosk-worker.js', 'vosk-model-small-en-us-0.15.tar.gz']) writeFileSync(join(KWS, f), `stand-in ${f}`)
 
 // claude: records its prompt; SLOW… never answers (until killed), anything else
 // answers one sentence.
@@ -49,7 +54,21 @@ const soniox = Bun.serve({
     },
   },
 })
-let ms = 0
+// Word times (audio ms): real Soniox's never run ahead of the audio sent, and a false wake
+// drops words before that point, so these start past all the audio the tests send.
+// --- fake decisions model (the fast path, live/fast.ts) ---
+const decisions: string[] = []
+const decider = Bun.serve({
+  port: 0, hostname: '127.0.0.1',
+  async fetch(req) {
+    const b: any = await req.json()
+    const said = String(b.state).split('Said: ')[1] ?? ''
+    decisions.push(said)
+    const pick = /turn off the mic/i.test(said) ? ['mic_off', 0.99] : /only a sound/i.test(said) ? ['answers_sound', 0.98] : /switch to assistant/i.test(said) ? ['mode_assistant', 0.6] : ['none', 0.97]
+    return Response.json({ model: b.model, answers: { action: { type: 'choice', choice: pick[0], confidence: pick[1] } }, usage: { cost: 0.00002 } })
+  },
+})
+let ms = 600_000
 let pendingTokens: any[] = []
 function partial(speaker: string, text: string) {
   pendingTokens = text.split(/(?= )/).map(w => ({ text: w, speaker, is_final: false, language: 'en', start_ms: (ms += 200) - 150, end_ms: ms }))
@@ -59,8 +78,8 @@ function partial(speaker: string, text: string) {
 function progress(silentMs: number) {
   sonioxSock!.send(JSON.stringify({ tokens: pendingTokens, total_audio_proc_ms: ms + silentMs }))
 }
-function say(speaker: string, text: string) {
-  const tokens = text.split(/(?= )/).map(w => ({ text: w, speaker, is_final: true, language: 'en', start_ms: (ms += 200) - 150, end_ms: ms }))
+function say(speaker: string, text: string, confidence?: number) {
+  const tokens = text.split(/(?= )/).map(w => ({ text: w, speaker, is_final: true, language: 'en', start_ms: (ms += 200) - 150, end_ms: ms, ...(confidence !== undefined ? { confidence } : {}) }))
   sonioxSock!.send(JSON.stringify({ tokens: [...tokens, { text: '<end>', is_final: true }], total_audio_proc_ms: ms + 1000 }))
 }
 
@@ -91,7 +110,8 @@ beforeAll(async () => {
   writeFileSync(LINKS, JSON.stringify({ [UUID]: { key: 'chat:topic', cwd: TMP, created: new Date().toISOString(), permission: ['--permission-mode', 'auto'] } }))
   server = spawn(process.execPath, ['run', join(import.meta.dir, '..', 'live', 'server.ts')], {
     env: { ...process.env, LIVE_PORT: '0', LIVE_TTS: 'off', LIVE_LINKS_FILE: LINKS, LIVE_CALLS_DIR: CALLS, CLAUDE_BIN: STUB,
-      SONIOX_API_KEY: 'test-key', LIVE_SONIOX_URL: `ws://127.0.0.1:${soniox.port}`, LIVE_QUIET_MS: '150', LIVE_MAX_WAIT_MS: '1500', LIVE_END_SILENCE_MS: '1300' },
+      SONIOX_API_KEY: 'test-key', LIVE_SONIOX_URL: `ws://127.0.0.1:${soniox.port}`, LIVE_QUIET_MS: '150', LIVE_MAX_WAIT_MS: '1500', LIVE_END_SILENCE_MS: '1300',
+      LIVE_KWS_DIR: KWS, LIVE_WOKE_CONFIRM_MS: '1200', LIVE_WOKE_IDLE_MS: '1500', OPENROUTER_API_KEY: 'test-or', LIVE_FAST_URL: `http://127.0.0.1:${decider.port}` },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   port = await new Promise<number>((res, rej) => {
@@ -100,7 +120,7 @@ beforeAll(async () => {
     setTimeout(() => rej(new Error(`server did not start: ${buf}`)), 10000)
   })
 })
-afterAll(() => { server?.kill('SIGKILL'); soniox.stop(true) })
+afterAll(() => { server?.kill('SIGKILL'); soniox.stop(true); decider.stop(true) })
 
 let A: Client
 test('the first device takes the link; a second device is refused', async () => {
@@ -111,13 +131,54 @@ test('the first device takes the link; a second device is refused', async () => 
   await B.wait(m => m.type === 'other_device')
 })
 
+test('the page is told what its wake spotter listens for ("hey" before each wake word it can spell), and gets its files', async () => {
+  const ready = A.got.find(m => m.type === 'ready')
+  expect(ready.kws).toEqual({ model: '/kws/vosk-model-small-en-us-0.15.tar.gz', bytes: 'stand-in vosk-model-small-en-us-0.15.tar.gz'.length, phrases: ['hey lucy', 'hey lucie'], conf: 0.9 })
+  const model = await fetch(`http://127.0.0.1:${port}/kws/vosk-model-small-en-us-0.15.tar.gz`)
+  expect(model.headers.get('content-type')).toBe('application/gzip')
+  expect(await model.text()).toBe('stand-in vosk-model-small-en-us-0.15.tar.gz')
+  expect((await fetch(`http://127.0.0.1:${port}/kws/vosk-worker.js`)).headers.get('content-type')).toContain('javascript')
+  // nothing else from that folder, and nothing outside it
+  expect((await fetch(`http://127.0.0.1:${port}/kws/..%2Flive-links.json`)).headers.get('content-type')).toContain('text/html')
+  expect((await fetch(`http://127.0.0.1:${port}/kws/secret.txt`)).headers.get('content-type')).toContain('text/html')
+  const page = await fetch(`http://127.0.0.1:${port}/${UUID}`)
+  expect(page.headers.get('content-security-policy')).toContain(`worker-src 'self'`)
+})
+
 test('mic audio reaches Soniox with the key, both languages and speakers on', async () => {
   A.ws.send(new Uint8Array(3200))
   for (let i = 0; i < 40 && sonioxBytes < 3200; i++) await Bun.sleep(50)
   expect(sonioxBytes).toBe(3200)
   expect(sonioxConfig).toMatchObject({ api_key: 'test-key', model: 'stt-rt-v6', language_hints: ['en', 'fa'], enable_speaker_diarization: true, sample_rate: 16000,
     enable_endpoint_detection: false })
-  expect(sonioxConfig.context).toBeUndefined()   // no "expected words" unless LIVE_TERMS is set
+  // Soniox expects the wake words (and "Hey …" for Latin ones), so a noisy "Hey Lucy" isn't heard as something else.
+  expect(sonioxConfig.context).toEqual({ terms: ['Lucy', 'Hey Lucy', 'Lucie', 'Hey Lucie', 'لوسی'] })
+})
+
+
+test('the mic as Opus is decoded to PCM for Soniox and counted as heard; the server says it takes it; pings come back', async () => {
+  expect(A.got.find(m => m.type === 'ready').audio).toEqual(['pcm', 'opus'])
+  const tone: Uint8Array[] = JSON.parse(readFileSync(join(import.meta.dir, 'fixtures-opus-tone.json'), 'utf8')).frames.map((b: string) => new Uint8Array(Buffer.from(b, 'base64')))
+  const before = sonioxBytes
+  for (let i = 0; i < tone.length; i += 5) A.ws.send(packOpus(tone.slice(i, i + 5)))
+  for (let i = 0; i < 60 && sonioxBytes < before + tone.length * 640; i++) await Bun.sleep(50)
+  expect(sonioxBytes - before).toBe(tone.length * 640)   // 20 ms of 16 kHz 16-bit PCM per frame
+  const trace = readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  expect(trace).toContain('the mic comes as Opus')
+  // A real mic goes on after the tone: quiet, so the voice detector doesn't hold the next tests' requests.
+  A.ws.send(new Uint8Array(32000 * 1.6))
+  await Bun.sleep(300)
+  A.ws.send(JSON.stringify({ type: 'rtt', t: 12345.5 }))
+  expect(await A.wait(m => m.type === 'rtt')).toEqual({ type: 'rtt', t: 12345.5 })
+})
+
+test('a wake heard on the phone that Soniox did not hear is a false wake: the mic goes off again', async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  A.got.length = 0
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'HEY_LUCY' }))
+  expect(await A.wait(m => m.type === 'mic', 4000)).toEqual({ type: 'mic', on: false, ms: 0, why: 'false_wake' })
+  expect(traceNow()).toContain('wake phrase heard on the phone (HEY_LUCY)')
+  expect(traceNow()).toContain('false wake')
 })
 
 test('the first voice is "you" and runs a turn in the topic\'s mode; the answer says what it answers', async () => {
@@ -316,12 +377,129 @@ test('Assistant mode, others allowed: another voice calling it by name is a requ
   await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
 })
 
+test('a wake heard on the phone that Soniox hears too ("Hey Hanna, …") is confirmed: the mic stays on', async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  A.got.length = 0
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'HEY_LUCY' }))
+  // By now the caller is speaker 2 and the wake word is Hanna (the tests above).
+  say('2', 'Hey Hanna, what day is it?')
+  const sent = await A.wait(m => m.type === 'sent')
+  await A.wait(m => m.type === 'turn_end' && m.req === sent.req)
+  await Bun.sleep(1500)   // past the confirmation window
+  expect(A.got.some(m => m.type === 'mic')).toBe(false)
+  expect(traceNow()).toContain('wake confirmed')
+}, 20000)
+
+test("an unclear wake phrase doesn't confirm a wake: the mic goes off again", async () => {
+  A.got.length = 0
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'hey lucy' }))
+  say('3', 'Hi, Hanna.', 0.6)            // unclear: 2 words under 0.75 (someone nearby, 2026-11-22)
+  expect(await A.wait(m => m.type === 'mic', 4000)).toEqual({ type: 'mic', on: false, ms: 0, why: 'false_wake' })
+}, 20000)
+
+test('a wake with nothing asked after it turns the mic off again', async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  await Bun.sleep(300)
+  // Assistant mode: the name alone sends nothing (in Interactive it would be a request, which is asking)
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'assistant' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'assistant')
+  A.got.length = 0
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'hey lucy' }))
+  say('2', 'Hey Hanna.')                 // confirmed, then nothing
+  expect(await A.wait(m => m.type === 'mic', 5000)).toEqual({ type: 'mic', on: false, ms: 0, why: 'nothing_asked' })
+  expect(A.got.some(m => m.type === 'sent')).toBe(false)
+  expect(traceNow()).toContain('wake confirmed in what was said')
+  expect(traceNow()).toContain('nothing asked after the wake: mic off again')
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'interactive' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
+}, 20000)
+
+test('a long request after a wake is never cut off: the mic stays on while still talking', async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'assistant' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'assistant')
+  A.got.length = 0
+  const before = traceNow().split('nothing asked after the wake').length
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'hey lucy' }))
+  const start = 'Hey Hanna, in the garden topic, add a note that the roses need water, and also that'
+  partial('2', start)
+  // past the old limit (idle time plus five rechecks: 9 s here, 25 s in a real call)
+  await Bun.sleep(10_000)
+  expect(A.got.some(m => m.type === 'mic')).toBe(false)
+  expect(traceNow().split('nothing asked after the wake').length).toBe(before)
+  say('2', start + ' the tulips can wait.')   // Soniox makes the whole piece final at the end
+  const sent = await A.wait(m => m.type === 'sent')
+  await A.wait(m => m.type === 'turn_end' && m.req === sent.req)
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'interactive' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
+}, 30000)
+
+test('a wake is confirmed from the words still coming: a long sentence with no pause keeps the mic on', async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  A.got.length = 0
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'HEY_LUCY' }))
+  partial('2', 'Hey Hanna, so I was wondering, before we leave, whether the museum opens late on Fridays')
+  await Bun.sleep(1800)   // past the confirmation window, the sentence still open
+  expect(A.got.some(m => m.type === 'mic')).toBe(false)
+  expect(traceNow()).toContain('wake confirmed in the words still coming')
+  say('2', ' today?')
+  const sent = await A.wait(m => m.type === 'sent')
+  await A.wait(m => m.type === 'turn_end' && m.req === sent.req)
+}, 20000)
+
+test("a false wake's words don't wait in the open piece to join the next request", async () => {
+  A.got.length = 0
+  const before = finalizes
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'HEY_LUCY' }))
+  partial('2', 'some talk on the radio')
+  expect(await A.wait(m => m.type === 'mic', 4000)).toEqual({ type: 'mic', on: false, ms: 0, why: 'false_wake' })
+  for (let i = 0; i < 40 && finalizes === before; i++) await Bun.sleep(50)
+  expect(finalizes).toBe(before + 1)   // the piece is ended, without its words
+  say('2', 'Hey Hanna, what day is it?')
+  const sent = await A.wait(m => m.type === 'sent')
+  expect(sent.said ?? prompts().at(-1)?.prompt ?? '').not.toContain('radio')
+  await A.wait(m => m.type === 'turn_end' && m.req === sent.req)
+  expect(prompts().at(-1).prompt).not.toContain('radio')
+  expect(A.got.filter(m => m.type === 'lines').flatMap(m => m.lines.map((l: any) => l.text)).join(' ')).not.toContain('radio')
+}, 20000)
+
+test('a short page action is done on the page by the fast path, with no Claude turn; the desk hears of it next time', async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  await Bun.sleep(1500)   // past the earlier tests' answers
+  A.got.length = 0
+  const n = prompts().length
+  say('2', 'Turn off the mic.')
+  expect(await A.wait(m => m.type === 'mic', 4000)).toEqual({ type: 'mic', on: false, ms: 0 })
+  await Bun.sleep(400)
+  expect(prompts()).toHaveLength(n)                  // no turn
+  expect(A.got.some(m => m.type === 'sent')).toBe(false)
+  expect(traceNow()).toMatch(/fast.*mic_off 0\.99 in \d+ ms: done on the page/)
+  // the answers switch too
+  say('2', 'Only a sound please.')
+  expect(await A.wait(m => m.type === 'answers', 4000)).toEqual({ type: 'answers', mode: 'sound', byVoice: true })
+  expect(prompts()).toHaveLength(n)
+  // unsure (0.6): the desk decides, and is told what the page did before
+  say('2', 'Switch to assistant mode.')
+  const sent = await A.wait(m => m.type === 'sent')
+  await A.wait(m => m.type === 'turn_end' && m.req === sent.req)
+  const p = prompts().at(-1).prompt
+  expect(p).toStartWith('Switch to assistant mode.')
+  expect(p).toContain('(done on the page, without you: turned the mic off)')
+  expect(p).toContain('(done on the page, without you: set answers to a sound when ready)')
+  // a long request, or one with a number, is never asked about
+  const asked = decisions.length
+  say('2', 'Turn off the mic for 2 minutes.')
+  await A.wait(m => m.type === 'sent' && m.req !== sent.req)
+  expect(decisions.length).toBe(asked)
+  A.ws.send(JSON.stringify({ type: 'answers', mode: 'voice' }))
+}, 20000)
+
 test('the call is recorded: mic audio, and a trace of every step', async () => {
   A.ws.close()
   await Bun.sleep(300)
   const [dir] = readdirSync(CALLS)
   const wav = readFileSync(join(CALLS, dir, 'mic.wav'))
-  expect(wav.readUInt32LE(40)).toBe(3200 * 22)   // every chunk the page sent
+  expect(wav.readUInt32LE(40)).toBe(3200 * 22 + 26 * 640 + 32000 * 1.6)   // every PCM chunk the page sent, the Opus tone decoded (26 frames of 20 ms), and the quiet after it
   const trace = readFileSync(join(CALLS, dir, 'trace.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
   const stages = new Set(trace.map(t => t.stage))
   for (const s of ['auth', 'audio', 'soniox', 'speaker', 'heard', 'decide', 'turn', 'claude', 'stop', 'call']) expect(stages).toContain(s)

@@ -70,7 +70,7 @@ describe('the tasks MCP server', () => {
   test('a person\'s run gets the task and topic tools; a scheduled run gets report, notify and its own task', async () => {
     const a = server('interactive', { kind: 'run', chat: '-100777', person: '1', runKind: 'interactive' })
     const names = (await a.rpc('tools/list')).result.tools.map((t: any) => t.name)
-    expect(names).toEqual(['task_create', 'task_list', 'task_get', 'task_update', 'task_pause', 'task_resume', 'task_delete', 'task_run_now', 'topic_list', 'topic_peek', 'answer_wait', 'stop_topic', 'show_topic', 'play_answer', 'call_mode', 'topic_create', 'topic_rename', 'topic_set_cwd', 'handoff'])
+    expect(names).toEqual(['task_create', 'task_list', 'task_get', 'task_update', 'task_pause', 'task_resume', 'task_delete', 'task_run_now', 'topic_list', 'topic_peek', 'answer_wait', 'stop_topic', 'show_topic', 'play_answer', 'call_mode', 'mic_off', 'topic_create', 'topic_rename', 'topic_set_cwd', 'handoff'])
     a.close()
     expect(toolsFor('scheduled').map(t => t.name)).toEqual(['task_create', 'task_propose', 'report', 'ask', 'notify', 'task_get', 'task_pause', 'task_done', 'handoff'])
     // approve is there only for a run that is the permission host, where Claude Code calls it.
