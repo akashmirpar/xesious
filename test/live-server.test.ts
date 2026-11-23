@@ -406,7 +406,7 @@ test("a wake from the phone isn't confirmed by the name at a sentence's end, and
   A.got.length = 0
   A.ws.send(JSON.stringify({ type: 'woke', keyword: 'hey lucy' }))
   // the phone took a word for the wake phrase, and Soniox wrote the name at the end (2026-11-23)
-  say('2', "It isn't much, Hanna. Just hide those two files.")
+  say('2', "Not today, Hanna. Water the plants first.")
   expect(await A.wait(m => m.type === 'mic', 4000)).toEqual({ type: 'mic', on: false, ms: 0, why: 'false_wake' })
   expect(A.got.some(m => m.type === 'sent' || m.type === 'called')).toBe(false)
   expect(traceNow()).toContain('not sent: the wake heard on the phone is not confirmed')
