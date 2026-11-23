@@ -30,7 +30,7 @@ import { randomUUID, createHash, timingSafeEqual } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import {
   parseIdList, keyFor, sanitize, encodeCwd, parseDirs, getPathArg, transferText, transferWorthShowing,
-  MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel, cliModel,
+  MODE_HELP, allowedModes, MODEL_ALIASES, MODEL_DEFAULT, normalizeModel,
   EFFORT_LEVELS, EFFORT_DEFAULT, normalizeEffort,
   parseStreamLine, type Step, THINKING, RUN_RECORD, runTitle, conflictAdvice, isNonAnswer, lastAnswerBlock, promoteBlock, stalenessNote,
   markdownToHtml, htmlDocument, previewCut, transcriptSpeech, lastEffortFrom, needsReplyLink,
@@ -1562,7 +1562,7 @@ async function runStreaming(ctx: Context, threadId: number | undefined, key: str
     resumeId = undefined
   }
   if (resumeId) args.push('--resume', resumeId)
-  if (model) args.push('--model', cliModel(model))
+  if (model) args.push('--model', model)
   if (effort) args.push('--effort', effort)
   if (fork && resumeId) args.push('--fork-session')
   // The group's memory: its folder added, and its CLAUDE.md read from there.
@@ -3361,7 +3361,7 @@ async function localComplete(system: string, user: string, maxTokens = 300): Pro
 function cliComplete(model: string, system: string, user: string, timeoutMs = 120_000, kind = 'chore'): Promise<string> {
   const dir = join(tmpdir(), `xesious-ctx-${process.getuid?.() ?? 'user'}`)
   mkdirSync(dir, { recursive: true })
-  const args = ['-p', user, '--model', cliModel(model), '--system-prompt', system, '--tools', '', '--strict-mcp-config',
+  const args = ['-p', user, '--model', model, '--system-prompt', system, '--tools', '', '--strict-mcp-config',
     '--no-session-persistence', '--disable-slash-commands', '--output-format', 'json', '--settings', '{"alwaysThinkingEnabled":false}']
   return new Promise(resolve => {
     const child = spawn(CLAUDE_BIN, args, { cwd: dir, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
@@ -3950,7 +3950,7 @@ function claudeJudge(model: string, system: string, user: string): Promise<AutoV
 // directory outside any repository: Auto mode's judge, a watcher's AI filter.
 function claudeOneShot(model: string, system: string, user: string, kind = 'judge'): Promise<{ text?: string; error?: string }> {
   mkdirSync(TRIAGE_DIR, { recursive: true })
-  const args = ['-p', user, '--model', cliModel(model), '--system-prompt', system, '--tools', '', '--strict-mcp-config',
+  const args = ['-p', user, '--model', model, '--system-prompt', system, '--tools', '', '--strict-mcp-config',
     '--no-session-persistence', '--disable-slash-commands', '--output-format', 'json', '--settings', '{"alwaysThinkingEnabled":false}']
   return new Promise(resolve => {
     const child = spawn(CLAUDE_BIN, args, { cwd: TRIAGE_DIR, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
@@ -4555,7 +4555,7 @@ function summarizeForSpeech(answer: string): Promise<string> {
     // No plan mode here either: the same shape as normaliseUnit, and the same reason —
     // there is nothing to plan about rewriting one reply into three sentences, and plan
     // mode is what produces a preamble about whether planning is needed.
-    const args = ['-p', prompt, '--output-format', 'json', '--model', cliModel(VOICE_SUMMARY_MODEL), ...STATELESS_NOTOOLS]
+    const args = ['-p', prompt, '--output-format', 'json', '--model', VOICE_SUMMARY_MODEL, ...STATELESS_NOTOOLS]
     const child = spawn(CLAUDE_BIN, args, { cwd: statelessCwd(), env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
     let out = ''
     child.stdout.on('data', d => (out += d))
@@ -4683,7 +4683,7 @@ function normaliseUnit(text: string): Promise<string> {
     // and it was worst on faithfulness (4/108 against 1/108). Dropping plan mode also
     // takes ~2s off the median call.
     const args = ['-p', `${NORMALISE_PROMPT}\n\n<line>\n${text}\n</line>`, '--output-format', 'json',
-                  '--model', cliModel(NORMALISE_MODEL), ...STATELESS_NOTOOLS]
+                  '--model', NORMALISE_MODEL, ...STATELESS_NOTOOLS]
     // An empty folder and no --resume, for the reasons summarizeForSpeech gives: a
     // stateless pass must not be able to touch or rebind the topic's session.
     const child = spawn(CLAUDE_BIN, args, { cwd: statelessCwd(), env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
@@ -9288,7 +9288,7 @@ class DeskSession {
       ...permissionArgs(modeFor(this.key), [...(history?.tools ?? []), ...(own?.tools ?? [])]),
       '--mcp-config', JSON.stringify({ mcpServers: servers }), '--strict-mcp-config',
       ...(own?.host ? ['--permission-prompt-tool', 'mcp__xesious__approve'] : []), ...taskGuardArgs(),
-      '--model', cliModel(model)]
+      '--model', model]
     const profile = profileFor(cwd, this.key)
     if (profile.trim()) args.push('--append-system-prompt', profile)
     const effort = effortFor(this.key)

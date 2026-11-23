@@ -208,15 +208,6 @@ export function permissionArgs(mode: string, opts: { allowBypass: boolean; allow
 export const MODEL_ALIASES = ['opus', 'sonnet', 'haiku', 'fable'] as const
 export const MODEL_DEFAULT = 'default' // the label for "clear the override"
 
-// Aliases the bridge pins to an id itself, rather than leaving to the CLI's own
-// mapping. A topic stores and shows the alias ("fable"); the id is substituted at
-// spawn time, so changing the pin here changes every topic on it at once.
-// 'fable' is pinned because the installed CLI still maps the bare alias to 5.1 and
-// logs unrecognized_model for 5.2 — while passing it through, and the API serves it.
-// Aliases not listed here go to the CLI as typed and track whatever it resolves.
-export const MODEL_ALIAS_IDS: Readonly<Record<string, string>> = { fable: 'claude-fable-5-2' }
-export const cliModel = (m: string): string => MODEL_ALIAS_IDS[m] ?? m
-
 // Returns '' for the default (clears the override), the alias/id otherwise,
 // undefined for something unrecognised.
 export function normalizeModel(m: string): string | undefined {
