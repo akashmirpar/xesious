@@ -209,7 +209,7 @@ function permissionArgs(link: LiveLink | undefined): string[] {
 
 function childEnv(): NodeJS.ProcessEnv {
   const e: NodeJS.ProcessEnv = { ...process.env }
-  for (const k of Object.keys(e)) if (/^(TELEGRAM_|TG_|LIVE_|SONIOX_)/.test(k)) delete e[k]
+  for (const k of Object.keys(e)) if (/^(TELEGRAM_|TG_|LIVE_|SONIOX_|OPENROUTER_)/.test(k)) delete e[k]
   for (const k of ['TG_KOKORO_VOICE', 'TG_KOKORO_MODEL', 'TG_KOKORO_VOICES', 'TG_KOKORO_SPEED', 'TG_KOKORO_LANG'])
     if (process.env[k]) e[k] = process.env[k]
   return e

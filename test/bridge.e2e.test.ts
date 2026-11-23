@@ -6657,10 +6657,30 @@ describe('tasks: cards, buttons, /tasks and topics (phase 1)', () => {
     T().tokens.revoke(deskTok)
   }, 90000)
 
+  test("a run is not given the keys that are the bot's or the live server's own", () => {
+    const was = { or: process.env.OPENROUTER_API_KEY, sx: process.env.SONIOX_API_KEY }
+    process.env.OPENROUTER_API_KEY = 'or-test'; process.env.SONIOX_API_KEY = 'sx-test'
+    try {
+      const e = bridge._childEnv()
+      expect(e.OPENROUTER_API_KEY).toBeUndefined()   // the live page's fast actions: a run could read it with `env`
+      expect(e.SONIOX_API_KEY).toBeUndefined()
+      expect(Object.keys(e).filter(k => k.startsWith('TELEGRAM_') || k.startsWith('TG_'))).toEqual([])
+      expect(e.PATH).toBe(process.env.PATH)          // the rest is passed on
+    } finally {
+      if (was.or === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = was.or
+      if (was.sx === undefined) delete process.env.SONIOX_API_KEY; else process.env.SONIOX_API_KEY = was.sx
+    }
+  })
+
   test("the front desk's claude is kept running for the call: one process, only the bot's tools, started again when the Live topic is used outside the call", async () => {
     const [uuid, link] = deskLink()!
     const desk = Number(link.desk.split(':')[1])
     const starts = () => existsSync(KEPT_LOG) ? readFileSync(KEPT_LOG, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l) as string[]) : []
+    // The page the test before this one closed ends its call 0.4 s later
+    // (LIVE_SUMMARY_AFTER_MS), which closes the kept claude. Let that pass first: it used
+    // to land wherever the first turn's cold start put it, and when that turn took over
+    // 0.3 s it landed between the two turns, which then needed a second claude.
+    await Bun.sleep(500)
     bridge._deskSessions().get(link.desk)?.close('test')
     await Bun.sleep(100)
     const n = starts().length

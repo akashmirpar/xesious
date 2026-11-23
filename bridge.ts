@@ -1326,8 +1326,10 @@ const permissionArgs = (mode: string, extraTools: string[] = []) =>
 function childEnv(): NodeJS.ProcessEnv {
   const e: NodeJS.ProcessEnv = { ...process.env }
   for (const k of Object.keys(e)) if (k.startsWith('TELEGRAM_') || k.startsWith('TG_')) delete e[k]
-  // The live page's speech-recognition key is the live server's, not Claude's.
+  // The live page's speech-recognition key is the live server's, not Claude's; so is the
+  // key its fast page actions are decided with (a run could read it with `env` and spend it).
   delete e.SONIOX_API_KEY
+  delete e.OPENROUTER_API_KEY
   // With tasks on, Claude Code's session crons are off: one made in a `claude -p` run
   // dies with it, so "every morning…" must become a task, not a cron that never fires.
   if (TASKS) e.CLAUDE_CODE_DISABLE_CRON = '1'
@@ -11779,6 +11781,7 @@ async function main() {
 // whether a redeploy is allowed to proceed, so they are worth pinning directly.
 export function _otherLiveBridge(): number | undefined { return otherLiveBridge() }
 export const _tokenLockPath = tokenLockPath
+export const _childEnv = childEnv
 export const _lockHolder = lockHolder
 export const _procStartTime = procStartTime
 export const _PID_FILE = PID_FILE

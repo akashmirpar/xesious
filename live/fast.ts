@@ -49,7 +49,8 @@ export async function decideFast(text: string, c: FastConfig): Promise<FastResul
       const j: any = await r.json().catch(() => ({}))
       if (!r.ok) { error = `${model}: ${r.status}`; continue }
       const a = j.answers?.action
-      if (a?.type !== 'choice' || !(a.choice in FAST_ACTIONS)) { error = `${model}: ${a?.type ?? 'no answer'}`; continue }
+      // One of the listed actions, by name: `in` also took ["mic_off"] and "constructor" for one.
+      if (a?.type !== 'choice' || typeof a.choice !== 'string' || !Object.hasOwn(FAST_ACTIONS, a.choice)) { error = `${model}: ${a?.type === 'choice' ? 'not a listed action' : a?.type ?? 'no answer'}`; continue }
       const conf = Number(a.confidence ?? a.probabilities?.[a.choice] ?? 0)
       return { action: a.choice as FastAction, conf, model, ms: Math.round(performance.now() - t0), cost: Number(j.usage?.cost ?? 0) }
     } catch (e) { error = `${model}: ${e instanceof Error ? e.name === 'TimeoutError' ? 'timed out' : e.message : e}` }
