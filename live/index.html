@@ -677,7 +677,7 @@ function paint(){ mic.classList.toggle('on', micOn && !talking); mic.classList.t
 
 // One button, like a video call: tap = mic on/off; hold = talking (what you say is
 // yours, pauses don't cut it, letting go sends it). Space does the same as holding.
-function setMic(on){ if(on) clearTimeout(micBack); if(micOn===on) return; micOn=on; paint(); trace(on?'mic on':'mic off'); if(stt==='browser'){ on?startRec():stopRec() }
+function setMic(on){ if(on){ clearTimeout(micBack); micBack=null } if(micOn===on) return; micOn=on; paint(); trace(on?'mic on':'mic off'); if(stt==='browser'){ on?startRec():stopRec() }
   if(!on) startSpotting(); if(kwsLoadMsg) hintRefresh() }
 function hintRefresh(){ $('#hint').textContent = mutedOn && !micOn ? mutedText() : hintNow(); paintKwsBar() }
 function paintKwsBar(){
@@ -688,7 +688,10 @@ function paintKwsBar(){
 }
 // The mic turned off by voice (the front desk's mic_off): with ms, back on by itself
 // then, with a sound so the caller knows it is listening again; the server allows at
-// most 3 minutes. Turning it on by hand first cancels that.
+// most 3 minutes. Turning it on by hand first cancels that. Only a mic that was on (or
+// is off for a time asked before) comes back on: one the caller turned off themselves
+// stays off whatever is asked, since the request can come from any run in the group, not
+// only from what was said on the call. A new request replaces the one before it.
 let micBack=null
 function micOffByVoice(ms, why){
   if(!started) return
@@ -702,8 +705,10 @@ function micOffByVoice(ms, why){
     if(!wokeAt) return
     wokeAt=0; setMic(false); sys('🔇 Nothing asked after “'+wakeSays()+'” — the mic is off again'); return
   }
+  const comesBack=ms>0 && (micOn || micBack!==null)
+  clearTimeout(micBack); micBack=null
   wokeAt=0; setMic(false); vibrate(20)
-  if(!(ms>0)){ sys('🔇 Mic off, asked by voice — '+(spotOn()?'say “'+wakeSays()+'” or tap it':'tap it')+' to turn it back on'); return }
+  if(!comesBack){ sys('🔇 Mic off, asked by voice — '+(spotOn()?'say “'+wakeSays()+'” or tap it':'tap it')+' to turn it back on'); return }
   const s=Math.round(ms/1000), span=s>=60 ? (s%60 ? (s/60).toFixed(1) : s/60)+' min' : s+' s'
   sys('🔇 Mic off for '+span+', asked by voice — it comes back on by itself')
   micBack=setTimeout(()=>{ micBack=null; if(micOn) return; setMic(true); micBackTone(); vibrate([20,50,20]); sys('🎙 The mic is back on') }, ms)
