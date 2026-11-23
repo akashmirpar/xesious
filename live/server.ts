@@ -951,8 +951,12 @@ function wokeIdle(ws: WS, at: number, ms = WOKE_IDLE_MS) {
   ws.data.wokeIdle = setTimeout(() => {
     ws.data.wokeIdle = undefined
     if ((ws.data.askedAt ?? 0) >= at || ws.readyState !== 1) return
-    const call = ws.data.call, t = ws.data.tracker
-    const talking = ws.data.hold.texts.length > 0 || (!!t && !!call && call.main !== null && t.openWordEnd(call.main) !== null) || !!ws.data.vad?.speaking()
+    const t = ws.data.tracker
+    // Still talking: words not finished yet (anyone's: at a call's start whose voice is the
+    // caller's is known only from the first finished piece, and a caller cut off there
+    // 10 s in, 2026-11-23), or less quiet in the audio than ends a piece.
+    const vad = ws.data.vad, quiet = vad?.quietMs() ?? Infinity
+    const talking = ws.data.hold.texts.length > 0 || (!!t && t.openWordEnd() !== null) || !!vad?.speaking() || (Number.isFinite(quiet) && quiet < END_SILENCE_MS)
     if (talking) return wokeIdle(ws, at, Math.min(3000, WOKE_IDLE_MS))
     ws.data.rec?.trace('voice', `nothing asked after the wake: mic off again`)
     out(ws, { type: 'mic', on: false, ms: 0, why: 'nothing_asked' })

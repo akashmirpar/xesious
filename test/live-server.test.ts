@@ -456,6 +456,24 @@ test('a long request after a wake is never cut off: the mic stays on while still
   await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
 }, 30000)
 
+test("after a wake, words not yet known as the caller's keep the mic on too", async () => {
+  // At a call's start whose voice is the caller's is known only from the first finished piece:
+  // a caller's long request was cut off 10 s in (2026-11-23). Here the open words are speaker 3's.
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'assistant' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'assistant')
+  A.got.length = 0
+  A.ws.send(JSON.stringify({ type: 'woke', keyword: 'hey lucy' }))
+  const start = 'Hey Hanna, could you look up when the library closes on Saturday, and whether'
+  partial('3', start)
+  await Bun.sleep(5000)   // past the idle time and a recheck (1.5 s each here)
+  expect(A.got.some(m => m.type === 'mic')).toBe(false)
+  say('3', start + ' it opens on Sunday?')
+  // someone else's request is not sent (others may not call it), so the mic goes off after all
+  expect(await A.wait(m => m.type === 'mic', 8000)).toMatchObject({ on: false, why: 'nothing_asked' })
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'interactive' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
+}, 30000)
+
 test('a wake is confirmed from the words still coming: a long sentence with no pause keeps the mic on', async () => {
   const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
   A.got.length = 0
