@@ -355,6 +355,15 @@ describe('Assistant mode: only what is addressed to it by name goes', () => {
     expect(['wait, make it five', 'No, the other one.', 'Actually, cancel that.', 'یعنی فردا', 'Um, sorry, not that'].every(isCorrection)).toBe(true)
     expect(['Nowhere near.', 'Waiter, please.', 'Book it.', 'Noted.'].some(isCorrection)).toBe(false)
   })
+  test("called by name again, it's a request of its own; by name with a correction, it is the last one's", () => {
+    const c = assistant()
+    expect(c.heard([T('1', 'Lucy, send the recipe to the cooking topic.')]).fresh).toBe(true)
+    const r = c.heard([T('1', 'Lucy, turn off the microphone.')])
+    expect(r.send).toBe('turn off the microphone.')
+    expect(r.fresh).toBe(true)
+    expect(c.heard([T('1', 'Lucy, wait, I mean the baking topic.')]).fresh).toBe(false)
+    expect(c.heard([T('1', 'Wait, I mean the baking topic.')]).fresh).toBeUndefined()
+  })
   test("the unsent talk goes with the next request, the caller's and others'", () => {
     const c = assistant()
     c.heard([T('2', 'The flight is at nine.'), T('1', 'Then we leave at seven.')])

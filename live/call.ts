@@ -218,7 +218,7 @@ export class CallState {
   // assembling: a request of the caller's is being put together; what the caller says now is its rest.
   // armed: its name alone was heard; it now waits ARMED_MS for the request (the page shows it).
   // from / ids: a request someone else made by calling it (othersMayCall): who, and its lines.
-  heard(turns: Turn[], o: { held?: boolean; busy?: boolean; assembling?: boolean } = {}): { lines: Line[]; send: string | null; stop: boolean; echo: Turn[]; why?: string; armed?: boolean; from?: string; ids?: number[] } {
+  heard(turns: Turn[], o: { held?: boolean; busy?: boolean; assembling?: boolean } = {}): { lines: Line[]; send: string | null; stop: boolean; echo: Turn[]; why?: string; armed?: boolean; from?: string; ids?: number[]; fresh?: boolean } {
     const echo: Turn[] = [], lines: Line[] = []
     for (const t of turns) {
       if (!t.text.trim()) continue
@@ -265,9 +265,10 @@ export class CallState {
     if (o.held) return asked({ lines, send: text, stop: false, echo, why: 'assistant: said with the talk button held' })
     const called = callWord(text, this.wake)
     if (called?.rest && isStopPhrase(called.rest)) { this.armedUntil = 0; return { lines, send: null, stop: true, echo, why: `assistant: told to stop by name ("${called.word}")` } }
-    if (called?.rest) { this.armedUntil = 0; return asked({ lines, send: called.rest, stop: false, echo, why: `assistant: called by name ("${called.word}")` }) }
+    // Called by name: a request of its own, not the rest of the last one (unless it corrects it).
+    if (called?.rest) { this.armedUntil = 0; return asked({ lines, send: called.rest, stop: false, echo, fresh: !isCorrection(called.rest), why: `assistant: called by name ("${called.word}")` }) }
     if (called) { this.armedBy = null; this.armedUntil = this.now() + ARMED_MS; return { lines, send: null, stop: false, echo, armed: true, why: `assistant: called by name ("${called.word}"), waiting ${ARMED_MS / 1000} s for the request` } }
-    if (this.armedBy === null && this.now() < this.armedUntil) { this.armedUntil = 0; return asked({ lines, send: text, stop: false, echo, why: 'assistant: the request after its name' }) }
+    if (this.armedBy === null && this.now() < this.armedUntil) { this.armedUntil = 0; return asked({ lines, send: text, stop: false, echo, fresh: !isCorrection(text), why: 'assistant: the request after its name' }) }
     if (o.assembling) return asked({ lines, send: text, stop: false, echo, why: 'assistant: the rest of the request' })
     if (this.now() - this.askedAt < FOLLOW_MS && isCorrection(text)) return asked({ lines, send: text, stop: false, echo, why: `assistant: a correction within ${FOLLOW_MS / 1000} s of its request` })
     return fromOthers() ?? { lines, send: null, stop: false, echo, why: 'assistant: not called, kept as background' }

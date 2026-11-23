@@ -474,6 +474,25 @@ test("after a wake, words not yet known as the caller's keep the mic on too", as
   await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
 }, 30000)
 
+test("called by name right after a request, it's a request of its own: done at once, the first one not cancelled", async () => {
+  const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'assistant' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'assistant')
+  A.got.length = 0
+  const cancels = () => traceNow().split('before any answer: it is cancelled').length
+  const before = cancels()
+  say('2', 'Hanna, SLOW send the recipe to the cooking topic.')   // sent; Claude is slow to answer
+  const first = await A.wait(m => m.type === 'sent')
+  A.got.length = 0
+  say('2', 'Hanna, turn off the microphone.')                       // 2 s later in the real call
+  expect(await A.wait(m => m.type === 'mic', 5000)).toMatchObject({ on: false })
+  expect(A.got.some(m => m.type === 'retract' && m.req === first.req)).toBe(false)
+  expect(cancels()).toBe(before)
+  A.ws.send(JSON.stringify({ type: 'interrupt' }))
+  A.ws.send(JSON.stringify({ type: 'mode', mode: 'interactive' }))
+  await A.wait(m => m.type === 'call_mode' && m.mode === 'interactive')
+}, 20000)
+
 test('a wake is confirmed from the words still coming: a long sentence with no pause keeps the mic on', async () => {
   const traceNow = () => readFileSync(join(CALLS, readdirSync(CALLS)[0], 'trace.jsonl'), 'utf8')
   A.got.length = 0

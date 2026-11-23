@@ -991,8 +991,9 @@ function heard(ws: WS, turns: Turn[], finalized: boolean) {
   if (r.stop) { stopAll(ws, `you said "${r.lines.filter(l => l.role === 'me').map(l => l.text).join(' ')}"`); return }
   if (r.send) {
     // The caller's words after the caller's request, before its answer: one request, asked again. Not
-    // someone else's request, which is a request of its own.
-    if (!r.from) redoIfCut(ws)
+    // someone else's request, which is a request of its own; nor one that calls it by name again
+    // ("Lucy, turn off the microphone" 2 s after a hand-off was merged into it, and not done, 2026-11-23).
+    if (!r.from && !r.fresh) redoIfCut(ws)
     const h = ws.data.hold
     if (!h.texts.length) h.since = Date.now()
     // Someone else called it: Claude is told who, since it acts with the caller's rights.
